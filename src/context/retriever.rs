@@ -116,6 +116,29 @@ impl Retriever {
         v
     }
 
+    /// Whole-file bodies of the files the query names by path, in the order the
+    /// query names them. These ride in the implementer's *volatile* tail rather
+    /// than the mid layer: the mid layer's `fit` and its summarize threshold
+    /// both sit at 16k chars, so a 20k source file named by the goal arrived
+    /// there as head+elided-tail — and the model then refused to patch text it
+    /// had not read, ending the task at "WRITES MADE is 0". Below the layers the
+    /// file is whole up to the volatile budget and never summarized.
+    pub(crate) fn named_file_contents(&self, query: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for p in self.named_paths(query) {
+            let Ok(content) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            // Same whole-file cap as a requested file: a bigger file is not a
+            // whole-file answer, and the window is the assembler's to choose.
+            if content.len() > 256 * 1024 {
+                continue;
+            }
+            out.push((rel(&self.root, &p), content));
+        }
+        out
+    }
+
     fn snippet(
         &self,
         path: &Path,
