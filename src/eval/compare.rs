@@ -181,13 +181,17 @@ impl Comparison {
                 // The context columns are the point of stage 0's instrument:
                 // a task that moved while retrieval did not is a model effect.
                 s.push_str(&format!(
-                    "      context: retrieved {} -> {} chars, referenced {} -> {}, proxy {:.3} -> {:.3}, summarize {} -> {} tok\n",
+                    "      context: retrieved {} -> {} chars, referenced {} -> {}, proxy {:.3} -> {:.3}, recall {:.2} -> {:.2} ({} -> {} files), summarize {} -> {} tok\n",
                     t.a_context.retrieved_chars,
                     t.b_context.retrieved_chars,
                     t.a_context.referenced_chars,
                     t.b_context.referenced_chars,
                     t.a_context.relevance_proxy,
                     t.b_context.relevance_proxy,
+                    t.a_context.recall(),
+                    t.b_context.recall(),
+                    t.a_context.recalled_files,
+                    t.b_context.recalled_files,
                     t.a_context.summarize_tokens,
                     t.b_context.summarize_tokens
                 ));
@@ -304,6 +308,7 @@ pub fn compare(a: &SuiteReport, b: &SuiteReport) -> Comparison {
         ctx_a.relevance_proxy as f64,
         ctx_b.relevance_proxy as f64,
     );
+    push("recall", ctx_a.recall() as f64, ctx_b.recall() as f64);
     push(
         "summarize_calls",
         ctx_a.summarize_calls as f64,

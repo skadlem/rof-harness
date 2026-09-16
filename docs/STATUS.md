@@ -22,8 +22,8 @@ still demonstrates improved verdict correctness, not completion rate.
 
 ## §4.2 tree-state substrate (2026-09-16)
 
-`docs/ARCHITECTURE-v3.md` §4.2 is implemented and uncommitted: git is the tree-state substrate of
-every task copy. `src/engine/tree.rs` (`TreeService`: `ensure`/`baseline`/`rollback`/`diff`, plus
+`docs/ARCHITECTURE-v3.md` §4.2 is implemented and **committed** (`34875ff`): git is the tree-state
+substrate of every task copy. `src/engine/tree.rs` (`TreeService`: `ensure`/`baseline`/`rollback`/`diff`, plus
 `copy_git_state`) drives it; `copy_tree` now ships `.git` (shallow `--depth 1` above 8 MiB, verbatim
 below, `git init` + one commit for a non-repo source) and keeps `target/` excluded. The write gate
 no longer reads the model's self-reported `writes[]` — it counts `git status --porcelain` (diff
@@ -32,9 +32,24 @@ the substrate for the §4.4 recall metric. A failed attempt is rolled back (`che
 clean -fdq`) only when a retry follows, so the final tree stays readable. `file_state_evidence` now
 reports a landed change as rolled back, without its post-attempt text; a refused patch still hands
 over its text. `git` is never on `ROF_ALLOW_CMDS` and `.git` is denied by every file tool and hidden
-from listings. Full suite (118 tests), Clippy and formatting are clean; a stub-mode run against a
-non-repo tree confirms the substrate is created end to end (`reviewing -> rolled_back` in the trace
-before each retry). Next: §4.4 recall, which only needs to read `changed_files` from the task JSON.
+from listings. The opt-in direct mode (`ROF_MODE=direct`) ships in the same commit — it shares the
+tree service, so a fabricated split was not worth it.
+
+## §4.4 recall + §4.6 symlink containment (2026-09-16)
+
+Both done and committed after this line was written.
+
+- **Recall** (`ContextMetrics::changed_files`/`recalled_files` + `recall()`): the change set comes
+  from §4.2's per-task `changed_files` — ground truth, not the artifact's self-reported `file_state`.
+  Prints per task (`recall=recalled/changed`) and aggregates in `rof compare` as a true ratio, not a
+  mean of per-task ratios, so a task touching 1/1 cannot average away one touching 0/100. This is
+  the baseline that gates the graph-retrieval and budget-dial backlog items; no retrieval feature
+  ships before it has a number.
+- **Symlink containment** (`tools::symlink_safe`): every read/list/write resolves its containing
+  directory against the canonical root and resolves a symlinked final name. The root itself is the
+  trust anchor (exempt, so `path: "."` still lists); a link resolving back inside still reads.
+
+Full suite (121 tests), Clippy and formatting clean.
 
 stage 3 (programmable state: `state/` module, `~/.rof/state.json`,
 `state.propose` behind the gate, `rof state approve|reject`) — but see the ranked list at the bottom

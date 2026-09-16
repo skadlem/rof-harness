@@ -164,7 +164,55 @@ fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, ToolError> {
             "path is the git substrate (.git): harness-only".to_string(),
         ));
     }
+    symlink_safe(root, &p)?;
     Ok(p)
+}
+
+/// §4.6: `under()` is lexical, so a symlink inside the root can point anywhere
+/// — deny-by-default must hold for symlinks, not just spellings. Resolve the
+/// containing directory (and a symlinked final name) against the canonical root.
+/// Reads and writes both route here: a link out of the root leaks data one way
+/// and corrupts it the other.
+fn symlink_safe(root: &Path, target: &Path) -> Result<(), ToolError> {
+    // The root may itself be a link; compare canonical to canonical.
+    let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // The root is the trust anchor: only what hangs under it gets resolved.
+    if normalize(target) == normalize(root) {
+        return Ok(());
+    }
+    let parent = target.parent().unwrap_or(root);
+    // Writes create no parent dirs, so this exists for every real call; a
+    // failure means a dangling link in the path, and that path is not writable.
+    let canon = std::fs::canonicalize(parent)
+        .map_err(|e| ToolError::Denied(format!("path is not resolvable: {e}")))?;
+    if !canon.starts_with(&canon_root) {
+        return Err(ToolError::Denied(
+            "symlink escapes the tool root".to_string(),
+        ));
+    }
+    // A verified directory is not enough: writing through `/root/link -> /etc/x`
+    // still lands in /etc.
+    if std::fs::symlink_metadata(target)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        let link = std::fs::read_link(target)
+            .map_err(|e| ToolError::Denied(format!("unreadable symlink: {e}")))?;
+        let resolved = if link.is_absolute() {
+            link
+        } else {
+            canon.join(link)
+        };
+        // Chains resolve fully when the target exists; a dangling link still
+        // names where the write would land, so it is checked, not trusted.
+        let real = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+        if !under(&canon_root, &real) {
+            return Err(ToolError::Denied(
+                "symlink escapes the tool root".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Safe tool 1: list files under root (read-only).
