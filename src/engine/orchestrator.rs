@@ -91,10 +91,37 @@ impl Orchestrator {
                 .await
         };
 
+        // A pre-check cheaper than the model that will consume
+        // the goal. It never blocks — it emits a trace event and (when
+        // enabled) a note in the planner prompt, because a pre-check that
+        // refuses goals would be the harness claiming a judgement it cannot
+        // make. Off by default (`AppConfig::goal_quality`).
+        let goal_note = if self.cfg.goal_quality {
+            match crate::eval::goal_quality::check_goal_quality(&session.goal) {
+                Some(note) => {
+                    self.trace.emit(TraceEvent::GoalQuality {
+                        goal: session.goal.clone(),
+                        note: note.clone(),
+                    });
+                    Some(note)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         // Planner (Context LLM, no tools)
         let plan_state = CtxState {
             long_term: planner_head.clone(),
-            mid_term: format!("goal: {}\n{retrieved}{planner_reuse}", session.goal),
+            mid_term: format!(
+                "goal: {}\n{}{retrieved}{planner_reuse}",
+                session.goal,
+                goal_note
+                    .as_deref()
+                    .map(|n| format!("GOAL QUALITY NOTE: {n}\n"))
+                    .unwrap_or_default()
+            ),
             short_term: session.ctx.short_term.clone(),
         };
         let (plan_view, _) = builder.plan(&plan_state);
@@ -187,7 +214,12 @@ impl Orchestrator {
                     &reviewer_skills,
                 )
                 .await;
-            for round in 1..=rounds {
+            // Round cap; the auto-poke below may extend it by exactly one
+            // which is why this is a `while` and not a range.
+            let mut rounds = rounds;
+            let mut round = 1u32;
+            let mut poked = false;
+            while round <= rounds {
                 // Token guard: stop before spending another expensive round.
                 let spent = self.tokens_since(task_start);
                 if limit > 0 && spent > limit {
@@ -358,6 +390,35 @@ impl Orchestrator {
                     from: "reviewing".to_string(),
                     to: "implementing".to_string(),
                 });
+                // Buy one more round instead of stopping when
+                // the failure shape says "instruction problem" (no writes when
+                // they were required) or a cap-exhausted retry. Bounded: a
+                // task is poked at most once, whatever the cap.
+                if !poked
+                    && self.cfg.auto_poke
+                    && round == rounds
+                    && crate::eval::goal_quality::should_auto_poke(
+                        verdict.pass,
+                        ran,
+                        writes_made,
+                        session.expect_writes,
+                        budget_hit.is_some(),
+                    )
+                {
+                    poked = true;
+                    rounds += 1;
+                    let reason = crate::eval::goal_quality::poke_reason(
+                        ran,
+                        writes_made,
+                        session.expect_writes,
+                    );
+                    self.trace.emit(TraceEvent::AutoPoke {
+                        task: task.clone(),
+                        reason: reason.clone(),
+                    });
+                    feedback = format!("{feedback}\n{reason}");
+                }
+                round += 1;
             }
             total_rounds += ran;
             let aborted = budget_hit.is_some();

@@ -210,6 +210,16 @@ pub struct AppConfig {
     /// (a task that runs cargo checks builds its own target/ there).
     #[serde(default)]
     pub task_root: Option<PathBuf>,
+    /// Run the goal-quality pre-check before planning. Emits a
+    /// `GoalQuality` trace event and, when set, a note in the planner prompt.
+    /// Off by default: it changes prompt content, which is an A/B'able change.
+    #[serde(default)]
+    pub goal_quality: bool,
+    /// Buy one extra implementer round when a task fails at its round cap
+    /// Off by default: it changes the number of
+    /// rounds a live arm executes.
+    #[serde(default)]
+    pub auto_poke: bool,
 }
 
 fn one_job() -> usize {
@@ -265,6 +275,10 @@ impl Default for AppConfig {
             expect_writes: true,
             max_parallel_tasks: 1,
             task_root: None,
+            // Off by default: both change live behaviour (prompt content /
+            // rounds executed), so they are opt-in A/B'able switches.
+            goal_quality: false,
+            auto_poke: false,
         }
     }
 }

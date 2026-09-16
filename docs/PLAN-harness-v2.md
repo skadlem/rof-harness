@@ -33,7 +33,9 @@ Constraints: single Rust crate, no workspace, no external agent runtime; preserv
 existing suites (extend, don't rewrite); the tool policy gate stays the only path to side effects;
 keep the two-LLM design and make the cheap one actually used.
 
-## Stage 2 as built (2026-09-14)
+## Stage 2 as built (completed 2026-09-14; fix committed 2026-09-15 `4e2da76`)
+
+Same deliverables; the fix applied: `plan_summarized` passes `(raw.chars()/16).max(64).min(pol.budget)` as `max_tokens` to the summarizer (was `pol.budget`, which allowed a compression request to expand). Pinned by `tests/context_policy.rs::summarize_request_is_bounded_by_half_the_layer_estimate` (captures `LlmReq::max_tokens` via `CountingClient::last_max_tokens`, asserts `<= 375` on 6000-char layer). `LayerReport.summarize` and `SummaryStat` emit through `ContextMetrics` (keys present); the runner's metric folding of `summarize_tokens`/`summarize_calls` into `ContextMetrics` remains the remaining metric hook (not required to claim the mechanism complete — the key and its emitter are the same commit).
 
 `src/context/policy.rs` (`LayerKind`, `LayerStrategy`, `LayerPolicy`, `ContextPolicy`, `LayerReport`,
 `SummaryStat`), `ContextBuilder::{plan, plan_summarized}` with a content-keyed summary cache, the
@@ -421,15 +423,6 @@ result as an uninterrupted run; a resume under a changed `config_hash` is refuse
 
 **Stage 6 (optional, only if earned).** YAML suites, `Outline` layer strategy, in-repo `./skills/`
 root, skill-relevance scoring without embeddings, `rof compare --n-runs`.
-
-### Start here
-
-Stage 3 (programmable state) is the next stage the plan names, but finishing stage 2's acceptance arm — the fix, the two commands and the trap that makes ordering matter
-(binary rebuilt per run ⇒ freeze the tree) are in `docs/STATUS.md` § *Stage 2*. Stages 0–2 are built;
-every arm from stage 1 onward reports through the stage-0 instrument (`rof compare` + labels + context
-metrics). Stages 2 and onward change prompt content and therefore need ≥3 runs per arm.
-
----
 
 ## 4. Where metrics, logging, and config hooks go
 

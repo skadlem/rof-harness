@@ -1,16 +1,88 @@
 # Status
 
-Last verified: 2026-09-14, on this working tree (`git log` has the v1 commit; this file is the
+Last verified: 2026-09-15, on this working tree (`git log` has the v1 commit; this file is the
 running handoff).
 
-finish stage 2's live acceptance, then stage 3. Stage 2 (per-layer
-context policy) is **built, offline-green and smoke-verified live**, but its acceptance *arm* was
-deliberately not run yet: writing the arm scripts surfaced a design flaw (the summarizer may be asked
-for a full layer's worth of tokens, i.e. a "compression" that is allowed to expand), and a run built
-from a tree that is about to change is a wasted run. Section *Stage 2* below has the fix and the exact
-commands. Stages 0 (observability) and 1 (skills) are done and recorded further down; stage 1's live
-finding still stands (agents wrote no skill unless the goal asked for one, because the nudge's trigger
-is a multi-round *success*).
+stage 3 (programmable state: `state/` module, `~/.rof/state.json`,
+`state.propose` behind the gate, `rof state approve|reject`) — but see the ranked list at the bottom
+first, because two items now outrank it. Stage 2's acceptance question is **answered** (arming the
+mid layer costs matches; the default stays) and the stage that ran after it is **reviewed and
+cleaned**: of its seven proposed goals only goal 4 (goal-quality + auto-poke) is real, and it is
+built, tested and off by default — its first live arm then measured the auto-poke half and left it off
+(+32% cost for a difference inside the instrument's noise; § *Goal 4 live arm*). Everything else in that
+stage was un-compiled skeleton files; they are deleted and the designs stay in `docs/PLAN-harness-v2.md`.
+
+Read in this order: § *Stage 2 acceptance* (the measurement, 2026-09-15) → § *Goal quality* (what was
+faked, what is real) → § *Verified state* → the ranked *Good next steps* at the bottom.
+
+## Stage 2 acceptance: arming the mid layer costs matches (2026-09-15, measured)
+
+Both arms were already on disk from the 2026-09-14 session; nobody had read them. `hard-two`,
+`--jobs 1`, `ROF_PLANNER=skip`, 6 runs per arm, **same tree** (`4e2da76`, the bounded-summary fix),
+`exec/ctx = deepseek-chat`, `config_hash` differs between the arms (`4a601062…` vs `debe343e…`) so the
+only variable is `ROF_SUMMARIZE_AT`. Reports: `~/rof-runs-s2-off/`, `~/rof-runs-s2-armed/`.
+
+| arm | matched | metrics-method | add-retriever-test | in tokens/run | $/run |
+|---|---|---|---|---|---|
+| off (defaults, mid at 0.8 → inert) | **8/12** | 4/6 | 4/6 | 47.8k | 0.0040 |
+| armed `ROF_SUMMARIZE_AT=0.6` | **2/12** | 2/6 | 0/6 | 43.1k | 0.0061 |
+
+Fisher two-sided p = 0.036 overall (`add-retriever-test` 0/6 vs 4/6, p = 0.061; `metrics-method` p =
+0.57). The mechanism is not broken — the armed arm fired exactly as designed (2 summarize calls per
+run, `layer_summaries [0,4,0]`, `layer_truncations [0,0,0]`) — it is **harmful on these tasks**: the
+mid layer carries the whole file the task then edits (retrieval gives a named file whole-file
+treatment up to 12k chars), so a summary replaces the anchor text the implementer patches against.
+Cost rose 53% per run while matches fell.
+
+**Conclusion: the 0.8 default stands; `0.6` is a measured loss, not a candidate default.** Any future
+claim that "stage 2 saves tokens" must name the arming and a suite where the mid layer is filler
+rather than the edit target.
+
+`~/rof-runs-s2-repo-{before,off,armed}` (9 reports, 3 runs each) are **not data**: every run used
+`deepseek-chat:free`, all 6 tasks failed with `all models in fallback chain failed`, 24 model errors
+per run, 0 tokens, $0. They were moved to `~/rof-runs-junk/` (with a README explaining why) so they
+cannot be read as a before/off/armed comparison later.
+
+## Goal 4 live arm: auto-poke (measured 2026-09-15, 6 runs/arm — the default stays off)
+
+The design was pre-registered in this file before the runs and was not changed afterwards: `hard-two`,
+`--jobs 1`, `ROF_PLANNER=skip`, empty skill store, frozen worktree `~/rof-arm-poke` at `0cd40db`, 6 runs
+per arm, arms = defaults vs `ROF_AUTO_POKE=yes`. Reports: `~/rof-runs-poke-off/`, `~/rof-runs-poke-on/`.
+
+| arm | matched | metrics-method | add-retriever-test | auto_pokes | in tokens/run | $/run |
+|---|---|---|---|---|---|---|
+| off (default) | 9/12 | 5/6 | 4/6 | 0 | 49.8k | 0.00402 |
+| `ROF_AUTO_POKE=yes` | 10/12 | 6/6 | 4/6 | 4, in 3 of 6 runs | 66.4k | 0.00530 |
+
+Fisher two-sided p = 1.0 (the baseline itself is 3 runs at 2/2 and 3 at 1/2 — a one-task difference is
+this instrument's noise).
+
+**Verdict: the default stays off**, by the rule registered above: the matched difference is not
+distinguishable from noise and it is paid for with +32% cost and +33% input tokens per run.
+
+The mechanism is not inert, and the traces say exactly where it works. Of the 4 pokes, **2 converted a
+failing task into a pass** — both on `metrics-method`, the task whose failure shape is "the artifact is
+prose / the write never landed" — and 2 did not (both on `add-retriever-test`, which fails for a
+compile-shaped reason no extra round can fix). So the lever is narrow and its honest description is: one
+extra round helps *"the model described the change but did not apply it"*, and does not help *"the model
+applied a wrong change"*. Cost per conversion: a poked run runs 1.3× ($0.0054–0.0100 against $0.0040).
+
+**If this feature is ever reopened, the only reason is the narrower trigger**: poke on the
+`expect_writes && writes == 0` rejection only, instead of every cap exhaustion — 2 of 2 conversions came
+from that half, and the other half paid for nothing. Measuring that is a new arm, not a default flip.
+
+**The goal-quality half stays unmeasurable on these suites**, and that is a finding, not a gap: the note
+goes into the *planner* prompt only (so a `ROF_PLANNER=skip` arm cannot see it), and hard-two's goals are
+anchored so the check never fires on them (0 `GoalQuality` events in 12 runs). Its only live effect today
+would be on the `expect_writes: false` explain tasks of `repo-tasks`, where the flag is a false positive
+(§ *Goal quality*, finding 2). Fix the false positive before any quality arm.
+
+## Earlier: stage 2 as built (2026-09-14, night)
+
+The design points and the six deviations from the plan's sketch are below in "Stage 2" — they still
+hold. Two corrections to that section: the armed arm **did** finish (see § *Stage 2 acceptance*
+above), and the `layer_summaries`/`layer_truncations` metric fold it calls "the remaining step" is
+**wired** (`eval/metrics.rs`, folded per task and shown by `rof compare`).
 
 **Two traps this session paid for, both now known:**
 
@@ -67,14 +139,19 @@ Offline: `cargo test` **84 passed** (73 before), clippy 0 warnings, fmt clean, c
 
 **Next, in this order:**
 
-1. **Bound the summary request.** `plan_summarized` currently passes `pol.budget` as the summarize
-   `max_tokens`, so it may ask for up to a full layer's worth of tokens: a compression that is allowed
-   to expand is not one. Ask for half the layer's estimated tokens instead
-   (`raw.chars() / 8`, clamped to `>= 64` and `<= the layer budget`), and pin it with a test that
-   captures `LlmReq::max_tokens` (the counting stub in `tests/context_policy.rs` is the place).
-   Re-run `cargo test`, `cargo clippy --all-targets`, `cargo fmt --check`, commit, and **only then**
-   run arms — see trap 1 above.
-2. **The acceptance arms** (scripts are written and unused: `~/rof-s2-hard2.sh`, `~/rof-s2-repo.sh`).
+1. **Bound the summary request.** DONE (`4e2da76`). `plan_summarized` passes
+   `(raw.chars() / 16).max(64).min(pol.budget)` as `max_tokens` (was `pol.budget`, allowing
+   expansion). Pinned by `tests/context_policy.rs::summarize_request_is_bounded_by_half_the_layer_estimate`
+   (captures `req.max_tokens` via `CountingClient::last_max_tokens`, asserts `<= 375` on 6000-char
+   layer). `cargo test` 85 passed (was 84), `clippy` 0, `fmt` clean.
+2. **The acceptance arms.** DONE — see § *Stage 2 acceptance* at the top of this file: off 8/12 vs
+   armed 2/12 on the same tree (Fisher p = 0.036), so the 0.8 default stays and `0.6` is recorded as a
+   measured loss. The off arm reports show `summarized: false` / `summarize_calls: 0` for both tasks
+   per run (defaults inert at these sizes, as predicted). The repo arm's 9 reports are junk (all three
+   arms ran on `deepseek-chat:free` and failed every task with `all models in fallback chain failed`);
+   they are quarantined in `~/rof-runs-junk/`, so `~/rof-s2-repo.sh` still has **no** usable run —
+   re-run it when a working (non-`:free`) endpoint is available.
+3. **The acceptance arms** — scripts kept for reuse; the numbers are recorded above.
    Both arms of each pair are the *same* tree; the only variable is the arming, because at these
    context sizes everything else stage 2 changed is inert:
 
@@ -262,7 +339,7 @@ Acceptance, measured:
 
 | Check | Result |
 |---|---|
-| `cargo test` | 84 passed, 0 failed (52 before stage 0, 57 before stage 1, 73 before stage 2) |
+| `cargo test` | 89 passed, 0 failed (52 before stage 0, 57 before stage 1, 73 before stage 2, 85 after it, +4 goal-quality unit tests) |
 | `cargo clippy --all-targets` | 0 warnings |
 | `cargo fmt --check` | clean |
 | `cargo build --release` | green, `target/release/rof` ≈ 5.9 MB |
@@ -600,20 +677,29 @@ the next round, not gaps in this one.
 
 ## Good next steps (ranked)
 
-1. **Stage 2's acceptance arm** — the fix and the two commands are in the *Stage 2* section at the
-   top of this file. Nothing else should run before it: the stage is built and its live behaviour is
-   known, but "does arming the mid layer cost matches?" is unanswered, and the answer decides whether
-   the 0.8 default stands.
-2. **Verification before the write** — `metrics-method`'s residual, and now the one failure class
+1. **Verification before the write** — `metrics-method`'s residual, and the one failure class
    that survived *two* executor models: the model asserts facts about code it has not read
    (`E0559`/`E0063` invented field sets, `E0592`/`E0428` duplicates, prose instead of a patch). The
    harness already hands it the file (path map + read-request turn + file-state evidence), so the
    missing piece is a check the model must pass *before* the artifact is accepted — e.g. the
    implementer's own `cargo check` result travelling with the artifact, or the reviewer (which holds
    `fs.read` in the policy but is handed `tools: None`) reading the file it is judging.
-3. **Independent review**: route only the reviewer to a second model and measure whether verdicts
+2. **Stage 3 (programmable state)** — the next stage the plan names: `state/` module, `~/.rof/state.json`,
+   `state.propose` behind the gate, `rof state approve|reject`. Nothing of it exists in the tree: the
+   skeleton and the CLI stub were deleted , so this is greenfield, and the same rule
+   applies — the module lands in the commit that calls it.
+3. **Goal 4's reopen condition (not a default flip)**: the auto-poke is measured and stays off
+   (§ *Goal 4 live arm*: 9/12 vs 10/12 at +32% cost). The only version worth another arm is the narrow
+   trigger — poke on the `expect_writes && writes == 0` rejection only, where 2 of 2 conversions came
+   from. The goal-quality half needs the `expect_writes: false` exemption first (it flags 4 of 28 real
+   suite goals, all explain tasks), otherwise any quality arm measures noise.
+4. **Independent review**: route only the reviewer to a second model and measure whether verdicts
    change. Distinct from the executor arm above, which swapped the model for every role at once.
-4. `writes[]` as structured results + one helper for `apply_patches`/`apply_writes` (the same 30-line
+5. `writes[]` as structured results + one helper for `apply_patches`/`apply_writes` (the same 30-line
    loop exists twice).
-5. Symlink-aware containment in `resolve_under` before any suite is allowed to run with a tool that
+6. Symlink-aware containment in `resolve_under` before any suite is allowed to run with a tool that
    can create links (the fix is ~5 lines: canonicalize the parent, compare against the canonical root).
+
+**Rule earned on 2026-09-15:** a commit that adds a module must declare it in the module tree and ship
+a caller or a test that fails without it — otherwise it is a doc, and docs live in `docs/`. Six
+skeletons were deleted here precisely because they were read as progress while compiling to nothing.

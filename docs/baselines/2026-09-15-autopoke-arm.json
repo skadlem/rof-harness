@@ -1,0 +1,347 @@
+{
+  "arm": "autopoke",
+  "date": "2026-09-15",
+  "suite": "hard-two",
+  "design": "hard-two --jobs 1, ROF_PLANNER=skip, empty skills store, frozen worktree ~/rof-arm-poke @0cd40db, 6 runs/arm",
+  "arms": {
+    "poke-off": [
+      {
+        "run": "run-poke-off-1.json",
+        "label": {
+          "git_head": "0cd40db",
+          "config_hash": "8fb578c3c1e0e781",
+          "suite_hash": "5b3e19ec6d31a1cd",
+          "ctx_model": "deepseek-chat",
+          "exec_model": "deepseek-chat",
+          "harness_version": "0.1.0"
+        },
+        "matched": 2,
+        "tasks": {
+          "metrics-method": {
+            "matched": true,
+            "rounds": 2
+          },
+          "add-retriever-test": {
+            "matched": true,
+            "rounds": 1
+          }
+        },
+        "auto_pokes": 0,
+        "est_cost_usd": 0.004662,
+        "est_input_tokens": 52873,
+        "model_errors": 0
+      },
+      {
+        "run": "run-poke-off-2.json",
+        "label": {
+          "git_head": "0cd40db",
+          "config_hash": "8fb578c3c1e0e781",
+          "suite_hash": "5b3e19ec6d31a1cd",
+          "ctx_model": "deepseek-chat",
+          "exec_model": "deepseek-chat",
+          "harness_version": "0.1.0"
+        },
+        "matched": 1,
+        "tasks": {
+          "metrics-method": {
+            "matched": true,
+            "rounds": 1
+          },
+          "add-retriever-test": {
+            "matched": false,
+            "rounds": 2
+          }
+        },
+        "auto_pokes": 0,
+        "est_cost_usd": 0.00395,
+        "est_input_tokens": 40872,
+        "model_errors": 0
+      },
+      {
+        "run": "run-poke-off-3.json",
+        "label": {
+          "git_head": "0cd40db",
+          "config_hash": "8fb578c3c1e0e781",
+          "suite_hash": "5b3e19ec6d31a1cd",
+          "ctx_model": "deepseek-chat",
+          "exec_model": "deepseek-chat",
+          "harness_version": "0.1.0"
+        },
+        "matched": 1,
+        "tasks": {
+          "metrics-method": {
+            "matched": true,
+            "rounds": 2
+          },
+          "add-retriever-test": {
+            "matched": false,
+            "rounds": 2
+          }
+        },
+        "auto_pokes": 0,
+        "est_cost_usd": 0.005279,
+        "est_input_tokens": 66841,
+        "model_errors": 0
+      },
+      {
+        "run": "run-poke-off-4.json",
+        "label": {
+          "git_head": "0cd40db",
+          "config_hash": "8fb578c3c1e0e781",
+          "suite_hash": "5b3e19ec6d31a1cd",
+          "ctx_model": "deepseek-chat",
+          "exec_model": "deepseek-chat",
+          "harness_version": "0.1.0"
+        },
+        "matched": 2,
+        "tasks": {
+          "metrics-method": {
+            "matched": true,
+            "rounds": 1
+          },
+          "add-retriever-test": {
+            "matched": true,
+            "rounds": 1
+          }
+        },
+        "auto_pokes": 0,
+        "est_cost_usd": 0.002338,
+        "est_input_tokens": 34313,
+        "model_errors": 0
+      },
+      {
+        "run": "run-poke-off-5.json",
+        "label": {
+          "git_head": "0cd40db",
+          "config_hash": "8fb578c3c1e0e781",
+          "suite_hash": "5b3e19ec6d31a1cd",
+          "ctx_model": "deepseek-chat",
+          "exec_model": "deepseek-chat",
+          "harness_version": "0.1.0"
+        },
+        "matched": 1,
+        "tasks": {
+          "metrics-method": {
+            "matched": false,
+            "rounds": 2
+          },
+          "add-retriever-test": {
+            "matched": true,
+            "rounds": 2
+          }
+        },
+        "auto_pokes": 0,
+        "est_cost_usd": 0.004076,
+        "est_input_tokens": 52248,
+        "model_errors": 0
+      },
+      {
+        "run": "run-poke-off-6.json",
+        "label": {
+          "git_head": "0cd40db",
+          "config_hash": "8fb578c3c1e0e781",
+          "suite_hash": "5b3e19ec6d31a1cd",
+          "ctx_model": "deepseek-chat",
+          "exec_model": "deepseek-chat",
+          "harness_version": "0.1.0"
+        },
+        "matched": 2,
+        "tasks": {
+          "metrics-method": {
+            "matched": true,
+            "rounds": 2
+          },
+          "add-retriever-test": {
+            "matched": true,
+            "rounds": 1
+          }
+        },
+        "auto_pokes": 0,
+        "est_cost_usd": 0.003827,
+        "est_input_tokens": 51360,
+        "model_errors": 0
+      }
+    ],
+    "poke-on": [
+      {
+        "run": "run-poke-on-1.json",
+        "label": {
+          "git_head": "0cd40db",
+          "config_hash": "2b5a59f5d4a91ef2",
+          "suite_hash": "5b3e19ec6d31a1cd",
+          "ctx_model": "deepseek-chat",
+          "exec_model": "deepseek-chat",
+          "harness_version": "0.1.0"
+        },
+        "matched": 1,
+        "tasks": {
+          "metrics-method": {
+            "matched": true,
+            "rounds": 2
+          },
+          "add-retriever-test": {
+            "matched": false,
+            "rounds": 3
+          }
+        },
+        "auto_pokes": 1,
+        "est_cost_usd": 0.005226,
+        "est_input_tokens": 70213,
+        "model_errors": 0
+      },
+      {
+        "run": "run-poke-on-2.json",
+        "label": {
+          "git_head": "0cd40db",
+          "config_hash": "2b5a59f5d4a91ef2",
+          "suite_hash": "5b3e19ec6d31a1cd",
+          "ctx_model": "deepseek-chat",
+          "exec_model": "deepseek-chat",
+          "harness_version": "0.1.0"
+        },
+        "matched": 2,
+        "tasks": {
+          "metrics-method": {
+            "matched": true,
+            "rounds": 2
+          },
+          "add-retriever-test": {
+            "matched": true,
+            "rounds": 1
+          }
+        },
+        "auto_pokes": 0,
+        "est_cost_usd": 0.003386,
+        "est_input_tokens": 51108,
+        "model_errors": 0
+      },
+      {
+        "run": "run-poke-on-3.json",
+        "label": {
+          "git_head": "0cd40db",
+          "config_hash": "2b5a59f5d4a91ef2",
+          "suite_hash": "5b3e19ec6d31a1cd",
+          "ctx_model": "deepseek-chat",
+          "exec_model": "deepseek-chat",
+          "harness_version": "0.1.0"
+        },
+        "matched": 2,
+        "tasks": {
+          "metrics-method": {
+            "matched": true,
+            "rounds": 2
+          },
+          "add-retriever-test": {
+            "matched": true,
+            "rounds": 1
+          }
+        },
+        "auto_pokes": 0,
+        "est_cost_usd": 0.003842,
+        "est_input_tokens": 49025,
+        "model_errors": 0
+      },
+      {
+        "run": "run-poke-on-4.json",
+        "label": {
+          "git_head": "0cd40db",
+          "config_hash": "2b5a59f5d4a91ef2",
+          "suite_hash": "5b3e19ec6d31a1cd",
+          "ctx_model": "deepseek-chat",
+          "exec_model": "deepseek-chat",
+          "harness_version": "0.1.0"
+        },
+        "matched": 2,
+        "tasks": {
+          "metrics-method": {
+            "matched": true,
+            "rounds": 3
+          },
+          "add-retriever-test": {
+            "matched": true,
+            "rounds": 1
+          }
+        },
+        "auto_pokes": 1,
+        "est_cost_usd": 0.005411,
+        "est_input_tokens": 63983,
+        "model_errors": 0
+      },
+      {
+        "run": "run-poke-on-5.json",
+        "label": {
+          "git_head": "0cd40db",
+          "config_hash": "2b5a59f5d4a91ef2",
+          "suite_hash": "5b3e19ec6d31a1cd",
+          "ctx_model": "deepseek-chat",
+          "exec_model": "deepseek-chat",
+          "harness_version": "0.1.0"
+        },
+        "matched": 1,
+        "tasks": {
+          "metrics-method": {
+            "matched": true,
+            "rounds": 3
+          },
+          "add-retriever-test": {
+            "matched": false,
+            "rounds": 3
+          }
+        },
+        "auto_pokes": 2,
+        "est_cost_usd": 0.010035,
+        "est_input_tokens": 111197,
+        "model_errors": 1
+      },
+      {
+        "run": "run-poke-on-6.json",
+        "label": {
+          "git_head": "0cd40db",
+          "config_hash": "2b5a59f5d4a91ef2",
+          "suite_hash": "5b3e19ec6d31a1cd",
+          "ctx_model": "deepseek-chat",
+          "exec_model": "deepseek-chat",
+          "harness_version": "0.1.0"
+        },
+        "matched": 2,
+        "tasks": {
+          "metrics-method": {
+            "matched": true,
+            "rounds": 2
+          },
+          "add-retriever-test": {
+            "matched": true,
+            "rounds": 1
+          }
+        },
+        "auto_pokes": 0,
+        "est_cost_usd": 0.003885,
+        "est_input_tokens": 52946,
+        "model_errors": 0
+      }
+    ]
+  },
+  "pokes": [
+    {
+      "trace": "trace-poke-on-1.jsonl",
+      "task": "In src/context/retriever.rs, add a `#[cfg(test)] mod tests` ",
+      "reason": "AUTO-POKE: the round cap (2) was reached without an accepted result. This task requires a file change and NONE was appli"
+    },
+    {
+      "trace": "trace-poke-on-4.jsonl",
+      "task": "In src/eval/metrics.rs, add a public method `tool_failures(&",
+      "reason": "AUTO-POKE: the round cap (2) was reached without an accepted result. Re-read the file you are changing and the last chec"
+    },
+    {
+      "trace": "trace-poke-on-5.jsonl",
+      "task": "In src/eval/metrics.rs, add a public method `tool_failures(&",
+      "reason": "AUTO-POKE: the round cap (2) was reached without an accepted result. Re-read the file you are changing and the last chec"
+    },
+    {
+      "trace": "trace-poke-on-5.jsonl",
+      "task": "In src/context/retriever.rs, add a `#[cfg(test)] mod tests` ",
+      "reason": "AUTO-POKE: the round cap (2) was reached without an accepted result. Re-read the file you are changing and the last chec"
+    }
+  ],
+  "verdict": "default stays off: 9/12 vs 10/12, Fisher p=1.0, cost +32%/run, tokens +33%/run"
+}
