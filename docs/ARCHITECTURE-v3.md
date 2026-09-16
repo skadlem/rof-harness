@@ -187,6 +187,20 @@ struct TaskOutcome {
 
 **Why not a strategy trait.** A trait with three strategies was considered and deferred: the config switch *already* makes orchestration a measured variable, and the third strategy (`PlanDirectVerify`) has no arm. See §8.
 
+**Implementation (landed).** `RoundServices` is a borrow-only struct holding the services both modes must use identically — `cfg`, `trace`, `context`, `executor`, `verify`, `tools` — with the methods that used to live in `run_loop` alone: `run_checks` (returns `Vec<CheckResult>`), `skill_index`, `skill_bodies`, `reviewer_file_evidence`, `goal_note`, `budget`, and the pure `head_with_index`. The two loops construct one each and call the same methods, so "which prompt part does a mode forget" became a compile error against the struct rather than a silent drift. A mode that wants the skill index must call the shared method; there is exactly one of each.
+
+Deliberate scope cuts (ponytail):
+
+- **No `TaskOutcome` struct.** The report is already a `serde_json::Value` and both the CLI and `compare` read it; a typed outcome would have rewritten the whole output path for no measured bug. What the outcome *needed* — a verdict that does not parse prose, and a check list `compare` can diff — is delivered by `CheckResult` alone, carried in the report as `check_results` next to the rendered `checks` log the prompts still show.
+- **No `WriteSummary`/`EvidenceRef`.** The write gate's numbers and the reviewer's evidence are already structured (`TreeDiff`, the artifact's `file_state`); new types would wrap existing ones.
+- **No shared `loop_one_round()`.** The loops differ in *policy* (who gets a model call, who decides pass), and collapsing them would re-introduce a mode flag inside one body. `RoundServices` removes the drift they shared; the policy difference stays explicit. `fold_layers` stays on the orchestrator — it is run-wide accounting, not a per-round service.
+
+The direct verdict is now `checks_pass(&results)` — a field read. The substring bug was not "the string was wrong" but that the verdict and the log were the same object, so any quoted failure text inside a passing body flipped the task; `render_checks` is now a pure function of the results, and the verdict never touches it.
+
+`Budget` is O(1): `TraceSink` totals `input+output` on every `ModelCall` at the `emit()` choke point (`total_tokens()`), `fork()` starts a child at zero, and `Budget::exceeded()` is a subtraction. The old `tokens_since` rescanned the event stream from a trace index once per round per task — O(rounds²) in the stream length. Direct mode also gained the three services it was missing, plus the bounded auto-poke (at most one extra round), which is off by default and now traced identically in both modes.
+
+`compare` reads `TaskResult.checks` and reports `CheckFlip` — same check name, different outcome — rendered as `check 'cargo test' flipped: fail -> pass`. A task that moved with **no** flipped check leaves the list empty, and that emptiness is the signal: the acceptance gate held, so the move was a verdict effect, not a gate effect. The two have different fixes, which is the point of naming them apart. Reports written before the field existed load with `#[serde(default)]` and compare as empty lists.
+
 ### 4.4 `eval/metrics.rs` — retrieval recall *(new metric)*
 
 **Trigger.** There is no measurement that can justify any retrieval improvement. `relevance_proxy` measures precision-ish value; nothing measures whether retrieval *found the right files*.

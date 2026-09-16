@@ -76,7 +76,9 @@ version — computed from inputs that are canonical by design (the config dump a
 two runs are comparable instead of anecdotal. `rof compare a.json b.json` prints the label diff, the
 matched totals, every task that moved (with the losing side's feedback) and the metric deltas; it
 warns when the two reports are not the same task set or config rather than dressing a set difference
-up as an effect.
+up as an effect. A moved task also names the check that flipped (`check 'cargo test' flipped: fail ->
+pass`) when the acceptance gate is what moved — and reports no flips when it was not, which is how
+you tell a gate effect from a verdict effect.
 
 Each task result also carries context accounting: `retrieved_files`/`retrieved_chars` (what the
 retriever put in front of the agents), `referenced_chars` (of those, the chars whose file the task
@@ -171,7 +173,7 @@ Deny-by-default, enforced inside `ToolRegistry::call` (not in agents):
 ## Layout
 
 ```
-src/engine/   session, orchestrator (supervisor loop), router (Context vs Executor)
+src/engine/   session (RoundServices, CheckResult, Budget), orchestrator (supervisor loop), router (Context/Executor/Verify)
 src/agents/   planner, implementer, reviewer — one file per role behind the Agent trait
 src/context/  layered state (long/mid/short), budgeted builder, keyword retriever
 src/skills/   SKILL.md store: frontmatter parser, index, proposals, approval

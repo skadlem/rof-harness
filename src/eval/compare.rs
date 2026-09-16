@@ -1,5 +1,5 @@
 use super::metrics::ContextMetrics;
-use super::runner::{RunLabel, SuiteReport};
+use super::runner::{RunLabel, SuiteReport, TaskResult};
 
 /// How one task's matched result moved between two reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +67,31 @@ pub struct TaskDelta {
     pub b_context: ContextMetrics,
     /// Why it moved: the losing side's feedback, first line, trimmed.
     pub note: String,
+    /// Checks that flipped between the runs (§4.3): same name, different
+    /// outcome. Empty when either side predates structured checks or when no
+    /// check changed — a task that moved without one is a *model* effect, not
+    /// a check effect, and that distinction is the point of the field.
+    pub flipped_checks: Vec<CheckFlip>,
+}
+
+/// One configured check, two outcomes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckFlip {
+    pub name: String,
+    pub a_passed: bool,
+    pub b_passed: bool,
+}
+
+impl CheckFlip {
+    /// The side that passed it is the one that earned the result.
+    pub fn render(&self) -> String {
+        format!(
+            "check '{}' flipped: {} -> {}",
+            self.name,
+            if self.a_passed { "pass" } else { "fail" },
+            if self.b_passed { "pass" } else { "fail" }
+        )
+    }
 }
 
 impl TaskDelta {
@@ -176,6 +201,13 @@ impl Comparison {
                     _ => "a",
                 };
                 s.push_str(&format!("      ({side}) {}\n", t.note));
+            }
+            // §4.3: name the check that flipped. An empty list on a moved task
+            // is itself the signal — the gate held, so the verdict moved.
+            if t.change() != TaskChange::Same && !t.flipped_checks.is_empty() {
+                for f in &t.flipped_checks {
+                    s.push_str(&format!("      {}\n", f.render()));
+                }
             }
             if t.change() != TaskChange::Same && t.change() != TaskChange::OnlyInA {
                 // The context columns are the point of stage 0's instrument:
@@ -448,6 +480,25 @@ fn comparability_notes(a: &SuiteReport, b: &SuiteReport) -> Vec<String> {
     notes
 }
 
+/// Checks whose outcome differs between two task results, matched by name.
+/// A task that moved while no check flipped is the interesting case: the
+/// change was in the model's verdict, not in the acceptance gate.
+fn flipped_checks(a: &TaskResult, b: &TaskResult) -> Vec<CheckFlip> {
+    let mut out = Vec::new();
+    for ca in &a.checks {
+        if let Some(cb) = b.checks.iter().find(|c| c.name == ca.name) {
+            if ca.passed != cb.passed {
+                out.push(CheckFlip {
+                    name: ca.name.clone(),
+                    a_passed: ca.passed,
+                    b_passed: cb.passed,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Union of both task lists, in `a`'s order first: reports keep suite order,
 /// so the table reads like the suite unless the two differ.
 fn task_deltas(a: &SuiteReport, b: &SuiteReport) -> Vec<TaskDelta> {
@@ -463,6 +514,10 @@ fn task_deltas(a: &SuiteReport, b: &SuiteReport) -> Vec<TaskDelta> {
             a_context: ta.context.clone(),
             b_context: tb.map(|t| t.context.clone()).unwrap_or_default(),
             note: String::new(),
+            flipped_checks: match tb {
+                Some(tb) => flipped_checks(ta, tb),
+                None => Vec::new(),
+            },
         });
     }
     for tb in &b.tasks {
@@ -476,6 +531,7 @@ fn task_deltas(a: &SuiteReport, b: &SuiteReport) -> Vec<TaskDelta> {
                 a_context: ContextMetrics::default(),
                 b_context: tb.context.clone(),
                 note: String::new(),
+                flipped_checks: Vec::new(),
             });
         }
     }

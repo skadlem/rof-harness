@@ -1,9 +1,40 @@
 # Status
 
 Last verified: 2026-09-16, on this working tree. v3 components §4.2 (tree-state
-substrate + direct mode), §4.4 (recall), §4.6 (symlink containment) and §4.5
-(the `verify_model` routing slot) are all landed; see `docs/ARCHITECTURE-v3.md`.
-This file is the running record of what is measured, not a handoff.
+substrate + direct mode), §4.3 (structured outcomes + `RoundServices`), §4.4
+(recall), §4.6 (symlink containment) and §4.5 (the `verify_model` routing
+slot) are all landed; see `docs/ARCHITECTURE-v3.md`. This file is the running
+record of what is measured, not a handoff.
+
+## §4.3 RoundServices + structured outcomes (2026-09-16)
+
+`RoundServices` now holds the services both execution modes must use
+identically (`cfg`, `trace`, `context`, `executor`, `verify`, `tools`) and the
+methods that used to live in `run_loop` alone: `run_checks`, `skill_index`,
+`skill_bodies`, `reviewer_file_evidence`, `goal_note`, `budget`,
+`head_with_index`. Each loop constructs one and calls the same methods, so a
+prompt part one mode forgets is a compile error against the struct, not a
+silent drift.
+
+Two bugs this fixed, both named in the spec: the direct verdict is no longer
+`checks_log.contains("STATUS: FAILED")` — it is `checks_pass(&results)`, a
+field read, so a check that passes while quoting failure text inside its body
+no longer flips the task; and direct mode now gets the skill index, the
+goal-quality note and the bounded auto-poke it was silently missing. The
+auto-poke is still off by default (it stays measured, § *Goal 4 live arm*).
+
+Per-task spend is O(1) now: `TraceSink` totals `input+output` at the `emit()`
+choke point and `Budget::exceeded()` is a subtraction, replacing `tokens_since`'s
+per-round rescan of the event stream.
+
+`compare` gained per-check resolution: a moved task names the check that
+flipped (`check 'cargo test' flipped: fail -> pass`), and a moved task with no
+flipped check reports the empty list — that emptiness is the signal that the
+gate held and the verdict moved, which has a different fix.
+
+No `TaskOutcome` struct, deliberately: the report is a `serde_json::Value` both
+the CLI and `compare` read, and `CheckResult` alone delivers what the outcome
+needed. Scope and rationale are in `docs/ARCHITECTURE-v3.md` §4.3.
 
 ## §4.5 verify_model slot (2026-09-16)
 

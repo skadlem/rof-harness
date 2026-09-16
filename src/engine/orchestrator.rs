@@ -1,3 +1,4 @@
+use super::session::{checks_pass, render_checks, RoundServices};
 use super::Session;
 use crate::agents::{Agent, AgentCtx, ImplementerAgent, PlannerAgent, ReviewerAgent, Verdict};
 use crate::config::AppConfig;
@@ -61,8 +62,20 @@ impl Orchestrator {
             });
             return serde_json::json!({ "error": e.to_string() });
         }
+        // §4.3: the shared services. Both execution modes hold one of these
+        // and call the same methods for skills, checks, budgets and reviewer
+        // evidence, so a prompt part one mode forgets is a compile error
+        // against this struct, not a silent drift between two loops.
+        let svc = RoundServices {
+            cfg: &self.cfg,
+            trace: &self.trace,
+            context: &self.context,
+            executor: &self.executor,
+            verify: &self.verify,
+            tools,
+        };
         if self.cfg.execution == "direct" {
-            return self.run_direct_loop(session, tools, workdir, &tree).await;
+            return self.run_direct_loop(session, &svc, workdir, &tree).await;
         }
         // Stage 2: the per-layer policy owns budgets, strategy and the
         // summarize threshold. `plan_summarized` below is the first-class path;
@@ -96,41 +109,27 @@ impl Orchestrator {
         // decides who sees what. These are prompt-construction reads, not
         // agent tool calls: they emit `SkillOp` and never `ToolCall`, because
         // folding them into tool_accuracy would quietly inflate it.
-        let planner_skills = self.skill_index(tools, "planner").await;
-        let impl_skills = self.skill_index(tools, "implementer").await;
-        let reviewer_skills = self.skill_index(tools, "reviewer").await;
-        let planner_head = head_with_index(&session.ctx.long_term, &planner_skills.text);
-        let impl_head = head_with_index(&session.ctx.long_term, &impl_skills.text);
-        let reviewer_head = head_with_index(&session.ctx.long_term, &reviewer_skills.text);
+        let planner_skills = svc.skill_index("planner").await;
+        let impl_skills = svc.skill_index("implementer").await;
+        let reviewer_skills = svc.skill_index("reviewer").await;
+        let planner_head =
+            RoundServices::head_with_index(&session.ctx.long_term, &planner_skills.text);
+        let impl_head = RoundServices::head_with_index(&session.ctx.long_term, &impl_skills.text);
+        let reviewer_head =
+            RoundServices::head_with_index(&session.ctx.long_term, &reviewer_skills.text);
         // The planner only gets bodies when it actually runs: with the planner
         // skipped there is no planner prompt to put them in, and a `reused`
         // count that includes a body nobody read would be a lie.
         let planner_reuse = if self.cfg.planner == "skip" {
             String::new()
         } else {
-            self.skill_bodies(tools, "planner", &session.goal, &planner_skills)
+            svc.skill_bodies("planner", &session.goal, &planner_skills)
                 .await
         };
 
-        // A pre-check cheaper than the model that will consume
-        // the goal. It never blocks — it emits a trace event and (when
-        // enabled) a note in the planner prompt, because a pre-check that
-        // refuses goals would be the harness claiming a judgement it cannot
-        // make. Off by default (`AppConfig::goal_quality`).
-        let goal_note = if self.cfg.goal_quality {
-            match crate::eval::goal_quality::check_goal_quality(&session.goal) {
-                Some(note) => {
-                    self.trace.emit(TraceEvent::GoalQuality {
-                        goal: session.goal.clone(),
-                        note: note.clone(),
-                    });
-                    Some(note)
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
+        // A pre-check cheaper than the model that will consume the goal — the
+        // one shared path, so direct mode cannot drift out of it again.
+        let goal_note = svc.goal_note(&session.goal);
 
         // Planner (Context LLM, no tools)
         let plan_state = CtxState {
@@ -212,6 +211,10 @@ impl Orchestrator {
             let mut changed_files: Vec<String> = Vec::new();
             // The last round's `git diff --stat`, evidence for the report.
             let mut diff_stat = String::new();
+            // §4.3: structured outcomes — the report carries them so `compare`
+            // can name the check that flipped for a task that moved, instead of
+            // only quoting the losing run's feedback.
+            let mut check_results: Vec<crate::engine::session::CheckResult> = Vec::new();
             let mut verdict = Verdict {
                 pass: false,
                 feedback: "no rounds ran".to_string(),
@@ -219,21 +222,19 @@ impl Orchestrator {
             let mut ran = 0;
             let mut writes_made = 0usize;
             let limit = session.max_tokens.unwrap_or(self.cfg.max_tokens_per_task);
-            let task_start = self.trace.len();
+            let budget = svc.budget(limit);
             let mut budget_hit: Option<u64> = None;
             // Skills this task names, once per task (not per round: a body
             // delivered five times is one reuse, not five).
-            let impl_reuse = self
+            let impl_reuse = svc
                 .skill_bodies(
-                    tools,
                     "implementer",
                     &format!("{} {task}", session.goal),
                     &impl_skills,
                 )
                 .await;
-            let reviewer_reuse = self
+            let reviewer_reuse = svc
                 .skill_bodies(
-                    tools,
                     "reviewer",
                     &format!("{} {task}", session.goal),
                     &reviewer_skills,
@@ -246,8 +247,8 @@ impl Orchestrator {
             let mut poked = false;
             while round <= rounds {
                 // Token guard: stop before spending another expensive round.
-                let spent = self.tokens_since(task_start);
-                if limit > 0 && spent > limit {
+                // O(1) — the sink totals at the emit choke point (§4.3).
+                if let Some(spent) = budget.exceeded() {
                     self.trace.emit(TraceEvent::BudgetExceeded {
                         task: task.clone(),
                         tokens: spent,
@@ -334,8 +335,13 @@ impl Orchestrator {
 
                 // Acceptance evidence: run the session's allowlisted checks BEFORE
                 // the verdict, so the reviewer judges execution, not prose.
-                checks_log = self.run_checks(session, tools, workdir).await;
-                let verified_files = self.reviewer_file_evidence(tools, workdir, &artifact).await;
+                let task_checks = svc.run_checks(session, workdir).await;
+                checks_log = render_checks(&task_checks);
+                // The last round's outcomes are the task's: `compare` matches by
+                // name, so accumulating earlier rounds would let a round-1
+                // failure outrank the round that fixed it.
+                check_results = task_checks;
+                let verified_files = svc.reviewer_file_evidence(workdir, &artifact).await;
                 // Write gate (§4.2): count what git saw change, not what the
                 // artifact claims. A new file the model wrote counts; prose-only
                 // work reads back as zero; a self-report that disagrees with the
@@ -368,7 +374,7 @@ impl Orchestrator {
                     short_term: format!(
                         "ARTIFACT: {}\nSKILL CHANGES: {}\nEXPECT WRITES: {}\nWRITES MADE: {}\nCHANGED (git): {}\nCHECKS:\n{}\nVERIFIED FILES:\n{}",
                         serde_json::to_string(&artifact).unwrap_or_default(),
-                        skill_changes_line(&artifact),
+                        crate::engine::session::skill_changes_line(&artifact),
                         if session.expect_writes { "yes" } else { "no" },
                         writes_made,
                         if diff.names.is_empty() {
@@ -498,7 +504,7 @@ impl Orchestrator {
                 }
                 // The retry's evidence, after the rollback: the tool verdicts,
                 // minus any content the rollback reverted (see the function).
-                refused = file_state_evidence(&artifact);
+                refused = crate::engine::session::file_state_evidence(&artifact);
                 round += 1;
             }
             total_rounds += ran;
@@ -521,7 +527,8 @@ impl Orchestrator {
                 "changed_files": changed_files,
                 "diff_stat": diff_stat,
                 "aborted": aborted,
-                "tokens_used": self.tokens_since(task_start),
+                "tokens_used": budget.spent(),
+                "check_results": check_results,
                 "artifact": artifact,
                 "feedback": verdict.feedback,
             }));
@@ -555,7 +562,7 @@ impl Orchestrator {
     async fn run_direct_loop(
         &self,
         session: &Session,
-        tools: &ToolRegistry,
+        svc: &RoundServices<'_>,
         workdir: &std::path::Path,
         tree: &crate::engine::tree::TreeService,
     ) -> serde_json::Value {
@@ -570,6 +577,9 @@ impl Orchestrator {
         let mut acc = LayerAcc::default();
         let mut feedback = String::new();
         let mut checks_log = String::new();
+        // §4.3: structured outcomes, same shape as the pipeline loop's — a
+        // direct verdict is a field read, not a substring of the log it renders.
+        let mut check_results: Vec<crate::engine::session::CheckResult> = Vec::new();
         let mut artifact = serde_json::Value::Null;
         let mut writes_made = 0usize;
         // Paths git saw change across the rounds (§4.4 recall).
@@ -577,14 +587,25 @@ impl Orchestrator {
         // The last round's `git diff --stat`, evidence for the report.
         let mut diff_stat = String::new();
         let mut passed = false;
+        // Rounds actually executed (the cap may grow by one on an auto-poke).
         let mut rounds = 0u32;
-        let start = self.trace.len();
         let limit = session.max_tokens.unwrap_or(self.cfg.max_tokens_per_task);
+        let budget = svc.budget(limit);
         let max_rounds = self.cfg.max_review_rounds.max(1);
-
-        for round in 1..=max_rounds {
-            let spent = self.tokens_since(start);
-            if limit > 0 && spent > limit {
+        // §4.3: direct mode now takes the same skill index, the same
+        // goal-quality note and the same auto-poke as the pipeline loop —
+        // all three used to be written into `run_loop` only, so a direct run
+        // silently saw no skills, no note and no poke.
+        let impl_skills = svc.skill_index("implementer").await;
+        let impl_head = RoundServices::head_with_index(&session.ctx.long_term, &impl_skills.text);
+        let goal_note = svc.goal_note(&session.goal);
+        let mut poked = false;
+        let mut round = 1u32;
+        let mut cap = max_rounds;
+        while round <= cap {
+            rounds = round;
+            // Token guard: O(1) — the sink totals at the emit choke point.
+            if let Some(spent) = budget.exceeded() {
                 self.trace.emit(TraceEvent::BudgetExceeded {
                     task: session.goal.clone(),
                     tokens: spent,
@@ -593,7 +614,6 @@ impl Orchestrator {
                 feedback = format!("aborted: token budget exceeded ({spent} > {limit})");
                 break;
             }
-            rounds = round;
             // The baseline this attempt starts from and rolls back to (§4.2).
             if let Err(e) = tree.baseline() {
                 self.trace.emit(TraceEvent::ModelError {
@@ -604,10 +624,14 @@ impl Orchestrator {
                 break;
             }
             let state = CtxState {
-                long_term: session.ctx.long_term.clone(),
+                long_term: impl_head.clone(),
                 mid_term: format!(
-                    "GOAL: {}\n{retrieved}\n{}",
+                    "GOAL: {}\n{retrieved}\n{}{}",
                     session.goal,
+                    goal_note
+                        .as_deref()
+                        .map(|n| format!("GOAL QUALITY NOTE: {n}\n"))
+                        .unwrap_or_default(),
                     if feedback.is_empty() {
                         String::new()
                     } else {
@@ -615,7 +639,7 @@ impl Orchestrator {
                     }
                 ),
                 short_term: format!(
-                    "WRITES REQUIRED: {}\nDIRECT ROUND {round}/{max_rounds}",
+                    "WRITES REQUIRED: {}\nDIRECT ROUND {round}/{cap}",
                     if session.expect_writes { "yes" } else { "no" }
                 ),
             };
@@ -627,7 +651,7 @@ impl Orchestrator {
                     view: &view,
                     context: None,
                     executor: Some(&self.executor),
-                    tools: Some(tools),
+                    tools: Some(svc.tools),
                     workdir: Some(workdir),
                     trace: &self.trace,
                 })
@@ -643,7 +667,9 @@ impl Orchestrator {
                     break;
                 }
             }
-            checks_log = self.run_checks(session, tools, workdir).await;
+            let task_checks = svc.run_checks(session, workdir).await;
+            checks_log = render_checks(&task_checks);
+            check_results = task_checks;
             // Write gate (§4.2): git's change set is the count, not the
             // artifact's self-report; the same names feed recall (§4.4).
             let diff = match tree.diff() {
@@ -664,12 +690,12 @@ impl Orchestrator {
                     changed_files.push(name.clone());
                 }
             }
-            let checks_ok = !checks_log.contains("STATUS: FAILED");
+            let checks_ok = checks_pass(&check_results);
             passed = (!session.expect_writes || writes_made > 0) && checks_ok;
             if passed {
                 break;
             }
-            let file_state = file_state_evidence(&artifact);
+            let file_state = crate::engine::session::file_state_evidence(&artifact);
             feedback = if writes_made == 0 && session.expect_writes {
                 format!("no file change landed; emit the actual patch or write now{file_state}")
             } else {
@@ -678,9 +704,36 @@ impl Orchestrator {
                     checks_log, file_state
                 )
             };
+            // §4.3: the same bounded auto-poke the pipeline loop has — a
+            // direct run used to stop at the cap even when the failure shape
+            // said "instruction problem".
+            if !poked
+                && self.cfg.auto_poke
+                && round == cap
+                && crate::eval::goal_quality::should_auto_poke(
+                    passed,
+                    round,
+                    writes_made,
+                    session.expect_writes,
+                    budget.exceeded().is_some(),
+                )
+            {
+                poked = true;
+                cap += 1;
+                let reason = crate::eval::goal_quality::poke_reason(
+                    round,
+                    writes_made,
+                    session.expect_writes,
+                );
+                self.trace.emit(TraceEvent::AutoPoke {
+                    task: session.goal.clone(),
+                    reason: reason.clone(),
+                });
+                feedback = format!("{feedback}\n{reason}");
+            }
             // §4.2: a failed attempt is discarded when a retry follows; the
             // last round keeps its state in the copy for reading.
-            if round < max_rounds {
+            if round < cap {
                 self.trace.emit(TraceEvent::StateTransition {
                     from: "direct_executing".to_string(),
                     to: "rolled_back".to_string(),
@@ -692,6 +745,7 @@ impl Orchestrator {
                     });
                 }
             }
+            round += 1;
         }
 
         self.trace.emit(TraceEvent::StateTransition {
@@ -707,6 +761,7 @@ impl Orchestrator {
                 "changed_files": changed_files,
                 "diff_stat": diff_stat,
                 "artifact": artifact,
+                "check_results": check_results,
                 "feedback": feedback,
             }],
             "rounds": rounds,
@@ -724,101 +779,6 @@ impl Orchestrator {
     /// Test hook: the configured default ceiling.
     pub fn token_limit_for_test(&self) -> u64 {
         self.cfg.max_tokens_per_task
-    }
-
-    /// The skill index as `agent` may see it. Empty when the grant does not
-    /// cover `skills.list`, when the store is empty, or when the tool fails —
-    /// an agent that may not list skills simply gets no `[SKILLS]` block.
-    /// Emits `SkillOp{op: "list"}` only when there was something to deliver.
-    async fn skill_index(&self, tools: &ToolRegistry, agent: &str) -> SkillIndex {
-        let (r, _) = tools
-            .call(agent, "skills.list", None, serde_json::json!({}))
-            .await;
-        let Ok(o) = r else {
-            return SkillIndex::default();
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&o.output) else {
-            return SkillIndex::default();
-        };
-        let text = v
-            .get("index")
-            .and_then(|i| i.as_str())
-            .unwrap_or("")
-            .to_string();
-        let names: Vec<String> = v
-            .get("skills")
-            .and_then(|s| s.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|s| Some(s.get("name")?.as_str()?.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !text.trim().is_empty() {
-            self.trace.emit(TraceEvent::SkillOp {
-                agent: agent.to_string(),
-                op: "list".to_string(),
-                name: String::new(),
-                ok: true,
-                bytes: text.len() as u64,
-            });
-        }
-        SkillIndex { text, names }
-    }
-
-    /// Bodies of the skills `text` names, as `agent`, through the gate. This is
-    /// the reuse path: the task says what it wants by name and the recorded
-    /// procedure arrives, the same way the retriever hands over a named file.
-    async fn skill_bodies(
-        &self,
-        tools: &ToolRegistry,
-        agent: &str,
-        text: &str,
-        index: &SkillIndex,
-    ) -> String {
-        // Two is already a lot of procedure for one task; more is a prompt
-        // stuffed with instructions nobody asked for.
-        const MAX_BODIES: usize = 2;
-        let mut out = String::new();
-        let mut taken = 0usize;
-        for name in &index.names {
-            if taken >= MAX_BODIES {
-                break;
-            }
-            if !crate::skills::mentions(text, name) {
-                continue;
-            }
-            let (r, _) = tools
-                .call(
-                    agent,
-                    "skills.view",
-                    None,
-                    serde_json::json!({ "name": name }),
-                )
-                .await;
-            let body = match r {
-                Ok(o) => serde_json::from_str::<serde_json::Value>(&o.output)
-                    .ok()
-                    .and_then(|v| v.get("body").and_then(|b| b.as_str()).map(str::to_string)),
-                Err(_) => None,
-            };
-            let Some(body) = body else {
-                continue;
-            };
-            taken += 1;
-            self.trace.emit(TraceEvent::SkillOp {
-                agent: agent.to_string(),
-                op: "reuse".to_string(),
-                name: name.clone(),
-                ok: true,
-                bytes: body.len() as u64,
-            });
-            out.push_str(&format!(
-                "\nSKILL {name} (recorded procedure — follow it):\n{}\n",
-                body.trim()
-            ));
-        }
-        out
     }
 
     /// Fold one view's layer reports into the run's context counters, and
@@ -852,123 +812,7 @@ impl Orchestrator {
             }
         }
     }
-
-    /// Sum of input+output tokens reported by model calls emitted at or
-    /// after `from` (per-task spend, read back from the trace stream).
-    fn tokens_since(&self, from: usize) -> u64 {
-        self.trace
-            .events()
-            .into_iter()
-            .skip(from)
-            .filter_map(|e| match e {
-                TraceEvent::ModelCall {
-                    input_tokens,
-                    output_tokens,
-                    ..
-                } => Some(input_tokens + output_tokens),
-                _ => None,
-            })
-            .sum()
-    }
-
-    /// Runs the session's allowlisted checks through the tool gate and
-    /// returns the combined log (empty when none configured).
-    async fn run_checks(
-        &self,
-        session: &Session,
-        tools: &ToolRegistry,
-        workdir: &std::path::Path,
-    ) -> String {
-        let mut log = String::new();
-        for cmd in &session.checks {
-            let (r, lat) = tools
-                .call(
-                    "reviewer",
-                    "proc.run",
-                    Some(workdir),
-                    serde_json::json!({ "cmd": cmd }),
-                )
-                .await;
-
-            self.trace.emit(TraceEvent::ToolCall {
-                agent: "reviewer".to_string(),
-                tool: "proc.run".to_string(),
-                ok: r.is_ok(),
-                latency_ms: lat,
-            });
-            log.push_str(&match r {
-                Ok(o) => {
-                    // State the outcome explicitly. A passing build prints only
-                    // progress lines, which condensation drops — the reviewer
-                    // must never have to infer "passed" from an empty body.
-                    let code = o.error.clone().unwrap_or_else(|| "exit 0".to_string());
-                    format!(
-                        "$ {cmd}\nSTATUS: {} ({code})\n{}\n",
-                        if o.ok { "PASSED" } else { "FAILED" },
-                        condense_output(&o.output)
-                    )
-                }
-                Err(e) => format!("$ {cmd}\nSTATUS: FAILED ({e})\n"),
-            });
-        }
-        log
-    }
-
-    /// Read touched files through the reviewer's grant after the implementer
-    /// has applied its artifact. This is independent evidence: the reviewer
-    /// should judge the tree, not only the implementer's self-reported state.
-    async fn reviewer_file_evidence(
-        &self,
-        tools: &ToolRegistry,
-        workdir: &std::path::Path,
-        artifact: &serde_json::Value,
-    ) -> String {
-        let mut paths = Vec::new();
-        if let Some(entries) = artifact.get("file_state").and_then(|v| v.as_array()) {
-            for entry in entries {
-                let Some(path) = entry.get("path").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                if !paths.iter().any(|seen| seen == path) {
-                    paths.push(path.to_string());
-                }
-            }
-        }
-
-        let mut out = String::new();
-        for path in paths.into_iter().take(5) {
-            let target = workdir.join(&path);
-            let (result, latency_ms) = tools
-                .call(
-                    "reviewer",
-                    "fs.read",
-                    Some(&target),
-                    serde_json::json!({"path": path, "max_bytes": 262_144}),
-                )
-                .await;
-            self.trace.emit(TraceEvent::ToolCall {
-                agent: "reviewer".to_string(),
-                tool: "fs.read".to_string(),
-                ok: result.is_ok(),
-                latency_ms,
-            });
-            match result {
-                Ok(read) => out.push_str(&format!("--- {path}\n{}\n", read.output)),
-                Err(error) => out.push_str(&format!("--- {path}\n(unreadable: {error})\n")),
-            }
-        }
-        out
-    }
 }
-
-/// What a model may see about skills: the rendered index and the names, so a
-/// task's text can be tested against them without re-reading the store.
-#[derive(Debug, Default, Clone)]
-struct SkillIndex {
-    text: String,
-    names: Vec<String>,
-}
-
 /// Context accounting for one run, folded from the `LayerReport`s of every
 /// view the round loop built (stage 2). `layer_*` are per `LayerKind::index()`;
 /// `truncated_views` is their sum, kept as its own number because it is the one
@@ -980,242 +824,4 @@ struct LayerAcc {
     layer_summaries: [u32; 3],
     summarize_calls: u64,
     summarize_tokens: u64,
-}
-
-/// The stable head a prompt gets: the session's conventions, plus the skill
-/// index when there is one. Byte-stable per task, which is what keeps it in the
-/// provider's cached prefix.
-fn head_with_index(base: &str, index: &str) -> String {
-    if index.trim().is_empty() {
-        return base.to_string();
-    }
-    format!("{base}\n[SKILLS]\n{index}")
-}
-
-/// One line for the reviewer: what the implementer did to the skill store.
-/// Empty work in the skills channel must be as legible as a zero WRITES MADE.
-fn skill_changes_line(artifact: &serde_json::Value) -> String {
-    let entries = artifact
-        .get("skill_changes")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if entries.is_empty() {
-        return "none".to_string();
-    }
-    let parts: Vec<String> = entries
-        .iter()
-        .map(|e| {
-            let outcome = e.get("outcome").and_then(|v| v.as_str()).unwrap_or("?");
-            let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let detail = e.get("detail").and_then(|v| v.as_str()).unwrap_or("");
-            format!("{outcome} {name} ({detail})")
-        })
-        .collect();
-    format!("{} - {}", entries.len(), parts.join("; "))
-}
-
-/// What the next round needs after a failed attempt: the tool verdicts, plus
-/// for a refused patch the file's text. A change that *landed* is reported
-/// without its text — §4.2 rolled the tree back to the baseline, so the
-/// post-attempt read describes a state the tree no longer has, and a retry that
-/// trusted it would skip a change that is gone. Two failures this addresses,
-/// both measured: "search string not found" with no file in front of the model
-/// makes it guess again, and a retry told an applied edit is in place neither
-/// re-applies it nor re-reads the file (duplicate definitions, E0592/E0428).
-fn file_state_evidence(artifact: &serde_json::Value) -> String {
-    // ponytail: one shared budget, first file takes it; split it per file when
-    // a run shows two touched files that both need their text.
-    const CAP: usize = 12_000;
-    let mut out = String::new();
-    let entries = artifact
-        .get("file_state")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    // One entry per path, the LAST one: a file patched twice in an artifact has
-    // two reads, and the earlier one describes a state the model already moved
-    // past — keeping it would hand the retry a stale file and a fresh-looking
-    // label (measured: the duplicate-definition class returning at 3 rounds).
-    let mut last: Vec<serde_json::Value> = Vec::new();
-    for e in entries {
-        let path = e.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        if let Some(slot) = last
-            .iter_mut()
-            .find(|k| k.get("path").and_then(|v| v.as_str()) == Some(path))
-        {
-            *slot = e;
-        } else {
-            last.push(e);
-        }
-    }
-    for e in last {
-        let left = CAP.saturating_sub(out.len());
-        if left == 0 {
-            break;
-        }
-        let path = e.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        let why = e.get("why").and_then(|v| v.as_str()).unwrap_or("changed");
-        if why == "applied" || why == "rewritten" {
-            // The text is deliberately not included: the harness restored the
-            // baseline, so this content is not on disk. `retrieved:` and a
-            // fresh read show the file as it is.
-            out.push_str(&format!(
-                "\nFILE {path} ({why} by your previous round, then ROLLED BACK by the harness: \
-                 the tree is back to its baseline and the change is NOT in it now — re-read \
-                 the file and re-apply the change if the task still needs it).\n"
-            ));
-        } else {
-            let text = e
-                .get("current_content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            // A refused patch changed no file, so its read survived the
-            // rollback and is still the tree's content.
-            let win: String = text.chars().take(left).collect();
-            out.push_str(&format!(
-                "\nPATCH REFUSED for {path}: {why}\n--- {path} (current content, read back) ---\n{win}\n"
-            ));
-        }
-    }
-    out
-}
-
-/// Keeps the lines a reviewer can act on and drops build noise. Raw
-/// `cargo test` output is mostly "test x ... ok" lines that the reviewer
-/// never uses but which every retry pays for (~2.4k tokens measured).
-fn condense_output(raw: &str) -> String {
-    const KEEP: [&str; 9] = [
-        "FAILED",
-        "error",
-        "panicked",
-        "assertion",
-        "warning",
-        "test result",
-        "failures:",
-        "left:",
-        "right:",
-    ];
-    let mut kept: Vec<&str> = Vec::new();
-    let mut dropped = 0usize;
-    for line in raw.lines() {
-        let t = line.trim();
-        let noise = t.is_empty()
-            || t.starts_with("Compiling")
-            || t.starts_with("Finished")
-            || t.starts_with("Running")
-            || t.starts_with("Doc-tests")
-            || t.starts_with("Blocking")
-            || (t.starts_with("test ") && t.ends_with("... ok"));
-        if noise {
-            dropped += 1;
-            continue;
-        }
-        if KEEP.iter().any(|k| t.contains(k)) {
-            kept.push(line);
-        } else {
-            dropped += 1;
-        }
-    }
-    if kept.is_empty() {
-        // Silence must be legible: an empty body means the command printed
-        // nothing actionable, not that the check failed to run.
-        return format!(
-            "(no actionable lines in {} lines of output)",
-            raw.lines().count()
-        );
-    }
-    let omitted = kept.len().saturating_sub(80);
-    let body = kept[..kept.len().min(80)].join("\n");
-    if omitted > 0 || dropped > 0 {
-        format!("{body}\n[...{dropped} noise lines and {omitted} kept-lines over cap omitted]")
-    } else {
-        body
-    }
-}
-
-#[cfg(test)]
-mod condense_tests {
-    use super::condense_output;
-
-    #[test]
-    fn keeps_failures_drops_noise() {
-        let raw = "Compiling rof v0.1.0\nFinished test profile\nRunning tests/a.rs\ntest a ... ok\ntest b ... FAILED\nassertion `left == right` failed\nleft: 1\nright: 2\ntest result: FAILED. 1 passed; 1 failed\n";
-        let out = condense_output(raw);
-        assert!(out.contains("test b ... FAILED"));
-        assert!(out.contains("left: 1"));
-        assert!(out.contains("test result: FAILED"));
-        assert!(!out.contains("test a ... ok"));
-        assert!(!out.contains("Compiling"));
-        assert!(out.len() < raw.len());
-    }
-
-    #[test]
-    fn green_run_collapses_to_summary() {
-        let raw = "test a ... ok\ntest b ... ok\ntest result: ok. 2 passed\n";
-        let out = condense_output(raw);
-        assert!(out.contains("test result: ok"));
-        assert!(!out.contains("test a ... ok"));
-    }
-
-    #[test]
-    fn empty_body_says_so() {
-        // A green `cargo check` prints only progress lines: the condensed
-        // body must read as "nothing to report", not as a blank.
-        let out = condense_output("   Compiling rof v0.1.0\n    Finished dev profile\n");
-        assert!(out.contains("no actionable lines"), "{out}");
-    }
-}
-
-#[cfg(test)]
-mod file_state_tests {
-    use super::file_state_evidence;
-
-    #[test]
-    fn the_last_read_of_a_path_wins() {
-        // Two patches to one file: the retry must get the second (current)
-        // read, not the first. Here the second is a refusal, so its text is
-        // the one the retry sees — the stale applied read is dropped, and
-        // with §4.2 an applied read carries no text at all (its change was
-        // rolled back).
-        let artifact = serde_json::json!({
-            "file_state": [
-                {"path": "src/a.rs", "why": "applied", "current_content": "OLD"},
-                {"path": "src/a.rs", "why": "search string not found", "current_content": "NEW"},
-            ]
-        });
-        let out = file_state_evidence(&artifact);
-        assert!(out.contains("NEW"), "{out}");
-        assert!(!out.contains("OLD"), "{out}");
-        assert!(out.contains("PATCH REFUSED for src/a.rs"), "{out}");
-    }
-
-    #[test]
-    fn an_applied_change_is_reported_as_rolled_back_without_its_text() {
-        // §4.2: the tree went back to the baseline, so the post-attempt text
-        // is not on disk and must not be handed to the retry as if it were.
-        let artifact = serde_json::json!({
-            "file_state": [{"path": "src/a.rs", "why": "applied", "current_content": "LANDED"}]
-        });
-        let out = file_state_evidence(&artifact);
-        assert!(out.contains("ROLLED BACK"), "{out}");
-        assert!(!out.contains("LANDED"), "{out}");
-    }
-
-    #[test]
-    fn separate_files_each_keep_their_evidence() {
-        // Applied files get the rollback line; a refused patch still hands over
-        // its text — the attempt changed nothing there, so the read survived.
-        let artifact = serde_json::json!({
-            "file_state": [
-                {"path": "src/a.rs", "why": "applied", "current_content": "AAA"},
-                {"path": "src/b.rs", "why": "search string not found", "current_content": "BBB"},
-            ]
-        });
-        let out = file_state_evidence(&artifact);
-        assert!(out.contains("ROLLED BACK"));
-        assert!(!out.contains("AAA"), "applied text must not survive: {out}");
-        assert!(out.contains("BBB"));
-        assert!(out.contains("PATCH REFUSED for src/b.rs"));
-    }
 }
