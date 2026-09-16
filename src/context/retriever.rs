@@ -25,7 +25,8 @@ const SKIP_DIRS: &[&str] = &["target", ".git", "node_modules", ".hg", ".svn", "b
 /// retrieval cap — the goal is asking for an edit to this file, so it gets
 /// whole-file treatment up to a typical source file's size, and a window
 /// centred on the named symbol beyond that.
-const NAMED_FILE_CAP: usize = 12_000;
+/// The widest window given to a file a goal or an artifact names.
+pub(crate) const NAMED_FILE_CAP: usize = 12_000;
 
 /// Paths listed by `Retriever::file_map`. Enough to cover this repo's sources
 /// with room over; the map is a lookup aid, not an inventory.
@@ -267,7 +268,15 @@ fn hints(query: &str) -> Vec<String> {
 /// after a refused patch. Same rule as a named file: a head-only cap cuts the
 /// anchor out of a large file, so centre on the *declaration*.
 pub fn window_on(content: &str, anchor: &str) -> String {
-    excerpt(content, NAMED_FILE_CAP, &hints(anchor))
+    window_anchored(content, anchor, NAMED_FILE_CAP)
+}
+
+/// `cap` chars of a file centred on `anchor`. §4.1's assembler shapes evidence
+/// and requested files through this rather than appending them whole: the
+/// reviewer's 262 KB reads used to be head+tail-collapsed by the short layer's
+/// budget, which can drop the only region the reviewer is judging.
+pub(crate) fn window_anchored(content: &str, anchor: &str, cap: usize) -> String {
+    excerpt(content, cap, &hints(anchor))
 }
 
 /// `cap` chars of a file. Head-only truncation cut the anchor out of the large

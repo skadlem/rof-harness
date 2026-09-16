@@ -1,10 +1,38 @@
 use crate::agents::Verdict;
 use crate::config::AppConfig;
-use crate::context::CtxState;
+use crate::context::{Assembly, ContextAssembler, ContextItem, CtxState, Fidelity, ItemKey};
 use crate::llm::{ContextService, ExecutorService};
 use crate::obs::{TraceEvent, TraceSink};
 use crate::tools::ToolRegistry;
 use std::sync::Arc;
+
+/// The widest window one evidence file is given before the budget forces it
+/// narrower. Larger than a requested file's cap: the reviewer judges a whole
+/// change, not one symbol.
+const EVIDENCE_WINDOW: usize = 24_000;
+
+/// One touched file's text as the implementer left it, plus the region the
+/// reviewer's window should centre on.
+struct Carried {
+    path: String,
+    content: String,
+    anchor: String,
+}
+
+/// The `[VERIFIED FILES]` block plus what the assembler decided about it.
+/// `excess` is empty when every touched file fit; the names are the files the
+/// reviewer is judging without seeing them, which is a different failure from
+/// a file that merely got a narrower window. `artifact` is the artifact with
+/// its file bodies removed: `file_state` keeps the path and the anchor, and
+/// `[VERIFIED FILES]` carries the text once, so the JSON is not the second
+/// copy of it. `eliminated` counts both.
+#[derive(Debug, Clone, Default)]
+pub struct Evidence {
+    pub block: String,
+    pub artifact: String,
+    pub eliminated: usize,
+    pub excess: Vec<String>,
+}
 
 /// One user goal execution. Holds the layered context others read/write.
 pub struct Session {
@@ -225,27 +253,72 @@ impl<'a> RoundServices<'a> {
     }
 
     /// Read touched files through the reviewer's grant after the implementer
-    /// has applied its artifact. This is independent evidence: the reviewer
-    /// should judge the tree, not only the implementer's self-reported state.
+    /// The touched files as the reviewer will see them, shaped by the §4.1
+    /// assembler: one volatile budget, one window per file centred on what the
+    /// artifact did to it, and no second read of text the artifact already
+    /// carries. Returns the `[VERIFIED FILES]` block and the chars a duplicate
+    /// carried.
     pub async fn reviewer_file_evidence(
         &self,
         workdir: &std::path::Path,
         artifact: &serde_json::Value,
-    ) -> String {
-        let mut paths = Vec::new();
+    ) -> Evidence {
+        // The implementer already read each touched file after it wrote, so
+        // its `file_state` is the tree's current content. Re-reading here was
+        // the measured triplicate's worst case: the same bytes, twice in one
+        // prompt, at up to 262 KB a file.
+        let mut carried = Vec::new();
         if let Some(entries) = artifact.get("file_state").and_then(|v| v.as_array()) {
             for entry in entries {
-                let Some(path) = entry.get("path").and_then(|v| v.as_str()) else {
+                let (Some(path), Some(content)) = (
+                    entry.get("path").and_then(|v| v.as_str()),
+                    entry.get("current_content").and_then(|v| v.as_str()),
+                ) else {
                     continue;
                 };
-                if !paths.iter().any(|seen: &String| seen == path) {
-                    paths.push(path.to_string());
+                if !carried.iter().any(|c: &Carried| c.path == path) {
+                    carried.push(Carried {
+                        path: path.to_string(),
+                        content: content.to_string(),
+                        anchor: entry
+                            .get("why")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    });
                 }
             }
         }
 
-        let mut out = String::new();
-        for path in paths.into_iter().take(5) {
+        let cap = self.cfg.context_policy().short.budget * 4;
+        let mut asm = ContextAssembler::new("", cap);
+        for c in &carried {
+            asm.add(ContextItem {
+                key: ItemKey {
+                    path: c.path.clone(),
+                    region: "current".to_string(),
+                    role: "reviewer".to_string(),
+                },
+                label: format!("--- {}", c.path),
+                text: c.content.clone(),
+                // ponytail: the anchor the implementer named (`applied` /
+                // `rewritten` / the refusal's search) is the region the
+                // reviewer is judging, so the window centres on it. A refusal
+                // carries the refused search text, which is where the model
+                // must look next.
+                fidelity: Fidelity::Windowed {
+                    anchor: c.anchor.clone(),
+                    cap: EVIDENCE_WINDOW,
+                },
+                must_include: true,
+            });
+        }
+        // Paths the artifact did not carry (a write the gate refused before
+        // any read-back) still get independent evidence from the tree.
+        for path in self.touched_paths(artifact) {
+            if carried.iter().any(|c: &Carried| c.path == path) {
+                continue;
+            }
             let target = workdir.join(&path);
             let (result, latency_ms) = self
                 .tools
@@ -263,11 +336,76 @@ impl<'a> RoundServices<'a> {
                 latency_ms,
             });
             match result {
-                Ok(read) => out.push_str(&format!("--- {path}\n{}\n", read.output)),
-                Err(error) => out.push_str(&format!("--- {path}\n(unreadable: {error})\n")),
+                Ok(read) => asm.add(ContextItem {
+                    key: ItemKey {
+                        path: path.clone(),
+                        region: "current".to_string(),
+                        role: "reviewer".to_string(),
+                    },
+                    label: format!("--- {path}"),
+                    text: read.output,
+                    fidelity: Fidelity::Windowed {
+                        anchor: String::new(),
+                        cap: EVIDENCE_WINDOW,
+                    },
+                    must_include: true,
+                }),
+                Err(error) => asm.add(ContextItem {
+                    key: ItemKey {
+                        path: path.clone(),
+                        region: "unreadable".to_string(),
+                        role: "reviewer".to_string(),
+                    },
+                    label: format!("--- {path}"),
+                    text: format!("(unreadable: {error})"),
+                    fidelity: Fidelity::Exact,
+                    must_include: true,
+                }),
+            };
+        }
+
+        let eliminated = asm.eliminated_chars();
+        // `file_state` travels twice in the reviewer's prompt: as JSON under
+        // `ARTIFACT:` and as text under `[VERIFIED FILES]`. The block above is
+        // the copy the reviewer reads, so the JSON keeps the path and the
+        // anchor and drops the body — otherwise the same bytes pay for a
+        // second trip through a prompt that already cut room for the first.
+        let (artifact, stripped) = strip_file_bodies(artifact);
+        match asm.assemble() {
+            Assembly::Ok(parts) => Evidence {
+                block: parts.tail,
+                artifact,
+                eliminated: eliminated + stripped,
+                excess: Vec::new(),
+            },
+            // The reviewer would judge a region it cannot see. That is a
+            // first-class signal, not a silent head+tail collapse: the parts
+            // that fit still go through, and the caller names what did not.
+            Assembly::SelectionFailure { parts, excess } => Evidence {
+                block: parts.tail,
+                artifact,
+                eliminated: eliminated + stripped,
+                excess: excess.into_iter().map(|i| i.key.path).collect(),
+            },
+        }
+    }
+
+    /// Every path the artifact touched, deduped, whether or not it carried the
+    /// file's text.
+    fn touched_paths(&self, artifact: &serde_json::Value) -> Vec<String> {
+        let mut paths = Vec::new();
+        for key in ["file_state", "writes"] {
+            if let Some(entries) = artifact.get(key).and_then(|v| v.as_array()) {
+                for entry in entries {
+                    if let Some(path) = entry.get("path").and_then(|v| v.as_str()) {
+                        if !paths.iter().any(|seen: &String| seen == path) {
+                            paths.push(path.to_string());
+                        }
+                    }
+                }
             }
         }
-        out
+        paths.into_iter().take(5).collect()
     }
 
     /// A pre-check cheaper than the model that will consume the goal. It never
@@ -296,6 +434,13 @@ impl<'a> RoundServices<'a> {
     /// the pre-§4.3 `tokens_since` was O(rounds) per round, once per task.
     pub fn budget(&self, limit: u64) -> Budget {
         Budget::new(self.trace.clone(), limit)
+    }
+
+    /// The chars the §4.1 assembler may spend below the layers. The short
+    /// layer's cap, because that is where these parts were being silently cut
+    /// before there was an owner for them.
+    pub fn volatile_budget(&self) -> usize {
+        self.cfg.context_policy().short.budget * 4
     }
 
     /// The stable head a prompt gets: the session's conventions, plus the
@@ -527,6 +672,29 @@ pub fn parse_verdict(data: &serde_json::Value, fallback_feedback: &str) -> Verdi
     }
 }
 
+/// The artifact with every `file_state` body removed, keeping the path and the
+/// anchor (`why`). Returns the JSON and the chars that no longer travel twice.
+/// A reviewer that needs the text reads `[VERIFIED FILES]`, which is the same
+/// text once, windowed and budgeted.
+fn strip_file_bodies(artifact: &serde_json::Value) -> (String, usize) {
+    let mut slim = artifact.clone();
+    let mut stripped = 0usize;
+    if let Some(states) = slim
+        .pointer_mut("/file_state")
+        .and_then(|v| v.as_array_mut())
+    {
+        for entry in states {
+            if let Some(body) = entry.get("current_content").and_then(|v| v.as_str()) {
+                stripped += body.chars().count();
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.remove("current_content");
+                }
+            }
+        }
+    }
+    (serde_json::to_string(&slim).unwrap_or_default(), stripped)
+}
+
 #[cfg(test)]
 mod condense_tests {
     use super::condense_output;
@@ -609,6 +777,40 @@ mod file_state_tests {
         assert!(out.contains("ROLLED BACK"), "{out}");
         assert!(out.contains("BBB"), "{out}");
         assert!(!out.contains("AAA"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::strip_file_bodies;
+    use serde_json::json;
+
+    #[test]
+    fn file_bodies_are_stripped_but_paths_and_anchors_stay() {
+        let artifact = json!({
+            "result": {"patches": [{"path": "a.rs", "search": "old", "replace": "new"}]},
+            "file_state": [
+                {"path": "a.rs", "why": "applied", "current_content": "fn new() {}"},
+                {"path": "b.rs", "why": "search not found", "current_content": "untouched"},
+            ],
+            "writes": [],
+        });
+        let (slim, stripped) = strip_file_bodies(&artifact);
+        assert_eq!(stripped, "fn new() {}".len() + "untouched".len());
+        assert!(!slim.contains("current_content"), "a body survived: {slim}");
+        // The reviewer still knows what was touched and where the window sits.
+        assert!(slim.contains("a.rs") && slim.contains("b.rs"));
+        assert!(slim.contains("applied"));
+        // The intent is not duplication: a patch's `replace` stays.
+        assert!(slim.contains("\"new\""));
+    }
+
+    #[test]
+    fn an_artifact_without_file_state_is_unchanged_and_costs_nothing() {
+        let artifact = json!({"result": {"artifact": "x"}});
+        let (slim, stripped) = strip_file_bodies(&artifact);
+        assert_eq!(stripped, 0);
+        assert!(slim.contains("artifact"));
     }
 }
 

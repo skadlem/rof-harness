@@ -1,10 +1,41 @@
 # Status
 
 Last verified: 2026-09-16, on this working tree. v3 components §4.2 (tree-state
-substrate + direct mode), §4.3 (structured outcomes + `RoundServices`), §4.4
-(recall), §4.6 (symlink containment) and §4.5 (the `verify_model` routing
-slot) are all landed; see `docs/ARCHITECTURE-v3.md`. This file is the running
-record of what is measured, not a handoff.
+substrate + direct mode), §4.3 (structured outcomes + `RoundServices`), §4.1
+(the one budget owner below the layers), §4.4 (recall), §4.6 (symlink
+containment) and §4.5 (the `verify_model` routing slot) are all landed; see
+`docs/ARCHITECTURE-v3.md`. This file is the running record of what is
+measured, not a handoff.
+
+## §4.1 assembler: one budget below the layers (2026-09-16)
+
+`context/assembler.rs` owns the parts no budget saw: the file map, the
+requested files and skill bodies `ImplementerAgent` appended *after* the layers
+were cut, and the reviewer's `[VERIFIED FILES]` evidence, which was read whole
+(≤262 KB × 5) and then head+tail-collapsed by the short layer's budget. Every
+one of them is now an item with a fidelity, a dedupe key and a budget, and an
+oversized `must_include` item is narrowed (halving to a 2 000-char floor)
+before it is declared excess — a first-class `SelectionFailure` the caller
+traces rather than a silent cut that drops the region under judgement.
+
+The duplications are fixed at the source as well: the evidence reuses the
+implementer's `file_state` instead of re-reading the same files, and the file
+bodies are stripped from the artifact JSON the reviewer sees, so `[VERIFIED
+FILES]` is the single copy. Both are counted in `eliminated_chars`, which folds
+into `ContextMetrics` and both reports.
+
+Coverage: 6 assembler unit tests (dedupe by key, fill-don't-optimize, window
+narrowing, optional drops, excess not consuming the budget), 2 `strip_file_bodies`
+tests, and `tests/loop.rs::reviewer_evidence_is_windowed_and_carried_once`,
+which writes an 80 KB file with the change at the middle line and asserts the
+judged region survives while the head and tail do not, and that the body is
+not delivered twice.
+
+Deliberate cuts (see `docs/ARCHITECTURE-v3.md` §4.1): the layers keep their own
+policy — the ungoverned surface was below them, and the summarize path is
+already measured; and `Fidelity::Summary` is dropped (a summary is an `Exact`
+item). Not yet done: layers are not items, so a layer that overflows still
+spends budget the assembler cannot see.
 
 ## §4.3 RoundServices + structured outcomes (2026-09-16)
 

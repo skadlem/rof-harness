@@ -249,6 +249,11 @@ pub struct ContextMetrics {
     /// Per-layer views the strategy had to cut, same indexing.
     #[serde(default)]
     pub layer_truncations: [u32; 3],
+    /// Chars a duplicate carried into a prompt the §4.1 assembler refused to
+    /// deliver twice. Zero is not "no duplication" — it is no duplication the
+    /// assembler was in a position to see.
+    #[serde(default)]
+    pub eliminated_chars: usize,
 }
 
 impl ContextMetrics {
@@ -343,6 +348,10 @@ impl ContextMetrics {
                 .unwrap_or(0) as u32,
             layer_summaries: layer_counts(out, "layer_summaries"),
             layer_truncations: layer_counts(out, "layer_truncations"),
+            eliminated_chars: out
+                .get("eliminated_chars")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize,
         }
     }
 
@@ -358,6 +367,7 @@ impl ContextMetrics {
             acc.truncated_views += t.truncated_views;
             acc.changed_files += t.changed_files;
             acc.recalled_files += t.recalled_files;
+            acc.eliminated_chars += t.eliminated_chars;
             for i in 0..3 {
                 acc.layer_summaries[i] += t.layer_summaries[i];
                 acc.layer_truncations[i] += t.layer_truncations[i];

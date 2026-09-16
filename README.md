@@ -83,8 +83,9 @@ you tell a gate effect from a verdict effect.
 Each task result also carries context accounting: `retrieved_files`/`retrieved_chars` (what the
 retriever put in front of the agents), `referenced_chars` (of those, the chars whose file the task
 actually touched), `relevance_proxy` (the ratio — a proxy, not a judgement), plus
-`summarize_calls`/`summarize_tokens` and `truncated_views`. Reports written before these fields
-existed still load: the fields default to zero.
+`summarize_calls`/`summarize_tokens`, `truncated_views` and `eliminated_chars` (the bytes a
+duplicate carried into a prompt the §4.1 assembler refused to deliver twice). Reports written
+before these fields existed still load: the fields default to zero.
 
 ## Skills
 
@@ -175,7 +176,7 @@ Deny-by-default, enforced inside `ToolRegistry::call` (not in agents):
 ```
 src/engine/   session (RoundServices, CheckResult, Budget), orchestrator (supervisor loop), router (Context/Executor/Verify)
 src/agents/   planner, implementer, reviewer — one file per role behind the Agent trait
-src/context/  layered state (long/mid/short), budgeted builder, keyword retriever
+src/context/  layered state (long/mid/short), budgeted builder, keyword retriever, §4.1 assembler
 src/skills/   SKILL.md store: frontmatter parser, index, proposals, approval
 src/tools/    registry + permission gate + fs.list/read/write/patch, proc.run, http.get, skills.*
 src/llm/      LlmClient trait, Context/Executor services, OpenAI-compatible client

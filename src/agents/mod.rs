@@ -21,6 +21,11 @@ pub struct AgentCtx<'a> {
     pub tools: Option<&'a ToolRegistry>,
     pub workdir: Option<&'a Path>,
     pub trace: &'a TraceSink,
+    /// The volatile budget (§4.1): chars the assembler may spend on the parts
+    /// below the layers. Owned by the orchestrator because the policy is
+    /// config; spent by the agent, because the two-turn read flow interleaves
+    /// assembly with model calls.
+    pub volatile_budget: usize,
 }
 
 #[async_trait]
