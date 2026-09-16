@@ -18,6 +18,9 @@ cargo build --release                 # single binary: target/release/rof
 ./target/release/rof eval eval/suites/repo-tasks.json       # run a suite
 ./target/release/rof eval eval/suites/repo-tasks.json --limit 6 --jobs 2   # first 6, two at a time
 ./target/release/rof config > my.json                       # effective config (diffable)
+./target/release/rof compare a.json b.json                  # delta between two --report dumps
+./target/release/rof skills list                            # SKILL.md store + pending proposals
+./target/release/rof skills approve <id>                    # apply an agent's proposed skill
 ./target/release/rof --config my.json eval suites/repo-tasks.json
 scripts/live-eval.sh eval/suites/repo-tasks.json --limit 6 --jobs 2        # same, wired to a live model
 scripts/measure-arm.sh before 3 eval/suites/repo-tasks.json --limit 6 --jobs 2   # an arm: 3 labelled runs
@@ -55,10 +58,58 @@ A suite run never touches `ROF_WORKDIR`: every task runs in its own copy
 | `ROF_CHECK` | run-mode checks, comma-separated exact commands |
 | `ROF_JOBS` / `ROF_MAX_PARALLEL_TASKS` | suite fan-out (`--jobs N` wins over both) |
 | `ROF_TASK_ROOT` | where per-task workdir copies live (default: system temp dir) |
+| `ROF_SKILLS_ROOT` | SKILL.md store (default `~/.rof/skills`) |
+| `ROF_SKILLS_POLICY` | `readonly` / `propose` (default) / `direct` — how a manage op lands |
 
 Precedence: defaults < config file < environment < CLI flags. `rof eval <suite> --report out.json`
 writes the suite report (per-task verdicts + feedback, folded metrics) next to the trace, so a
 baseline survives the terminal it was printed to.
+
+## Comparing runs
+
+Every report carries a label — `git_head`, `config_hash`, `suite_hash`, the model pair, the harness
+version — computed from inputs that are canonical by design (the config dump and the suite JSON), so
+two runs are comparable instead of anecdotal. `rof compare a.json b.json` prints the label diff, the
+matched totals, every task that moved (with the losing side's feedback) and the metric deltas; it
+warns when the two reports are not the same task set or config rather than dressing a set difference
+up as an effect.
+
+Each task result also carries context accounting: `retrieved_files`/`retrieved_chars` (what the
+retriever put in front of the agents), `referenced_chars` (of those, the chars whose file the task
+actually touched), `relevance_proxy` (the ratio — a proxy, not a judgement), plus
+`summarize_calls`/`summarize_tokens` and `truncated_views`. Reports written before these fields
+existed still load: the fields default to zero.
+
+## Skills
+
+Procedural memory, in the agentskills.io shape: `~/.rof/skills/<name>/SKILL.md` with YAML-ish
+frontmatter (`name`, `description`, optional `version`/`tags`) and optional support files
+(`references/`, `scripts/`, anything). A repo can ship skills with it in `<workdir>/skills/`
+(read-only, and never writable: the harness does not edit a checked-in tree behind your back).
+
+Disclosure is progressive, because a prompt that carries every procedure pays for all of them:
+
+- The **index** — `- name: description`, one line each, sorted, capped — rides the stable head of
+  the planner, implementer and reviewer prompts. It is byte-stable, so it stays in the provider's
+  cached prefix.
+- A **body** is fetched only when it is needed: the task names the skill (the same rule the
+  retriever uses for a goal-named file), or the model asks for it with `skill_views: ["name"]` and
+  gets one bounded extra turn.
+
+Writes are proposals by default. `skills.manage` (create / patch / write_file / delete) validates
+the op and writes `~/.rof/proposals/skills/<id>.json`; nothing reaches the store until a human runs
+`rof skills approve <id>` (`reject <id>` marks it refused and keeps the record). `skills.policy`
+can be set to `direct` for a trusted loop, or `readonly` to freeze the store.
+
+```bash
+rof skills list                 # index + pending proposals
+rof skills show <name> [file]   # a body or a support file
+rof skills approve <id>         # the human half of the loop
+```
+
+Grants: planner `skills.list`; reviewer `skills.list`/`skills.view`; implementer all three. The
+skills root is deliberately **not** on the file-tool allowlist — `fs.write` must not become a way
+around the write policy.
 
 ## Fan-out
 
@@ -105,6 +156,9 @@ Deny-by-default, enforced inside `ToolRegistry::call` (not in agents):
   anchors on what is there.
 - The reviewer cannot write; a pass with no writes is rejected by the harness itself, not only by
   the reviewer prompt.
+- The one place an agent could edit its own instructions — the skill store — defaults to
+  proposals: `skills.manage` validates an op and writes a proposal file; only `rof skills approve`
+  applies it. The skills root is not on the file-tool allowlist, so `fs.write` cannot bypass that.
 
 ## Layout
 
@@ -112,9 +166,10 @@ Deny-by-default, enforced inside `ToolRegistry::call` (not in agents):
 src/engine/   session, orchestrator (supervisor loop), router (Context vs Executor)
 src/agents/   planner, implementer, reviewer — one file per role behind the Agent trait
 src/context/  layered state (long/mid/short), budgeted builder, keyword retriever
-src/tools/    registry + permission gate + fs.list/read/write/patch, proc.run, http.get
+src/skills/   SKILL.md store: frontmatter parser, index, proposals, approval
+src/tools/    registry + permission gate + fs.list/read/write/patch, proc.run, http.get, skills.*
 src/llm/      LlmClient trait, Context/Executor services, OpenAI-compatible client
-src/eval/     suite loader, runner, trace-folded metrics
+src/eval/     suite loader, runner, trace-folded metrics, report compare
 src/obs/      trace events + append-only JSONL sink
 src/config/   budgets, routing, permissions, pricing as versioned structs
 ```

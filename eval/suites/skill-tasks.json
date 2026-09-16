@@ -1,0 +1,27 @@
+{
+  "name": "skill-tasks",
+  "_comment": "Three tasks that share one procedure (add a focused unit test to an existing file, in that file's own #[cfg(test)] module). The suite exists to answer one question: does an agent write a skill after the first task and reuse it on the next two? Watch the trace for SkillOp events and the report for the skill_* metrics. Live only: the stub implementer writes nothing, so expect_writes tasks cannot pass offline.",
+  "tasks": [
+    {
+      "name": "test-sanitize",
+      "goal": "Add a unit test for the private helper `fn sanitize` in src/eval/runner.rs. That file has no test module yet, so follow the repo's unit-test convention: create one `#[cfg(test)] mod tests` block at the end of the file and put the test inside it. The test must call `sanitize(\"a b/c\")` and assert the result is `a-b-c`. Run `cargo test` and make it pass.",
+      "expect_pass": true,
+      "expect_writes": true,
+      "checks": ["cargo test"]
+    },
+    {
+      "name": "test-condense",
+      "goal": "Add a unit test to src/engine/orchestrator.rs for `condense_output`. Follow the repo's unit-test convention: the file already has a test module — extend it rather than adding a second `mod tests`. The test must feed condense_output a body containing a line with `FAILED` and a line starting with `Compiling`, then assert the FAILED line survives and the Compiling line is dropped. Run `cargo test` and make it pass.",
+      "expect_pass": true,
+      "expect_writes": true,
+      "checks": ["cargo test"]
+    },
+    {
+      "name": "test-window-on",
+      "goal": "Add a unit test to src/context/retriever.rs for the public helper `window_on`. That file has no test module yet, so follow the repo's unit-test convention: create one `#[cfg(test)] mod tests` block and put the test inside it. The test must assert that window_on returns a short input unchanged. Run `cargo test` and make it pass.",
+      "expect_pass": true,
+      "expect_writes": true,
+      "checks": ["cargo test"]
+    }
+  ]
+}

@@ -1,3 +1,4 @@
+use crate::skills::SkillPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -58,12 +59,26 @@ impl Default for PermissionPolicy {
         let mut agents_tools = BTreeMap::new();
         agents_tools.insert(
             "planner".to_string(),
-            vec!["fs.list".to_string(), "fs.read".to_string()],
+            vec![
+                "fs.list".to_string(),
+                "fs.read".to_string(),
+                "skills.list".to_string(),
+                // The plan is where a procedure shapes the task list, so the
+                // planner may read a body the task names (the plan's sketch
+                // granted `list` only; a grant the harness then depends on
+                // must exist, or the injection is dead code).
+                "skills.view".to_string(),
+            ],
         );
         // reviewer verifies by running allowlisted checks; it never writes
         agents_tools.insert(
             "reviewer".to_string(),
-            vec!["fs.read".to_string(), "proc.run".to_string()],
+            vec![
+                "fs.read".to_string(),
+                "proc.run".to_string(),
+                "skills.list".to_string(),
+                "skills.view".to_string(),
+            ],
         );
         // reviewer stays read-only; implementer alone may write, still path-gated
         agents_tools.insert(
@@ -74,6 +89,11 @@ impl Default for PermissionPolicy {
                 "fs.write".to_string(),
                 "fs.patch".to_string(),
                 "http.get".to_string(),
+                "skills.list".to_string(),
+                "skills.view".to_string(),
+                // The only agent that may change the skill store, and by
+                // default that means "write a proposal", not "edit itself".
+                "skills.manage".to_string(),
             ],
         );
         Self {
@@ -132,6 +152,27 @@ impl Default for PricingConfig {
     }
 }
 
+/// SKILL.md store. `Propose` is the default on purpose: an agent editing the
+/// instructions that govern it, unattended, is the failure mode this design
+/// must not have.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    /// Where skills live. None = `~/.rof/skills` (`ROF_SKILLS_ROOT` overrides).
+    pub root: Option<PathBuf>,
+    /// `readonly` | `propose` | `direct`.
+    pub policy: SkillPolicy,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            root: None,
+            policy: SkillPolicy::Propose,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -139,6 +180,7 @@ pub struct AppConfig {
     pub routing: RoutingConfig,
     pub permissions: PermissionPolicy,
     pub retrieval: RetrievalConfig,
+    pub skills: SkillsConfig,
     pub max_review_rounds: u32,
     /// Per-task token ceiling (input+output across all calls). 0 = unlimited.
     pub max_tokens_per_task: u64,
@@ -195,6 +237,7 @@ impl Default for AppConfig {
             routing: RoutingConfig::default(),
             permissions: PermissionPolicy::default(),
             retrieval: RetrievalConfig::default(),
+            skills: SkillsConfig::default(),
             max_review_rounds: 2,
             // ~2.5x observed per-task usage: catches runaway loops, not normal work.
             max_tokens_per_task: 50_000,

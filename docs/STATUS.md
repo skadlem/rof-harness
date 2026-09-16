@@ -3,11 +3,149 @@
 Last verified: 2026-09-14, on this working tree (`git log` has the v1 commit; this file is the
 running handoff).
 
+stage 2 of `docs/PLAN-harness-v2.md` (context policy + cheap Context
+LLM). Stages 0 (observability) and 1 (skills) are **done** and recorded below; stage 1 has one live
+finding worth reading before touching prompts again: agents wrote no skill unless the goal asked for
+one, and the reason is the nudge's own trigger.
+
+**Measured-claim rule for every arm below:** 3+ runs per arm, same `--limit`, same models, compare
+per-task matched sets — one 6-task run swings ±2 tasks.
+
+## Stage 1: skills — SKILL.md as procedural memory (2026-09-14, night — done)
+
+| Deliverable | Where |
+|---|---|
+| SKILL.md store: frontmatter parser, index, proposals, approval | `src/skills/mod.rs` |
+| `skills.list` / `skills.view` / `skills.manage` behind the gate | `src/tools/skills.rs`, grants in `config/mod.rs` |
+| Index in the stable head; bodies injected when the task names the skill | `engine/orchestrator.rs` |
+| Artifact keys `skills: [{op,…}]` and `skill_views: […]`; prompt nudges | `agents/implementer.rs`, `agents/reviewer.rs` |
+| `TraceEvent::SkillOp`, `SkillMetrics` (report + `rof compare` rows) | `obs/trace.rs`, `eval/metrics.rs`, `eval/compare.rs` |
+| `rof skills list\|show\|approve\|reject`; `ROF_SKILLS_ROOT`, `ROF_SKILLS_POLICY` | `main.rs` |
+| Live instrument: three tasks sharing the unit-test procedure | `eval/suites/skill-tasks.json` |
+
+Design points worth knowing before changing anything (the plan's §2.1 sketch is updated to match):
+
+- **Writes are proposals.** `skills.manage` validates an op and writes
+  `~/.rof/proposals/skills/<id>.json`; `rof skills approve <id>` applies it. `skills.policy` can be
+  `direct` (trusted loop) or `readonly` (frozen).
+- **The skills root is not on `allowed_dirs`**, deliberately: the plan's shortcut would have let the
+  implementer's `fs.write` bypass the Propose policy. The skill tools address skills by name and
+  enforce their own containment; `tests/skills.rs` pins both halves.
+- **The index is fetched per agent through the gate** (`skills.list` run *as* that agent by the
+  harness), so the grant matrix decides who sees it. Those reads emit `SkillOp{op:"list"}`, never
+  `ToolCall` — folding prompt-construction reads into `tool_accuracy` would inflate it silently.
+- **Models reach the tools through the artifact** (this crate has no tool-call loop):
+  `skills: [{op,…}]` → `skills.manage`, `skill_views: […]` → `skills.view` in the same bounded extra
+  turn `reads` already used. The harness overwrites `agent`/`rationale` before the call.
+- **`reused` = bodies delivered, `viewed` = bodies asked for.** Two reuse paths, counted apart.
+
+Acceptance, offline: `tests/skills.rs` (9 tests) drives stub agents through create → propose →
+approve → a later task's prompt carrying the body (injected, and on request through the gate); the
+metrics fold only successful ops; `cargo test` 73 passed, clippy 0 warnings, fmt clean.
+
+Acceptance, live (2 suites, 5 runs, 14 task-runs; DeepSeek `deepseek-chat`):
+
+| Run | Suite | matched | skills (listed/proposed/reused) | est $ |
+|---|---|---|---|---|
+| `skill-a` | skill-tasks (empty store) | **3/3**, all round 1 | 0 / **0** / 0 | $0.0039 |
+| `skill-hard` ×2 | hard-two (multi-round tasks) | 0/2, 1/2 | 0 / **0** / 0 | $0.0037–0.0066 |
+| `skill-b` | skill-tasks (approved skill, planner skipped) | 2/3 | **9** / 0 / **6** | $0.0046 |
+| `skill-c` | skill-tasks (approved skill, planner on) | 2/3 | **9** / 0 / **11** | $0.0096 |
+
+- **The new suite runs clean**: 3/3 with no skill in the store, no writes outside the task copies.
+- **No agent proposed a skill on its own, in any of the 11 task-runs** (runs A, hard ×2, and the
+  3 task-runs inside `skill-b`). The nudge's trigger is "a workflow that took more than one round
+  *and worked*", and no measured run had a multi-round success — `metrics-method` now usually passes
+  in round 1, and when it doesn't, it fails. So the invitation never became eligible: this is a
+  nudge-design finding, not a plumbing failure.
+- **The propose path works when the goal asks for it.** One `rof run` goal ("record how a unit test
+  is added … as a skill named `add-a-unit-test`", `ROF_EXPECT_WRITES=no`, scratch workdir, $0.00125)
+  produced exactly one manage op → proposal `1789393370-2811`, store untouched, and the reviewer also
+  emitted a `SKILL:` line as nudged. `rof skills approve` applied it; `rof skills show` reads it
+  back. That skill is now in `~/.rof/skills/` and is what `skill-b`/`skill-c` reused.
+- **Reuse is real and measurable.** With the approved skill in the store, every task delivered the
+  index to all three agents (9 `list` events) and the body to each agent the task ran under: 6
+  deliveries with the planner skipped (implementer + reviewer — no phantom events for an agent that
+  never ran) and 11 with it on (planner + implementer + reviewer, once per plan task, and one goal
+  planned as two tasks). Matched held at 2/3 in both: each run's one failure was a model-side round
+  limit, not anything the skill did.
+- **What the channel costs**: `skill-b` spent 37.2k input tokens against run A's 21.6k for the same
+  suite (+72%, ~$0.0007) — three index lines × three agents × three tasks, plus 109-byte bodies.
+  Cheap at this store size, and the reason the index is capped and bodies are opt-in.
+
+**Two hygiene findings from running live arms against a working tree, both now fixed:**
+
+1. A task's `cargo test` check failed at `tests/skills.rs:211` during the `skill-hard` arm — the
+   harness copies the workdir *at run time*, so an in-flight edit in this repo is part of the arm's
+   input, and the failure showed up in the reviewer's evidence as though it belonged to the task
+   (`add-retriever-test` was failing for its own reason anyway, so the matched set did not move). The
+   same test is green in the committed tree. **Commit or freeze the tree before an arm.**
+2. `AppConfig::default()` means `~/.rof/skills`, so `tests/eval_suite.rs` was reading whatever skill
+   store the machine happened to have — a hidden input that changes prompts and metrics. Those tests
+   now pin the store to a scratch path (`test_cfg()`); a home-directory store is an input like any
+   other, and tests must not have one.
+
+**Bug found by this stage's parallel runs, fixed:** two tasks' trace lines collided into one corrupt
+line on a `--jobs 2` run (`writeln!` on a `File` issues two writes per event — body then newline —
+and two forks raced them). The sink now shares one file lock across forks and writes each event as a
+single buffer; covered by `obs::trace::tests::concurrent_forks_write_one_line_per_event`. The same
+race had been silent in earlier arms (`skill-a`'s trace parsed clean); a corrupt trace is invisible
+until something parses it strictly, which the live-arm evidence here finally did.
+
+**Next lever for this stage (not done, ranked)**: (1) make the invitation match reality — the nudge
+fires only after a retry, so a task that goes green in one round teaches nothing even when it does
+something reusable; either drop the round condition or have the reviewer's `SKILL:` line become an
+implementer action in the *next* task rather than a passive note; (2) measure a store with 3–5 skills
+to see whether the index stays cheap and whether bodies actually change behaviour (matched), not just
+tokens.
+
+## Stage 0: labels, context metrics, `rof compare` (2026-09-14, night — done)
+
+Additive and behaviour-free; no live tokens (every number below is a stub run or a committed file).
+
+| Deliverable | Where |
+|---|---|
+| `RunLabel` (`git_head`, `config_hash`, `suite_hash`, `ctx_model`, `exec_model`, `harness_version`) on every report | `src/eval/runner.rs`, `SuiteReport::label` |
+| Per-task `ContextMetrics` (`retrieved_files/chars`, `referenced_chars`, `relevance_proxy`, `summarize_calls/tokens`, `truncated_views`) | `src/eval/metrics.rs`, folded from the orchestrator's return value |
+| `rof compare a.json b.json` | `src/eval/compare.rs` + `main.rs` |
+
+- Hashes are in-house **FNV-1a-64 over canonical JSON**: `config_hash` hashes the `rof config` dump
+  verbatim (so it can be recomputed by hand), `suite_hash` the suite *as it ran* — a `--limit 6` run
+  labels the six tasks it executed. No `sha2`: the report only needs identical-vs-different, and the
+  crate stays dependency-free.
+- New evidence rides the orchestrator's existing return value (`retrieved: [{path, chars}]`,
+  `summarize_calls`, `summarize_tokens`, `truncated_views`), counted where the summarizer is already
+  invoked; the runner folds it per task. `relevance_proxy` is a **proxy**, never "context
+  relevance": the share of retrieved chars whose file the task then touched
+  (`file_state[].path`), so it is 0 for a task that retrieved context and wrote nothing.
+- `ContextMetrics` deliberately omits the plan's `layer_truncations`/`layer_summaries`: they have no
+  emitter until stage 2's `LayerReport`, and a metric fed by nothing reads as a measured zero.
+- Labels are `#[serde(default)]`, so reports written before this round still load: `rof compare`
+  against the committed `docs/baselines/2026-09-14-deepseek-chat-6.json` says "unlabeled (report
+  predates stage 0)" and warns that it records no retrieved context — instead of printing zeros that
+  look like measurements.
+- `rof compare` prints the label diff, matched totals, every task that moved (gain / loss /
+  only-in-one, with the losing side's feedback, rounds and context columns) and metric deltas
+  (cost, in/out tokens, cache hit rate, tool accuracy, retries, aborts, model errors, latency,
+  retrieved/referenced chars, proxy, summarize tokens, truncated views). It warns when the two
+  reports are not the same task set (different `suite_hash`) or config.
+
+Acceptance, measured:
+
+- Same tree (a worktree at `c9b4cbf`), old binary vs new binary: **identical** per-task results and
+  identical aggregate — `matched 2/2`, `in/out 26471/840`, `implementer=19742 planner=6077
+  reviewer=652`; the report JSONs are byte-equal modulo the two added fields. The live `repo-tasks`
+  suite was not re-run — stage 0 is a zero-token stage by design, and the loop's only touch is
+  counting views the builder already reported as truncated. Run `rof compare` on the next live arm's
+  report against the previous one; the instrument exists for exactly that.
+- `cargo test` **57 passed, 0 failed** (was 52; five stage-0 tests added in `tests/eval_suite.rs`),
+  `cargo clippy --all-targets` 0 warnings, `cargo fmt --check` clean.
+
 ## Verified state
 
 | Check | Result |
 |---|---|
-| `cargo test` | 46 passed, 0 failed |
+| `cargo test` | 73 passed, 0 failed (52 before stage 0, 57 before stage 1) |
 | `cargo clippy --all-targets` | 0 warnings |
 | `cargo fmt --check` | clean |
 | `cargo build --release` | green, `target/release/rof` ≈ 5.9 MB |
