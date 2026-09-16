@@ -28,6 +28,9 @@ pub struct RoutingConfig {
     pub context_model: String,
     pub executor_model: String,
     pub executor_fallback: Option<String>,
+    /// Model serving the reviewer. `None` = the executor model, so the
+    /// default is self-review and the slot changes nothing until set.
+    pub verify_model: Option<String>,
 }
 
 impl Default for RoutingConfig {
@@ -36,6 +39,7 @@ impl Default for RoutingConfig {
             context_model: "cheap-model".to_string(),
             executor_model: "strong-model".to_string(),
             executor_fallback: None,
+            verify_model: None,
         }
     }
 }

@@ -1,11 +1,23 @@
 # Status
 
-Last verified: 2026-09-16, on this working tree (`git log` has the v1 commit; this file is the
-running handoff).
+Last verified: 2026-09-16, on this working tree. v3 components §4.2 (tree-state
+substrate + direct mode), §4.4 (recall), §4.6 (symlink containment) and §4.5
+(the `verify_model` routing slot) are all landed; see `docs/ARCHITECTURE-v3.md`.
+This file is the running record of what is measured, not a handoff.
+
+## §4.5 verify_model slot (2026-09-16)
+
+`RoutingConfig.verify_model` (`None` = the executor model, i.e. self-review),
+`Role::Verify` in `ModelRouter`, and `ROF_VERIFY_MODEL` in `apply_env`.
+`Orchestrator` holds a separate `verify: ExecutorService` and
+`ReviewerAgent::new(&self.verify)` runs on it. Zero behavior change until the
+env var is set: this is arm #4's decision gate, not a feature. The eval runner
+and the test helper still pass the executor clone, so the default path is
+byte-identical in cost and trace.
 
 ## Direct execution experiment (2026-09-16)
 
-The opt-in `ROF_MODE=direct` path is implemented but remains uncommitted. It runs one executor
+The opt-in `ROF_MODE=direct` path is implemented and committed. It runs one executor
 without planner or reviewer model calls, applies edits through the existing tool gate, runs every
 configured check after each attempt, and includes failed-check output in the next executor prompt.
 Regression coverage is in `tests/loop.rs` (`direct_mode_*`); both tests pass. The full Rust suite,
@@ -22,7 +34,7 @@ still demonstrates improved verdict correctness, not completion rate.
 
 ## §4.2 tree-state substrate (2026-09-16)
 
-`docs/ARCHITECTURE-v3.md` §4.2 is implemented and **committed** (`34875ff`): git is the tree-state
+`docs/ARCHITECTURE-v3.md` §4.2 is implemented and **committed**: git is the tree-state
 substrate of every task copy. `src/engine/tree.rs` (`TreeService`: `ensure`/`baseline`/`rollback`/`diff`, plus
 `copy_git_state`) drives it; `copy_tree` now ships `.git` (shallow `--depth 1` above 8 MiB, verbatim
 below, `git init` + one commit for a non-repo source) and keeps `target/` excluded. The write gate

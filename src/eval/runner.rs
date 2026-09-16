@@ -220,6 +220,7 @@ impl EvaluationRunner {
             sink.clone(),
             self.context.clone(),
             self.executor.clone(),
+            self.executor.clone(),
         );
         let out = orch
             .run_loop(

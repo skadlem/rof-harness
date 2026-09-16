@@ -16,6 +16,9 @@ pub struct Orchestrator {
     trace: Arc<TraceSink>,
     context: ContextService,
     executor: ExecutorService,
+    /// Model serving the reviewer. Defaults to a clone of the executor
+    /// (self-review) until `verify_model` is configured.
+    verify: ExecutorService,
 }
 
 impl Orchestrator {
@@ -24,12 +27,14 @@ impl Orchestrator {
         trace: Arc<TraceSink>,
         context: ContextService,
         executor: ExecutorService,
+        verify: ExecutorService,
     ) -> Self {
         Self {
             cfg,
             trace,
             context,
             executor,
+            verify,
         }
     }
 
@@ -389,7 +394,7 @@ impl Orchestrator {
                 // `policy.rs`), so what it usually needs here is the cut.
                 let (rview, rreports) = builder.plan_summarized(&rstate, &self.context).await;
                 self.fold_layers(&rreports, &mut acc);
-                let reviewer = ReviewerAgent::new(&self.executor);
+                let reviewer = ReviewerAgent::new(&self.verify);
                 match reviewer
                     .run(AgentCtx {
                         view: &rview,

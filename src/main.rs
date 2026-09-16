@@ -14,6 +14,7 @@ struct Setup {
     trace: Arc<TraceSink>,
     context: ContextService,
     executor: ExecutorService,
+    verify: ExecutorService,
     registry: ToolRegistry,
     root: PathBuf,
 }
@@ -100,6 +101,11 @@ fn apply_env(cfg: &mut AppConfig) {
     }
     if let Some(m) = get("ROF_EXEC_FALLBACK") {
         cfg.routing.executor_fallback = Some(m);
+    }
+    // Reviewer model. Unset = the executor model (self-review); setting it
+    // is what makes independent verification testable.
+    if let Some(m) = get("ROF_VERIFY_MODEL") {
+        cfg.routing.verify_model = Some(m);
     }
     // Opt-in allowlists (comma separated; empty = deny all).
     if let Some(cmds) = get("ROF_ALLOW_CMDS") {
@@ -252,16 +258,26 @@ fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
         .or_else(|| OpenRouterClient::from_env().map(|c| Arc::new(c) as Arc<dyn LlmClient>));
     let (ctx_model, _) = router.resolve(Role::Context);
     let (exec_model, exec_fb) = router.resolve(Role::Executor);
-    let (context, executor) = match &real {
+    let (verify_model, verify_fb) = router.resolve(Role::Verify);
+    let (context, executor, verify) = match &real {
         Some(c) => {
             let via = std::env::var("ROF_CHAT_BASE").unwrap_or("openrouter".to_string());
-            println!("llm: {via} (ctx={ctx_model}, exec={exec_model})");
+            if verify_model == exec_model {
+                println!("llm: {via} (ctx={ctx_model}, exec={exec_model})");
+            } else {
+                println!("llm: {via} (ctx={ctx_model}, exec={exec_model}, verify={verify_model})");
+            }
             (
                 ContextService::new(c.clone(), ctx_model.to_string()),
                 ExecutorService::new(
                     c.clone(),
                     exec_model.to_string(),
                     exec_fb.map(str::to_string),
+                ),
+                ExecutorService::new(
+                    c.clone(),
+                    verify_model.to_string(),
+                    verify_fb.map(str::to_string),
                 ),
             )
         }
@@ -270,6 +286,7 @@ fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
             (
                 ContextService::new(Arc::new(StubClient), "context-stub".to_string()),
                 ExecutorService::new(Arc::new(StubClient), "executor-stub".to_string(), None),
+                ExecutorService::new(Arc::new(StubClient), "verify-stub".to_string(), None),
             )
         }
     };
@@ -281,6 +298,7 @@ fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
         trace,
         context,
         executor,
+        verify,
         registry,
         root,
     })
@@ -480,7 +498,7 @@ async fn run_goal(goal: &str, config_path: Option<&str>) -> anyhow::Result<()> {
         })
         .unwrap_or_default();
     let expect_writes = s.cfg.expect_writes;
-    let orch = Orchestrator::new(s.cfg, s.trace.clone(), s.context, s.executor);
+    let orch = Orchestrator::new(s.cfg, s.trace.clone(), s.context, s.executor, s.verify);
     let out = orch
         .run_loop(
             &Session::new(goal.to_string())
