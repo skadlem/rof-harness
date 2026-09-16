@@ -118,7 +118,8 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-// ponytail: lexical only (no symlink resolution); realpath when write tools land.
+// ponytail: lexical containment only, no symlink resolution — a link inside the
+// root is followed out of it. Canonicalize the parent before a write.
 // Component-wise starts_with: /allowed2 never matches /allowed, .. can't escape.
 fn under(root: &Path, cand: &Path) -> bool {
     normalize(cand).starts_with(normalize(root))

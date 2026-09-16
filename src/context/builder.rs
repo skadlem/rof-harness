@@ -5,6 +5,20 @@ pub struct ContextBuilder {
     budgets: TokenBudgets,
 }
 
+/// Nearest char boundary at or below `i` (0 when there is none).
+fn floor_boundary(s: &str, i: usize) -> usize {
+    let i = i.min(s.len());
+    (0..=i).rev().find(|&j| s.is_char_boundary(j)).unwrap_or(0)
+}
+
+/// Nearest char boundary at or above `i` (`s.len()` when there is none).
+fn ceil_boundary(s: &str, i: usize) -> usize {
+    let i = i.min(s.len());
+    (i..=s.len())
+        .find(|&j| s.is_char_boundary(j))
+        .unwrap_or(s.len())
+}
+
 impl ContextBuilder {
     pub fn new(budgets: TokenBudgets) -> Self {
         Self { budgets }
@@ -16,11 +30,16 @@ impl ContextBuilder {
         if s.len() <= max_chars {
             (s.to_string(), false)
         } else {
-            // keep head + tail (conventions + latest logs matter most)
+            // keep head + tail (conventions + latest logs matter most).
+            // Cut on char boundaries, never raw byte indices: a cut landing
+            // inside a multi-byte character panicked the run (measured live:
+            // "start byte index 1 is not a char boundary").
             let head = max_chars * 2 / 3;
             let tail = max_chars - head;
-            let h = &s[..head.min(s.len())];
-            let t = &s[s.len().saturating_sub(tail)..];
+            let hs = floor_boundary(s, head);
+            let ts = ceil_boundary(s, s.len() - tail);
+            let h = &s[..hs];
+            let t = &s[ts..];
             (format!("{h}\n...[truncated]...\n{t}"), true)
         }
     }

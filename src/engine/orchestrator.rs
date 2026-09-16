@@ -115,6 +115,8 @@ impl Orchestrator {
 
         for (ti, task) in tasks.iter().enumerate() {
             let mut feedback = String::new();
+            // Fresh-read evidence from a refused patch, for the next round.
+            let mut refused = String::new();
             let mut artifact = serde_json::Value::Null;
             let mut verdict = Verdict {
                 pass: false,
@@ -159,7 +161,7 @@ impl Orchestrator {
                         )
                     } else {
                         format!(
-                            "WRITES REQUIRED: {}\nround {round}/{rounds}: reviewer feedback: {feedback}\nPREVIOUS CHECKS:\n{}",
+                            "WRITES REQUIRED: {}\nround {round}/{rounds}: reviewer feedback: {feedback}\nPREVIOUS CHECKS:\n{}{refused}",
                             if session.expect_writes { "yes" } else { "no" },
                             if checks_log.is_empty() {
                                 "(none configured)"
@@ -238,6 +240,7 @@ impl Orchestrator {
                             .count()
                     })
                     .unwrap_or(0);
+                refused = file_state_evidence(&artifact);
 
                 let rstate = CtxState {
                     long_term: state.long_term.clone(),
@@ -421,6 +424,65 @@ impl Orchestrator {
     }
 }
 
+/// What the next round needs after a patch is refused or applied: the tool's
+/// verdict and the file's current text (windowed on the anchor that matters).
+/// Two failures this addresses, both measured: "search string not found" with no
+/// file in front of the model makes it guess again, and a retry that only sees
+/// the pre-round snapshot re-applies an edit that already landed (duplicate
+/// definitions, E0592/E0428).
+fn file_state_evidence(artifact: &serde_json::Value) -> String {
+    // ponytail: one shared budget, first file takes it; split it per file when
+    // a run shows two touched files that both need their text.
+    const CAP: usize = 12_000;
+    let mut out = String::new();
+    let entries = artifact
+        .get("file_state")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    // One entry per path, the LAST one: a file patched twice in an artifact has
+    // two reads, and the earlier one describes a state the model already moved
+    // past — keeping it would hand the retry a stale file and a fresh-looking
+    // label (measured: the duplicate-definition class returning at 3 rounds).
+    let mut last: Vec<serde_json::Value> = Vec::new();
+    for e in entries {
+        let path = e.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        if let Some(slot) = last
+            .iter_mut()
+            .find(|k| k.get("path").and_then(|v| v.as_str()) == Some(path))
+        {
+            *slot = e;
+        } else {
+            last.push(e);
+        }
+    }
+    for e in last {
+        let left = CAP.saturating_sub(out.len());
+        if left == 0 {
+            break;
+        }
+        let path = e.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let why = e.get("why").and_then(|v| v.as_str()).unwrap_or("changed");
+        let text = e
+            .get("current_content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let win: String = text.chars().take(left).collect();
+        let head = if why == "applied" || why == "rewritten" {
+            format!(
+                "\nFILE {path} ({why} by your previous round — this is its content NOW, \
+                 do not apply the same change again):\n--- {path} ---\n{win}\n"
+            )
+        } else {
+            format!(
+                "\nPATCH REFUSED for {path}: {why}\n--- {path} (current content, read back) ---\n{win}\n"
+            )
+        };
+        out.push_str(&head);
+    }
+    out
+}
+
 /// Keeps the lines a reviewer can act on and drops build noise. Raw
 /// `cargo test` output is mostly "test x ... ok" lines that the reviewer
 /// never uses but which every retry pays for (~2.4k tokens measured).
@@ -504,5 +566,40 @@ mod condense_tests {
         // body must read as "nothing to report", not as a blank.
         let out = condense_output("   Compiling rof v0.1.0\n    Finished dev profile\n");
         assert!(out.contains("no actionable lines"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod file_state_tests {
+    use super::file_state_evidence;
+
+    #[test]
+    fn the_last_read_of_a_path_wins() {
+        // Two patches to one file: the retry must get the second (current)
+        // read, not the first — the stale one is what made round 3 re-apply an
+        // edit that had already landed.
+        let artifact = serde_json::json!({
+            "file_state": [
+                {"path": "src/a.rs", "why": "applied", "current_content": "OLD"},
+                {"path": "src/a.rs", "why": "applied", "current_content": "NEW"},
+            ]
+        });
+        let out = file_state_evidence(&artifact);
+        assert!(out.contains("NEW"), "{out}");
+        assert!(!out.contains("OLD"), "{out}");
+    }
+
+    #[test]
+    fn separate_files_each_keep_their_evidence() {
+        let artifact = serde_json::json!({
+            "file_state": [
+                {"path": "src/a.rs", "why": "applied", "current_content": "AAA"},
+                {"path": "src/b.rs", "why": "search string not found", "current_content": "BBB"},
+            ]
+        });
+        let out = file_state_evidence(&artifact);
+        assert!(out.contains("AAA"));
+        assert!(out.contains("BBB"));
+        assert!(out.contains("PATCH REFUSED for src/b.rs"));
     }
 }

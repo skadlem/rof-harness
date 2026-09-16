@@ -143,13 +143,9 @@ fn apply_env(cfg: &mut AppConfig) {
         }
     }
     // Task copies: keep them on a disk-backed path for suite runs whose
-    // checks build (each copy grows its own target/).
+    // checks build (each copy grows its own target/). Deleting them is `rm -rf`.
     if let Some(r) = get("ROF_TASK_ROOT") {
         cfg.task_root = Some(std::path::PathBuf::from(r.trim()));
-    }
-    if let Some(c) = get("ROF_CLEAN_TASKS") {
-        cfg.clean_task_dirs =
-            matches!(c.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1");
     }
 }
 

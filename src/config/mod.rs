@@ -161,10 +161,6 @@ pub struct AppConfig {
     /// (a task that runs cargo checks builds its own target/ there).
     #[serde(default)]
     pub task_root: Option<PathBuf>,
-    /// Delete a task's copy once the task has finished. Off by default:
-    /// a kept copy is how a MISMATCH gets inspected after the fact.
-    #[serde(default)]
-    pub clean_task_dirs: bool,
 }
 
 fn one_job() -> usize {
@@ -208,7 +204,6 @@ impl Default for AppConfig {
             expect_writes: true,
             max_parallel_tasks: 1,
             task_root: None,
-            clean_task_dirs: false,
         }
     }
 }

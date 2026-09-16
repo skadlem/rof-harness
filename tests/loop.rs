@@ -3,15 +3,25 @@ use rof::config::{AppConfig, PermissionPolicy};
 use rof::engine::{Orchestrator, Session};
 use rof::llm::{ContextService, ExecutorService, LlmClient, LlmError, LlmReq, LlmResp};
 use rof::obs::TraceSink;
-use rof::tools::{FsListTool, FsReadTool, ProcRunTool, ToolRegistry};
+use rof::tools::{FsListTool, FsPatchTool, FsReadTool, ProcRunTool, ToolRegistry};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Dispatches canned JSON by role keyword in the system prompt.
 struct FakeClient {
     review_calls: AtomicUsize,
     fail_first_review: bool,
     plan_tasks: Vec<&'static str>,
+    /// Guess a patch anchor never read, then fix it once the retry hands over
+    /// the file (exercises the refused-patch evidence path).
+    guess_then_fix: bool,
+    /// Patch a file successfully in round 1, then answer round 2 from the file
+    /// state it was handed (exercises the applied-change evidence path).
+    applied_retry: bool,
+    /// Ask to read a file, then write with it (exercises the read-request turn).
+    read_then_write: bool,
+    /// Ask for a path outside the workdir, then answer.
+    read_escape: bool,
 }
 
 /// Set when a reviewer prompt carries the CHECKS section.
@@ -22,6 +32,17 @@ static IMPL_SAW_CHECKS: AtomicBool = AtomicBool::new(false);
 static SAW_WRITE_EXPECT: AtomicBool = AtomicBool::new(false);
 /// Set when the cheap model was asked to compress overflowing context.
 static SAW_SUMMARY: AtomicBool = AtomicBool::new(false);
+/// The implementer prompt of a retry round, kept for assertions.
+static IMPL_RETRY_PROMPT: Mutex<String> = Mutex::new(String::new());
+/// Same, for the applied-change test (separate slot: tests run in parallel).
+static IMPL_RETRY_PROMPT_APPLIED: Mutex<String> = Mutex::new(String::new());
+/// The prompt of the implementer turn that carried requested files.
+static IMPL_READ_PROMPT: Mutex<String> = Mutex::new(String::new());
+/// Implementer calls seen in the read-request test.
+static IMPL_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Implementer calls + last prompt for the escaping-read test.
+static IMPL_ESCAPE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static IMPL_ESCAPE_PROMPT: Mutex<String> = Mutex::new(String::new());
 
 impl FakeClient {
     fn pass() -> Self {
@@ -29,6 +50,10 @@ impl FakeClient {
             review_calls: AtomicUsize::new(0),
             fail_first_review: false,
             plan_tasks: vec!["t1"],
+            guess_then_fix: false,
+            applied_retry: false,
+            read_then_write: false,
+            read_escape: false,
         }
     }
     fn fail_then_pass() -> Self {
@@ -36,6 +61,10 @@ impl FakeClient {
             review_calls: AtomicUsize::new(0),
             fail_first_review: true,
             plan_tasks: vec!["t1"],
+            guess_then_fix: false,
+            applied_retry: false,
+            read_then_write: false,
+            read_escape: false,
         }
     }
     fn two_tasks() -> Self {
@@ -43,6 +72,56 @@ impl FakeClient {
             review_calls: AtomicUsize::new(0),
             fail_first_review: false,
             plan_tasks: vec!["t1", "t2"],
+            guess_then_fix: false,
+            applied_retry: false,
+            read_then_write: false,
+            read_escape: false,
+        }
+    }
+    fn guess_then_fix() -> Self {
+        Self {
+            review_calls: AtomicUsize::new(0),
+            fail_first_review: false,
+            plan_tasks: vec!["t1"],
+            guess_then_fix: true,
+            applied_retry: false,
+            read_then_write: false,
+            read_escape: false,
+        }
+    }
+    fn applied_retry() -> Self {
+        Self {
+            review_calls: AtomicUsize::new(0),
+            // the change lands in round 1, so the retry only happens if the
+            // reviewer fails it
+            fail_first_review: true,
+            plan_tasks: vec!["t1"],
+            guess_then_fix: false,
+            applied_retry: true,
+            read_then_write: false,
+            read_escape: false,
+        }
+    }
+    fn read_then_write() -> Self {
+        Self {
+            review_calls: AtomicUsize::new(0),
+            fail_first_review: false,
+            plan_tasks: vec!["t1"],
+            guess_then_fix: false,
+            applied_retry: false,
+            read_then_write: true,
+            read_escape: false,
+        }
+    }
+    fn read_escape() -> Self {
+        Self {
+            review_calls: AtomicUsize::new(0),
+            fail_first_review: false,
+            plan_tasks: vec!["t1"],
+            guess_then_fix: false,
+            applied_retry: false,
+            read_then_write: false,
+            read_escape: true,
         }
     }
     fn resp(text: &str) -> Result<LlmResp, LlmError> {
@@ -97,6 +176,49 @@ impl LlmClient for FakeClient {
         {
             IMPL_SAW_CHECKS.store(true, Ordering::SeqCst);
         }
+        if req.system.contains("implementer") && self.guess_then_fix {
+            if req.prompt.contains("round 2/2") {
+                *IMPL_RETRY_PROMPT.lock().unwrap() = req.prompt.clone();
+                // Round 2, file in hand: anchor on text that is actually there.
+                return Self::resp(
+                    "{\"patches\":[{\"path\":\"a.txt\",\"search\":\"beta_real_line\",\"replace\":\"beta_fixed\"}],\"notes\":\"ok\"}",
+                );
+            }
+            // Round 1: a patch anchor this model never read.
+            return Self::resp(
+                "{\"patches\":[{\"path\":\"a.txt\",\"search\":\"line nobody read\",\"replace\":\"x\"}],\"notes\":\"guessing\"}",
+            );
+        }
+        if req.system.contains("implementer") && self.read_then_write {
+            IMPL_READ_CALLS.fetch_add(1, Ordering::SeqCst);
+            if req.prompt.contains("[REQUESTED FILES]") {
+                *IMPL_READ_PROMPT.lock().unwrap() = req.prompt.clone();
+                return Self::resp(
+                    "{\"patches\":[{\"path\":\"a.txt\",\"search\":\"beta_real_line\",\"replace\":\"beta_fixed\"}],\"notes\":\"now that I have seen it\"}",
+                );
+            }
+            // Would-be guesser: ask for the file instead of inventing a field list.
+            return Self::resp("{\"reads\":[\"schema.txt\"],\"artifact\":\"need the field list\"}");
+        }
+        if req.system.contains("implementer") && self.read_escape {
+            IMPL_ESCAPE_CALLS.fetch_add(1, Ordering::SeqCst);
+            *IMPL_ESCAPE_PROMPT.lock().unwrap() = req.prompt.clone();
+            return Self::resp(
+                "{\"reads\":[\"../../etc/passwd\",\"../outside.txt\"],\"artifact\":\"gimme\"}",
+            );
+        }
+        if req.system.contains("implementer") && self.applied_retry {
+            if req.prompt.contains("round 2/2") {
+                *IMPL_RETRY_PROMPT_APPLIED.lock().unwrap() = req.prompt.clone();
+                // No second edit: the file already carries round 1's change.
+                return Self::resp(
+                    "{\"artifact\": \"no further change\", \"notes\": \"already applied\"}",
+                );
+            }
+            return Self::resp(
+                "{\"patches\":[{\"path\":\"a.txt\",\"search\":\"beta_real_line\",\"replace\":\"beta_fixed\"}],\"notes\":\"first attempt\"}",
+            );
+        }
         Self::resp("{\"artifact\": \"did t1\", \"notes\": \"ok\"}")
     }
 }
@@ -127,6 +249,7 @@ fn harness_budget(
     let mut reg = ToolRegistry::new(policy);
     reg.register(FsListTool::new(root.clone()));
     reg.register(FsReadTool::new(root.clone()));
+    reg.register(FsPatchTool::new(root.clone()));
     reg.register(ProcRunTool::new(
         root.clone(),
         vec!["echo checked".to_string()],
@@ -298,4 +421,126 @@ async fn loop_exhausts_rounds_on_persistent_fail() {
     assert_eq!(out["passed"], false);
     assert_eq!(out["rounds"], 1);
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn a_refused_patch_hands_the_file_to_the_retry() {
+    // Round 1 patches an anchor the model never read. The harness must put the
+    // file's real text into round 2's prompt — a bare "search string not found"
+    // is what makes a retry repeat the same guess.
+    let (orch, reg, root) = harness(Arc::new(FakeClient::guess_then_fix()), "refused", 2);
+    std::fs::write(root.join("a.txt"), "alpha\nbeta_real_line\ngamma\n").unwrap();
+    let out = orch.run_loop(&Session::new("g".into()), &reg, &root).await;
+    let retry = IMPL_RETRY_PROMPT.lock().unwrap().clone();
+    assert!(
+        retry.contains("PATCH REFUSED for a.txt"),
+        "retry prompt lacks the refusal: {retry}"
+    );
+    assert!(
+        retry.contains("beta_real_line"),
+        "retry prompt lacks the file's current text: {retry}"
+    );
+    // the retry's patch lands on the real file, so the task completes
+    assert_eq!(out["rounds"], 2);
+    assert_eq!(out["passed"], true);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "alpha\nbeta_fixed\ngamma\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn an_applied_change_is_handed_to_the_retry_as_it_is_now() {
+    // Round 1's patch lands; the mid-term retrieval is a pre-round snapshot, so
+    // without this evidence round 2 sees the file as it was and applies the
+    // same change again (measured: E0592/E0428 duplicate definitions).
+    let (orch, reg, root) = harness(Arc::new(FakeClient::applied_retry()), "applied", 2);
+    std::fs::write(root.join("a.txt"), "alpha\nbeta_real_line\ngamma\n").unwrap();
+    let out = orch
+        .run_loop(
+            &Session::new("g".into()).expecting_writes(false),
+            &reg,
+            &root,
+        )
+        .await;
+    let retry = IMPL_RETRY_PROMPT_APPLIED.lock().unwrap().clone();
+    assert!(
+        retry.contains("FILE a.txt (applied by your previous round"),
+        "retry prompt lacks the applied-change state: {retry}"
+    );
+    assert!(
+        retry.contains("beta_fixed"),
+        "retry prompt does not show the file as it is now: {retry}"
+    );
+    assert_eq!(out["rounds"], 2);
+    assert_eq!(out["passed"], true);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn a_read_request_is_honored_once_and_then_the_model_writes() {
+    // The measured blocker: the model needs a fact it never read (a struct's
+    // field list) and has no way to look. It can now ask, gets one extra turn
+    // with the file, and the patch lands in the same round.
+    let (orch, reg, root) = harness(Arc::new(FakeClient::read_then_write()), "reads", 2);
+    std::fs::write(root.join("a.txt"), "alpha\nbeta_real_line\ngamma\n").unwrap();
+    std::fs::write(root.join("schema.txt"), "struct Thing { field_a: u8 }\n").unwrap();
+    let out = orch.run_loop(&Session::new("g".into()), &reg, &root).await;
+    let seen = IMPL_READ_PROMPT.lock().unwrap().clone();
+    assert!(
+        seen.contains("schema.txt") && seen.contains("field_a"),
+        "the requested file never reached the second turn: {seen}"
+    );
+    // the path map tells the model what it may ask for
+    assert!(
+        seen.contains("[REPO FILES]") && seen.contains("schema.txt"),
+        "implementer prompt lacks the path map: {seen}"
+    );
+    assert_eq!(
+        IMPL_READ_CALLS.load(Ordering::SeqCst),
+        2,
+        "one request, one extra call"
+    );
+    assert_eq!(
+        out["rounds"], 1,
+        "the read turn must not burn a review round"
+    );
+    assert_eq!(out["passed"], true);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "alpha\nbeta_fixed\ngamma\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn a_read_request_outside_the_root_is_refused() {
+    // The path is model-chosen, so it goes through the same gate as everything
+    // else: denied, no content leaked into the prompt, and a repeated request
+    // does not loop.
+    let (orch, reg, root) = harness(Arc::new(FakeClient::read_escape()), "escape", 2);
+    std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+    // `../outside.txt` from the workdir is a real file next to it, so a leak is
+    // detectable rather than assumed.
+    let outside = std::env::temp_dir().join("outside.txt");
+    std::fs::write(&outside, "OUTSIDE-SECRET-CONTENT\n").unwrap();
+    let out = orch.run_loop(&Session::new("g".into()), &reg, &root).await;
+    let seen = IMPL_ESCAPE_PROMPT.lock().unwrap().clone();
+    assert!(
+        !seen.contains("OUTSIDE-SECRET-CONTENT") && !seen.contains("root:x:"),
+        "an out-of-root file's content leaked into the prompt: {seen}"
+    );
+    assert!(
+        seen.contains("unreadable"),
+        "denial must be legible to the model: {seen}"
+    );
+    assert!(
+        IMPL_ESCAPE_CALLS.load(Ordering::SeqCst) <= 4,
+        "a request may add one call per round (2 rounds here), never a loop: {}",
+        IMPL_ESCAPE_CALLS.load(Ordering::SeqCst)
+    );
+    assert_eq!(out["passed"], false, "no writes means no pass");
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_file(&outside).ok();
 }

@@ -1,0 +1,18 @@
+{
+  "name": "hard-two",
+  "description": "The two repo-tasks that fail in every measured arm. Both are edit goals whose failure is a wrong fact about the code (an invented TraceEvent::ToolCall shape, a duplicated method or test module) rather than a missing file, so this suite is the cheap instrument for the 'the model asserts what it never checked' class: 2 tasks, ~40 s, ~$0.002 per run.",
+  "tasks": [
+    {
+      "name": "metrics-method",
+      "goal": "In src/eval/metrics.rs, add a public method `tool_failures(&self) -> usize` on EvalReport returning tool_calls minus tool_ok (saturating). Add a unit test in the existing test module asserting it returns 0 for a fresh report and 1 after folding one failing ToolCall event.",
+      "checks": ["cargo test"],
+      "expect_writes": true
+    },
+    {
+      "name": "add-retriever-test",
+      "goal": "In src/context/retriever.rs, add a `#[cfg(test)] mod tests` block containing one unit test named `skips_hidden_files` asserting that a file named `.env` is not returned by Retriever::retrieve. Follow the style of the other test modules in this repo.",
+      "checks": ["cargo test"],
+      "expect_writes": true
+    }
+  ]
+}
