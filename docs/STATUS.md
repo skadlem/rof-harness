@@ -907,3 +907,41 @@ answer is already committed, so the task measured nothing. It is replaced with
 an equivalent additive task (`model_calls` + `cost_reporting_rate`) that is not
 in the tree, and the suite hash changed accordingly. A benchmark that the
 operator has already solved is not a benchmark.
+
+## Three caps elided the file the goal named (2026-09-18)
+
+`multi-metric-and-trace` reads its own failure back to me: "I need the full
+metrics.rs tail". `metrics.rs` is 20,374 chars. A file the goal names by path
+passed through three compounding ceilings, all ~12-16k:
+
+1. `Retriever::snippet` excerpts a named file at `NAMED_FILE_CAP = 12_000`,
+   head and tail with the middle elided;
+2. `max_total_chars = 12_000` trims the assembled retrieval block;
+3. the mid layer's `fit` cuts at `budget * 4 = 16_000`, and above 0.8 of that
+   it *summarizes* the layer instead of cutting it.
+
+So the struct, `Default`, `fold` and the test module lived in the hole. The
+system prompt forbids patching unseen text and a re-request for the same path
+is deduped, so the hole was unreachable and the task ended at
+"WRITES MADE is 0". Atria's own feedback named the missing tail.
+
+**The fix.** A file the goal names is a whole-file answer, and §4.1 already
+created the place for it: the volatile tail below the layers, where the budget
+is `short_term * 4 = 24_000` chars and nothing is ever summarized. The
+implementer now serves goal-named files there with a window centred on the
+goal's symbols, and the orchestrator drops them out of the (summarized) mid
+layer so the implementer never sees the same file twice.
+
+**Why not just raise the mid layer.** Raising `mid_term` to 6000 tokens does
+not deliver the file whole — the summarize threshold is a share of the cap, so
+a 20k file at a 24k cap trips `wants_summary` and is collapsed into a summary,
+which destroys the file instead of cutting it. The layers are sized for the
+context model; a whole source file is a volatile item.
+
+**A first probe misread the cause.** An A/B on conversation shape (eager files
+in turn 1 vs ask-then-receive) showed 5/8 patch emission against 2/8 and I
+wired an eager-files path in the implementer. Reverting it and probing the
+*first* implementer call showed the file already present on HEAD: the
+orchestrator's retrieval had been serving it all along, just elided. The
+measured difference was the elision, not the turn shape. The eager scaffold was
+reverted; only the volatile-delivery part survived.

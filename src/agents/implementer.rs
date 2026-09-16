@@ -79,6 +79,41 @@ impl ImplementerAgent<'_> {
             fidelity: Fidelity::Drop,
             must_include: false,
         });
+        // §4.1: a file the goal names by path is a whole-file answer, so it
+        // rides below the layers where the volatile budget (24k chars) can
+        // actually hold it. The mid layer caps at 16k and summarizes above
+        // 12.8k, which is why a 20k source file named by the goal used to
+        // arrive as head+elided-tail and the task then died at
+        // "WRITES MADE is 0".
+        //
+        // Optional, not must_include: two named files over one volatile
+        // budget must not become a SelectionFailure that delivers neither. A
+        // file that does not fit here is still asked for by name later, and
+        // then it is must_include and wins priority. Its region is its own so
+        // that the assembler's dedupe (which counts an item as placed whether
+        // or not it was delivered) never blocks that later request.
+        if let Some(workdir) = ctx.workdir {
+            let r = crate::context::Retriever::new(
+                workdir.to_path_buf(),
+                crate::config::RetrievalConfig::default(),
+            );
+            for (path, content) in r.named_file_contents(&ctx.view.prompt) {
+                asm.add(ContextItem {
+                    key: ItemKey {
+                        path: path.clone(),
+                        region: "goal-named".to_string(),
+                        role: "implementer".to_string(),
+                    },
+                    label: format!("--- {path}"),
+                    text: content,
+                    fidelity: Fidelity::Windowed {
+                        anchor: ctx.view.prompt.to_string(),
+                        cap: ctx.volatile_budget,
+                    },
+                    must_include: false,
+                });
+            }
+        }
         let prompt = match asm.assemble() {
             // The map is optional, so either arm delivers the parts that fit.
             Assembly::Ok(parts) | Assembly::SelectionFailure { parts, .. } => parts.full(),

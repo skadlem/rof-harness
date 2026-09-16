@@ -2,7 +2,7 @@ use super::session::{checks_pass, render_checks, RoundServices};
 use super::Session;
 use crate::agents::{Agent, AgentCtx, ImplementerAgent, PlannerAgent, ReviewerAgent, Verdict};
 use crate::config::AppConfig;
-use crate::context::{render, ContextBuilder, CtxState, LayerReport, Retriever};
+use crate::context::{render, ContextBuilder, CtxState, LayerReport, Retriever, Snippet};
 use crate::llm::{ContextService, ExecutorService};
 use crate::obs::{TraceEvent, TraceSink};
 use crate::tools::ToolRegistry;
@@ -88,6 +88,21 @@ impl Orchestrator {
         let retriever = Retriever::new(workdir.to_path_buf(), self.cfg.retrieval.clone());
         let snips = retriever.retrieve(&session.goal, self.cfg.retrieval.max_total_chars);
         let retrieved = render(&snips);
+        // Files the goal names by path ride below the layers in the
+        // implementer's volatile tail instead (see `named_file_contents`), so
+        // they are neither cut nor summarized by the mid layer — and the
+        // implementer is not handed the same file twice.
+        let named: Vec<String> = retriever
+            .named_file_contents(&session.goal)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        let unnamed: Vec<Snippet> = snips
+            .iter()
+            .filter(|s| !named.contains(&s.path))
+            .cloned()
+            .collect();
+        let impl_retrieved = render(&unnamed);
         let retrieved_files = snips.len();
         // Context accounting (stage 0), folded per task by the eval layer. The
         // retriever's snippets are echoed with their sizes so a report can say
@@ -280,7 +295,7 @@ impl Orchestrator {
                     // cacheable prefix (this block) stays byte-identical, and
                     // an injected skill body goes last for the same reason.
                     mid_term: format!(
-                        "goal: {}\n{retrieved}\nplan: {}\nCURRENT TASK ({}/{}) : {task}{impl_reuse}",
+                        "goal: {}\n{impl_retrieved}\nplan: {}\nCURRENT TASK ({}/{}) : {task}{impl_reuse}",
                         session.goal,
                         plan_json,
                         ti + 1,
