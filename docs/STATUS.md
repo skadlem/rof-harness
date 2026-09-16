@@ -825,3 +825,42 @@ the next round, not gaps in this one.
 **Rule earned on 2026-09-15:** a commit that adds a module must declare it in the module tree and ship
 a caller or a test that fails without it — otherwise it is a doc, and docs live in `docs/`. Six
 skeletons were deleted here precisely because they were read as progress while compiling to nothing.
+
+## The reasoning-model bug class (2026-09-17, live, deepseek-flash)
+
+Two live suite runs on `deepseek-flash` (DeepSeek-V4.1-Flash) found the largest
+single correctness bug the harness has ever shipped, and it was not in the
+harness's logic — it was in the seam between the harness and a reasoning model.
+
+**The bug.** `deepseek-flash` is a hidden-chain model: a turn's output tokens
+are spent on reasoning *before* the visible answer. The client asked for
+1200/800/600 output tokens (implementer/planner/reviewer). The model spent
+every one of them reasoning and returned an **empty `content`** with
+`finish_reason: "length"`. The harness read an empty artifact as "the model
+chose to write nothing"; the reviewer then failed the task with the accurate
+but useless charge "WRITES MADE is 0"; and the retry loop could not help,
+because a 200 response with empty content was not an error.
+
+Measured on the 20-task suite: three tasks failed repeatedly with
+`WRITES MADE is 0` while the model was in fact being cut off mid-thought.
+The model was not misbehaving — it was asking for more files and refusing to
+invent struct fields it had not read, which is exactly the discipline the
+system prompt demands. The harness was truncating it before it could speak.
+
+**The fix.** `once()` reads `finish_reason` and returns `Err` on `"length"`
+instead of an empty answer, so the retry loop that already existed can act on
+it; a truncation retry doubles `max_tokens` (a same-size re-roll just
+truncates again) and gets exactly one; agent ceilings are raised to reasoning
+scale (8192 / 4096 / 4096) and `summarize()` asks for the content budget plus
+fixed headroom. `402` (insufficient balance) is now retryable.
+
+**Cost of the discovery.** Two runs, \$0.17 and \$0.23 — the second one was
+spent diagnosing, not progressing: the truncation-retry landed before the
+ceiling raise, so it re-asked at the same too-small size and burned budget.
+The lesson is recorded as a rule for the harness itself, not just a note: a
+retry that cannot change the request's shape is a donation to the provider.
+
+**Open, blocked on budget.** The balance is exhausted, so the re-measurement
+that would confirm the fix's effect on pass rate has not run. The one task
+that failed three times pre-fix passes in a single round post-fix, which is
+evidence but not a measurement.
