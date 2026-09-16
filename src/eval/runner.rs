@@ -299,6 +299,9 @@ impl EvaluationRunner {
                 rep.tasks.push(self.run_task_isolated(t.clone()).await);
             }
             rep.aggregate = self.report();
+            for task in &rep.tasks {
+                rep.aggregate.record_task(task.passed);
+            }
             rep.label = self.label(suite);
             return rep;
         }
@@ -329,6 +332,9 @@ impl EvaluationRunner {
             }
         }
         rep.aggregate = self.report();
+        for task in &rep.tasks {
+            rep.aggregate.record_task(task.passed);
+        }
         rep.label = self.label(suite);
         rep
     }
@@ -366,16 +372,25 @@ fn sanitize(name: &str) -> String {
     s
 }
 
-/// Recursive copy of a task tree, skipping `target/` (rebuildable
-/// artifacts, by far the largest subtree) and `.git/` (history the
-/// agents must never see or mutate).
+/// Recursive copy of a task tree, skipping `target/` (rebuildable artifacts,
+/// by far the largest subtree). `.git` comes along as the tree-state substrate
+/// (§4.2) — shallow when the source history is large, or `git init` plus one
+/// commit when the source was no repo — so the copy is always a repo and
+/// rollback never silently degrades. The agents never see `.git`: it is
+/// excluded from retrieval and from every path the file tools resolve
+/// (`tools::resolve_under`).
 fn copy_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if name_str == "target" || name_str == ".git" {
+        if name_str == "target" {
+            continue;
+        }
+        if name_str == ".git" {
+            // Copied as repo state below (shallow when large), not as a plain
+            // subtree.
             continue;
         }
         let from = entry.path();
@@ -390,6 +405,13 @@ fn copy_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
         }
         // Symlinks and sockets are skipped: they escape the tree or
         // cannot be meaningfully copied per task.
+    }
+    if src.join(".git").is_dir() {
+        crate::engine::tree::copy_git_state(src, dst)?;
+    } else {
+        // A source without git still gets a substrate: rollback and the write
+        // gate work on every task copy, not just repo tasks.
+        crate::engine::tree::TreeService::new(dst.to_path_buf()).ensure()?;
     }
     Ok(())
 }

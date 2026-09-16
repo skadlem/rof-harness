@@ -160,3 +160,77 @@ async fn read_only_tools_allow_and_deny() {
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&outside).ok();
 }
+
+/// §4.2: `.git` is the tree-state substrate the write gate and rollback read,
+/// so no agent may read or write it — not at the top level, not nested, and not
+/// via a listing that would hand it a handle. An agent that reached it could
+/// forge the gate's evidence or undo a rollback.
+#[tokio::test]
+async fn git_substrate_is_unreachable_by_any_agent() {
+    let root = std::env::temp_dir().join(format!("rof-git-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+    std::fs::write(root.join("src"), "").ok();
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+
+    let mut reg = ToolRegistry::new(policy_for(root.clone()));
+    reg.register(FsListTool::new(root.clone()));
+    reg.register(FsReadTool::new(root.clone()));
+    reg.register(FsWriteTool::new(root.clone()));
+    reg.register(ProcRunTool::new(root.clone(), vec!["echo hi".to_string()]));
+
+    // No read of the substrate, at any depth, for any agent.
+    for agent in ["planner", "implementer", "reviewer"] {
+        for path in [
+            ".git/HEAD",
+            ".git",
+            "sub/.git/config",
+            "sub/../../.git/HEAD",
+        ] {
+            let (r, _) = reg
+                .call(
+                    agent,
+                    "fs.read",
+                    Some(&root),
+                    serde_json::json!({"path": path}),
+                )
+                .await;
+            assert!(r.is_err(), "{agent} must not read {path}");
+        }
+    }
+
+    // No writing into it either: a commit forged by the model would be
+    // indistinguishable from a harness baseline.
+    let (r, _) = reg
+        .call(
+            "implementer",
+            "fs.write",
+            Some(&root),
+            serde_json::json!({"path": ".git/HEAD", "content": "ref: refs/heads/pwned"}),
+        )
+        .await;
+    assert!(r.is_err());
+    assert_eq!(
+        std::fs::read_to_string(root.join(".git/HEAD")).unwrap(),
+        "ref: refs/heads/main",
+        "the substrate must be unchanged"
+    );
+
+    // A listing never offers the handle, so the model cannot probe it.
+    let (r, _) = reg
+        .call(
+            "planner",
+            "fs.list",
+            Some(&root),
+            serde_json::json!({"path": "."}),
+        )
+        .await;
+    let listed = r.unwrap().output;
+    assert!(
+        !listed.contains(".git"),
+        "listing leaks the substrate: {listed}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}

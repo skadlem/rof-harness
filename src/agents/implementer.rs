@@ -10,6 +10,7 @@ use async_trait::async_trait;
 /// in one bounded extra turn. Without it a model that needs a struct's real
 /// field list has to invent one (measured: E0559/E0063 on every arm).
 const IMPLEMENTER_SYSTEM: &str = "You are an implementer. Output JSON {artifact, notes, patches?: [{path, search, replace}], writes?: [{path, content}], reads?: [path], skill_views?: [name], skills?: [{op, ...}]}. Prefer patches (one uniquely-matching hunk each, whitespace-tolerant) for edits to existing files; use writes only to create a file or rewrite most of it. A patch `search` MUST be text you have read from that file in this session — if you have not read it, read it first, because a search string you did not see is a guess and the patch is refused; never replace an existing file with a stub or a fragment of it. If you need a fact to be right (a struct's exact fields, an existing helper's signature, an import path), output {\"reads\": [\"path\", ...]} with no patches and no writes: you will get those files and be asked again. Never invent a field list. The prompt's [SKILLS] block lists recorded procedures; if one applies, output {\"skill_views\": [\"name\"]} (nothing else) and it will be handed to you. After a workflow that took more than one round and worked, record the lesson as a skill: {\"skills\": [{\"op\": \"create\", \"name\": \"lowercase-hyphen\", \"description\": \"when to use it, <=60 chars\", \"body\": \"one rule per lesson\", \"rationale\": \"why it generalizes\"}]} — it is stored as a proposal for a human to approve; other ops are patch {name, find, replace}, write_file {name, rel, content}, delete {name}. Propose only what is genuinely reusable. If the context says WRITES REQUIRED: yes, the JSON MUST include a non-empty patches or writes array — prose, reconnaissance notes or plans are not a deliverable and will be rejected. Keep both minimal.";
+const DIRECT_SYSTEM: &str = "You are a direct coding agent. Complete the user's goal end to end in this repository. Output JSON {artifact, notes, patches?: [{path, search, replace}], writes?: [{path, content}], reads?: [path]}. Make the requested code and test edits now; do not stop at inspection, explanation, or a test run. Use patches for existing files and writes only for new files. A patch search must be copied from a file you read. If you need a file first, request it with reads and your next turn must contain the actual patch or write. Keep the change minimal. The task is not complete until a non-empty patches or writes array is emitted when WRITES REQUIRED is yes.";
 
 /// Implementer: reads repo state through the gated tools, then asks the
 /// Executor LLM for an implementation artifact whose `patches[]`/`writes[]`
@@ -36,6 +37,10 @@ impl<'a> ImplementerAgent<'a> {
         );
         r.file_map()
     }
+
+    pub async fn run_direct(&self, ctx: AgentCtx<'_>) -> anyhow::Result<AgentOutput> {
+        self.run_with_system(ctx, DIRECT_SYSTEM).await
+    }
 }
 
 #[async_trait]
@@ -44,13 +49,23 @@ impl Agent for ImplementerAgent<'_> {
         "implementer"
     }
     async fn run(&self, ctx: AgentCtx<'_>) -> anyhow::Result<AgentOutput> {
+        self.run_with_system(ctx, IMPLEMENTER_SYSTEM).await
+    }
+}
+
+impl ImplementerAgent<'_> {
+    async fn run_with_system(
+        &self,
+        ctx: AgentCtx<'_>,
+        system: &str,
+    ) -> anyhow::Result<AgentOutput> {
         let map = ctx.workdir.map(Self::file_map).unwrap_or_default();
         let mut prompt = ctx.view.prompt.clone();
         if !map.is_empty() {
             prompt.push_str("\n\n[REPO FILES]\n");
             prompt.push_str(&map);
         }
-        let mut data = self.ask(&ctx, &prompt).await?;
+        let mut data = self.ask_with_system(&ctx, &prompt, system).await?;
         // A model that must not guess asks for the files it needs ("reads"),
         // or for a recorded procedure ("skill_views"). One extra turn, never
         // more: the request is only honored when the artifact proposed no
@@ -76,7 +91,7 @@ impl Agent for ImplementerAgent<'_> {
                 got_any = true;
             }
             if got_any {
-                data = self.ask(&ctx, &prompt).await?;
+                data = self.ask_with_system(&ctx, &prompt, system).await?;
             }
         }
         let files_seen = map.lines().count();
@@ -136,18 +151,28 @@ fn string_list(data: &serde_json::Value, key: &str, max: usize) -> Vec<String> {
 
 impl ImplementerAgent<'_> {
     /// One Executor call, traced.
-    async fn ask(&self, ctx: &AgentCtx<'_>, prompt: &str) -> anyhow::Result<serde_json::Value> {
+    async fn ask_with_system(
+        &self,
+        ctx: &AgentCtx<'_>,
+        prompt: &str,
+        system: &str,
+    ) -> anyhow::Result<serde_json::Value> {
         let resp = self
             .llm
             .complete(LlmReq {
-                system: IMPLEMENTER_SYSTEM.to_string(),
+                system: system.to_string(),
                 prompt: prompt.to_string(),
                 max_tokens: 1200,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         ctx.trace.emit(TraceEvent::ModelCall {
-            agent: self.name().to_string(),
+            agent: if system == DIRECT_SYSTEM {
+                "executor"
+            } else {
+                self.name()
+            }
+            .to_string(),
             model: self.llm.model.clone(),
             input_tokens: resp.input_tokens,
             output_tokens: resp.output_tokens,
