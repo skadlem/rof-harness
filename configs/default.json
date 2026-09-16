@@ -58,5 +58,5 @@
   "expect_writes": true,
   "max_parallel_tasks": 1,
   "task_root": null,
-  "clean_task_dirs": false
+  "clean_task_dirs": true
 }

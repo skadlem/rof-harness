@@ -35,6 +35,7 @@ pub enum Role {
 ///
 /// [`ModelRouter::from_config`] maps `RoutingConfig` fields to these slots:
 /// `context_model`, `executor_model` and `executor_fallback` respectively.
+/// `verify_model` maps to the verify slot (`None` resolves to the executor model).
 /// Pure data + accessor today; routing policies plug in here later.
 pub struct ModelRouter {
     pub context_model: String,

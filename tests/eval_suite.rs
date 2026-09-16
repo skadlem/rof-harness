@@ -123,6 +123,54 @@ fn cleanup_task_dirs(tags: &[&str]) {
     }
 }
 
+/// A suite whose checks run a build leaves a full `target/` in every task
+/// copy (~1 GB on a Rust repo). The default deletes the copy when the task
+/// is done: leftover state is debug-only, and on a small tmpfs it has cost
+/// real task failures (disk quota). `clean_task_dirs: false` keeps it.
+#[tokio::test]
+async fn task_dirs_are_removed_by_default() {
+    let root = std::env::temp_dir().join(format!("rof-eval-clean-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("in.md"), "seed").unwrap();
+    let copies = std::env::temp_dir().join(format!("rof-eval-clean-copies-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&copies);
+    std::fs::create_dir_all(&copies).unwrap();
+
+    let client = Arc::new(Fake);
+    let runner = EvaluationRunner::new(
+        Arc::new(TraceSink::new()),
+        AppConfig {
+            task_root: Some(copies.clone()),
+            ..test_cfg()
+        },
+        ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client, "fake-exec".to_string(), None),
+        root.clone(),
+    );
+    let suite = EvalSuite {
+        name: "clean".to_string(),
+        tasks: vec![EvalTask {
+            name: "clean".to_string(),
+            goal: "write out.md".to_string(),
+            expect_pass: true,
+            checks: Vec::new(),
+            expect_writes: true,
+            max_tokens: None,
+        }],
+    };
+    let rep = runner.run_suite(&suite).await;
+    assert!(rep.tasks[0].matched, "the task should pass: {rep:?}");
+    // The copy is gone once the task finished — nothing in it is needed to
+    // interpret the report.
+    assert!(
+        std::fs::read_dir(&copies).unwrap().next().is_none(),
+        "the task copy survived a clean_task_dirs run"
+    );
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&copies).ok();
+}
+
 /// Fan-out: every task runs in its own copy of the tree, so two tasks
 /// writing different paths cannot see or clobber each other's work — and
 /// the source tree is never a target.
@@ -168,6 +216,10 @@ async fn parallel_tasks_are_isolated_per_task_dir() {
     let client = Arc::new(GoalAware);
     let cfg = AppConfig {
         max_parallel_tasks: 2,
+        // Keep the copies so isolation can be asserted on them afterwards;
+        // production runs delete them (a suite whose checks build leaves a
+        // full target/ per task).
+        clean_task_dirs: false,
         ..test_cfg()
     };
     let runner = EvaluationRunner::new(
@@ -415,7 +467,11 @@ async fn a_non_repo_source_still_gets_the_substrate() {
     let client = Arc::new(Fake);
     let runner = EvaluationRunner::new(
         Arc::new(TraceSink::new()),
-        test_cfg(),
+        // The assertions below read the copy after the run, so it must survive.
+        AppConfig {
+            clean_task_dirs: false,
+            ..test_cfg()
+        },
         ContextService::new(client.clone(), "fake-ctx".to_string()),
         ExecutorService::new(client, "fake-exec".to_string(), None),
         root.clone(),
@@ -508,6 +564,7 @@ async fn task_root_is_honoured() {
     let client = Arc::new(Writer);
     let cfg = AppConfig {
         task_root: Some(copies_root.clone()),
+        clean_task_dirs: false, // the assertion below reads the copy
         ..test_cfg()
     };
     let suite = EvalSuite {
