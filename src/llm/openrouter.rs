@@ -40,9 +40,19 @@ struct PromptDetails {
     cached_tokens: Option<u64>,
 }
 
+/// A completion that hit the output ceiling is not a completion: the
+/// caller sees an empty or partial answer and treats it as the model's
+/// choice. DeepSeek's reasoning models spend the whole budget on hidden
+/// reasoning and ship an empty `content` when `max_tokens` is too small, so
+/// this is the difference between "the model wrote nothing" and "the model
+/// was cut off".
+const FINISH_LENGTH: &str = "length";
+
 #[derive(Debug, Clone, Deserialize)]
 struct Choice {
     message: ChoiceMsg,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -176,12 +186,19 @@ impl OpenRouterClient {
             .json()
             .await
             .map_err(|e| LlmError::Transport(e.to_string()))?;
-        let text = body
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .unwrap_or_default();
+        let choice = body.choices.into_iter().next();
+        // A truncation is reported as an error, not as an empty answer: the
+        // retry loop above then re-asks, and a caller that counts model
+        // errors sees a cutoff instead of "the model wrote nothing".
+        let truncated =
+            choice.as_ref().and_then(|c| c.finish_reason.as_deref()) == Some(FINISH_LENGTH);
+        let text = choice.map(|c| c.message.content).unwrap_or_default();
+        if truncated {
+            return Err(LlmError::Transport(format!(
+                "output truncated at {} tokens (finish_reason=length); raise max_tokens",
+                req.max_tokens
+            )));
+        }
         let (inp, out, cost, cached) = body
             .usage
             .map(|u| {

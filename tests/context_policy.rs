@@ -307,11 +307,12 @@ async fn summarize_request_is_bounded_by_half_the_layer_estimate() {
     // The request's max_tokens is bounded; the stub returns `req.prompt.len()`
     // as input_tokens, so we verify via the call having occurred with bounded
     // input rather than the full budget (pol.budget = 1000 => 4000 chars cap).
-    // The key invariant: max_tokens <= (raw.chars().count()/16).max(64).min(budget)
-    // => 6000 chars => 375 max_tokens.
+    // The key invariant: max_tokens is the content budget (bounded by half
+    // est => 6000 chars => 375) plus a fixed reasoning headroom, because a
+    // hidden-chain model spends tokens before its visible answer.
     assert!(
-        client.last_max_tokens.load(Ordering::SeqCst) <= 375,
-        "max_tokens bounded by half est (375): got {}",
+        client.last_max_tokens.load(Ordering::SeqCst) <= 375 + 3072,
+        "max_tokens bounded by half est + headroom (3447): got {}",
         client.last_max_tokens.load(Ordering::SeqCst)
     );
 }
