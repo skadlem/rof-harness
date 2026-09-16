@@ -50,7 +50,7 @@ A suite run never touches `ROF_WORKDIR`: every task runs in its own copy
 |---|---|
 | `ROF_CONFIG` | config file path (same as `--config`) |
 | `ROF_WORKDIR` | target tree, copied per task; the permission allowlist is anchored here |
-| `ROF_CTX_MODEL` / `ROF_EXEC_MODEL` / `ROF_EXEC_FALLBACK` | model routing without recompiling |
+| `ROF_CTX_MODEL` / `ROF_EXEC_MODEL` / `ROF_EXEC_FALLBACK` / `ROF_VERIFY_MODEL` | model routing without recompiling; verify defaults to exec (self-review) |
 | `ROF_ALLOW_CMDS` | comma-separated exact command allowlist (empty = deny all) |
 | `ROF_ALLOW_HOSTS` | comma-separated host allowlist for `http.get` (empty = deny all) |
 | `ROF_EXPECT_WRITES` | `yes`/`no` — run mode: must the goal change a file to pass (default yes) |

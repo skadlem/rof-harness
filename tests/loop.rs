@@ -333,8 +333,15 @@ fn harness_with(
     tweak(&mut cfg);
     let trace = Arc::new(TraceSink::new());
     let context = ContextService::new(client.clone(), "fake-ctx".to_string());
-    let executor = ExecutorService::new(client, "fake-exec".to_string(), None);
-    (Orchestrator::new(cfg, trace, context, executor), reg, root)
+    let executor = ExecutorService::new(client.clone(), "fake-exec".to_string(), None);
+    // Verify slot: unset in the router means the executor model, so the
+    // test helper clones it too.
+    let verify = ExecutorService::new(client, "fake-verify".to_string(), None);
+    (
+        Orchestrator::new(cfg, trace, context, executor, verify),
+        reg,
+        root,
+    )
 }
 
 #[tokio::test]

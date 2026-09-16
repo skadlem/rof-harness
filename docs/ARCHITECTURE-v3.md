@@ -201,6 +201,8 @@ struct TaskOutcome {
 
 **Design.** One new routing slot, defaulting to the executor — zero behavior change until set; `ROF_VERIFY_MODEL` selects it. This is the decision gate for the reviewer's future (arm #4), not a feature. Escalation, if it ever exists, is a logged *suggestion*, never an executed swap (principle 7).
 
+**Implementation (landed).** `RoutingConfig.verify_model: Option<String>` (default `None` = self-review), `Role::Verify` in `ModelRouter` resolving to the executor model plus its fallback chain when unset, and `ROF_VERIFY_MODEL` in `apply_env`. `Orchestrator` holds a separate `verify: ExecutorService` and `ReviewerAgent::new(&self.verify)` runs on it, so a live A/B is `ROF_VERIFY_MODEL=x` with nothing else changed and no code path differing between the arms. The eval runner and the test helper pass the executor clone until a config sets the slot.
+
 ### 4.6 Security — symlink-aware containment *(correctness, not an arm)*
 
 **Trigger.** v2 documents the hole: `under()` is lexical, so a symlink inside an allowed dir can escape it. Until this lands, "deny-by-default" is real for paths and performative for symlinks.
