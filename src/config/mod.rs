@@ -217,6 +217,12 @@ pub struct AppConfig {
     /// (a task that runs cargo checks builds its own target/ there).
     #[serde(default)]
     pub task_root: Option<PathBuf>,
+    /// Delete a task's workdir copy when the task finishes. A suite whose
+    /// checks run a build leaves a full `target/` per task (~1 GB on a Rust
+    /// repo), which is debug-only state: on by default, set false to keep a
+    /// failing copy for inspection.
+    #[serde(default = "yes")]
+    pub clean_task_dirs: bool,
     /// Run the goal-quality pre-check before planning. Emits a
     /// `GoalQuality` trace event and, when set, a note in the planner prompt.
     /// Off by default: it changes prompt content, which is an A/B'able change.
@@ -231,6 +237,10 @@ pub struct AppConfig {
 
 fn one_job() -> usize {
     1
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl AppConfig {
@@ -283,6 +293,7 @@ impl Default for AppConfig {
             expect_writes: true,
             max_parallel_tasks: 1,
             task_root: None,
+            clean_task_dirs: true,
             // Off by default: both change live behaviour (prompt content /
             // rounds executed), so they are opt-in A/B'able switches.
             goal_quality: false,

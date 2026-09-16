@@ -280,8 +280,11 @@ impl EvaluationRunner {
         }
     }
 
-    /// One task in isolation: copy the tree, run, keep the copy for
-    /// debugging (disposable; see README on temp-dir pressure).
+    /// One task in isolation: copy the tree, run, then delete the copy
+    /// unless `clean_task_dirs` is off. A suite whose checks run a build
+    /// leaves a full `target/` per task (~1 GB on a Rust repo), and that
+    /// blowup is debug-only state that has cost real disk (and, when the
+    /// disk is a small tmpfs, real task failures).
     async fn run_task_isolated(&self, task: EvalTask) -> TaskResult {
         let dir = match self.prepare_task_dir(&task.name) {
             Ok(d) => d,
@@ -298,7 +301,13 @@ impl EvaluationRunner {
                 };
             }
         };
-        self.run_task_in(&task, dir).await
+        let res = self.run_task_in(&task, dir.clone()).await;
+        if self.cfg.clean_task_dirs {
+            // Best effort: a copy that will not delete must never fail the
+            // task that just succeeded.
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        res
     }
 
     pub async fn run_suite(&self, suite: &EvalSuite) -> SuiteReport {
