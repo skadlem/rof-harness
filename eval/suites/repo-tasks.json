@@ -10,7 +10,7 @@
     },
     {
       "name": "add-retriever-test",
-      "goal": "In src/context/retriever.rs, add a unit test named `skips_hidden_files` inside the existing #[cfg(test)] module asserting that a file named `.env` is not returned by Retriever::retrieve. Follow the style of the existing tests in that module.",
+      "goal": "In src/context/retriever.rs, add a `#[cfg(test)] mod tests` block containing one unit test named `skips_hidden_files` asserting that a file named `.env` is not returned by Retriever::retrieve. Follow the style of the other test modules in this repo.",
       "checks": ["cargo test"],
       "expect_writes": true
     },

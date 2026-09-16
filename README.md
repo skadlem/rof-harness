@@ -19,6 +19,8 @@ cargo build --release                 # single binary: target/release/rof
 ./target/release/rof eval eval/suites/repo-tasks.json --limit 6 --jobs 2   # first 6, two at a time
 ./target/release/rof config > my.json                       # effective config (diffable)
 ./target/release/rof --config my.json eval suites/repo-tasks.json
+scripts/live-eval.sh eval/suites/repo-tasks.json --limit 6 --jobs 2        # same, wired to a live model
+scripts/measure-arm.sh before 3 eval/suites/repo-tasks.json --limit 6 --jobs 2   # an arm: 3 labelled runs
 ```
 
 Live models need credentials in the environment (`OR_TOKEN` for OpenRouter, or
@@ -53,7 +55,6 @@ A suite run never touches `ROF_WORKDIR`: every task runs in its own copy
 | `ROF_CHECK` | run-mode checks, comma-separated exact commands |
 | `ROF_JOBS` / `ROF_MAX_PARALLEL_TASKS` | suite fan-out (`--jobs N` wins over both) |
 | `ROF_TASK_ROOT` | where per-task workdir copies live (default: system temp dir) |
-| `ROF_CLEAN_TASKS` | `yes` deletes a task's copy when the task finishes |
 
 Precedence: defaults < config file < environment < CLI flags. `rof eval <suite> --report out.json`
 writes the suite report (per-task verdicts + feedback, folded metrics) next to the trace, so a
@@ -72,8 +73,8 @@ fails to be made fails only its own task.
 
 Disk is the price of that isolation: a task whose checks build owns its own `target/`
 (~250 MB for `cargo check`, ~1 GB for `cargo test` on this repo). Point `ROF_TASK_ROOT` at
-disk rather than a small tmpfs, and set `ROF_CLEAN_TASKS=yes` for long suites. Copies that
-are kept are how a MISMATCH is inspected after the fact.
+disk rather than a small tmpfs, and `rm -rf` the copies when you are done with them — keeping
+them is how a MISMATCH gets inspected after the fact.
 
 ## Config files
 
@@ -99,7 +100,9 @@ Deny-by-default, enforced inside `ToolRegistry::call` (not in agents):
 - `proc.run` executes exact allowlisted strings only, with no shell.
 - `http.get` requires an exact host allowlist match, refuses non-http(s) schemes, and does not
   follow redirects (a redirect would bypass the allowlist).
-- `fs.patch` refuses ambiguous or missing search strings rather than guessing.
+- `fs.patch` refuses ambiguous or missing search strings rather than guessing. A refusal is not a
+  dead end: the file's current text is re-read and handed to the retry round, so the next attempt
+  anchors on what is there.
 - The reviewer cannot write; a pass with no writes is rejected by the harness itself, not only by
   the reviewer prompt.
 
@@ -123,5 +126,5 @@ cargo test && cargo clippy --all-targets && cargo fmt --check
 ```
 
 Tests default to `std::env::temp_dir()` and clean up the task copies they make. Live runs leave
-copies under `ROF_TASK_ROOT` (the temp dir by default) — they are disposable; delete them or set
-`ROF_CLEAN_TASKS=yes`. See `docs/STATUS.md` for what is done, what is left, and how to verify each claim.
+copies under `ROF_TASK_ROOT` (the temp dir by default) — they are disposable; `rm -rf` them.
+See `docs/STATUS.md` for what is done, what is left, and how to verify each claim.

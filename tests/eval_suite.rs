@@ -301,10 +301,10 @@ async fn harness_rejects_pass_without_writes() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// The task root is configurable (a suite whose checks build needs copies on
-/// disk, not in a small tmpfs), and cleanup is opt-in.
+/// The task root is configurable: a suite whose checks build needs copies on
+/// disk, not in a small tmpfs.
 #[tokio::test]
-async fn task_root_is_honoured_and_cleanup_removes_copies() {
+async fn task_root_is_honoured() {
     struct Writer;
     #[async_trait]
     impl LlmClient for Writer {
@@ -339,7 +339,6 @@ async fn task_root_is_honoured_and_cleanup_removes_copies() {
     let client = Arc::new(Writer);
     let cfg = AppConfig {
         task_root: Some(copies_root.clone()),
-        clean_task_dirs: false,
         ..Default::default()
     };
     let suite = EvalSuite {
@@ -357,7 +356,7 @@ async fn task_root_is_honoured_and_cleanup_removes_copies() {
         Arc::new(TraceSink::new()),
         cfg,
         ContextService::new(client.clone(), "fake-ctx".to_string()),
-        ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
+        ExecutorService::new(client, "fake-exec".to_string(), None),
         root.clone(),
     );
     let rep = runner.run_suite(&suite).await;
@@ -374,36 +373,7 @@ async fn task_root_is_honoured_and_cleanup_removes_copies() {
         "the write is visible in the kept copy"
     );
     self_clean(&copies_root);
-
-    // Same run with cleanup on: the copy must be gone afterwards.
-    let root2 = std::env::temp_dir().join(format!("rof-eval-root2-{}", std::process::id()));
-    let copies2 = std::env::temp_dir().join(format!("rof-eval-copies2-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root2);
-    let _ = std::fs::remove_dir_all(&copies2);
-    std::fs::create_dir_all(&root2).unwrap();
-    std::fs::write(root2.join("in.md"), "seed").unwrap();
-    let runner = EvaluationRunner::new(
-        Arc::new(TraceSink::new()),
-        AppConfig {
-            task_root: Some(copies2.clone()),
-            clean_task_dirs: true,
-            ..Default::default()
-        },
-        ContextService::new(client.clone(), "fake-ctx".to_string()),
-        ExecutorService::new(client, "fake-exec".to_string(), None),
-        root2.clone(),
-    );
-    let rep = runner.run_suite(&suite).await;
-    assert!(rep.tasks[0].matched, "{:?}", rep.tasks);
-    assert_eq!(
-        std::fs::read_dir(&copies2).unwrap().count(),
-        0,
-        "clean_task_dirs removes the copy"
-    );
-    self_clean(&copies_root);
-    self_clean(&copies2);
     std::fs::remove_dir_all(&root).ok();
-    std::fs::remove_dir_all(&root2).ok();
 }
 
 fn self_clean(dir: &std::path::Path) {

@@ -1,12 +1,20 @@
 use super::{Agent, AgentCtx, AgentOutput};
+use crate::context::window_on;
 use crate::llm::LlmReq;
 use crate::obs::TraceEvent;
+use crate::tools::ToolRegistry;
 use async_trait::async_trait;
 
-/// Implementer: reads repo state through strict read-only tools, then asks
-/// the Executor LLM to produce an implementation artifact (description of
-/// the change + notes). v1 never writes; write tools slot in behind the
-/// same policy gate later.
+/// The implementer's contract. `reads` is the one way it can *look something
+/// up* before writing: emit `{"reads": [...]}` and nothing else, get those files
+/// in one bounded extra turn. Without it a model that needs a struct's real
+/// field list has to invent one (measured: E0559/E0063 on every arm).
+const IMPLEMENTER_SYSTEM: &str = "You are an implementer. Output JSON {artifact, notes, patches?: [{path, search, replace}], writes?: [{path, content}], reads?: [path]}. Prefer patches (one uniquely-matching hunk each, whitespace-tolerant) for edits to existing files; use writes only to create a file or rewrite most of it. A patch `search` MUST be text you have read from that file in this session — if you have not read it, read it first, because a search string you did not see is a guess and the patch is refused; never replace an existing file with a stub or a fragment of it. If you need a fact to be right (a struct's exact fields, an existing helper's signature, an import path), output {\"reads\": [\"path\", ...]} with no patches and no writes: you will get those files and be asked again. Never invent a field list. If the context says WRITES REQUIRED: yes, the JSON MUST include a non-empty patches or writes array — prose, reconnaissance notes or plans are not a deliverable and will be rejected. Keep both minimal.";
+
+/// Implementer: reads repo state through the gated tools, then asks the
+/// Executor LLM for an implementation artifact whose `patches[]`/`writes[]`
+/// are applied through the same gate. A refused patch comes back with the
+/// file's current text, which the orchestrator hands to the retry round.
 pub struct ImplementerAgent<'a> {
     llm: &'a crate::llm::ExecutorService,
 }
@@ -16,60 +24,18 @@ impl<'a> ImplementerAgent<'a> {
         Self { llm }
     }
 
-    async fn gather(&self, ctx: &AgentCtx<'_>) -> Vec<String> {
-        let mut seen = Vec::new();
-        let (tools, workdir) = match (ctx.tools, ctx.workdir) {
-            (Some(t), Some(w)) => (t, w),
-            _ => return seen,
-        };
-        let (list, lat) = tools
-            .call(
-                "implementer",
-                "fs.list",
-                Some(workdir),
-                serde_json::json!({"path": "."}),
-            )
-            .await;
-        ctx.trace.emit(TraceEvent::ToolCall {
-            agent: self.name().to_string(),
-            tool: "fs.list".to_string(),
-            ok: list.is_ok(),
-            latency_ms: lat,
-        });
-        let entries: Vec<Entry> = list
-            .ok()
-            .and_then(|o| serde_json::from_str(&o.output).ok())
-            .unwrap_or_default();
-        for e in entries.into_iter().filter(|e| !e.is_dir).take(5) {
-            let name = e.name;
-            let target = workdir.join(&name);
-            let (r, lat) = tools
-                .call(
-                    "implementer",
-                    "fs.read",
-                    Some(&target),
-                    serde_json::json!({"path": name, "max_bytes": 4000}),
-                )
-                .await;
-            ctx.trace.emit(TraceEvent::ToolCall {
-                agent: self.name().to_string(),
-                tool: "fs.read".to_string(),
-                ok: r.is_ok(),
-                latency_ms: lat,
-            });
-            if let Ok(out) = r {
-                seen.push(format!("--- {name}\n{}", out.output));
-            }
-        }
-        seen
+    /// The tree's paths, replacing the old gather(): five arbitrary root files
+    /// cost five tool calls and up to 20k chars per round and told the model
+    /// nothing it needed, while the read-request turn failed a quarter of the
+    /// time on a path the model had simply guessed. A map is ~2k chars,
+    /// byte-stable per task, and lets the implementer name what it wants.
+    fn file_map(workdir: &std::path::Path) -> String {
+        let r = crate::context::Retriever::new(
+            workdir.to_path_buf(),
+            crate::config::RetrievalConfig::default(),
+        );
+        r.file_map()
     }
-}
-
-#[derive(serde::Deserialize)]
-struct Entry {
-    name: String,
-    #[serde(default)]
-    is_dir: bool,
 }
 
 #[async_trait]
@@ -78,21 +44,75 @@ impl Agent for ImplementerAgent<'_> {
         "implementer"
     }
     async fn run(&self, ctx: AgentCtx<'_>) -> anyhow::Result<AgentOutput> {
-        let files = self.gather(&ctx).await;
+        let map = ctx.workdir.map(Self::file_map).unwrap_or_default();
         let mut prompt = ctx.view.prompt.clone();
-        if !files.is_empty() {
-            prompt.push_str("\n\n[REPO SNIPPETS]\n");
-            prompt.push_str(&files.join("\n"));
+        if !map.is_empty() {
+            prompt.push_str("\n\n[REPO FILES]\n");
+            prompt.push_str(&map);
         }
-        let req = LlmReq {
-            system: "You are an implementer. Output JSON {artifact, notes, patches?: [{path, search, replace}], writes?: [{path, content}]}. Prefer patches (one uniquely-matching hunk each, whitespace-tolerant) for edits to existing files; use writes only to create a file or rewrite most of it. If the context says WRITES REQUIRED: yes, the JSON MUST include a non-empty patches or writes array — prose, reconnaissance notes or plans are not a deliverable and will be rejected. Keep both minimal."
-                .to_string(),
-            prompt,
-            max_tokens: 1200,
-        };
+        let mut data = self.ask(&ctx, &prompt).await?;
+        // A model that must not guess asks for the files it needs ("reads").
+        // One extra turn, never more: the request is only honored when the
+        // artifact proposed no change at all, and a second request is ignored
+        // because by then the requested files are already in the prompt.
+        let wanted = read_requests(&data);
+        if !wanted.is_empty() && data.get("patches").is_none() && data.get("writes").is_none() {
+            let got = self.requested(&ctx, &wanted).await;
+            if !got.is_empty() {
+                prompt.push_str("\n\n[REQUESTED FILES]\n");
+                prompt.push_str(&got.join("\n"));
+                data = self.ask(&ctx, &prompt).await?;
+            }
+        }
+        let files_seen = map.lines().count();
+        // Patches first, then whole-file writes (a write to the same path wins).
+        // Both land in `writes` so the reviewer's WRITES MADE count is unchanged.
+        // `file_state` carries the file text each touched path has *now*.
+        let (mut writes, mut state) = self.apply_patches(&ctx, &data).await;
+        let (w2, s2) = self.apply_writes(&ctx, &data).await;
+        writes.extend(w2);
+        state.extend(s2);
+        Ok(AgentOutput {
+            summary: format!(
+                "artifact drafted from {files_seen} files, {} writes, {} files re-read",
+                writes.len(),
+                state.len()
+            ),
+            data: serde_json::json!({
+                "result": data,
+                "files_seen": files_seen,
+                "writes": writes,
+                "file_state": state,
+            }),
+        })
+    }
+}
+
+/// Paths an artifact asked to see before it writes.
+fn read_requests(data: &serde_json::Value) -> Vec<String> {
+    const MAX: usize = 3;
+    data.get("reads")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .take(MAX)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl ImplementerAgent<'_> {
+    /// One Executor call, traced.
+    async fn ask(&self, ctx: &AgentCtx<'_>, prompt: &str) -> anyhow::Result<serde_json::Value> {
         let resp = self
             .llm
-            .complete(req)
+            .complete(LlmReq {
+                system: IMPLEMENTER_SYSTEM.to_string(),
+                prompt: prompt.to_string(),
+                max_tokens: 1200,
+            })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         ctx.trace.emit(TraceEvent::ModelCall {
@@ -105,35 +125,58 @@ impl Agent for ImplementerAgent<'_> {
             cached_input_tokens: resp.cached_input_tokens,
             attempts: resp.attempts,
         });
-        let data: serde_json::Value =
-            crate::llm::parse_lenient(&resp.text).unwrap_or(serde_json::json!({"raw": resp.text}));
-        let files_seen = files.len();
-        // Patches first, then whole-file writes (a write to the same path wins).
-        // Both land in `writes` so the reviewer's WRITES MADE count is unchanged.
-        let mut writes = self.apply_patches(&ctx, &data).await;
-        writes.extend(self.apply_writes(&ctx, &data).await);
-        Ok(AgentOutput {
-            summary: format!(
-                "artifact drafted from {files_seen} files, {} writes",
-                writes.len()
-            ),
-            data: serde_json::json!({
-                "result": data,
-                "files_seen": files_seen,
-                "writes": writes,
-            }),
-        })
+        Ok(crate::llm::parse_lenient(&resp.text).unwrap_or(serde_json::json!({"raw": resp.text})))
     }
-}
 
-impl ImplementerAgent<'_> {
+    /// The files an artifact asked to read, through the same policy gate as
+    /// every other tool call (a model-chosen path is untrusted input).
+    async fn requested(&self, ctx: &AgentCtx<'_>, paths: &[String]) -> Vec<String> {
+        let (Some(tools), Some(workdir)) = (ctx.tools, ctx.workdir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for path in paths {
+            let target = workdir.join(path);
+            let (r, lat) = tools
+                .call(
+                    "implementer",
+                    "fs.read",
+                    Some(&target),
+                    serde_json::json!({"path": path, "max_bytes": 262_144}),
+                )
+                .await;
+            ctx.trace.emit(TraceEvent::ToolCall {
+                agent: self.name().to_string(),
+                tool: "fs.read".to_string(),
+                ok: r.is_ok(),
+                latency_ms: lat,
+            });
+            match r {
+                // Whole file, like a goal-named one: the model asked for it to
+                // settle a fact, so a head-only cap would answer the wrong
+                // question.
+                Ok(o) => out.push(format!("--- {path}\n{}", window_on(&o.output, ""))),
+                Err(e) => out.push(format!("--- {path}\n(unreadable: {e})")),
+            }
+        }
+        out
+    }
     /// Applies artifact `patches[]` through the registry, same gate as writes.
-    async fn apply_patches(&self, ctx: &AgentCtx<'_>, data: &serde_json::Value) -> Vec<String> {
+    /// Returns `(results, state)`: every path touched comes back with the file's
+    /// text as it is *now*, because the mid-term retrieval is a pre-round
+    /// snapshot — a retry that only sees it re-applies an edit that already
+    /// landed (measured: duplicate definitions, E0592/E0428).
+    async fn apply_patches(
+        &self,
+        ctx: &AgentCtx<'_>,
+        data: &serde_json::Value,
+    ) -> (Vec<String>, Vec<serde_json::Value>) {
         let (tools, workdir) = match (ctx.tools, ctx.workdir) {
             (Some(t), Some(w)) => (t, w),
-            _ => return Vec::new(),
+            _ => return (Vec::new(), Vec::new()),
         };
         let mut done = Vec::new();
+        let mut state = Vec::new();
         let empty = Vec::new();
         let patches = data
             .get("patches")
@@ -158,22 +201,82 @@ impl ImplementerAgent<'_> {
                 ok: r.is_ok(),
                 latency_ms: lat,
             });
-            done.push(match r {
-                Ok(o) => o.output,
-                Err(e) => format!("FAILED {path}: {e}"),
-            });
+            match r {
+                Ok(o) => {
+                    done.push(o.output);
+                    // The patch landed: hand the retry the file with its own
+                    // edit in it, or it will add the same thing twice.
+                    state.push(
+                        self.file_state(ctx, tools, workdir, path, replace, "applied")
+                            .await,
+                    );
+                }
+                Err(e) => {
+                    // Refused: hand it the text the search was supposed to match.
+                    state.push(
+                        self.file_state(ctx, tools, workdir, path, search, &e.to_string())
+                            .await,
+                    );
+                    done.push(format!("FAILED {path}: {e}"));
+                }
+            }
         }
-        done
+        (done, state)
+    }
+
+    /// The file's current text, windowed on `anchor`, plus why it is being
+    /// handed over ("applied" or the tool's refusal).
+    async fn file_state(
+        &self,
+        ctx: &AgentCtx<'_>,
+        tools: &ToolRegistry,
+        workdir: &std::path::Path,
+        path: &str,
+        anchor: &str,
+        why: &str,
+    ) -> serde_json::Value {
+        let target = workdir.join(path);
+        // Read generously and window in memory: a head-only read would cut out
+        // the very anchor the centre-on-the-symbol rule exists to keep.
+        let (r, lat) = tools
+            .call(
+                "implementer",
+                "fs.read",
+                Some(&target),
+                serde_json::json!({"path": path, "max_bytes": 262_144}),
+            )
+            .await;
+        ctx.trace.emit(TraceEvent::ToolCall {
+            agent: self.name().to_string(),
+            tool: "fs.read".to_string(),
+            ok: r.is_ok(),
+            latency_ms: lat,
+        });
+        let current_content = match r {
+            Ok(o) => window_on(&o.output, anchor),
+            Err(e) => format!("(unreadable: {e})"),
+        };
+        serde_json::json!({
+            "path": path,
+            "why": why,
+            "current_content": current_content,
+        })
     }
 
     /// Applies artifact `writes[]` through the registry, so the policy gate
     /// (agent grant + allowlist + root containment) checks every write.
-    async fn apply_writes(&self, ctx: &AgentCtx<'_>, data: &serde_json::Value) -> Vec<String> {
+    /// Returns `(results, state)` like `apply_patches`.
+    async fn apply_writes(
+        &self,
+        ctx: &AgentCtx<'_>,
+        data: &serde_json::Value,
+    ) -> (Vec<String>, Vec<serde_json::Value>) {
         let (tools, workdir) = match (ctx.tools, ctx.workdir) {
             (Some(t), Some(w)) => (t, w),
-            _ => return Vec::new(),
+            _ => return (Vec::new(), Vec::new()),
         };
         let mut done = Vec::new();
+        let mut state = Vec::new();
         let empty = Vec::new();
         let writes = data
             .get("writes")
@@ -197,11 +300,17 @@ impl ImplementerAgent<'_> {
                 ok: r.is_ok(),
                 latency_ms: lat,
             });
-            done.push(match r {
-                Ok(o) => o.output,
-                Err(e) => format!("FAILED {path}: {e}"),
-            });
+            match r {
+                Ok(o) => {
+                    done.push(o.output);
+                    state.push(
+                        self.file_state(ctx, tools, workdir, path, content, "rewritten")
+                            .await,
+                    );
+                }
+                Err(e) => done.push(format!("FAILED {path}: {e}")),
+            }
         }
-        done
+        (done, state)
     }
 }

@@ -67,3 +67,77 @@ fn empty_query_returns_nothing() {
     assert_eq!(render(&[]), "retrieved: (none)");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// The measured failure mode: the goal names the file to edit, keyword
+/// density picks a bigger file, and the implementer guesses a patch anchor it
+/// never saw. A named path must win.
+#[test]
+fn named_path_beats_keyword_density() {
+    let root = setup("named");
+    // Big, keyword-dense decoy that would outscore the small real target.
+    let noise = "tool permissions policy allowlist route model ids roles struct\n".repeat(200);
+    std::fs::write(root.join("sub").join("big.rs"), noise).unwrap();
+    let r = Retriever::new(root.clone(), RetrievalConfig::default());
+    let goal = "In sub/router.rs, add exactly one new doc comment line \
+                `/// Maps roles to model ids.` directly above `fn route_model`.";
+    let snips = r.retrieve(goal, 50_000);
+    assert!(
+        snips[0].path.ends_with("router.rs"),
+        "the named file must lead: {:?}",
+        snips.iter().map(|s| &s.path).collect::<Vec<_>>()
+    );
+    assert!(
+        snips[0].content.contains("fn route_model"),
+        "and its text must be present, not truncated away: {}",
+        snips[0].content
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A goal names a symbol deep inside a file larger than the per-file cap: the
+/// excerpt must contain that symbol, or the implementer patches an anchor it
+/// never saw (measured: `ProcRunTool` sat at line 421 of 521 and the patch was
+/// refused twice).
+#[test]
+fn excerpt_centres_on_the_named_symbol() {
+    let root = setup("window");
+    let mut body = "// filler line to push the anchor past the cap\n".repeat(200);
+    body.push_str(
+        "/// Runs allowlisted commands.\npub struct ProcRunTool {\n    root: PathBuf,\n}\n",
+    );
+    body.push_str(&"// trailer\n".repeat(200));
+    std::fs::write(root.join("tools.rs"), body).unwrap();
+    let r = Retriever::new(root.clone(), RetrievalConfig::default());
+    let snips = r.retrieve(
+        "In tools.rs, replace the doc comment on `struct ProcRunTool` with one \
+         that states the allowlist rules. Change nothing else.",
+        50_000,
+    );
+    let s = snips
+        .iter()
+        .find(|s| s.path.ends_with("tools.rs"))
+        .unwrap_or_else(|| panic!("named file must be retrieved: {:?}", snips.len()));
+    assert!(
+        s.content.contains("pub struct ProcRunTool"),
+        "the excerpt must contain the named symbol, got: {}",
+        s.content.chars().take(160).collect::<String>()
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The implementer names paths to read them and guessed wrong a quarter of the
+/// time (src/obs.rs for src/obs/trace.rs); the map is what it gets instead.
+#[test]
+fn file_map_lists_sources_and_skips_build_dirs() {
+    let root = setup("map");
+    let r = Retriever::new(root.clone(), RetrievalConfig::default());
+    let map = r.file_map();
+    assert!(map.contains("policy.md"), "map: {map}");
+    assert!(map.contains("sub/router.rs"), "map: {map}");
+    assert!(!map.contains("target/"), "build dir must be skipped: {map}");
+    assert!(
+        !map.contains("notes.bin"),
+        "extension filter must apply: {map}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

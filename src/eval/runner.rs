@@ -180,11 +180,7 @@ impl EvaluationRunner {
                 };
             }
         };
-        let result = self.run_task_in(&task, dir.clone()).await;
-        if self.cfg.clean_task_dirs {
-            std::fs::remove_dir_all(&dir).ok();
-        }
-        result
+        self.run_task_in(&task, dir).await
     }
 
     pub async fn run_suite(&self, suite: &EvalSuite) -> SuiteReport {
