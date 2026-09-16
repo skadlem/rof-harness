@@ -1,0 +1,126 @@
+{
+  "name": "repo-tasks",
+  "description": "20 real tickets against a copy of this repo. Mix: single-file edits, multi-file changes, and read-only analysis goals. Run with a scratch ROF_WORKDIR so the harness repo is never the target.",
+  "tasks": [
+    {
+      "name": "doc-comment",
+      "goal": "In src/engine/router.rs, add exactly one new doc comment line `/// Maps roles to model ids.` as the first line of the existing doc comment block directly above `pub struct ModelRouter`. Change nothing else in the file.",
+      "checks": ["cargo check"],
+      "expect_writes": true
+    },
+    {
+      "name": "add-retriever-test",
+      "goal": "In src/context/retriever.rs, add a unit test named `skips_hidden_files` inside the existing #[cfg(test)] module asserting that a file named `.env` is not returned by Retriever::retrieve. Follow the style of the existing tests in that module.",
+      "checks": ["cargo test"],
+      "expect_writes": true
+    },
+    {
+      "name": "metrics-method",
+      "goal": "In src/eval/metrics.rs, add a public method `tool_failures(&self) -> usize` on EvalReport returning tool_calls minus tool_ok (saturating). Add a unit test in the existing test module asserting it returns 0 for a fresh report and 1 after folding one failing ToolCall event.",
+      "checks": ["cargo test"],
+      "expect_writes": true
+    },
+    {
+      "name": "tool-count",
+      "goal": "In src/tools/mod.rs, add a public method `tool_count(&self) -> usize` on ToolRegistry returning the number of registered tools.",
+      "checks": ["cargo check"],
+      "expect_writes": true
+    },
+    {
+      "name": "procrun-doc",
+      "goal": "In src/tools/mod.rs, replace the doc comment on `struct ProcRunTool` with one that states: only exact strings from the allowlist are executed, no shell is involved, and the process runs with the tool root as its working directory.",
+      "checks": ["cargo check"],
+      "expect_writes": true
+    },
+    {
+      "name": "trace-doc",
+      "goal": "In src/obs/trace.rs, add a doc comment above `pub fn fork(&self)` explaining that a fork writes to the same JSONL file but keeps its own in-memory event vector, which is what gives per-task attribution under retries.",
+      "checks": ["cargo check"],
+      "expect_writes": true
+    },
+    {
+      "name": "role-label",
+      "goal": "In src/engine/router.rs, add a public method `label(&self) -> &'static str` on the Role enum returning \"context\" for Role::Context and \"executor\" for Role::Executor.",
+      "checks": ["cargo check"],
+      "expect_writes": true
+    },
+    {
+      "name": "budget-doc",
+      "goal": "In src/config/mod.rs, add a doc comment above the `max_tokens_per_task` field stating it is a per-task ceiling summed from the trace, that 0 means unlimited, and that crossing it aborts the task with a BudgetExceeded event.",
+      "checks": ["cargo check"],
+      "expect_writes": true
+    },
+    {
+      "name": "regression-test-cache-rate",
+      "goal": "In src/eval/metrics.rs, add a unit test named `cache_hit_rate_zero_without_input` asserting EvalReport::cache_hit_rate() returns 0.0 for a fresh report (no divide-by-zero panic).",
+      "checks": ["cargo test"],
+      "expect_writes": true
+    },
+    {
+      "name": "http-deny-test",
+      "goal": "In tests/v1_config_http.rs, add a test asserting that HttpGetTool rejects a url whose host is not in the allowlist, and that the error message contains \"not allowlisted\".",
+      "checks": ["cargo test"],
+      "expect_writes": true
+    },
+    {
+      "name": "summarize-doc",
+      "goal": "In src/llm/mod.rs, add a doc comment above `pub async fn summarize` explaining it is the Context LLM's second duty, that it is called when a layered budget overflows, and that the returned response is traced like any other model call.",
+      "checks": ["cargo check"],
+      "expect_writes": true
+    },
+    {
+      "name": "workspace-flag",
+      "goal": "In src/config/mod.rs, add a public field `pub tool_output_cap: usize` to AppConfig with a Default of 8000, documented as the character cap applied to captured command output.",
+      "checks": ["cargo check"],
+      "expect_writes": true
+    },
+    {
+      "name": "analysis-tools-grants",
+      "goal": "Report every tool registered by ToolRegistry::with_defaults and the exact agent grants that allow each tool to run. Do not modify any file; answer in prose with the tool names and the agents.",
+      "checks": [],
+      "expect_writes": false
+    },
+    {
+      "name": "analysis-token-ceiling",
+      "goal": "Explain how the per-task token ceiling is enforced: name the function that checks it, where in the round loop it runs, which trace event it emits, and what the metric counts. Do not modify any file.",
+      "checks": [],
+      "expect_writes": false
+    },
+    {
+      "name": "analysis-verdict-path",
+      "goal": "Trace how a reviewer verdict reaches the eval report: name the agent type, the JSON shape it returns, the type parsed from it, the trace event emitted, and the metric field it increments. Do not modify any file.",
+      "checks": [],
+      "expect_writes": false
+    },
+    {
+      "name": "analysis-cache-shape",
+      "goal": "Explain the prompt ordering rule this codebase uses to preserve provider prefix caching, which context layer holds volatile data, and what happens to the cache when a dynamic marker is placed in a stable layer. Do not modify any file.",
+      "checks": [],
+      "expect_writes": false
+    },
+    {
+      "name": "analysis-permission-failures",
+      "goal": "List every distinct way a tool call can be denied by the policy gate in ToolRegistry::call, quoting the error text for each. Do not modify any file.",
+      "checks": [],
+      "expect_writes": false
+    },
+    {
+      "name": "multi-config-env",
+      "goal": "Wire a new env override ROF_MAX_SNIPPETS in src/main.rs apply_env that sets cfg.retrieval.max_snippets when the value parses as usize, and add a line documenting it to the doc comment above apply_env.",
+      "checks": ["cargo check"],
+      "expect_writes": true
+    },
+    {
+      "name": "multi-tool-and-grant",
+      "goal": "Add a read-only tool `fs.stat` in src/tools/mod.rs that returns JSON {exists, bytes, is_dir} for a path under the tool root, register it in ToolRegistry::with_defaults, and grant it to the planner agent in the default permission policy in src/config/mod.rs.",
+      "checks": ["cargo check"],
+      "expect_writes": true
+    },
+    {
+      "name": "multi-metric-and-trace",
+      "goal": "Add a `tool_failures` counter to EvalReport in src/eval/metrics.rs that counts ToolCall events with ok=false, increment it in fold, and print it in the eval summary block in src/main.rs next to the budget aborts line.",
+      "checks": ["cargo check"],
+      "expect_writes": true
+    }
+  ]
+}

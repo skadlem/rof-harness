@@ -1,0 +1,62 @@
+{
+  "budgets": {
+    "long_term": 2000,
+    "mid_term": 4000,
+    "short_term": 6000
+  },
+  "routing": {
+    "context_model": "cheap-model",
+    "executor_model": "strong-model",
+    "executor_fallback": null
+  },
+  "permissions": {
+    "allowed_dirs": [],
+    "agents_tools": {
+      "implementer": [
+        "fs.list",
+        "fs.read",
+        "fs.write",
+        "fs.patch",
+        "http.get"
+      ],
+      "planner": [
+        "fs.list",
+        "fs.read"
+      ],
+      "reviewer": [
+        "fs.read",
+        "proc.run"
+      ]
+    },
+    "allowed_commands": [],
+    "allowed_hosts": []
+  },
+  "retrieval": {
+    "max_snippets": 5,
+    "max_bytes_per_file": 4000,
+    "max_total_chars": 12000,
+    "extensions": [
+      "rs",
+      "md",
+      "toml",
+      "json",
+      "yaml",
+      "yml",
+      "txt"
+    ],
+    "max_depth": 4
+  },
+  "max_review_rounds": 2,
+  "max_tokens_per_task": 50000,
+  "pricing": {
+    "input_per_mtok": 0.15,
+    "cached_input_per_mtok": 0.003,
+    "output_per_mtok": 0.6
+  },
+  "cost_lambda": 0.0,
+  "planner": "always",
+  "expect_writes": true,
+  "max_parallel_tasks": 1,
+  "task_root": null,
+  "clean_task_dirs": false
+}

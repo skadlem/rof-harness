@@ -1,0 +1,20 @@
+{
+  "name": "sample",
+  "_comment": "Offline demo: two read-only analysis goals, so a stub run matches 2/2 with no network and no writes. An analysis task MUST declare expect_writes:false or the harness will (correctly) refuse its pass.",
+  "tasks": [
+    {
+      "name": "policy-tour",
+      "goal": "explain how the tool permission policy gates fs.write in src/tools/mod.rs",
+      "expect_pass": true,
+      "expect_writes": false,
+      "checks": ["cargo test"]
+    },
+    {
+      "name": "router-tour",
+      "goal": "explain how ModelRouter picks context vs executor models",
+      "expect_pass": true,
+      "expect_writes": false,
+      "checks": ["cargo test"]
+    }
+  ]
+}

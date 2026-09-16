@@ -1,0 +1,23 @@
+{
+  "_comment": "Lean profile: cheapest tier, planner skipped, tight budgets. Compare against configs/default.json with `rof config` diffs.",
+  "budgets": {
+    "long_term": 1200,
+    "mid_term": 2500,
+    "short_term": 3000
+  },
+  "routing": {
+    "context_model": "deepseek-chat",
+    "executor_model": "deepseek-chat"
+  },
+  "retrieval": {
+    "max_snippets": 3,
+    "max_bytes_per_file": 2500,
+    "max_total_chars": 6000,
+    "max_depth": 3
+  },
+  "max_review_rounds": 1,
+  "max_tokens_per_task": 25000,
+  "cost_lambda": 0.0,
+  "planner": "skip",
+  "max_parallel_tasks": 4
+}
