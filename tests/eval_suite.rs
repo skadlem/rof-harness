@@ -86,6 +86,11 @@ async fn suite_tracks_per_task_match() {
     assert!(rep.tasks[0].matched);
     assert!(!rep.tasks[1].matched);
     assert_eq!(rep.matched(), 1);
+    assert_eq!((rep.aggregate.tasks, rep.aggregate.passed), (2, 2));
+    assert_eq!(
+        (rep.aggregate.verdicts, rep.aggregate.passed_verdicts),
+        (2, 2)
+    );
     assert!(rep.aggregate.tool_calls > 0);
     // Isolation: the eval must never mutate the tree it was pointed at.
     assert_eq!(
@@ -314,6 +319,153 @@ async fn harness_rejects_pass_without_writes() {
         )
     });
     assert!(rejected, "the override is visible in the trace");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// §4.2: the write gate reads the tree through git, not the artifact's
+/// self-report. A "write" that leaves the file byte-identical changed nothing,
+/// so a pass-happy reviewer on an expect_writes task must still be rejected —
+/// with the old self-reported count that no-op read as one write.
+#[tokio::test]
+async fn write_gate_counts_the_tree_not_the_claim() {
+    struct NoOp;
+    #[async_trait]
+    impl LlmClient for NoOp {
+        async fn complete(&self, _model: &str, req: LlmReq) -> Result<LlmResp, LlmError> {
+            let text = if req.system.contains("reviewer") {
+                "{\"pass\": true, \"feedback\": \"looks done\"}"
+            } else if req.system.contains("implementer") {
+                // The file already holds this content: the write lands and
+                // changes nothing, though the artifact reports it as a write.
+                "{\"artifact\":\"x\",\"notes\":\"y\",\"writes\":[{\"path\":\"notes.md\",\"content\":\"seed\"}]}"
+            } else {
+                "{\"tasks\": [\"t\"], \"acceptance\": [\"a\"]}"
+            };
+            Ok(LlmResp {
+                text: text.to_string(),
+                input_tokens: 4,
+                output_tokens: 2,
+                latency_ms: 1,
+                cost_usd: None,
+                cached_input_tokens: 0,
+                attempts: 1,
+            })
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("rof-eval-noop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("notes.md"), "seed").unwrap();
+
+    let client = Arc::new(NoOp);
+    let sink = Arc::new(TraceSink::new());
+    let runner = EvaluationRunner::new(
+        sink.clone(),
+        test_cfg(),
+        ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client, "fake-exec".to_string(), None),
+        root.clone(),
+    );
+    let suite = EvalSuite {
+        name: "git-gate".to_string(),
+        tasks: vec![EvalTask {
+            name: "noop".to_string(),
+            goal: "change a file".to_string(),
+            expect_pass: true,
+            checks: Vec::new(),
+            expect_writes: true,
+            max_tokens: None,
+        }],
+    };
+    let rep = runner.run_suite(&suite).await;
+
+    // Expected to pass; git counted no change, so the pass was rejected.
+    assert!(!rep.tasks[0].passed, "a no-op write must not pass");
+    assert!(!rep.tasks[0].matched, "expected pass, got the gate");
+    assert!(
+        rep.tasks[0].feedback.contains("no writes were applied"),
+        "the gate names the real change set: {}",
+        rep.tasks[0].feedback
+    );
+    let rejected = sink.events().iter().any(|e| {
+        matches!(
+            e,
+            rof::obs::TraceEvent::StateTransition { to, .. } if to == "rejected_no_writes"
+        )
+    });
+    assert!(rejected, "git's empty diff is what tripped the gate");
+    cleanup_task_dirs(&["noop"]);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// §4.2: every task copy is a git repo, even when the source tree was not one —
+/// a non-repo source gets `git init` plus one commit, so rollback and the write
+/// gate never silently degrade on the degenerate input.
+#[tokio::test]
+async fn a_non_repo_source_still_gets_the_substrate() {
+    let root = std::env::temp_dir().join(format!("rof-eval-norepo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("notes.md"), "seed").unwrap();
+    // The source is deliberately not a repo: no `.git` anywhere.
+    assert!(!root.join(".git").exists());
+
+    let client = Arc::new(Fake);
+    let runner = EvaluationRunner::new(
+        Arc::new(TraceSink::new()),
+        test_cfg(),
+        ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client, "fake-exec".to_string(), None),
+        root.clone(),
+    );
+    let suite = EvalSuite {
+        name: "substrate".to_string(),
+        tasks: vec![EvalTask {
+            name: "substrate".to_string(),
+            goal: "eval target".to_string(),
+            expect_pass: true,
+            checks: Vec::new(),
+            expect_writes: true,
+            max_tokens: None,
+        }],
+    };
+    let rep = runner.run_suite(&suite).await;
+    assert!(rep.tasks[0].matched, "the task should pass: {rep:?}");
+
+    // The copy the run made carries the substrate the gate read.
+    let mut found = 0;
+    let rd = std::fs::read_dir(std::env::temp_dir()).unwrap();
+    for e in rd.filter_map(|e| e.ok()) {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string());
+        let is_copy = name
+            .map(|n| n.starts_with(&format!("rof-task-{}-substrate-", std::process::id())))
+            .unwrap_or(false);
+        if !is_copy {
+            continue;
+        }
+        found += 1;
+        assert!(
+            p.join(".git").exists(),
+            "a non-repo source must still become a repo: {}",
+            p.display()
+        );
+        // The change the task made is visible to git in the copy.
+        let out = std::process::Command::new("git")
+            .args(["-C", p.to_str().unwrap(), "status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("notes.md"),
+            "the gate's change set must be git-visible in the copy"
+        );
+    }
+    assert_eq!(found, 1, "expected exactly one task copy, found {found}");
+    cleanup_task_dirs(&["substrate"]);
     std::fs::remove_dir_all(&root).ok();
 }
 

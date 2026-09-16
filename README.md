@@ -31,7 +31,9 @@ Live models need credentials in the environment (`OR_TOKEN` for OpenRouter, or
 Without them the harness runs against a deterministic stub, which is how the tests exercise the
 full loop offline.
 
-**Always point `ROF_WORKDIR` at a scratch copy** — the harness edits the working directory:
+**Always point `ROF_WORKDIR` at a scratch copy** — the harness edits the working directory,
+and a run commits a baseline before each attempt (`git init` plus one commit if the tree is
+not already a repo):
 
 ```bash
 WD=$(mktemp -d); cp -r src tests eval Cargo.toml "$WD"/
@@ -120,9 +122,13 @@ and `--limit K` runs only the first K tasks — a baseline without a second suit
 
 Isolation is by copy: each task gets its own scratch copy of the workdir under
 `task_root`, so two writers never share a tree and the source tree is never a target.
-`target/` and `.git/` are excluded from the copy (rebuildable, and history the agents must
-not see). Results are recorded in suite order regardless of finish order, and a copy that
-fails to be made fails only its own task.
+`target/` is excluded from the copy (rebuildable, and by far the largest subtree); `.git/` is
+included as the tree-state substrate — shallow (`--depth 1`) when the source history is large,
+`git init` plus one commit when the source was no repo — so every attempt starts from a
+committed baseline and the write gate counts what git sees change, not what the model reports.
+Agents never reach `.git`: it is excluded from retrieval and denied by every file tool. Results
+are recorded in suite order regardless of finish order, and a copy that fails to be made fails
+only its own task.
 
 Disk is the price of that isolation: a task whose checks build owns its own `target/`
 (~250 MB for `cargo check`, ~1 GB for `cargo test` on this repo). Point `ROF_TASK_ROOT` at

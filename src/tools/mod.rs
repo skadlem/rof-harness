@@ -156,6 +156,14 @@ fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, ToolError> {
     if !under(root, &p) {
         return Err(ToolError::Denied("path escapes tool root".to_string()));
     }
+    // §4.2: `.git` is the tree-state substrate the write gate and rollback
+    // read. An agent that reaches it could forge the gate's evidence or undo a
+    // rollback, so no path naming it is readable or writable, at any depth.
+    if p.components().any(|c| c.as_os_str() == ".git") {
+        return Err(ToolError::Denied(
+            "path is the git substrate (.git): harness-only".to_string(),
+        ));
+    }
     Ok(p)
 }
 
@@ -180,6 +188,11 @@ impl Tool for FsListTool {
         let mut names: Vec<serde_json::Value> = Vec::new();
         let rd = std::fs::read_dir(&dir).map_err(|e| ToolError::Failed(e.to_string()))?;
         for e in rd.flatten() {
+            // The substrate stays invisible even in a listing: the gate denies
+            // it, and a name the model cannot see is a name it cannot probe.
+            if e.file_name() == ".git" {
+                continue;
+            }
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
             names.push(serde_json::json!({
                 "name": e.file_name().to_string_lossy().to_string(),

@@ -9,6 +9,10 @@ use std::sync::{Arc, Mutex};
 
 /// Dispatches canned JSON by role keyword in the system prompt.
 struct FakeClient {
+    direct_calls: AtomicUsize,
+    direct_saw_feedback: AtomicBool,
+    review_saw_verified_file: AtomicBool,
+    planner_calls: AtomicUsize,
     review_calls: AtomicUsize,
     fail_first_review: bool,
     plan_tasks: Vec<&'static str>,
@@ -47,6 +51,10 @@ static IMPL_ESCAPE_PROMPT: Mutex<String> = Mutex::new(String::new());
 impl FakeClient {
     fn pass() -> Self {
         Self {
+            direct_calls: AtomicUsize::new(0),
+            direct_saw_feedback: AtomicBool::new(false),
+            review_saw_verified_file: AtomicBool::new(false),
+            planner_calls: AtomicUsize::new(0),
             review_calls: AtomicUsize::new(0),
             fail_first_review: false,
             plan_tasks: vec!["t1"],
@@ -58,6 +66,10 @@ impl FakeClient {
     }
     fn fail_then_pass() -> Self {
         Self {
+            direct_calls: AtomicUsize::new(0),
+            direct_saw_feedback: AtomicBool::new(false),
+            review_saw_verified_file: AtomicBool::new(false),
+            planner_calls: AtomicUsize::new(0),
             review_calls: AtomicUsize::new(0),
             fail_first_review: true,
             plan_tasks: vec!["t1"],
@@ -69,6 +81,10 @@ impl FakeClient {
     }
     fn two_tasks() -> Self {
         Self {
+            direct_calls: AtomicUsize::new(0),
+            direct_saw_feedback: AtomicBool::new(false),
+            review_saw_verified_file: AtomicBool::new(false),
+            planner_calls: AtomicUsize::new(0),
             review_calls: AtomicUsize::new(0),
             fail_first_review: false,
             plan_tasks: vec!["t1", "t2"],
@@ -80,6 +96,10 @@ impl FakeClient {
     }
     fn guess_then_fix() -> Self {
         Self {
+            direct_calls: AtomicUsize::new(0),
+            direct_saw_feedback: AtomicBool::new(false),
+            review_saw_verified_file: AtomicBool::new(false),
+            planner_calls: AtomicUsize::new(0),
             review_calls: AtomicUsize::new(0),
             fail_first_review: false,
             plan_tasks: vec!["t1"],
@@ -91,6 +111,10 @@ impl FakeClient {
     }
     fn applied_retry() -> Self {
         Self {
+            direct_calls: AtomicUsize::new(0),
+            direct_saw_feedback: AtomicBool::new(false),
+            review_saw_verified_file: AtomicBool::new(false),
+            planner_calls: AtomicUsize::new(0),
             review_calls: AtomicUsize::new(0),
             // the change lands in round 1, so the retry only happens if the
             // reviewer fails it
@@ -104,6 +128,10 @@ impl FakeClient {
     }
     fn read_then_write() -> Self {
         Self {
+            direct_calls: AtomicUsize::new(0),
+            direct_saw_feedback: AtomicBool::new(false),
+            review_saw_verified_file: AtomicBool::new(false),
+            planner_calls: AtomicUsize::new(0),
             review_calls: AtomicUsize::new(0),
             fail_first_review: false,
             plan_tasks: vec!["t1"],
@@ -115,6 +143,10 @@ impl FakeClient {
     }
     fn read_escape() -> Self {
         Self {
+            direct_calls: AtomicUsize::new(0),
+            direct_saw_feedback: AtomicBool::new(false),
+            review_saw_verified_file: AtomicBool::new(false),
+            planner_calls: AtomicUsize::new(0),
             review_calls: AtomicUsize::new(0),
             fail_first_review: false,
             plan_tasks: vec!["t1"],
@@ -144,7 +176,24 @@ impl LlmClient for FakeClient {
             SAW_SUMMARY.store(true, Ordering::SeqCst);
             return Self::resp("condensed: goal + task + prior feedback");
         }
+        if req.system.contains("direct coding agent") {
+            let call = self.direct_calls.fetch_add(1, Ordering::SeqCst);
+            if call > 0
+                && req.prompt.contains("CHECK OUTPUT:")
+                && req.prompt.contains("FILE a.txt")
+                && req.prompt.contains("ROLLED BACK")
+            {
+                // §4.2: a failed attempt is rolled back, so the retry's
+                // feedback must say the change is gone rather than show text
+                // the tree no longer has.
+                self.direct_saw_feedback.store(true, Ordering::SeqCst);
+            }
+            return Self::resp(
+                "{\"patches\":[{\"path\":\"a.txt\",\"search\":\"before\",\"replace\":\"after\"}],\"notes\":\"edited\"}",
+            );
+        }
         if req.system.contains("planner") {
+            self.planner_calls.fetch_add(1, Ordering::SeqCst);
             let tasks = self
                 .plan_tasks
                 .iter()
@@ -156,6 +205,9 @@ impl LlmClient for FakeClient {
             ));
         }
         if req.system.contains("reviewer") {
+            if req.prompt.contains("VERIFIED FILES:") && req.prompt.contains("beta_fixed") {
+                self.review_saw_verified_file.store(true, Ordering::SeqCst);
+            }
             if req.prompt.contains("CHECKS:") && req.prompt.contains("checked") {
                 SAW_CHECKS.store(true, Ordering::SeqCst);
             }
@@ -210,9 +262,10 @@ impl LlmClient for FakeClient {
         if req.system.contains("implementer") && self.applied_retry {
             if req.prompt.contains("round 2/2") {
                 *IMPL_RETRY_PROMPT_APPLIED.lock().unwrap() = req.prompt.clone();
-                // No second edit: the file already carries round 1's change.
+                // §4.2: round 1's change was rolled back to the baseline, so
+                // the retry applies it again against the file the prompt shows.
                 return Self::resp(
-                    "{\"artifact\": \"no further change\", \"notes\": \"already applied\"}",
+                    "{\"patches\":[{\"path\":\"a.txt\",\"search\":\"beta_real_line\",\"replace\":\"beta_fixed\"}],\"notes\":\"re-applied\"}",
                 );
             }
             return Self::resp(
@@ -256,7 +309,7 @@ fn harness_with(
     // Real default grants + one allowlisted check for evidence flow.
     let policy = PermissionPolicy {
         allowed_dirs: vec![root.clone()],
-        allowed_commands: vec!["echo checked".to_string()],
+        allowed_commands: vec!["echo checked".to_string(), "false".to_string()],
         ..Default::default()
     };
     let mut reg = ToolRegistry::new(policy);
@@ -265,7 +318,7 @@ fn harness_with(
     reg.register(FsPatchTool::new(root.clone()));
     reg.register(ProcRunTool::new(
         root.clone(),
-        vec!["echo checked".to_string()],
+        vec!["echo checked".to_string(), "false".to_string()],
     ));
 
     let mut cfg = AppConfig {
@@ -296,6 +349,62 @@ async fn loop_passes_first_round() {
         .await;
     assert_eq!(out["passed"], true);
     assert_eq!(out["rounds"], 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn direct_mode_uses_one_executor_and_requires_passing_checks() {
+    let client = Arc::new(FakeClient::pass());
+    let (orch, reg, root) = harness_with(client.clone(), "direct", 2, |cfg| {
+        cfg.execution = "direct".to_string();
+    });
+    std::fs::write(root.join("a.txt"), "before\n").unwrap();
+    let out = orch
+        .run_loop(
+            &Session::new("edit a.txt".into()).with_checks(vec!["echo checked".to_string()]),
+            &reg,
+            &root,
+        )
+        .await;
+
+    assert_eq!(out["passed"], true);
+    assert_eq!(out["rounds"], 1);
+    assert_eq!(out["tasks"][0]["writes_made"], 1);
+    assert_eq!(out["tasks"][0]["feedback"], "");
+    assert_eq!(client.direct_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(client.planner_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(client.review_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "after\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn direct_mode_retries_with_failed_check_feedback() {
+    let client = Arc::new(FakeClient::pass());
+    let (orch, reg, root) = harness_with(client.clone(), "direct-fail", 2, |cfg| {
+        cfg.execution = "direct".to_string();
+    });
+    std::fs::write(root.join("a.txt"), "before\n").unwrap();
+    let out = orch
+        .run_loop(
+            &Session::new("edit a.txt".into()).with_checks(vec!["false".to_string()]),
+            &reg,
+            &root,
+        )
+        .await;
+
+    assert_eq!(out["passed"], false);
+    assert_eq!(out["rounds"], 2);
+    assert!(out["checks"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("STATUS: FAILED"));
+    assert!(client.direct_saw_feedback.load(Ordering::SeqCst));
+    assert_eq!(client.planner_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(client.review_calls.load(Ordering::SeqCst), 0);
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -352,6 +461,22 @@ async fn checks_reach_reviewer_as_evidence() {
         "reviewer never saw EXPECT WRITES / WRITES MADE"
     );
     assert_eq!(out["tasks"][0]["writes_made"], 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn reviewer_gets_independent_file_evidence() {
+    let client = Arc::new(FakeClient::guess_then_fix());
+    let (orch, reg, root) = harness_with(client.clone(), "review-file", 2, |cfg| {
+        cfg.expect_writes = true;
+    });
+    std::fs::write(root.join("a.txt"), "alpha\nbeta_real_line\ngamma\n").unwrap();
+    let out = orch
+        .run_loop(&Session::new("edit a.txt".into()), &reg, &root)
+        .await;
+
+    assert_eq!(out["passed"], true);
+    assert!(client.review_saw_verified_file.load(Ordering::SeqCst));
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -478,10 +603,13 @@ async fn a_refused_patch_hands_the_file_to_the_retry() {
 }
 
 #[tokio::test]
-async fn an_applied_change_is_handed_to_the_retry_as_it_is_now() {
-    // Round 1's patch lands; the mid-term retrieval is a pre-round snapshot, so
-    // without this evidence round 2 sees the file as it was and applies the
-    // same change again (measured: E0592/E0428 duplicate definitions).
+async fn an_applied_change_is_rolled_back_and_re_applied_by_the_retry() {
+    // Round 1's patch lands and the reviewer fails it, so §4.2 restores the
+    // baseline: the retry's prompt must say the change is gone rather than
+    // hand it the post-attempt text as if it were still on disk. With that
+    // stale text a retry re-applies an edit that is already there (measured:
+    // E0592/E0428 duplicate definitions); told nothing, it applies nothing
+    // and the task's change is silently lost.
     let (orch, reg, root) = harness(Arc::new(FakeClient::applied_retry()), "applied", 2);
     std::fs::write(root.join("a.txt"), "alpha\nbeta_real_line\ngamma\n").unwrap();
     let out = orch
@@ -493,15 +621,20 @@ async fn an_applied_change_is_handed_to_the_retry_as_it_is_now() {
         .await;
     let retry = IMPL_RETRY_PROMPT_APPLIED.lock().unwrap().clone();
     assert!(
-        retry.contains("FILE a.txt (applied by your previous round"),
-        "retry prompt lacks the applied-change state: {retry}"
+        retry.contains("ROLLED BACK"),
+        "retry prompt must say the change was rolled back: {retry}"
     );
     assert!(
-        retry.contains("beta_fixed"),
-        "retry prompt does not show the file as it is now: {retry}"
+        !retry.contains("beta_fixed"),
+        "retry prompt carries the post-attempt text the tree no longer has: {retry}"
     );
     assert_eq!(out["rounds"], 2);
     assert_eq!(out["passed"], true);
+    // The retry re-applied the change against the baseline, so it landed.
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "alpha\nbeta_fixed\ngamma\n"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

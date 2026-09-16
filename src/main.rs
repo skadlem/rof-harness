@@ -124,6 +124,11 @@ fn apply_env(cfg: &mut AppConfig) {
             cfg.planner = p.trim().to_string();
         }
     }
+    if let Some(mode) = get("ROF_MODE") {
+        if matches!(mode.trim(), "pipeline" | "direct") {
+            cfg.execution = mode.trim().to_string();
+        }
+    }
     if let Some(l) = get("ROF_COST_LAMBDA") {
         if let Ok(v) = l.trim().parse::<f64>() {
             cfg.cost_lambda = v;
@@ -281,11 +286,12 @@ fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
     })
 }
 
-fn print_report(trace: &TraceSink) {
+fn print_report(trace: &TraceSink, passed: bool) {
     let mut report = rof::eval::EvalReport::default();
     for ev in trace.events() {
         report.fold(&ev);
     }
+    report.record_task(passed);
     println!(
         "trace events: {} | tool accuracy: {:.0}% | tokens in/out: {}/{} | cache-hit input: {:.0}% | latency: {}ms",
         trace.len(),
@@ -484,7 +490,7 @@ async fn run_goal(goal: &str, config_path: Option<&str>) -> anyhow::Result<()> {
         .await;
     println!("goal: {goal}");
     println!("result: {}", serde_json::to_string_pretty(&out)?);
-    print_report(&s.trace);
+    print_report(&s.trace, out["passed"].as_bool().unwrap_or(false));
     Ok(())
 }
 

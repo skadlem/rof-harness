@@ -43,6 +43,22 @@ impl Orchestrator {
             session_id: session.id.clone(),
             goal: session.goal.clone(),
         });
+        // §4.2: git is the task copy's tree-state substrate — the baseline an
+        // attempt starts from, the rollback a failed attempt restores, and the
+        // change set the write gate counts. Present always, harness-side only:
+        // `git` is never on `ROF_ALLOW_CMDS` and `.git` is unreachable by any
+        // path an agent names.
+        let tree = crate::engine::tree::TreeService::new(workdir.to_path_buf());
+        if let Err(e) = tree.ensure() {
+            self.trace.emit(TraceEvent::ModelError {
+                agent: "tree".to_string(),
+                error: e.to_string(),
+            });
+            return serde_json::json!({ "error": e.to_string() });
+        }
+        if self.cfg.execution == "direct" {
+            return self.run_direct_loop(session, tools, workdir, &tree).await;
+        }
         // Stage 2: the per-layer policy owns budgets, strategy and the
         // summarize threshold. `plan_summarized` below is the first-class path;
         // the planner's view stays on the pure `plan` because building a prompt
@@ -187,6 +203,10 @@ impl Orchestrator {
             // Fresh-read evidence from a refused patch, for the next round.
             let mut refused = String::new();
             let mut artifact = serde_json::Value::Null;
+            // Paths git saw change across this task's rounds (§4.4 recall).
+            let mut changed_files: Vec<String> = Vec::new();
+            // The last round's `git diff --stat`, evidence for the report.
+            let mut diff_stat = String::new();
             let mut verdict = Verdict {
                 pass: false,
                 feedback: "no rounds ran".to_string(),
@@ -232,6 +252,19 @@ impl Orchestrator {
                     break;
                 }
                 ran = round;
+                // The baseline this attempt starts from and rolls back to
+                // (§4.2), committed before the implementer touches anything.
+                if let Err(e) = tree.baseline() {
+                    self.trace.emit(TraceEvent::ModelError {
+                        agent: "tree".to_string(),
+                        error: e.to_string(),
+                    });
+                    verdict = Verdict {
+                        pass: false,
+                        feedback: format!("harness: git baseline failed: {e}"),
+                    };
+                    break;
+                }
                 let istate = CtxState {
                     long_term: impl_head.clone(),
                     // Stable-first ordering: goal and repo retrieval are
@@ -297,34 +330,56 @@ impl Orchestrator {
                 // Acceptance evidence: run the session's allowlisted checks BEFORE
                 // the verdict, so the reviewer judges execution, not prose.
                 checks_log = self.run_checks(session, tools, workdir).await;
-                // Count real writes: prose-only artifacts must not pass a
-                // task that was supposed to change the tree.
-                writes_made = artifact
-                    .get("writes")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter(|w| {
-                                !w.as_str().map(|s| s.starts_with("FAILED")).unwrap_or(false)
-                            })
-                            .count()
-                    })
-                    .unwrap_or(0);
-                refused = file_state_evidence(&artifact);
+                let verified_files = self.reviewer_file_evidence(tools, workdir, &artifact).await;
+                // Write gate (§4.2): count what git saw change, not what the
+                // artifact claims. A new file the model wrote counts; prose-only
+                // work reads back as zero; a self-report that disagrees with the
+                // tree loses to the tree. The same names feed recall (§4.4).
+                let diff = match tree.diff() {
+                    Ok(diff) => diff,
+                    Err(e) => {
+                        self.trace.emit(TraceEvent::ModelError {
+                            agent: "tree".to_string(),
+                            error: e.to_string(),
+                        });
+                        verdict = Verdict {
+                            pass: false,
+                            feedback: format!("harness: git diff failed: {e}"),
+                        };
+                        break;
+                    }
+                };
+                writes_made = diff.changed();
+                diff_stat = diff.stat.clone();
+                for name in &diff.names {
+                    if !changed_files.iter().any(|seen: &String| seen == name) {
+                        changed_files.push(name.clone());
+                    }
+                }
 
                 let rstate = CtxState {
                     long_term: reviewer_head.clone(),
                     mid_term: format!("PLAN: {plan_json}\nCURRENT TASK: {task}{reviewer_reuse}"),
                     short_term: format!(
-                        "ARTIFACT: {}\nSKILL CHANGES: {}\nEXPECT WRITES: {}\nWRITES MADE: {}\nCHECKS:\n{}",
+                        "ARTIFACT: {}\nSKILL CHANGES: {}\nEXPECT WRITES: {}\nWRITES MADE: {}\nCHANGED (git): {}\nCHECKS:\n{}\nVERIFIED FILES:\n{}",
                         serde_json::to_string(&artifact).unwrap_or_default(),
                         skill_changes_line(&artifact),
                         if session.expect_writes { "yes" } else { "no" },
                         writes_made,
+                        if diff.names.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            diff.names.join(", ")
+                        },
                         if checks_log.is_empty() {
                             "(none configured)".to_string()
                         } else {
                             checks_log.clone()
+                        },
+                        if verified_files.is_empty() {
+                            "(none touched)".to_string()
+                        } else {
+                            verified_files.clone()
                         }
                     ),
                 };
@@ -340,8 +395,8 @@ impl Orchestrator {
                         view: &rview,
                         context: None,
                         executor: Some(&self.executor),
-                        tools: None,
-                        workdir: None,
+                        tools: Some(tools),
+                        workdir: Some(workdir),
                         trace: &self.trace,
                     })
                     .await
@@ -418,6 +473,27 @@ impl Orchestrator {
                     });
                     feedback = format!("{feedback}\n{reason}");
                 }
+                // §4.2: a failed attempt is discarded when a retry follows, so
+                // the retry starts from the baseline its snapshot shows. The
+                // last round keeps its state in the copy for reading.
+                if round < rounds {
+                    self.trace.emit(TraceEvent::StateTransition {
+                        from: "reviewing".to_string(),
+                        to: "rolled_back".to_string(),
+                    });
+                    if let Err(e) = tree.rollback() {
+                        // Best effort: a failed rollback leaves the tree as it
+                        // is, the next baseline re-commits it, and the run
+                        // continues — the substrate is a means, not a result.
+                        self.trace.emit(TraceEvent::ModelError {
+                            agent: "tree".to_string(),
+                            error: format!("rollback failed (continuing): {e}"),
+                        });
+                    }
+                }
+                // The retry's evidence, after the rollback: the tool verdicts,
+                // minus any content the rollback reverted (see the function).
+                refused = file_state_evidence(&artifact);
                 round += 1;
             }
             total_rounds += ran;
@@ -437,6 +513,8 @@ impl Orchestrator {
                 "passed": verdict.pass,
                 "rounds": ran,
                 "writes_made": writes_made,
+                "changed_files": changed_files,
+                "diff_stat": diff_stat,
                 "aborted": aborted,
                 "tokens_used": self.tokens_since(task_start),
                 "artifact": artifact,
@@ -466,6 +544,175 @@ impl Orchestrator {
             "layer_truncations": acc.layer_truncations,
             "checks": checks_log,
             "ctx_tokens": plan_view.used_tokens,
+        })
+    }
+
+    async fn run_direct_loop(
+        &self,
+        session: &Session,
+        tools: &ToolRegistry,
+        workdir: &std::path::Path,
+        tree: &crate::engine::tree::TreeService,
+    ) -> serde_json::Value {
+        let builder = ContextBuilder::with_policy(self.cfg.context_policy());
+        let retriever = Retriever::new(workdir.to_path_buf(), self.cfg.retrieval.clone());
+        let snips = retriever.retrieve(&session.goal, self.cfg.retrieval.max_total_chars);
+        let retrieved = render(&snips);
+        let retrieved_json: Vec<serde_json::Value> = snips
+            .iter()
+            .map(|s| serde_json::json!({ "path": s.path, "chars": s.content.chars().count() }))
+            .collect();
+        let mut acc = LayerAcc::default();
+        let mut feedback = String::new();
+        let mut checks_log = String::new();
+        let mut artifact = serde_json::Value::Null;
+        let mut writes_made = 0usize;
+        // Paths git saw change across the rounds (§4.4 recall).
+        let mut changed_files: Vec<String> = Vec::new();
+        // The last round's `git diff --stat`, evidence for the report.
+        let mut diff_stat = String::new();
+        let mut passed = false;
+        let mut rounds = 0u32;
+        let start = self.trace.len();
+        let limit = session.max_tokens.unwrap_or(self.cfg.max_tokens_per_task);
+        let max_rounds = self.cfg.max_review_rounds.max(1);
+
+        for round in 1..=max_rounds {
+            let spent = self.tokens_since(start);
+            if limit > 0 && spent > limit {
+                self.trace.emit(TraceEvent::BudgetExceeded {
+                    task: session.goal.clone(),
+                    tokens: spent,
+                    limit,
+                });
+                feedback = format!("aborted: token budget exceeded ({spent} > {limit})");
+                break;
+            }
+            rounds = round;
+            // The baseline this attempt starts from and rolls back to (§4.2).
+            if let Err(e) = tree.baseline() {
+                self.trace.emit(TraceEvent::ModelError {
+                    agent: "tree".to_string(),
+                    error: e.to_string(),
+                });
+                feedback = format!("harness: git baseline failed: {e}");
+                break;
+            }
+            let state = CtxState {
+                long_term: session.ctx.long_term.clone(),
+                mid_term: format!(
+                    "GOAL: {}\n{retrieved}\n{}",
+                    session.goal,
+                    if feedback.is_empty() {
+                        String::new()
+                    } else {
+                        format!("PREVIOUS ATTEMPT:\n{feedback}\n")
+                    }
+                ),
+                short_term: format!(
+                    "WRITES REQUIRED: {}\nDIRECT ROUND {round}/{max_rounds}",
+                    if session.expect_writes { "yes" } else { "no" }
+                ),
+            };
+            let (view, reports) = builder.plan_summarized(&state, &self.context).await;
+            self.fold_layers(&reports, &mut acc);
+            let agent = ImplementerAgent::new(&self.executor);
+            match agent
+                .run_direct(AgentCtx {
+                    view: &view,
+                    context: None,
+                    executor: Some(&self.executor),
+                    tools: Some(tools),
+                    workdir: Some(workdir),
+                    trace: &self.trace,
+                })
+                .await
+            {
+                Ok(output) => artifact = output.data,
+                Err(e) => {
+                    self.trace.emit(TraceEvent::ModelError {
+                        agent: "executor".to_string(),
+                        error: e.to_string(),
+                    });
+                    feedback = e.to_string();
+                    break;
+                }
+            }
+            checks_log = self.run_checks(session, tools, workdir).await;
+            // Write gate (§4.2): git's change set is the count, not the
+            // artifact's self-report; the same names feed recall (§4.4).
+            let diff = match tree.diff() {
+                Ok(diff) => diff,
+                Err(e) => {
+                    self.trace.emit(TraceEvent::ModelError {
+                        agent: "tree".to_string(),
+                        error: e.to_string(),
+                    });
+                    feedback = format!("harness: git diff failed: {e}");
+                    break;
+                }
+            };
+            writes_made = diff.changed();
+            diff_stat = diff.stat.clone();
+            for name in &diff.names {
+                if !changed_files.iter().any(|seen: &String| seen == name) {
+                    changed_files.push(name.clone());
+                }
+            }
+            let checks_ok = !checks_log.contains("STATUS: FAILED");
+            passed = (!session.expect_writes || writes_made > 0) && checks_ok;
+            if passed {
+                break;
+            }
+            let file_state = file_state_evidence(&artifact);
+            feedback = if writes_made == 0 && session.expect_writes {
+                format!("no file change landed; emit the actual patch or write now{file_state}")
+            } else {
+                format!(
+                    "the configured check failed; fix the change and retry.\nCHECK OUTPUT:\n{}{}",
+                    checks_log, file_state
+                )
+            };
+            // §4.2: a failed attempt is discarded when a retry follows; the
+            // last round keeps its state in the copy for reading.
+            if round < max_rounds {
+                self.trace.emit(TraceEvent::StateTransition {
+                    from: "direct_executing".to_string(),
+                    to: "rolled_back".to_string(),
+                });
+                if let Err(e) = tree.rollback() {
+                    self.trace.emit(TraceEvent::ModelError {
+                        agent: "tree".to_string(),
+                        error: format!("rollback failed (continuing): {e}"),
+                    });
+                }
+            }
+        }
+
+        self.trace.emit(TraceEvent::StateTransition {
+            from: "direct_executing".to_string(),
+            to: "done".to_string(),
+        });
+        serde_json::json!({
+            "tasks": [{
+                "task": session.goal,
+                "passed": passed,
+                "rounds": rounds,
+                "writes_made": writes_made,
+                "changed_files": changed_files,
+                "diff_stat": diff_stat,
+                "artifact": artifact,
+                "feedback": feedback,
+            }],
+            "rounds": rounds,
+            "passed": passed,
+            "retrieved": retrieved_json,
+            "summarize_calls": acc.summarize_calls,
+            "summarize_tokens": acc.summarize_tokens,
+            "truncated_views": acc.truncated_views,
+            "layer_summaries": acc.layer_summaries,
+            "layer_truncations": acc.layer_truncations,
+            "checks": checks_log,
         })
     }
 
@@ -637,6 +884,7 @@ impl Orchestrator {
                     serde_json::json!({ "cmd": cmd }),
                 )
                 .await;
+
             self.trace.emit(TraceEvent::ToolCall {
                 agent: "reviewer".to_string(),
                 tool: "proc.run".to_string(),
@@ -659,6 +907,52 @@ impl Orchestrator {
             });
         }
         log
+    }
+
+    /// Read touched files through the reviewer's grant after the implementer
+    /// has applied its artifact. This is independent evidence: the reviewer
+    /// should judge the tree, not only the implementer's self-reported state.
+    async fn reviewer_file_evidence(
+        &self,
+        tools: &ToolRegistry,
+        workdir: &std::path::Path,
+        artifact: &serde_json::Value,
+    ) -> String {
+        let mut paths = Vec::new();
+        if let Some(entries) = artifact.get("file_state").and_then(|v| v.as_array()) {
+            for entry in entries {
+                let Some(path) = entry.get("path").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if !paths.iter().any(|seen| seen == path) {
+                    paths.push(path.to_string());
+                }
+            }
+        }
+
+        let mut out = String::new();
+        for path in paths.into_iter().take(5) {
+            let target = workdir.join(&path);
+            let (result, latency_ms) = tools
+                .call(
+                    "reviewer",
+                    "fs.read",
+                    Some(&target),
+                    serde_json::json!({"path": path, "max_bytes": 262_144}),
+                )
+                .await;
+            self.trace.emit(TraceEvent::ToolCall {
+                agent: "reviewer".to_string(),
+                tool: "fs.read".to_string(),
+                ok: result.is_ok(),
+                latency_ms,
+            });
+            match result {
+                Ok(read) => out.push_str(&format!("--- {path}\n{}\n", read.output)),
+                Err(error) => out.push_str(&format!("--- {path}\n(unreadable: {error})\n")),
+            }
+        }
+        out
     }
 }
 
@@ -716,12 +1010,14 @@ fn skill_changes_line(artifact: &serde_json::Value) -> String {
     format!("{} - {}", entries.len(), parts.join("; "))
 }
 
-/// What the next round needs after a patch is refused or applied: the tool's
-/// verdict and the file's current text (windowed on the anchor that matters).
-/// Two failures this addresses, both measured: "search string not found" with no
-/// file in front of the model makes it guess again, and a retry that only sees
-/// the pre-round snapshot re-applies an edit that already landed (duplicate
-/// definitions, E0592/E0428).
+/// What the next round needs after a failed attempt: the tool verdicts, plus
+/// for a refused patch the file's text. A change that *landed* is reported
+/// without its text — §4.2 rolled the tree back to the baseline, so the
+/// post-attempt read describes a state the tree no longer has, and a retry that
+/// trusted it would skip a change that is gone. Two failures this addresses,
+/// both measured: "search string not found" with no file in front of the model
+/// makes it guess again, and a retry told an applied edit is in place neither
+/// re-applies it nor re-reads the file (duplicate definitions, E0592/E0428).
 fn file_state_evidence(artifact: &serde_json::Value) -> String {
     // ponytail: one shared budget, first file takes it; split it per file when
     // a run shows two touched files that both need their text.
@@ -755,22 +1051,27 @@ fn file_state_evidence(artifact: &serde_json::Value) -> String {
         }
         let path = e.get("path").and_then(|v| v.as_str()).unwrap_or("?");
         let why = e.get("why").and_then(|v| v.as_str()).unwrap_or("changed");
-        let text = e
-            .get("current_content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let win: String = text.chars().take(left).collect();
-        let head = if why == "applied" || why == "rewritten" {
-            format!(
-                "\nFILE {path} ({why} by your previous round — this is its content NOW, \
-                 do not apply the same change again):\n--- {path} ---\n{win}\n"
-            )
+        if why == "applied" || why == "rewritten" {
+            // The text is deliberately not included: the harness restored the
+            // baseline, so this content is not on disk. `retrieved:` and a
+            // fresh read show the file as it is.
+            out.push_str(&format!(
+                "\nFILE {path} ({why} by your previous round, then ROLLED BACK by the harness: \
+                 the tree is back to its baseline and the change is NOT in it now — re-read \
+                 the file and re-apply the change if the task still needs it).\n"
+            ));
         } else {
-            format!(
+            let text = e
+                .get("current_content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // A refused patch changed no file, so its read survived the
+            // rollback and is still the tree's content.
+            let win: String = text.chars().take(left).collect();
+            out.push_str(&format!(
                 "\nPATCH REFUSED for {path}: {why}\n--- {path} (current content, read back) ---\n{win}\n"
-            )
-        };
-        out.push_str(&head);
+            ));
+        }
     }
     out
 }
@@ -868,21 +1169,38 @@ mod file_state_tests {
     #[test]
     fn the_last_read_of_a_path_wins() {
         // Two patches to one file: the retry must get the second (current)
-        // read, not the first — the stale one is what made round 3 re-apply an
-        // edit that had already landed.
+        // read, not the first. Here the second is a refusal, so its text is
+        // the one the retry sees — the stale applied read is dropped, and
+        // with §4.2 an applied read carries no text at all (its change was
+        // rolled back).
         let artifact = serde_json::json!({
             "file_state": [
                 {"path": "src/a.rs", "why": "applied", "current_content": "OLD"},
-                {"path": "src/a.rs", "why": "applied", "current_content": "NEW"},
+                {"path": "src/a.rs", "why": "search string not found", "current_content": "NEW"},
             ]
         });
         let out = file_state_evidence(&artifact);
         assert!(out.contains("NEW"), "{out}");
         assert!(!out.contains("OLD"), "{out}");
+        assert!(out.contains("PATCH REFUSED for src/a.rs"), "{out}");
+    }
+
+    #[test]
+    fn an_applied_change_is_reported_as_rolled_back_without_its_text() {
+        // §4.2: the tree went back to the baseline, so the post-attempt text
+        // is not on disk and must not be handed to the retry as if it were.
+        let artifact = serde_json::json!({
+            "file_state": [{"path": "src/a.rs", "why": "applied", "current_content": "LANDED"}]
+        });
+        let out = file_state_evidence(&artifact);
+        assert!(out.contains("ROLLED BACK"), "{out}");
+        assert!(!out.contains("LANDED"), "{out}");
     }
 
     #[test]
     fn separate_files_each_keep_their_evidence() {
+        // Applied files get the rollback line; a refused patch still hands over
+        // its text — the attempt changed nothing there, so the read survived.
         let artifact = serde_json::json!({
             "file_state": [
                 {"path": "src/a.rs", "why": "applied", "current_content": "AAA"},
@@ -890,7 +1208,8 @@ mod file_state_tests {
             ]
         });
         let out = file_state_evidence(&artifact);
-        assert!(out.contains("AAA"));
+        assert!(out.contains("ROLLED BACK"));
+        assert!(!out.contains("AAA"), "applied text must not survive: {out}");
         assert!(out.contains("BBB"));
         assert!(out.contains("PATCH REFUSED for src/b.rs"));
     }

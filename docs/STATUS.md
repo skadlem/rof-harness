@@ -1,7 +1,40 @@
 # Status
 
-Last verified: 2026-09-15, on this working tree (`git log` has the v1 commit; this file is the
+Last verified: 2026-09-16, on this working tree (`git log` has the v1 commit; this file is the
 running handoff).
+
+## Direct execution experiment (2026-09-16)
+
+The opt-in `ROF_MODE=direct` path is implemented but remains uncommitted. It runs one executor
+without planner or reviewer model calls, applies edits through the existing tool gate, runs every
+configured check after each attempt, and includes failed-check output in the next executor prompt.
+Regression coverage is in `tests/loop.rs` (`direct_mode_*`); both tests pass. The full Rust suite,
+Clippy, and formatting also pass. External KDL validation remains **0 successful tasks**. A fresh
+three-round run after the file-state fix received the current `src/node.rs` contents, then produced
+an ambiguous patch that the gate correctly refused; it still did not pass the repository checks.
+The pipeline reviewer now gets independently gated read-back content for touched files in
+`[VERIFIED FILES]`, with regression coverage in `tests/loop.rs`; the reviewer also receives its
+read-only tool/workdir context. A three-run planner-skipped pipeline arm measured **0/3**. A matched
+three-run direct arm measured **1/3**: one run passed all configured KDL checks, while two failed on
+model-side edit/retry errors. This is a signal in direct mode's favor, not yet a reliable win; the
+arms are too small and variable for a default change. The reviewer arm's unchanged-tree rejection
+still demonstrates improved verdict correctness, not completion rate.
+
+## §4.2 tree-state substrate (2026-09-16)
+
+`docs/ARCHITECTURE-v3.md` §4.2 is implemented and uncommitted: git is the tree-state substrate of
+every task copy. `src/engine/tree.rs` (`TreeService`: `ensure`/`baseline`/`rollback`/`diff`, plus
+`copy_git_state`) drives it; `copy_tree` now ships `.git` (shallow `--depth 1` above 8 MiB, verbatim
+below, `git init` + one commit for a non-repo source) and keeps `target/` excluded. The write gate
+no longer reads the model's self-reported `writes[]` — it counts `git status --porcelain` (diff
+alone misses files an attempt created), with `diff --stat` for the evidence line; the same names are
+the substrate for the §4.4 recall metric. A failed attempt is rolled back (`checkout -- . &&
+clean -fdq`) only when a retry follows, so the final tree stays readable. `file_state_evidence` now
+reports a landed change as rolled back, without its post-attempt text; a refused patch still hands
+over its text. `git` is never on `ROF_ALLOW_CMDS` and `.git` is denied by every file tool and hidden
+from listings. Full suite (118 tests), Clippy and formatting are clean; a stub-mode run against a
+non-repo tree confirms the substrate is created end to end (`reviewing -> rolled_back` in the trace
+before each retry). Next: §4.4 recall, which only needs to read `changed_files` from the task JSON.
 
 stage 3 (programmable state: `state/` module, `~/.rof/state.json`,
 `state.propose` behind the gate, `rof state approve|reject`) — but see the ranked list at the bottom

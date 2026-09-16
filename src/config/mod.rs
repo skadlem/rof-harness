@@ -197,6 +197,9 @@ pub struct AppConfig {
     pub cost_lambda: f64,
     /// "always" plans every goal; "skip" treats the goal as one task.
     pub planner: String,
+    /// "pipeline" runs Planner -> Implementer -> Reviewer; "direct" uses one executor.
+    #[serde(default)]
+    pub execution: String,
     /// Whether a goal must produce a file change to be considered passing.
     /// Suite tasks declare this per task; this is the run-mode default.
     pub expect_writes: bool,
@@ -272,6 +275,7 @@ impl Default for AppConfig {
             pricing: PricingConfig::default(),
             cost_lambda: 0.0,
             planner: "always".to_string(),
+            execution: "pipeline".to_string(),
             expect_writes: true,
             max_parallel_tasks: 1,
             task_root: None,

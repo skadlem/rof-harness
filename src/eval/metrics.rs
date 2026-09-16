@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 pub struct EvalReport {
     pub tasks: usize,
     pub passed: usize,
+    #[serde(default)]
+    pub verdicts: usize,
+    #[serde(default)]
+    pub passed_verdicts: usize,
     pub tool_calls: usize,
     pub tool_ok: usize,
     pub total_latency_ms: u64,
@@ -69,6 +73,8 @@ impl Default for EvalReport {
         Self {
             tasks: 0,
             passed: 0,
+            verdicts: 0,
+            passed_verdicts: 0,
             tool_calls: 0,
             tool_ok: 0,
             total_latency_ms: 0,
@@ -93,6 +99,13 @@ impl Default for EvalReport {
 }
 
 impl EvalReport {
+    pub fn record_task(&mut self, passed: bool) {
+        self.tasks += 1;
+        if passed {
+            self.passed += 1;
+        }
+    }
+
     pub fn success_rate(&self) -> f64 {
         if self.tasks == 0 {
             0.0
@@ -168,9 +181,9 @@ impl EvalReport {
                 self.total_latency_ms += latency_ms;
             }
             TraceEvent::ReviewVerdict { pass, .. } => {
-                self.tasks += 1;
+                self.verdicts += 1;
                 if *pass {
-                    self.passed += 1;
+                    self.passed_verdicts += 1;
                 }
             }
             TraceEvent::BudgetExceeded { .. } => {
@@ -373,11 +386,31 @@ mod tests {
             pass: true,
             feedback: String::new(),
         });
+        r.record_task(true);
         assert_eq!(r.est_input_tokens, 800);
         assert_eq!(r.cached_input_tokens, 400);
         assert!((r.cache_hit_rate() - 0.5).abs() < 1e-9);
         assert_eq!(r.success_rate(), 1.0);
         assert_eq!(r.utility(), 1.0); // λ=0 by default
         assert_eq!(r.tokens_by_agent.get("implementer"), Some(&800));
+    }
+
+    #[test]
+    fn verdicts_do_not_define_task_success() {
+        let mut r = EvalReport::default();
+        r.fold(&TraceEvent::ReviewVerdict {
+            pass: true,
+            feedback: String::new(),
+        });
+        r.fold(&TraceEvent::ReviewVerdict {
+            pass: false,
+            feedback: String::new(),
+        });
+        assert_eq!((r.tasks, r.passed), (0, 0));
+        assert_eq!((r.verdicts, r.passed_verdicts), (2, 1));
+        r.record_task(true);
+        r.record_task(false);
+        assert_eq!((r.tasks, r.passed), (2, 1));
+        assert_eq!(r.success_rate(), 0.5);
     }
 }
