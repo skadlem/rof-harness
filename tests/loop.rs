@@ -42,6 +42,10 @@ static IMPL_RETRY_PROMPT: Mutex<String> = Mutex::new(String::new());
 static IMPL_RETRY_PROMPT_APPLIED: Mutex<String> = Mutex::new(String::new());
 /// The prompt of the implementer turn that carried requested files.
 static IMPL_READ_PROMPT: Mutex<String> = Mutex::new(String::new());
+// The tests that read it run in parallel and the capture is a global, so a
+// held lock on this orders them without deadlocking the fake (which locks
+// only IMPL_READ_PROMPT, on another thread).
+static READ_TEST_ORDER: Mutex<()> = Mutex::new(());
 /// The last reviewer prompt that carried evidence, kept for assertions.
 static REVIEW_PROMPT: Mutex<String> = Mutex::new(String::new());
 /// Implementer calls seen in the read-request test.
@@ -865,7 +869,9 @@ async fn an_applied_change_is_rolled_back_and_re_applied_by_the_retry() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: the READ_TEST_ORDER guard is the serializer
 async fn a_read_request_is_honored_once_and_then_the_model_writes() {
+    let _o = READ_TEST_ORDER.lock().unwrap();
     // The measured blocker: the model needs a fact it never read (a struct's
     // field list) and has no way to look. It can now ask, gets one extra turn
     // with the file, and the patch lands in the same round.
@@ -902,6 +908,38 @@ async fn a_read_request_is_honored_once_and_then_the_model_writes() {
         std::fs::read_to_string(root.join("a.txt")).unwrap(),
         "alpha\nbeta_fixed\ngamma\n"
     );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: the READ_TEST_ORDER guard is the serializer
+async fn a_requested_file_below_the_volatile_budget_is_delivered_whole() {
+    let _o = READ_TEST_ORDER.lock().unwrap();
+    // Measured on Atria: a goal naming metrics.rs (20,374 chars) got a 12k
+    // window with the struct, `Default`, `fold` and the test module in the
+    // elided middle. The model must not patch text it has not seen and its
+    // re-request is deduped, so the hole was a dead end and the task failed
+    // with "WRITES MADE is 0". The cap is the volatile budget, so a file that
+    // fits it arrives whole.
+    let (orch, reg, root) = harness(Arc::new(FakeClient::read_then_write()), "whole", 2);
+    std::fs::write(root.join("a.txt"), "alpha\nbeta_real_line\ngamma\n").unwrap();
+    // 20k chars with a marker the head+tail split used to cut out.
+    let mut big = String::new();
+    for _ in 0..490 {
+        big.push_str("padding line that fills the window budget\n");
+    }
+    let mid = big.len() / 2;
+    big.insert_str(mid, "MIDDLE_MARKER_LINE\n");
+    std::fs::write(root.join("schema.txt"), big).unwrap();
+
+    let out = orch.run_loop(&Session::new("g".into()), &reg, &root).await;
+    let seen = IMPL_READ_PROMPT.lock().unwrap().clone();
+    assert!(
+        seen.contains("MIDDLE_MARKER_LINE"),
+        "the middle of a requested file that fits the budget was elided: {}...",
+        seen.chars().take(400).collect::<String>()
+    );
+    assert_eq!(out["passed"], true);
     std::fs::remove_dir_all(&root).ok();
 }
 

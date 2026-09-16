@@ -1,5 +1,5 @@
 use super::{Agent, AgentCtx, AgentOutput};
-use crate::context::retriever::{window_on, NAMED_FILE_CAP};
+use crate::context::retriever::window_on;
 use crate::context::{Assembly, ContextAssembler, ContextItem, Fidelity, ItemKey};
 use crate::llm::LlmReq;
 use crate::obs::TraceEvent;
@@ -114,9 +114,17 @@ impl ImplementerAgent<'_> {
                     },
                     label,
                     text: f.content,
+                    // A requested file is a whole-file answer, so the cap is
+                    // the volatile budget itself: a fixed 12k cap below it
+                    // elided the middle of the files the goal names (a 20k
+                    // metrics.rs arrived as head+tail with the struct, `Default`,
+                    // `fold` and test module in the hole). The model must not
+                    // patch text it has not seen, so the hole was a dead end —
+                    // and its re-request was deduped. Only a file over budget
+                    // takes a window, centred on what the goal names.
                     fidelity: Fidelity::Windowed {
-                        anchor: String::new(),
-                        cap: NAMED_FILE_CAP,
+                        anchor: ctx.view.prompt.to_string(),
+                        cap: ctx.volatile_budget,
                     },
                     must_include: true,
                 });
