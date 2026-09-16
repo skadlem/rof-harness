@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Every orchestrator / agent / tool step emits one of these.
@@ -92,6 +93,10 @@ pub enum TraceEvent {
 pub struct TraceSink {
     inner: Mutex<Vec<TraceEvent>>,
     file: Option<(Arc<Mutex<std::fs::File>>, PathBuf)>,
+    /// Sum of `input_tokens + output_tokens` over every `ModelCall` emitted
+    /// here. §4.3: the per-task budget reads this instead of rescanning the
+    /// event stream, so spend accounting is O(1) per round, not O(rounds²).
+    total: AtomicU64,
 }
 
 impl TraceSink {
@@ -99,6 +104,7 @@ impl TraceSink {
         Self {
             inner: Mutex::new(Vec::new()),
             file: None,
+            total: AtomicU64::new(0),
         }
     }
 
@@ -108,6 +114,7 @@ impl TraceSink {
         Ok(Self {
             inner: Mutex::new(Vec::new()),
             file: Some((Arc::new(Mutex::new(file)), path.to_path_buf())),
+            total: AtomicU64::new(0),
         })
     }
 
@@ -126,12 +133,24 @@ impl TraceSink {
             Some((f, p)) => Self {
                 inner: Mutex::new(Vec::new()),
                 file: Some((f.clone(), p.clone())),
+                // A fork counts only what it emits itself; the parent's total
+                // already holds the events being handed over.
+                total: AtomicU64::new(0),
             },
             None => Self::new(),
         }
     }
 
     pub fn emit(&self, ev: TraceEvent) {
+        if let TraceEvent::ModelCall {
+            input_tokens,
+            output_tokens,
+            ..
+        } = &ev
+        {
+            self.total
+                .fetch_add(*input_tokens + *output_tokens, Ordering::Relaxed);
+        }
         if let Some((file, _)) = &self.file {
             if let Ok(line) = serde_json::to_string(&ev) {
                 if let Ok(mut f) = file.lock() {
@@ -162,8 +181,25 @@ impl TraceSink {
     /// In-memory only: the source sink already wrote these lines to file.
     pub fn extend(&self, events: Vec<TraceEvent>) {
         if let Ok(mut guard) = self.inner.lock() {
+            for ev in &events {
+                if let TraceEvent::ModelCall {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } = ev
+                {
+                    self.total
+                        .fetch_add(*input_tokens + *output_tokens, Ordering::Relaxed);
+                }
+            }
             guard.extend(events);
         }
+    }
+
+    /// Total model-call tokens emitted into this sink (input + output). The
+    /// budget counter (§4.3) reads this; a fork starts from zero.
+    pub fn total_tokens(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
     }
 }
 

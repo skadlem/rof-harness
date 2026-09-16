@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use rof::config::AppConfig;
+use rof::engine::CheckResult;
 use rof::eval::{
     compare, fnv1a_hex, git_head, ContextMetrics, EvalSuite, EvalTask, EvaluationRunner, RunLabel,
     SuiteReport, TaskChange, TaskResult,
@@ -736,6 +737,7 @@ fn labelled_task(name: &str, matched: bool, rounds: u32, feedback: &str) -> Task
             relevance_proxy: 0.5,
             ..ContextMetrics::default()
         },
+        checks: Vec::new(),
     }
 }
 
@@ -851,6 +853,74 @@ fn compare_names_the_tasks_and_metrics_that_moved() {
     for needle in ["breaker", "est_cost_usd", "relevance_proxy", "+0.01000"] {
         assert!(text.contains(needle), "missing {needle} in:\n{text}");
     }
+}
+
+/// §4.3: a task that moved because a check flipped must say which one, and a
+/// task that moved with no check flipped must say that too — the second is the
+/// model's verdict moving, not the gate's, and the two have different fixes.
+#[test]
+fn compare_names_the_check_that_flipped_for_a_moved_task() {
+    let mut breaker = labelled_task("breaker", false, 2, "the configured check failed");
+    breaker.checks = vec![
+        CheckResult {
+            name: "cargo test".to_string(),
+            passed: false,
+            output: String::new(),
+        },
+        CheckResult {
+            name: "cargo fmt --check".to_string(),
+            passed: true,
+            output: String::new(),
+        },
+    ];
+    let mut fixed = labelled_task("breaker", true, 1, "");
+    fixed.checks = vec![
+        CheckResult {
+            name: "cargo test".to_string(),
+            passed: true,
+            output: String::new(),
+        },
+        CheckResult {
+            name: "cargo fmt --check".to_string(),
+            passed: true,
+            output: String::new(),
+        },
+    ];
+    // A task that moved with NO check flipped: the verdict changed, the gate
+    // did not. This is the case where an empty `flipped_checks` carries
+    // information.
+    let mut mood_a = labelled_task("mood", false, 3, "reviewer: not convinced");
+    mood_a.checks = vec![CheckResult {
+        name: "cargo test".to_string(),
+        passed: true,
+        output: String::new(),
+    }];
+    let mut mood_b = labelled_task("mood", true, 3, "reviewer: convinced");
+    mood_b.checks = mood_a.checks.clone();
+
+    let a = labelled_report("suite-a", vec![breaker, mood_a]);
+    let b = labelled_report("suite-a", vec![fixed, mood_b]);
+    let c = compare(&a, &b);
+
+    let breaker = c.tasks.iter().find(|t| t.name == "breaker").unwrap();
+    assert_eq!(breaker.change(), TaskChange::Gained);
+    assert_eq!(breaker.flipped_checks.len(), 1, "only cargo test flipped");
+    assert_eq!(breaker.flipped_checks[0].name, "cargo test");
+    assert!(breaker.flipped_checks[0].render().contains("fail -> pass"));
+
+    let mood = c.tasks.iter().find(|t| t.name == "mood").unwrap();
+    assert_eq!(mood.change(), TaskChange::Gained);
+    assert!(
+        mood.flipped_checks.is_empty(),
+        "the gate held; an empty list is the signal, not a gap"
+    );
+
+    // The rendered table names the check, so a human reads the cause.
+    let text = c.render();
+    assert!(
+        text.contains("check 'cargo test' flipped: fail -> pass"),
+        "missing the flip line in:\n{text}"
+    );
 }
 
 /// The committed baseline predates stage 0: it must still load, compare, and

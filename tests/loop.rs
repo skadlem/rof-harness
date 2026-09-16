@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use rof::config::{AppConfig, PermissionPolicy};
 use rof::engine::{Orchestrator, Session};
 use rof::llm::{ContextService, ExecutorService, LlmClient, LlmError, LlmReq, LlmResp};
-use rof::obs::TraceSink;
+use rof::obs::{TraceEvent, TraceSink};
 use rof::tools::{FsListTool, FsPatchTool, FsReadTool, ProcRunTool, ToolRegistry};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -309,7 +309,13 @@ fn harness_with(
     // Real default grants + one allowlisted check for evidence flow.
     let policy = PermissionPolicy {
         allowed_dirs: vec![root.clone()],
-        allowed_commands: vec!["echo checked".to_string(), "false".to_string()],
+        allowed_commands: vec![
+            "echo checked".to_string(),
+            "false".to_string(),
+            // §4.3: a passing check whose output quotes the failure marker —
+            // the verdict must read the field, not the log text.
+            "echo \"prior STATUS: FAILED, now fixed\"".to_string(),
+        ],
         ..Default::default()
     };
     let mut reg = ToolRegistry::new(policy);
@@ -318,7 +324,11 @@ fn harness_with(
     reg.register(FsPatchTool::new(root.clone()));
     reg.register(ProcRunTool::new(
         root.clone(),
-        vec!["echo checked".to_string(), "false".to_string()],
+        vec![
+            "echo checked".to_string(),
+            "false".to_string(),
+            "echo \"prior STATUS: FAILED, now fixed\"".to_string(),
+        ],
     ));
 
     let mut cfg = AppConfig {
@@ -412,6 +422,155 @@ async fn direct_mode_retries_with_failed_check_feedback() {
     assert!(client.direct_saw_feedback.load(Ordering::SeqCst));
     assert_eq!(client.planner_calls.load(Ordering::SeqCst), 0);
     assert_eq!(client.review_calls.load(Ordering::SeqCst), 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// §4.3: the verdict is a field read on `CheckResult`, not a substring of the
+/// rendered log. A check that passes may quote "STATUS: FAILED" from a
+/// previous error it fixed; the old `checks_log.contains(...)` would flip the
+/// whole task to failed on that quote.
+#[tokio::test]
+async fn direct_mode_does_not_read_the_verdict_off_the_log_text() {
+    let client = Arc::new(FakeClient::pass());
+    let (orch, reg, root) = harness_with(client.clone(), "direct-verdict", 2, |cfg| {
+        cfg.execution = "direct".to_string();
+    });
+    std::fs::write(root.join("a.txt"), "before\n").unwrap();
+    // A passing check whose output happens to contain the failure marker.
+    let out = orch
+        .run_loop(
+            &Session::new("edit a.txt".into())
+                .with_checks(vec!["echo \"prior STATUS: FAILED, now fixed\"".to_string()]),
+            &reg,
+            &root,
+        )
+        .await;
+
+    assert_eq!(
+        out["passed"], true,
+        "a passed check quoting the marker must not fail the task"
+    );
+    assert_eq!(out["rounds"], 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// §4.3: direct mode now takes the same skill index and goal-quality note the
+/// pipeline loop takes — both were written into `run_loop` only, so a direct
+/// run used to see neither. Both are observable in the trace.
+#[tokio::test]
+async fn direct_mode_gets_the_skill_index_and_goal_note() {
+    let client = Arc::new(FakeClient::pass());
+    let trace = Arc::new(TraceSink::new());
+    let root = std::env::temp_dir().join(format!("rof-direct-parity-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "before\n").unwrap();
+    // A real skill in an out-of-workdir store, so the index is non-empty and
+    // the shared `skill_index` has something to deliver.
+    let skills_store = root.join("skills-store");
+    let skill_dir = skills_store.join("a-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: a-skill\ndescription: one-line when to use it\n---\nbody\n",
+    )
+    .unwrap();
+    let manager = Arc::new(rof::skills::SkillManager::new(
+        skills_store,
+        None,
+        rof::skills::SkillPolicy::ReadOnly,
+    ));
+    let mut reg = ToolRegistry::new(PermissionPolicy {
+        allowed_dirs: vec![root.clone()],
+        allowed_commands: vec!["echo checked".to_string()],
+        ..Default::default()
+    });
+    reg.register(FsPatchTool::new(root.clone()));
+    reg.register(rof::tools::SkillsListTool::new(manager));
+
+    let cfg = AppConfig {
+        execution: "direct".to_string(),
+        goal_quality: true,
+        ..Default::default()
+    };
+    let context = ContextService::new(client.clone(), "fake-ctx".to_string());
+    let executor = ExecutorService::new(client.clone(), "fake-exec".to_string(), None);
+    let verify = ExecutorService::new(client, "fake-verify".to_string(), None);
+    let orch = Orchestrator::new(cfg, trace.clone(), context, executor, verify);
+
+    let out = orch
+        .run_loop(&Session::new("edit a.txt in the repo".into()), &reg, &root)
+        .await;
+    assert_eq!(out["passed"], true);
+
+    let events = trace.events();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            TraceEvent::SkillOp { agent, op, .. } if agent == "implementer" && op == "list"
+        )),
+        "direct mode must deliver the skill index: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::GoalQuality { .. })),
+        "direct mode must run the goal-quality note"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// §4.3: direct mode takes the same bounded auto-poke. A run that hits the cap
+/// without an accepted result gets exactly one extra round, not a hard stop.
+#[tokio::test]
+async fn direct_mode_auto_pokes_once_at_the_cap() {
+    let client = Arc::new(FakeClient::pass());
+    let trace = Arc::new(TraceSink::new());
+    let root = std::env::temp_dir().join(format!("rof-direct-poke-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "before\n").unwrap();
+    let mut reg = ToolRegistry::new(PermissionPolicy {
+        allowed_dirs: vec![root.clone()],
+        allowed_commands: vec!["false".to_string()],
+        ..Default::default()
+    });
+    reg.register(FsPatchTool::new(root.clone()));
+    reg.register(ProcRunTool::new(root.clone(), vec!["false".to_string()]));
+
+    let cfg = AppConfig {
+        execution: "direct".to_string(),
+        auto_poke: true,
+        max_review_rounds: 2,
+        ..Default::default()
+    };
+    let context = ContextService::new(client.clone(), "fake-ctx".to_string());
+    let executor = ExecutorService::new(client.clone(), "fake-exec".to_string(), None);
+    let verify = ExecutorService::new(client, "fake-verify".to_string(), None);
+    let orch = Orchestrator::new(cfg, trace.clone(), context, executor, verify);
+
+    let out = orch
+        .run_loop(
+            &Session::new("edit a.txt in the repo".into()).with_checks(vec!["false".to_string()]),
+            &reg,
+            &root,
+        )
+        .await;
+
+    // The cap was 2 and the poke added exactly one; the check still fails, so
+    // the run ends at 3 rather than passing.
+    assert_eq!(
+        out["rounds"], 3,
+        "the poke must extend the cap by exactly one"
+    );
+    assert_eq!(out["passed"], false);
+    assert!(
+        trace
+            .events()
+            .iter()
+            .any(|e| matches!(e, TraceEvent::AutoPoke { .. })),
+        "an auto-poke must be traced"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

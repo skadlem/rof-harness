@@ -100,6 +100,11 @@ pub struct TaskResult {
     /// before the field existed.
     #[serde(default)]
     pub context: ContextMetrics,
+    /// The configured checks and their outcomes (§4.3). Zeroes on a report
+    /// written before the field existed; the rendered log is not kept here —
+    /// `compare` reads outcomes, not prose.
+    #[serde(default)]
+    pub checks: Vec<crate::engine::CheckResult>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -235,24 +240,33 @@ impl EvaluationRunner {
         self.trace.extend(sink.events());
         let passed = out["passed"].as_bool().unwrap_or(false);
         // The orchestrator records one entry per plan task, each with its own
-        // feedback. Surface the first failure reason, else the last note, so a
-        // MISMATCH line in the report is never a blank.
-        let feedback = {
+        // feedback and checks. Surface the first failure's reason and its
+        // checks (else the last entry's), so a MISMATCH line in the report is
+        // never blank and the flipped-check row names the task that failed.
+        let (feedback, checks) = {
             let entries = out["tasks"].as_array().cloned().unwrap_or_default();
             let failed = entries.iter().find(|t| {
                 !t["passed"].as_bool().unwrap_or(false)
                     && !t["feedback"].as_str().unwrap_or("").is_empty()
             });
-            failed
-                .or_else(|| {
-                    entries
-                        .iter()
-                        .rev()
-                        .find(|t| !t["feedback"].as_str().unwrap_or("").is_empty())
-                })
-                .and_then(|t| t["feedback"].as_str())
-                .unwrap_or("")
-                .to_string()
+            let pick = failed.or_else(|| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|t| !t["feedback"].as_str().unwrap_or("").is_empty())
+            });
+            (
+                pick.and_then(|t| t["feedback"].as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                pick.and_then(|t| t["check_results"].as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|c| serde_json::from_value(c.clone()).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
         };
         TaskResult {
             name: task.name.clone(),
@@ -262,6 +276,7 @@ impl EvaluationRunner {
             rounds: out["rounds"].as_u64().unwrap_or(0) as u32,
             feedback,
             context: ContextMetrics::from_run(&out),
+            checks,
         }
     }
 
@@ -279,6 +294,7 @@ impl EvaluationRunner {
                     rounds: 0,
                     feedback: format!("harness: task-dir copy failed: {e:#}"),
                     context: ContextMetrics::default(),
+                    checks: Vec::new(),
                 };
             }
         };
@@ -329,6 +345,7 @@ impl EvaluationRunner {
                     rounds: 0,
                     feedback: format!("harness: task join failed: {e}"),
                     context: ContextMetrics::default(),
+                    checks: Vec::new(),
                 }),
             }
         }
