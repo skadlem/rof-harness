@@ -60,6 +60,14 @@ impl ContextService {
     /// Compress context that overflowed its budget — the cheap model's second
     /// duty per the two-tier design. Returns the full response so the caller
     /// can trace tokens/cost like any other model call.
+    ///
+    /// `max_tokens` is the *content* budget. A reasoning model spends hidden
+    /// tokens before the visible summary, so the request asks for the content
+    /// budget plus room for the reasoning; a truncation in the answer is an
+    /// error the client retries (see `openrouter::once`), not a silent short
+    /// summary.
+    const REASONING_HEADROOM: usize = 3072;
+
     pub async fn summarize(&self, text: &str, max_tokens: usize) -> Result<LlmResp, LlmError> {
         self.complete(LlmReq {
             system: format!(
@@ -68,7 +76,7 @@ impl ContextService {
                  repeated context. Output only the compressed text."
             ),
             prompt: text.to_string(),
-            max_tokens,
+            max_tokens: max_tokens + Self::REASONING_HEADROOM,
         })
         .await
     }

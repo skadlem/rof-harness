@@ -38,7 +38,7 @@ impl Agent for PlannerAgent<'_> {
         let req = LlmReq {
             system: "You are a planner. Output JSON {tasks[], acceptance[]}.".to_string(),
             prompt: ctx.view.prompt.clone(),
-            max_tokens: 800,
+            max_tokens: 4096,
         };
         let resp = self
             .llm

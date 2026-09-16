@@ -241,7 +241,7 @@ impl ImplementerAgent<'_> {
             .complete(LlmReq {
                 system: system.to_string(),
                 prompt: prompt.to_string(),
-                max_tokens: 1200,
+                max_tokens: 8192,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
