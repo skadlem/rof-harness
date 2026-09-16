@@ -1,5 +1,6 @@
 use super::{Agent, AgentCtx, AgentOutput};
-use crate::context::window_on;
+use crate::context::retriever::{window_on, NAMED_FILE_CAP};
+use crate::context::{Assembly, ContextAssembler, ContextItem, Fidelity, ItemKey};
 use crate::llm::LlmReq;
 use crate::obs::TraceEvent;
 use crate::tools::ToolRegistry;
@@ -59,12 +60,29 @@ impl ImplementerAgent<'_> {
         ctx: AgentCtx<'_>,
         system: &str,
     ) -> anyhow::Result<AgentOutput> {
+        // §4.1: the file map, requested files and skill bodies are appended
+        // *after* the layers were budgeted and cut, so they were the largest
+        // token consumers in the system with no budget at all. The assembler
+        // owns them: one volatile budget, one window per file, and a duplicate
+        // request for a path already delivered is refused and counted.
         let map = ctx.workdir.map(Self::file_map).unwrap_or_default();
-        let mut prompt = ctx.view.prompt.clone();
-        if !map.is_empty() {
-            prompt.push_str("\n\n[REPO FILES]\n");
-            prompt.push_str(&map);
-        }
+        let files_seen = map.lines().count();
+        let mut asm = ContextAssembler::new(&ctx.view.prompt, ctx.volatile_budget);
+        asm.add(ContextItem {
+            key: ItemKey {
+                path: "<repo-files>".to_string(),
+                region: "map".to_string(),
+                role: "implementer".to_string(),
+            },
+            label: "[REPO FILES]".to_string(),
+            text: map,
+            fidelity: Fidelity::Drop,
+            must_include: false,
+        });
+        let prompt = match asm.assemble() {
+            // The map is optional, so either arm delivers the parts that fit.
+            Assembly::Ok(parts) | Assembly::SelectionFailure { parts, .. } => parts.full(),
+        };
         let mut data = self.ask_with_system(&ctx, &prompt, system).await?;
         // A model that must not guess asks for the files it needs ("reads"),
         // or for a recorded procedure ("skill_views"). One extra turn, never
@@ -78,23 +96,70 @@ impl ImplementerAgent<'_> {
             && data.get("writes").is_none()
         {
             let mut got_any = false;
-            let files = self.requested(&ctx, &wanted).await;
-            if !files.is_empty() {
-                prompt.push_str("\n\n[REQUESTED FILES]\n");
-                prompt.push_str(&files.join("\n"));
+            for f in self.requested(&ctx, &wanted).await {
+                // The label is in the text when the read failed (`--- path`),
+                // and otherwise the assembler's own: a requested file is a
+                // whole-file answer, so the window falls back to head+tail
+                // when no anchor is named.
+                let label = if f.content.starts_with("--- ") {
+                    String::new()
+                } else {
+                    format!("--- {}", f.path)
+                };
+                asm.add(ContextItem {
+                    key: ItemKey {
+                        path: f.path,
+                        region: "requested".to_string(),
+                        role: "implementer".to_string(),
+                    },
+                    label,
+                    text: f.content,
+                    fidelity: Fidelity::Windowed {
+                        anchor: String::new(),
+                        cap: NAMED_FILE_CAP,
+                    },
+                    must_include: true,
+                });
                 got_any = true;
             }
-            let skills = self.skill_bodies(&ctx, &wanted_skills).await;
-            if !skills.is_empty() {
-                prompt.push_str("\n\n[REQUESTED SKILLS]\n");
-                prompt.push_str(&skills.join("\n"));
+            for s in self.skill_bodies(&ctx, &wanted_skills).await {
+                asm.add(ContextItem {
+                    key: ItemKey {
+                        path: format!("<skill:{}>", s.name),
+                        region: "body".to_string(),
+                        role: "implementer".to_string(),
+                    },
+                    label: format!("--- <skill:{}>", s.name),
+                    text: s.body,
+                    fidelity: Fidelity::Exact,
+                    must_include: true,
+                });
                 got_any = true;
             }
             if got_any {
-                data = self.ask_with_system(&ctx, &prompt, system).await?;
+                let parts = match asm.assemble() {
+                    Assembly::Ok(parts) => parts,
+                    // A requested file that does not fit even at the narrowest
+                    // window: the model asked for it to settle a fact it will
+                    // now have to reason without. Named, not silently cut.
+                    Assembly::SelectionFailure { parts, excess } => {
+                        ctx.trace.emit(TraceEvent::ModelError {
+                            agent: "context".to_string(),
+                            error: format!(
+                                "requested files too large for the volatile budget: {}",
+                                excess
+                                    .into_iter()
+                                    .map(|i| i.key.path)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        });
+                        parts
+                    }
+                };
+                data = self.ask_with_system(&ctx, &parts.full(), system).await?;
             }
         }
-        let files_seen = map.lines().count();
         // Patches first, then whole-file writes (a write to the same path wins).
         // Both land in `writes` so the reviewer's WRITES MADE count is unchanged.
         // `file_state` carries the file text each touched path has *now*.
@@ -124,7 +189,21 @@ impl ImplementerAgent<'_> {
     }
 }
 
-/// Paths an artifact asked to see before it writes.
+/// A file an artifact asked to read. The content is delivered whole: the
+/// §4.1 assembler owns the windowing and the budget, so a requested file can
+/// no longer push the prompt past every budget that already cut.
+struct ReqFile {
+    path: String,
+    content: String,
+}
+
+/// A skill body an artifact asked to read.
+struct ReqSkill {
+    name: String,
+    body: String,
+}
+
+/// The files an artifact asked to read.
 fn read_requests(data: &serde_json::Value) -> Vec<String> {
     const MAX: usize = 3;
     string_list(data, "reads", MAX)
@@ -186,7 +265,7 @@ impl ImplementerAgent<'_> {
 
     /// The files an artifact asked to read, through the same policy gate as
     /// every other tool call (a model-chosen path is untrusted input).
-    async fn requested(&self, ctx: &AgentCtx<'_>, paths: &[String]) -> Vec<String> {
+    async fn requested(&self, ctx: &AgentCtx<'_>, paths: &[String]) -> Vec<ReqFile> {
         let (Some(tools), Some(workdir)) = (ctx.tools, ctx.workdir) else {
             return Vec::new();
         };
@@ -208,11 +287,17 @@ impl ImplementerAgent<'_> {
                 latency_ms: lat,
             });
             match r {
-                // Whole file, like a goal-named one: the model asked for it to
-                // settle a fact, so a head-only cap would answer the wrong
-                // question.
-                Ok(o) => out.push(format!("--- {path}\n{}", window_on(&o.output, ""))),
-                Err(e) => out.push(format!("--- {path}\n(unreadable: {e})")),
+                // Whole file: the model asked for it to settle a fact, so a
+                // head-only cap would answer the wrong question. The window
+                // is the assembler's to choose.
+                Ok(o) => out.push(ReqFile {
+                    path: path.to_string(),
+                    content: o.output,
+                }),
+                Err(e) => out.push(ReqFile {
+                    path: path.to_string(),
+                    content: format!("--- {path}\n(unreadable: {e})"),
+                }),
             }
         }
         out
@@ -220,7 +305,7 @@ impl ImplementerAgent<'_> {
     /// The skill bodies an artifact asked for, through the same policy gate as
     /// every other read. A refused or unreadable skill comes back as a line the
     /// model can act on rather than as silence.
-    async fn skill_bodies(&self, ctx: &AgentCtx<'_>, names: &[String]) -> Vec<String> {
+    async fn skill_bodies(&self, ctx: &AgentCtx<'_>, names: &[String]) -> Vec<ReqSkill> {
         let Some(tools) = ctx.tools else {
             return Vec::new();
         };
@@ -251,9 +336,15 @@ impl ImplementerAgent<'_> {
                         ok: true,
                         bytes: body.len() as u64,
                     });
-                    out.push(format!("--- {name}\n{}", body.trim()));
+                    out.push(ReqSkill {
+                        name: name.clone(),
+                        body: body.trim().to_string(),
+                    });
                 }
-                Err(e) => out.push(format!("--- {name}\n(unavailable: {e})")),
+                Err(e) => out.push(ReqSkill {
+                    name: name.clone(),
+                    body: format!("--- {name}\n(unavailable: {e})"),
+                }),
             }
         }
         out

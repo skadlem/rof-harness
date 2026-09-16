@@ -162,6 +162,7 @@ impl Orchestrator {
                     tools: None,
                     workdir: None,
                     trace: &self.trace,
+                    volatile_budget: 0,
                 })
                 .await
             {
@@ -316,6 +317,7 @@ impl Orchestrator {
                         tools: Some(tools),
                         workdir: Some(workdir),
                         trace: &self.trace,
+                        volatile_budget: svc.volatile_budget(),
                     })
                     .await
                 {
@@ -341,7 +343,24 @@ impl Orchestrator {
                 // name, so accumulating earlier rounds would let a round-1
                 // failure outrank the round that fixed it.
                 check_results = task_checks;
-                let verified_files = svc.reviewer_file_evidence(workdir, &artifact).await;
+                let evidence = svc.reviewer_file_evidence(workdir, &artifact).await;
+                // A touched file the budget could not deliver even at the
+                // narrowest window: the reviewer is judging it blind, which is
+                // a harness condition, not a model verdict. Name it rather
+                // than letting a silent cut answer the wrong question.
+                if !evidence.excess.is_empty() {
+                    self.trace.emit(TraceEvent::ModelError {
+                        agent: "context".to_string(),
+                        error: format!(
+                            "evidence too large for the volatile budget: {}",
+                            evidence.excess.join(", ")
+                        ),
+                    });
+                }
+                if evidence.eliminated > 0 {
+                    acc.eliminated_chars = acc.eliminated_chars.saturating_add(evidence.eliminated);
+                }
+                let verified_files = evidence.block;
                 // Write gate (§4.2): count what git saw change, not what the
                 // artifact claims. A new file the model wrote counts; prose-only
                 // work reads back as zero; a self-report that disagrees with the
@@ -373,7 +392,8 @@ impl Orchestrator {
                     mid_term: format!("PLAN: {plan_json}\nCURRENT TASK: {task}{reviewer_reuse}"),
                     short_term: format!(
                         "ARTIFACT: {}\nSKILL CHANGES: {}\nEXPECT WRITES: {}\nWRITES MADE: {}\nCHANGED (git): {}\nCHECKS:\n{}\nVERIFIED FILES:\n{}",
-                        serde_json::to_string(&artifact).unwrap_or_default(),
+                        // The bodies travel once, under VERIFIED FILES.
+                        evidence.artifact,
                         crate::engine::session::skill_changes_line(&artifact),
                         if session.expect_writes { "yes" } else { "no" },
                         writes_made,
@@ -405,10 +425,11 @@ impl Orchestrator {
                     .run(AgentCtx {
                         view: &rview,
                         context: None,
-                        executor: Some(&self.executor),
+                        executor: Some(&self.verify),
                         tools: Some(tools),
                         workdir: Some(workdir),
                         trace: &self.trace,
+                        volatile_budget: 0,
                     })
                     .await
                 {
@@ -554,6 +575,7 @@ impl Orchestrator {
             "truncated_views": acc.truncated_views,
             "layer_summaries": acc.layer_summaries,
             "layer_truncations": acc.layer_truncations,
+            "eliminated_chars": acc.eliminated_chars,
             "checks": checks_log,
             "ctx_tokens": plan_view.used_tokens,
         })
@@ -654,6 +676,7 @@ impl Orchestrator {
                     tools: Some(svc.tools),
                     workdir: Some(workdir),
                     trace: &self.trace,
+                    volatile_budget: svc.volatile_budget(),
                 })
                 .await
             {
@@ -772,6 +795,7 @@ impl Orchestrator {
             "truncated_views": acc.truncated_views,
             "layer_summaries": acc.layer_summaries,
             "layer_truncations": acc.layer_truncations,
+            "eliminated_chars": acc.eliminated_chars,
             "checks": checks_log,
         })
     }
@@ -824,4 +848,7 @@ struct LayerAcc {
     layer_summaries: [u32; 3],
     summarize_calls: u64,
     summarize_tokens: u64,
+    /// Chars a duplicate carried into a prompt the assembler refused to
+    /// deliver twice (§4.1).
+    eliminated_chars: usize,
 }

@@ -42,6 +42,8 @@ static IMPL_RETRY_PROMPT: Mutex<String> = Mutex::new(String::new());
 static IMPL_RETRY_PROMPT_APPLIED: Mutex<String> = Mutex::new(String::new());
 /// The prompt of the implementer turn that carried requested files.
 static IMPL_READ_PROMPT: Mutex<String> = Mutex::new(String::new());
+/// The last reviewer prompt that carried evidence, kept for assertions.
+static REVIEW_PROMPT: Mutex<String> = Mutex::new(String::new());
 /// Implementer calls seen in the read-request test.
 static IMPL_READ_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Implementer calls + last prompt for the escaping-read test.
@@ -205,6 +207,9 @@ impl LlmClient for FakeClient {
             ));
         }
         if req.system.contains("reviewer") {
+            if req.prompt.contains("VERIFIED FILES:") {
+                *REVIEW_PROMPT.lock().unwrap() = req.prompt.clone();
+            }
             if req.prompt.contains("VERIFIED FILES:") && req.prompt.contains("beta_fixed") {
                 self.review_saw_verified_file.store(true, Ordering::SeqCst);
             }
@@ -243,7 +248,9 @@ impl LlmClient for FakeClient {
         }
         if req.system.contains("implementer") && self.read_then_write {
             IMPL_READ_CALLS.fetch_add(1, Ordering::SeqCst);
-            if req.prompt.contains("[REQUESTED FILES]") {
+            // §4.1: a requested file reaches the second turn as an assembled
+            // item labeled with its own path, not as a section header.
+            if req.prompt.contains("--- schema.txt") {
                 *IMPL_READ_PROMPT.lock().unwrap() = req.prompt.clone();
                 return Self::resp(
                     "{\"patches\":[{\"path\":\"a.txt\",\"search\":\"beta_real_line\",\"replace\":\"beta_fixed\"}],\"notes\":\"now that I have seen it\"}",
@@ -647,6 +654,59 @@ async fn reviewer_gets_independent_file_evidence() {
 }
 
 #[tokio::test]
+async fn reviewer_evidence_is_windowed_and_carried_once() {
+    // §4.1's two measured failures in one prompt: the evidence was read whole
+    // (up to 262 KB a file) and then head+tail-collapsed by the short layer's
+    // budget, which can drop the only region under judgement; and the same
+    // bytes travelled twice, as `file_state` JSON and as `[VERIFIED FILES]`.
+    let client = Arc::new(FakeClient::guess_then_fix());
+    let (orch, reg, root) = harness_with(client.clone(), "window", 2, |cfg| {
+        cfg.expect_writes = true;
+    });
+    // 80_000 chars with the change at the middle line: a whole-file view
+    // cannot fit the evidence window, and a head+tail cut loses the change.
+    let mut big = String::new();
+    for i in 0..2000 {
+        if i == 1000 {
+            big.push_str("beta_real_line\n");
+        } else {
+            big.push_str(&format!("filler line number {i:04} padded out\n"));
+        }
+    }
+    std::fs::write(root.join("a.txt"), big).unwrap();
+    let out = orch
+        .run_loop(&Session::new("edit a.txt".into()), &reg, &root)
+        .await;
+    assert_eq!(out["passed"], true);
+    let reviewer = REVIEW_PROMPT.lock().unwrap().clone();
+    assert!(!reviewer.is_empty(), "no reviewer prompt carried evidence");
+    // The judged region survives the window...
+    assert!(
+        reviewer.contains("beta_fixed"),
+        "the window lost the region under judgement: {reviewer}"
+    );
+    // ...and the head and tail of an 80 KB file do not.
+    assert!(
+        !reviewer.contains("filler line number 0000")
+            && !reviewer.contains("filler line number 1999"),
+        "evidence was delivered whole instead of windowed: {reviewer}"
+    );
+    // The body travels once: `file_state` is stripped to its path and anchor,
+    // so `[VERIFIED FILES]` is the only copy of the 80 KB. A patch's `replace`
+    // is intent, not duplication, and stays.
+    assert!(
+        !reviewer.contains("current_content"),
+        "the file body travelled twice, as JSON and as evidence: {reviewer}"
+    );
+    assert!(
+        out["eliminated_chars"].as_u64().unwrap_or(0) > 0,
+        "nothing was counted as eliminated: {}",
+        out["eliminated_chars"]
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
 async fn plan_tasks_each_get_their_own_cycle() {
     let (orch, reg, root) = harness(Arc::new(FakeClient::two_tasks()), "tasks", 2);
     let out = orch
@@ -817,6 +877,11 @@ async fn a_read_request_is_honored_once_and_then_the_model_writes() {
     assert!(
         seen.contains("schema.txt") && seen.contains("field_a"),
         "the requested file never reached the second turn: {seen}"
+    );
+    // the same file asked for twice is delivered once: the dedupe is by key
+    assert!(
+        seen.matches("field_a: u8").count() <= 1,
+        "the requested file's bytes reached the prompt twice: {seen}"
     );
     // the path map tells the model what it may ask for
     assert!(

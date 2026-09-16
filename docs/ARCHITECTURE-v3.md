@@ -132,6 +132,19 @@ Three rules, kept deliberately small:
 
 `ContextBuilder` is deprecated in favor of the assembler; every file view, including the reviewer's evidence, goes through the same windowing and budget.
 
+**Implementation (landed).** `context/assembler.rs` owns one budget for everything below the layers: the file map, the requested files and skill bodies the implementer appends, and the reviewer's `[VERIFIED FILES]` evidence. `Fidelity::{Exact, Windowed{anchor, cap}, Drop}` is how an item is shaped when it does not fit; `ItemKey{path, region, role}` is the dedupe key; `Assembly::{Ok | SelectionFailure{parts, excess}}` is the result.
+
+The three rules landed as written, with two seams where the measured bug did not need the full abstraction:
+
+- **The layers keep their own policy.** The spec's "one prompt budget" is delivered as *one owner for everything below the layers*, because the three-layer summarize path is already bounded, content-cached and measured, while the ungoverned surface was exactly the parts appended after it. The assembler's budget is the short layer's char cap — the ceiling those parts were being silently cut against when there was no owner.
+- **`SelectionFailure` carries the parts that fit.** The caller that cannot narrow further still gets a prompt; the excess is a signal it traces and acts on. The assembler tightens a `Windowed` item's cap itself (halving to a 2 000-char floor) before declaring it excess, so a failure means "undeliverable even at the narrowest view", not "would not fit at full width".
+
+`Fidelity::Summary` was dropped: a summary is text handed to the assembler as an `Exact` item, so the module stays pure and synchronous and the summarizer stays where its cache lives.
+
+Two duplications the spec names are fixed at their source, not only in the assembler. The reviewer's evidence reuses the implementer's `file_state` instead of re-reading the same files (the measured triplicate's worst case: identical bytes, twice in one prompt, up to 262 KB a file), and `strip_file_bodies` removes `file_state[].current_content` from the artifact JSON the reviewer sees, keeping the path and the anchor — so `[VERIFIED FILES]` is the one copy. Both are counted in `eliminated_chars`, which folds into `ContextMetrics` and both reports. The reviewer's window centres on the artifact's `why`/`search` text, which is the region under judgement; a requested file names no anchor, so it keeps the head+tail fallback.
+
+What is **not** done: the layers are not yet items, so a layer that overflows still consumes budget the assembler cannot see, and `loop_one_round()`-style sharing is §4.3's remaining surface. Both are measured, not assumed, before they become code.
+
 ### 4.2 `engine/tree.rs` — attempt rollback + diff-based write gate *(new)*
 
 **Trigger.** The duplicate-edit bug class (E0592/E0428 — item already defined) and a write gate that counts the model's *self-reported* `artifact["writes"]` array, filtering entries starting with `FAILED`. The model is grading its own homework.

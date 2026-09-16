@@ -286,7 +286,7 @@ async fn a_skill_view_request_is_honored_in_the_bounded_extra_turn() {
         "the goal does not name the skill, so nothing was injected"
     );
     assert!(
-        client.wrote("[REQUESTED SKILLS]") && client.wrote(LESSON),
+        client.wrote("--- <skill:add-a-unit-test>") && client.wrote(LESSON),
         "the asked-for body reaches the model: {:?}",
         client.prompts()
     );
