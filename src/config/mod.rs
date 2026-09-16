@@ -1,3 +1,4 @@
+use crate::context::ContextPolicy;
 use crate::skills::SkillPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -177,6 +178,12 @@ impl Default for SkillsConfig {
 #[serde(default)]
 pub struct AppConfig {
     pub budgets: TokenBudgets,
+    /// Stage 2 per-layer policy (budgets, strategy, summarize threshold).
+    /// `None` = derive from `budgets`, so a config file that never mentions
+    /// `context` keeps meaning exactly what it said. Present = this block
+    /// decides, budgets included — one source per case, no silent override.
+    #[serde(default)]
+    pub context: Option<ContextPolicy>,
     pub routing: RoutingConfig,
     pub permissions: PermissionPolicy,
     pub retrieval: RetrievalConfig,
@@ -228,12 +235,23 @@ impl AppConfig {
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_default()
     }
+
+    /// The effective per-layer context policy: the config's `context` block
+    /// when it has one, otherwise derived from `budgets` — so a file that only
+    /// states budgets (every config written before stage 2) behaves exactly as
+    /// it did, and a file that states `context` is not silently overridden by
+    /// the older field.
+    pub fn context_policy(&self) -> ContextPolicy {
+        self.context
+            .unwrap_or_else(|| ContextPolicy::from(&self.budgets))
+    }
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             budgets: TokenBudgets::default(),
+            context: None,
             routing: RoutingConfig::default(),
             permissions: PermissionPolicy::default(),
             retrieval: RetrievalConfig::default(),

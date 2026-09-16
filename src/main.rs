@@ -1,4 +1,5 @@
 use rof::config::AppConfig;
+use rof::context::LayerKind;
 use rof::engine::{ModelRouter, Orchestrator, Role, Session};
 use rof::eval::{EvalSuite, EvaluationRunner, SuiteReport};
 use rof::llm::{ContextService, ExecutorService, LlmClient, OpenRouterClient, StubClient};
@@ -159,6 +160,52 @@ fn apply_env(cfg: &mut AppConfig) {
             "direct" => cfg.skills.policy = SkillPolicy::Direct,
             other => eprintln!("ignoring ROF_SKILLS_POLICY={other} (readonly|propose|direct)"),
         }
+    }
+    // Stage 2 context policy. Layer budgets write both the legacy `budgets`
+    // block and the derived policy, so the two can never disagree; the
+    // summarize knob materializes `context` (turning it from "derive" into
+    // "decided here") and arms the long + mid layers. The short layer holds the
+    // fresh evidence a reviewer judges, so the env knob deliberately leaves it
+    // unarmed — set it explicitly in a config file if you want it compressed.
+    let mut ctx_policy = None;
+    for (var, kind) in [
+        ("ROF_BUDGET_LONG", LayerKind::Long),
+        ("ROF_BUDGET_MID", LayerKind::Mid),
+        ("ROF_BUDGET_SHORT", LayerKind::Short),
+    ] {
+        if let Some(v) = get(var) {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                let mut p = ctx_policy.take().unwrap_or_else(|| cfg.context_policy());
+                p.layer_mut(kind).budget = n;
+                match kind {
+                    LayerKind::Long => cfg.budgets.long_term = n,
+                    LayerKind::Mid => cfg.budgets.mid_term = n,
+                    LayerKind::Short => cfg.budgets.short_term = n,
+                }
+                ctx_policy = Some(p);
+            } else {
+                eprintln!("ignoring {var}={v} (tokens)");
+            }
+        }
+    }
+    if let Some(v) = get("ROF_SUMMARIZE_AT") {
+        let t = v.trim().to_ascii_lowercase();
+        let at = match t.as_str() {
+            "off" | "none" | "no" | "false" => Some(0.0),
+            _ => t.parse::<f32>().ok().filter(|f| (0.0..=1.0).contains(f)),
+        };
+        match at {
+            Some(at) => {
+                let mut p = ctx_policy.take().unwrap_or_else(|| cfg.context_policy());
+                p.long.summarize_at = at;
+                p.mid.summarize_at = at;
+                ctx_policy = Some(p);
+            }
+            None => eprintln!("ignoring ROF_SUMMARIZE_AT={v} (0.0-1.0 or off)"),
+        }
+    }
+    if ctx_policy.is_some() {
+        cfg.context = ctx_policy;
     }
 }
 

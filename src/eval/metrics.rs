@@ -191,10 +191,6 @@ impl EvalReport {
 /// `relevance_proxy` is named a *proxy* on purpose: it is the share of
 /// retrieved chars whose file the task then touched, not a judgement that the
 /// context was relevant. Nothing here needs a model call.
-///
-/// Per-layer truncation/summarization counts (`layer_truncations`,
-/// `layer_summaries` in the plan) are deliberately absent until stage 2 gives
-/// them an emitter: a metric field fed by nothing reads as a measured zero.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContextMetrics {
     pub retrieved_files: usize,
@@ -210,6 +206,14 @@ pub struct ContextMetrics {
     /// counts once, and again if it still overflows after summarization. The
     /// planner's one-shot view is outside the loop and is not counted.
     pub truncated_views: u32,
+    /// Per-layer views delivered as a model summary (stage 2), indexed by
+    /// `LayerKind::index()`: long, mid, short. Counts a cached summary too —
+    /// what was delivered, not what was paid for here.
+    #[serde(default)]
+    pub layer_summaries: [u32; 3],
+    /// Per-layer views the strategy had to cut, same indexing.
+    #[serde(default)]
+    pub layer_truncations: [u32; 3],
 }
 
 impl ContextMetrics {
@@ -273,6 +277,8 @@ impl ContextMetrics {
                 .get("truncated_views")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32,
+            layer_summaries: layer_counts(out, "layer_summaries"),
+            layer_truncations: layer_counts(out, "layer_truncations"),
         }
     }
 
@@ -286,6 +292,10 @@ impl ContextMetrics {
             acc.summarize_calls += t.summarize_calls;
             acc.summarize_tokens += t.summarize_tokens;
             acc.truncated_views += t.truncated_views;
+            for i in 0..3 {
+                acc.layer_summaries[i] += t.layer_summaries[i];
+                acc.layer_truncations[i] += t.layer_truncations[i];
+            }
         }
         acc.relevance_proxy = if acc.retrieved_chars == 0 {
             0.0
@@ -294,6 +304,19 @@ impl ContextMetrics {
         };
         acc
     }
+}
+
+/// One per-layer counter triple (`[long, mid, short]`) off the orchestrator's
+/// return value. Missing or short arrays read as zeros — a pre-stage-2 return
+/// value has no such keys at all.
+fn layer_counts(out: &serde_json::Value, key: &str) -> [u32; 3] {
+    let mut v = [0u32; 3];
+    if let Some(a) = out.get(key).and_then(|x| x.as_array()) {
+        for (i, n) in a.iter().take(3).enumerate() {
+            v[i] = n.as_u64().unwrap_or(0) as u32;
+        }
+    }
+    v
 }
 
 #[cfg(test)]

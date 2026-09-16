@@ -1,0 +1,303 @@
+{
+ "note": "hard-two, 2 tasks, --jobs 1, planner ON (shipped default), 6 runs per arm, frozen worktree at a0d47a4 (git worktree add ~/rof-arm-reasoner a0d47a4), ROF_SKILLS_ROOT pinned to an empty scratch store. Raw reports: ~/rof-runs-chat-baseline, ~/rof-runs-reasoner (not committed).",
+ "suite": "eval/suites/hard-two.json",
+ "planner": "always",
+ "jobs": 1,
+ "runs_per_arm": 6,
+ "git_head": "a0d47a4",
+ "arms": {
+  "exec=deepseek-chat": {
+   "per_run": [
+    {
+     "report": "run-chat-baseline-1.json",
+     "exec_model": "deepseek-chat",
+     "matched": 0,
+     "tasks": 2,
+     "per_task": {
+      "metrics-method": {
+       "passed": false,
+       "rounds": 5
+      },
+      "add-retriever-test": {
+       "passed": false,
+       "rounds": 5
+      }
+     },
+     "est_cost_usd": 0.016589,
+     "est_input_tokens": 149636,
+     "est_output_tokens": 8115,
+     "cached_input_tokens": 72960,
+     "latency_ms": 109445,
+     "tool_accuracy": 1.0
+    },
+    {
+     "report": "run-chat-baseline-2.json",
+     "exec_model": "deepseek-chat",
+     "matched": 0,
+     "tasks": 2,
+     "per_task": {
+      "metrics-method": {
+       "passed": false,
+       "rounds": 2
+      },
+      "add-retriever-test": {
+       "passed": false,
+       "rounds": 3
+      }
+     },
+     "est_cost_usd": 0.010731,
+     "est_input_tokens": 93171,
+     "est_output_tokens": 5913,
+     "cached_input_tokens": 46208,
+     "latency_ms": 81310,
+     "tool_accuracy": 1.0
+    },
+    {
+     "report": "run-chat-baseline-3.json",
+     "exec_model": "deepseek-chat",
+     "matched": 1,
+     "tasks": 2,
+     "per_task": {
+      "metrics-method": {
+       "passed": true,
+       "rounds": 2
+      },
+      "add-retriever-test": {
+       "passed": false,
+       "rounds": 2
+      }
+     },
+     "est_cost_usd": 0.007272,
+     "est_input_tokens": 72474,
+     "est_output_tokens": 3284,
+     "cached_input_tokens": 37888,
+     "latency_ms": 64330,
+     "tool_accuracy": 1.0
+    },
+    {
+     "report": "run-chat-baseline-4.json",
+     "exec_model": "deepseek-chat",
+     "matched": 1,
+     "tasks": 2,
+     "per_task": {
+      "metrics-method": {
+       "passed": true,
+       "rounds": 2
+      },
+      "add-retriever-test": {
+       "passed": false,
+       "rounds": 4
+      }
+     },
+     "est_cost_usd": 0.010838,
+     "est_input_tokens": 107010,
+     "est_output_tokens": 4921,
+     "cached_input_tokens": 55552,
+     "latency_ms": 101765,
+     "tool_accuracy": 1.0
+    },
+    {
+     "report": "run-chat-baseline-5.json",
+     "exec_model": "deepseek-chat",
+     "matched": 0,
+     "tasks": 2,
+     "per_task": {
+      "metrics-method": {
+       "passed": false,
+       "rounds": 5
+      },
+      "add-retriever-test": {
+       "passed": false,
+       "rounds": 2
+      }
+     },
+     "est_cost_usd": 0.011123,
+     "est_input_tokens": 106194,
+     "est_output_tokens": 4690,
+     "cached_input_tokens": 51840,
+     "latency_ms": 90557,
+     "tool_accuracy": 1.0
+    },
+    {
+     "report": "run-chat-baseline-6.json",
+     "exec_model": "deepseek-chat",
+     "matched": 1,
+     "tasks": 2,
+     "per_task": {
+      "metrics-method": {
+       "passed": true,
+       "rounds": 2
+      },
+      "add-retriever-test": {
+       "passed": false,
+       "rounds": 3
+      }
+     },
+     "est_cost_usd": 0.007874,
+     "est_input_tokens": 78207,
+     "est_output_tokens": 3576,
+     "cached_input_tokens": 40832,
+     "latency_ms": 74494,
+     "tool_accuracy": 1.0
+    }
+   ],
+   "totals": {
+    "matched": 3,
+    "task_runs": 12,
+    "metrics-method": "3/6",
+    "add-retriever-test": "0/6",
+    "est_cost_usd_per_run": 0.010738,
+    "est_input_tokens_per_run": 101115,
+    "est_output_tokens_per_run": 5083,
+    "latency_ms_per_run": 86984
+   }
+  },
+  "exec=deepseek-reasoner": {
+   "per_run": [
+    {
+     "report": "run-reasoner-1.json",
+     "exec_model": "deepseek-reasoner",
+     "matched": 0,
+     "tasks": 2,
+     "per_task": {
+      "metrics-method": {
+       "passed": false,
+       "rounds": 2
+      },
+      "add-retriever-test": {
+       "passed": false,
+       "rounds": 2
+      }
+     },
+     "est_cost_usd": 0.007543,
+     "est_input_tokens": 43461,
+     "est_output_tokens": 6504,
+     "cached_input_tokens": 19584,
+     "latency_ms": 82564,
+     "tool_accuracy": 1.0
+    },
+    {
+     "report": "run-reasoner-2.json",
+     "exec_model": "deepseek-reasoner",
+     "matched": 0,
+     "tasks": 2,
+     "per_task": {
+      "metrics-method": {
+       "passed": false,
+       "rounds": 2
+      },
+      "add-retriever-test": {
+       "passed": false,
+       "rounds": 2
+      }
+     },
+     "est_cost_usd": 0.007963,
+     "est_input_tokens": 53729,
+     "est_output_tokens": 7366,
+     "cached_input_tokens": 30720,
+     "latency_ms": 89700,
+     "tool_accuracy": 1.0
+    },
+    {
+     "report": "run-reasoner-3.json",
+     "exec_model": "deepseek-reasoner",
+     "matched": 0,
+     "tasks": 2,
+     "per_task": {
+      "metrics-method": {
+       "passed": false,
+       "rounds": 2
+      },
+      "add-retriever-test": {
+       "passed": false,
+       "rounds": 2
+      }
+     },
+     "est_cost_usd": 0.008128,
+     "est_input_tokens": 50149,
+     "est_output_tokens": 8662,
+     "cached_input_tokens": 31232,
+     "latency_ms": 94677,
+     "tool_accuracy": 1.0
+    },
+    {
+     "report": "run-reasoner-4.json",
+     "exec_model": "deepseek-reasoner",
+     "matched": 0,
+     "tasks": 2,
+     "per_task": {
+      "metrics-method": {
+       "passed": false,
+       "rounds": 2
+      },
+      "add-retriever-test": {
+       "passed": false,
+       "rounds": 2
+      }
+     },
+     "est_cost_usd": 0.007162,
+     "est_input_tokens": 46466,
+     "est_output_tokens": 7847,
+     "cached_input_tokens": 30720,
+     "latency_ms": 82361,
+     "tool_accuracy": 1.0
+    },
+    {
+     "report": "run-reasoner-5.json",
+     "exec_model": "deepseek-reasoner",
+     "matched": 0,
+     "tasks": 2,
+     "per_task": {
+      "metrics-method": {
+       "passed": false,
+       "rounds": 2
+      },
+      "add-retriever-test": {
+       "passed": false,
+       "rounds": 2
+      }
+     },
+     "est_cost_usd": 0.006774,
+     "est_input_tokens": 47605,
+     "est_output_tokens": 7103,
+     "cached_input_tokens": 31488,
+     "latency_ms": 78945,
+     "tool_accuracy": 1.0
+    },
+    {
+     "report": "run-reasoner-6.json",
+     "exec_model": "deepseek-reasoner",
+     "matched": 1,
+     "tasks": 2,
+     "per_task": {
+      "metrics-method": {
+       "passed": true,
+       "rounds": 1
+      },
+      "add-retriever-test": {
+       "passed": false,
+       "rounds": 2
+      }
+     },
+     "est_cost_usd": 0.007668,
+     "est_input_tokens": 52196,
+     "est_output_tokens": 6410,
+     "cached_input_tokens": 27264,
+     "latency_ms": 70389,
+     "tool_accuracy": 1.0
+    }
+   ],
+   "totals": {
+    "matched": 1,
+    "task_runs": 12,
+    "metrics-method": "1/6",
+    "add-retriever-test": "0/6",
+    "est_cost_usd_per_run": 0.00754,
+    "est_input_tokens_per_run": 48934,
+    "est_output_tokens_per_run": 7315,
+    "latency_ms_per_run": 83106
+   }
+  }
+ },
+ "caveat": "est_cost uses the config's flat table (0.15 / 0.003 / 0.60 USD per Mtok = deepseek-chat off-peak) for every call regardless of model, so it is only comparable within one arm; deepseek-reasoner's own rates were not verifiable in this session (no web access) and are higher, so its real spend is above the table."
+}
