@@ -864,3 +864,46 @@ retry that cannot change the request's shape is a donation to the provider.
 that would confirm the fix's effect on pass rate has not run. The one task
 that failed three times pre-fix passes in a single round post-fix, which is
 evidence but not a measurement.
+
+## The parser threw away correct answers (2026-09-17, live, Atria-Dawn-Preview)
+
+DeepSeek's budget ran out, so the live work moved to a local preview model
+(Atria-Dawn-Preview, an OpenAI-compatible reasoning endpoint). The first
+single-task run scored 0% with two reviewer failures, both "WRITES MADE is 0",
+while the trace showed the model emitting patches. The model was not refusing
+to write; the harness was dropping its output.
+
+**The bug.** `parse_lenient` scans for the first brace-balanced `{...}` span so
+a model that wraps JSON in prose still gets parsed. But it counted braces
+*inside string literals*. An artifact's `search`/`replace` fields carry source
+text, so they routinely contain `fn f() {` or a lone `}`. Those moved the depth
+counter: an extra `}` in a string closed the object early (serde then reported
+"unterminated string") and an unbalanced `{` meant it never closed at all.
+Either way a complete, correct answer became unparseable, and the round was
+spent on a retry that produced the same good output and lost it again.
+
+**The measurement.** The same implementer prompt, replayed directly against the
+API 12 times with both scanners, isolated the parser from everything else:
+
+| span scan | recovered | malformed | no balanced span |
+|---|---|---|---|
+| before (brace-naive) | 3/12 | 3 | 6 |
+| after (string-aware) | 12/12 | 0 | 0 |
+
+All three failing classes were one bug. The fix is a few lines: track whether
+the scan is inside a string and whether the previous character escaped.
+
+**Why it matters beyond Atria.** DeepSeek emits the same patch shape, so this
+bug was silently taxing the paid provider too — every affected turn paid for a
+retry that could only reproduce the answer it had already received.
+
+## A suite task was measuring my own edit (2026-09-17)
+
+The suite asked for `EvalReport::tool_failures`. That method exists in the tree
+because I wrote it by hand while diagnosing the truncation bug above — the
+failing probe asked for exactly that method, and I unblocked the probe by
+implementing it myself. The suite measures the model against a repo where the
+answer is already committed, so the task measured nothing. It is replaced with
+an equivalent additive task (`model_calls` + `cost_reporting_rate`) that is not
+in the tree, and the suite hash changed accordingly. A benchmark that the
+operator has already solved is not a benchmark.
