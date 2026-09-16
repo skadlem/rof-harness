@@ -38,6 +38,12 @@ pub struct EvalReport {
     /// What agents did with the skill store (folded from `SkillOp` events).
     #[serde(default)]
     pub skills: SkillMetrics,
+    /// Extra rounds the harness bought after a failed task.
+    #[serde(default)]
+    pub auto_pokes: u64,
+    /// Goals the quality pre-check flagged.
+    #[serde(default)]
+    pub goal_quality_flags: u64,
 }
 
 /// Skill-store traffic for one run. Only successful ops count: a refused
@@ -80,6 +86,8 @@ impl Default for EvalReport {
             pricing: PricingConfig::default(),
             cost_lambda: 0.0,
             skills: SkillMetrics::default(),
+            auto_pokes: 0,
+            goal_quality_flags: 0,
         }
     }
 }
@@ -181,6 +189,11 @@ impl EvalReport {
                 "reuse" => self.skills.reused += 1,
                 _ => {}
             },
+            // What the quality pre-check flagged and how many
+            // extra rounds the poke bought. Both are trace facts, folded here
+            // so a report can say whether either feature did anything at all.
+            TraceEvent::GoalQuality { .. } => self.goal_quality_flags += 1,
+            TraceEvent::AutoPoke { .. } => self.auto_pokes += 1,
             _ => {}
         }
     }

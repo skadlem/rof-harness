@@ -6,3 +6,4 @@ pub use compare::{compare, Comparison, LabelDelta, MetricDelta, TaskChange, Task
 pub use metrics::{ContextMetrics, EvalReport, SkillMetrics};
 pub use runner::{fnv1a_hex, git_head, EvaluationRunner, RunLabel, SuiteReport, TaskResult};
 pub use suite::{EvalSuite, EvalTask};
+pub mod goal_quality;

@@ -114,6 +114,11 @@ fn runner_with(
     cfg.skills.root = Some(e.skills.clone());
     cfg.skills.policy = policy;
     cfg.planner = planner.to_string();
+    // Per-task copies stay inside this test's own base dir. With the default
+    // (the shared system temp dir) every test in this binary writes copies
+    // named `rof-task-<pid>-task-<uuid>` and one test's teardown can delete a
+    // sibling's in-flight copy — the flake this file used to clean up after.
+    cfg.task_root = Some(e.base.join("task-root"));
     EvaluationRunner::new(
         Arc::new(TraceSink::new()),
         cfg,
@@ -121,28 +126,6 @@ fn runner_with(
         ExecutorService::new(client, "fake-exec".to_string(), None),
         e.work.clone(),
     )
-}
-
-/// Remove the per-task copies this process left in the temp dir.
-fn cleanup_task_dirs(tags: &[&str]) {
-    let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
-        return;
-    };
-    for e in rd.filter_map(|e| e.ok()) {
-        let p = e.path();
-        let name = p.file_name().map(|n| n.to_string_lossy().to_string());
-        let matches = name.map(|n| {
-            tags.iter()
-                .any(|t| n.starts_with(&format!("rof-task-{}-{t}-", std::process::id())))
-        });
-        if p.is_dir() && matches.unwrap_or(false) {
-            std::fs::remove_dir_all(&p).ok();
-        }
-    }
-}
-
-fn done() {
-    cleanup_task_dirs(&["task"]);
 }
 
 const LESSON: &str =
@@ -258,7 +241,6 @@ async fn create_propose_approve_then_a_later_task_reuses_the_skill() {
         "implementer + reviewer, no phantom planner reuse: {:?}",
         rep3.aggregate.skills
     );
-    done();
     std::fs::remove_dir_all(&e.base).ok();
 }
 
@@ -322,7 +304,6 @@ async fn a_skill_view_request_is_honored_in_the_bounded_extra_turn() {
         )),
         "a model-initiated read is a tool call too"
     );
-    done();
     std::fs::remove_dir_all(&e.base).ok();
 }
 

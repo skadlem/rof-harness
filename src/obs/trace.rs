@@ -67,6 +67,18 @@ pub enum TraceEvent {
         #[serde(default)]
         bytes: u64,
     },
+    /// A goal the quality pre-check flagged before a plan was paid for
+    /// Informational: the round loop proceeds either way.
+    GoalQuality {
+        goal: String,
+        note: String,
+    },
+    /// The harness bought one extra round after a task failed at its cap
+    /// `reason` is what the retry was told.
+    AutoPoke {
+        task: String,
+        reason: String,
+    },
 }
 
 /// In-memory event stream, optionally mirrored to a JSONL file so each run

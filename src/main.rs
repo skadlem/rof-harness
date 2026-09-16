@@ -207,6 +207,14 @@ fn apply_env(cfg: &mut AppConfig) {
     if ctx_policy.is_some() {
         cfg.context = ctx_policy;
     }
+    // Opt-in quality pre-check and auto-poke round. Accept the
+    // same truthy spellings as ROF_EXPECT_WRITES so one habit covers both.
+    if let Some(v) = get("ROF_GOAL_QUALITY") {
+        cfg.goal_quality = matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1");
+    }
+    if let Some(v) = get("ROF_AUTO_POKE") {
+        cfg.auto_poke = matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1");
+    }
 }
 
 fn split_list(s: &str) -> Vec<String> {
