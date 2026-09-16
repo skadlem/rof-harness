@@ -1,0 +1,12 @@
+{
+  "name": "smoke-real-change",
+  "tasks": [
+    {
+      "name": "doc-comment",
+      "goal": "in src/engine/router.rs, add a doc comment line above the ModelRouter struct explaining that it maps roles to model ids. Change nothing else.",
+      "expect_pass": true,
+      "expect_writes": true,
+      "checks": ["cargo test"]
+    }
+  ]
+}

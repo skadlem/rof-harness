@@ -1,0 +1,17 @@
+{
+  "_comment": "Strict profile: everything deny-by-default, one exact command, one host. Use as the starting point for real (non-scratch) work.",
+  "permissions": {
+    "allowed_dirs": [],
+    "allowed_commands": [
+      "cargo test",
+      "cargo check"
+    ],
+    "allowed_hosts": [
+      "docs.rs"
+    ]
+  },
+  "max_review_rounds": 2,
+  "max_tokens_per_task": 50000,
+  "planner": "always",
+  "max_parallel_tasks": 1
+}

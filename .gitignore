@@ -1,0 +1,14 @@
+# build output
+/target
+
+# scratch run dirs and traces
+/scratch
+*.jsonl.tmp
+
+# local configs (keep the examples in configs/)
+/*.local.json
+config.local.json
+
+# editor / OS noise
+.DS_Store
+*.swp
