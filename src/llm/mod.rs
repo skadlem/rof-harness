@@ -140,22 +140,38 @@ impl LlmClient for StubClient {
 
 /// Strict JSON parse first; else scan for the first {...} block (weak
 /// models wrap JSON in prose). Brace-match so nested objects survive.
+///
+/// Braces *inside string literals* must not move the depth counter: an
+/// artifact carries source text, and `fn f() {` inside a JSON string made the
+/// naive scan either close the object early ("unterminated string") or never
+/// close it. Measured on 12 live implementer turns from Atria: 3/12 recovered
+/// before, 12/12 after.
 pub fn parse_lenient(text: &str) -> Option<serde_json::Value> {
     if let Ok(v) = serde_json::from_str(text) {
         return Some(v);
     }
     let start = text.find('{')?;
     let mut depth = 0;
+    let mut in_str = false;
+    let mut esc = false;
     for (i, c) in text[start..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return serde_json::from_str(&text[start..start + i + 1]).ok();
-                }
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
             }
-            _ => {}
+        } else if c == '"' {
+            in_str = true;
+        } else if c == '{' {
+            depth += 1;
+        } else if c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return serde_json::from_str(&text[start..start + i + 1]).ok();
+            }
         }
     }
     None
@@ -176,6 +192,31 @@ mod tests {
     fn rejects_garbage() {
         assert!(parse_lenient("no braces here").is_none());
         assert!(parse_lenient("{\"pass\": tru").is_none());
+    }
+
+    #[test]
+    fn braces_inside_string_literals_do_not_close_the_object() {
+        // A patch carries source text; `fn f() {` inside a JSON string used to
+        // make the depth counter close the span at the wrong brace.
+        let v = parse_lenient(
+            r#"```json
+{"patches": [{"path": "a.rs", "search": "fn f() {", "replace": "fn g() {"}]}
+```"#,
+        )
+        .unwrap();
+        assert_eq!(v["patches"][0]["search"], "fn f() {");
+        assert_eq!(v["patches"][0]["replace"], "fn g() {");
+    }
+
+    #[test]
+    fn an_unbalanced_close_brace_in_a_string_does_not_truncate() {
+        // A search string that is only a closing brace: the object must still
+        // extend to its real end, not stop at the first `}`.
+        let v =
+            parse_lenient(r#"{"writes": [{"path": "b.rs", "content": "    }\n"}], "ok": true}"#)
+                .unwrap();
+        assert_eq!(v["writes"][0]["content"], "    }\n");
+        assert_eq!(v["ok"], true);
     }
 }
 
