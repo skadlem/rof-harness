@@ -237,9 +237,22 @@ fn harness_budget(
     max_rounds: u32,
     short_term_budget: usize,
 ) -> (Orchestrator, ToolRegistry, std::path::PathBuf) {
+    harness_with(client, tag, max_rounds, move |cfg| {
+        cfg.budgets.short_term = short_term_budget;
+    })
+}
+
+/// The same harness with the config open for tweaks (stage 2's per-layer tests
+/// need to move one layer's budget without touching the others).
+fn harness_with(
+    client: Arc<FakeClient>,
+    tag: &str,
+    max_rounds: u32,
+    tweak: impl FnOnce(&mut AppConfig),
+) -> (Orchestrator, ToolRegistry, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("rof-loop-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+    std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
     // Real default grants + one allowlisted check for evidence flow.
     let policy = PermissionPolicy {
         allowed_dirs: vec![root.clone()],
@@ -255,15 +268,16 @@ fn harness_budget(
         vec!["echo checked".to_string()],
     ));
 
-    let cfg = AppConfig {
+    let mut cfg = AppConfig {
         max_review_rounds: max_rounds,
         budgets: rof::config::TokenBudgets {
             long_term: 2000,
             mid_term: 4000,
-            short_term: short_term_budget,
+            short_term: 6000,
         },
         ..Default::default()
     };
+    tweak(&mut cfg);
     let trace = Arc::new(TraceSink::new());
     let context = ContextService::new(client.clone(), "fake-ctx".to_string());
     let executor = ExecutorService::new(client, "fake-exec".to_string(), None);
@@ -386,12 +400,17 @@ async fn token_budget_stops_a_task_before_the_next_round() {
 
 #[tokio::test]
 async fn overflowing_context_is_compressed_by_the_cheap_model() {
-    // A 1-token short-term budget forces the builder to truncate, which must
-    // route through ContextService::summarize instead of blind chopping.
-    let (orch, reg, root) = harness_budget(Arc::new(FakeClient::pass()), "summ", 2, 1);
+    // A long goal against a 30-token mid-term budget puts the mid layer (goal +
+    // retrieval + plan) far over its threshold, so it must route through
+    // ContextService::summarize instead of blind chopping. (v1 compressed the
+    // whole prompt *after* it had overflowed; stage 2 compresses one layer
+    // *before* the cut, and truncation is only the fallback.)
+    let (orch, reg, root) = harness_with(Arc::new(FakeClient::pass()), "summ", 2, |cfg| {
+        cfg.budgets.mid_term = 30;
+    });
     let out = orch
         .run_loop(
-            &Session::new("g".into())
+            &Session::new(format!("g {}", "x".repeat(5000)))
                 .expecting_writes(false)
                 .with_checks(vec!["echo checked".to_string()]),
             &reg,
@@ -400,10 +419,18 @@ async fn overflowing_context_is_compressed_by_the_cheap_model() {
         .await;
     assert!(
         SAW_SUMMARY.load(Ordering::SeqCst),
-        "summarizer never ran on truncated context"
+        "summarizer never ran on an over-threshold layer"
     );
     // the run still completes normally after compression
     assert_eq!(out["passed"], true);
+    // and the layer traffic is attributable: mid summarized, none truncated.
+    assert!(
+        out["layer_summaries"][1].as_u64().unwrap_or(0) >= 1,
+        "layer_summaries: {}",
+        out["layer_summaries"]
+    );
+    assert_eq!(out["layer_truncations"][1], 0);
+    assert!(out["summarize_calls"].as_u64().unwrap_or(0) >= 1);
     std::fs::remove_dir_all(&root).ok();
 }
 

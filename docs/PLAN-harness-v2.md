@@ -1,8 +1,8 @@
 # rof harness v2 — implementation plan
 
-**Status: stages 0 and 1 done (2026-09-14, evidence in `docs/STATUS.md`); stage 2 is next.** Written
-2026-09-14, repo at `967023c` before stage 0 began; the *Stage 0 as built* and *Stage 1 as built*
-sections below record where the implementation differs from the sketch.
+**Status: stages 0, 1 and 2 built (2026-09-14, evidence in `docs/STATUS.md`); stage 3 is next.** Written
+2026-09-14, repo at `967023c` before stage 0 began; the *Stage 0 as built*, *Stage 1 as built* and
+*Stage 2 as built* sections below record where the implementation differs from the sketch.
 
 Goal: evolve the harness toward Hermes-style practices (programmable state, skills as procedural
 memory, recursive delegation, persistent sessions) while it stays **one local Rust crate**, the CLI
@@ -32,6 +32,43 @@ side effect, and the Context/Executor split stops being decorative (the cheap mo
 Constraints: single Rust crate, no workspace, no external agent runtime; preserve the CLI and the
 existing suites (extend, don't rewrite); the tool policy gate stays the only path to side effects;
 keep the two-LLM design and make the cheap one actually used.
+
+## Stage 2 as built (2026-09-14)
+
+`src/context/policy.rs` (`LayerKind`, `LayerStrategy`, `LayerPolicy`, `ContextPolicy`, `LayerReport`,
+`SummaryStat`), `ContextBuilder::{plan, plan_summarized}` with a content-keyed summary cache, the
+orchestrator's per-layer folding (`fold_layers` → `layer_summaries`/`layer_truncations` in
+`ContextMetrics` and in the `--report` dump), `AppConfig.context`, and the env knobs
+`ROF_BUDGET_LONG|MID|SHORT`, `ROF_SUMMARIZE_AT`. Offline: `tests/context_policy.rs` (9 tests) plus the
+loop test that used to pin whole-prompt condensation, now pinning the per-layer path and its counters.
+Live arms and their numbers are in `docs/STATUS.md`.
+
+**Deviations from the sketch above, all deliberate:**
+
+1. `LayerStrategy` has two arms, not four. `Raw` and `HeadTail` have distinct behaviour; `Retrieval`
+   and `Outline` have none yet (retrieval feeds the mid layer from the outside already, and `Outline`
+   is the plan's own stage-6 item) — a variant with no distinct behaviour is dead schema, the same
+   rule that kept the `TraceEvent` variants out of stage 0.
+2. `summarize_at` is per layer and `0.0` means *never*, so the three layers can be armed
+   independently. The defaults are asymmetric on purpose: mid (retrieval, the only layer whose size
+   follows the repo) at `0.8`, long (the stable head — the cached prefix) and short (artifact +
+   checks + refusals, the evidence a reviewer judges) at `0.0`. The plan's single `summarize_at: f32`
+   per layer had no way to say "this layer is never paraphrased".
+3. The summary cache lives in `ContextBuilder`, not in `CtxState::summaries[3]`. The orchestrator
+   rebuilds `CtxState` from scratch every round, so a cache inside it would cache nothing between
+   rounds — the exact case the cache exists for (a retry must not buy the same summary twice).
+4. `plan_summarized` returns `(CtxView, Vec<LayerReport>)` where the plan's `LayerReport` had no
+   fields for summarize tokens; `LayerReport.summarize: SummaryStat` carries call/cached/tokens/
+   latency/cost/attempts, which is what lets the orchestrator emit the `ModelCall{agent:
+   "summarizer"}` trace event without the builder owning a trace sink.
+5. The orchestrator's whole-prompt condensation path is deleted, not kept as a second path: it
+   summarized *after* an overflow and then cut anyway, and two summarization paths that disagree
+   about the order would be two things to measure. `truncated_views` is still reported (as the sum of
+   the per-layer cuts) because every pre-stage-2 report carries it.
+6. `AppConfig.context` is `Option<ContextPolicy>`: a config file that only states `budgets` (every
+   file written before this stage) keeps its exact meaning, and one that states `context` decides —
+   budgets included. Without the `Option`, a file with `budgets` and no `context` would silently
+   have its budgets ignored, which is the kind of hidden input the eval layer exists to catch.
 
 ## Stage 1 as built (done 2026-09-14)
 
@@ -361,10 +398,12 @@ drives stub agents through create → propose → approve → a later task's pro
 *First live arm answered: agents wrote no skill on a suite whose tasks all pass in one round, and the
 nudge's trigger is a multi-round workflow — see `docs/STATUS.md`.*
 
-**Stage 2 — context policy + cheap Context LLM.** `LayerPolicy`, `plan`/`plan_summarized`,
-per-layer summary cache, reviewer budgeted, config + env knobs; live scripts point `ROF_CTX_MODEL` at
-the cheap model. Acceptance: 3 runs per arm on `repo-tasks --limit 6` with **matched non-inferior**
-and cost/tokens strictly down; summarize calls visible in the trace with their tokens.
+**Stage 2 — context policy + cheap Context LLM. — BUILT 2026-09-14 (live arm in `docs/STATUS.md`)**
+`LayerPolicy`, `plan`/`plan_summarized`, per-layer summary cache, budgeted reviewer, config + env
+knobs; the cheap model is the one already wired as `ContextService` (`ROF_CTX_MODEL`). Acceptance:
+3 runs per arm on `repo-tasks --limit 6` with **matched non-inferior** and cost/tokens down, and
+summarize calls visible in the trace with their tokens — see `docs/STATUS.md` for the measured arm
+and for what the default threshold does (and does not) fire on at this suite's context sizes.
 
 **Stage 3 — programmable state.** `state/` module, `~/.rof/state.json`, `state.propose` tool,
 approval CLI, evaluator auto-approve hook, instructions/constraints rendering. Acceptance: a suite
@@ -385,10 +424,10 @@ root, skill-relevance scoring without embeddings, `rof compare --n-runs`.
 
 ### Start here
 
-Stage 1: `skills/` module (SKILL.md parsing, three gated tools, prompt index, `Propose` default,
-`rof skills list|show|approve`) with its own offline acceptance test. Stage 0 is done and its
-instrument (`rof compare` + labels + context metrics) is what every later arm reports through.
-Stage 2 is the first that changes prompt content and therefore the first that needs ≥3 runs per arm.
+Stage 3 (programmable state) is the next stage the plan names, but finishing stage 2's acceptance arm — the fix, the two commands and the trap that makes ordering matter
+(binary rebuilt per run ⇒ freeze the tree) are in `docs/STATUS.md` § *Stage 2*. Stages 0–2 are built;
+every arm from stage 1 onward reports through the stage-0 instrument (`rof compare` + labels + context
+metrics). Stages 2 and onward change prompt content and therefore need ≥3 runs per arm.
 
 ---
 

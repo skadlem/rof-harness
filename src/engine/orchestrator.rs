@@ -1,7 +1,7 @@
 use super::Session;
 use crate::agents::{Agent, AgentCtx, ImplementerAgent, PlannerAgent, ReviewerAgent, Verdict};
 use crate::config::AppConfig;
-use crate::context::{render, ContextBuilder, CtxState, Retriever};
+use crate::context::{render, ContextBuilder, CtxState, LayerReport, Retriever};
 use crate::llm::{ContextService, ExecutorService};
 use crate::obs::{TraceEvent, TraceSink};
 use crate::tools::ToolRegistry;
@@ -43,7 +43,11 @@ impl Orchestrator {
             session_id: session.id.clone(),
             goal: session.goal.clone(),
         });
-        let builder = ContextBuilder::new(self.cfg.budgets.clone());
+        // Stage 2: the per-layer policy owns budgets, strategy and the
+        // summarize threshold. `plan_summarized` below is the first-class path;
+        // the planner's view stays on the pure `plan` because building a prompt
+        // must not cost a model call before the planner's own call.
+        let builder = ContextBuilder::with_policy(self.cfg.context_policy());
 
         // Keyword retrieval over the workdir feeds the mid-term layer,
         // so planner + implementer see relevant files beyond top-level.
@@ -58,12 +62,10 @@ impl Orchestrator {
             .iter()
             .map(|s| serde_json::json!({ "path": s.path, "chars": s.content.chars().count() }))
             .collect();
-        // Summarizer traffic and truncation counts, both read off the round
-        // loop below. The planner's one-shot view is outside that loop and is
-        // not counted.
-        let mut summarize_calls: u64 = 0;
-        let mut summarize_tokens: u64 = 0;
-        let mut truncated_views: u32 = 0;
+        // Per-layer accounting (stage 2): every view the round loop builds
+        // folds its LayerReports here. The planner's one-shot view is outside
+        // the loop and is not counted.
+        let mut acc = LayerAcc::default();
 
         // Skills, progressive disclosure: the index (names + one-line
         // descriptions) goes into the stable head of every prompt; a body is
@@ -95,7 +97,7 @@ impl Orchestrator {
             mid_term: format!("goal: {}\n{retrieved}{planner_reuse}", session.goal),
             short_term: session.ctx.short_term.clone(),
         };
-        let plan_view = builder.build(&plan_state);
+        let (plan_view, _) = builder.plan(&plan_state);
         // Planner (Context LLM, no tools). Skippable: for goals that are
         // already task-shaped the call is pure overhead (see ROF_PLANNER).
         let plan_out = if self.cfg.planner == "skip" {
@@ -167,7 +169,6 @@ impl Orchestrator {
             let limit = session.max_tokens.unwrap_or(self.cfg.max_tokens_per_task);
             let task_start = self.trace.len();
             let mut budget_hit: Option<u64> = None;
-            let mut condensed: Option<String> = None;
             // Skills this task names, once per task (not per round: a body
             // delivered five times is one reuse, not five).
             let impl_reuse = self
@@ -199,7 +200,7 @@ impl Orchestrator {
                     break;
                 }
                 ran = round;
-                let mut istate = CtxState {
+                let istate = CtxState {
                     long_term: impl_head.clone(),
                     // Stable-first ordering: goal and repo retrieval are
                     // byte-stable across runs, the plan is not, the task text
@@ -230,42 +231,11 @@ impl Orchestrator {
                         )
                     },
                 };
-                let mut iview = builder.build(&istate);
-                // Budget overflow: compress once per task with the cheap model
-                // instead of letting the builder chop context blindly.
-                if iview.truncated {
-                    truncated_views += 1;
-                    if let Some(c) = &condensed {
-                        istate.short_term = c.clone();
-                        iview = builder.build(&istate);
-                        if iview.truncated {
-                            truncated_views += 1;
-                        }
-                    } else if let Ok(r) = self
-                        .context
-                        .summarize(&iview.prompt, self.cfg.budgets.short_term)
-                        .await
-                    {
-                        self.trace.emit(TraceEvent::ModelCall {
-                            agent: "summarizer".to_string(),
-                            model: self.context.model.clone(),
-                            input_tokens: r.input_tokens,
-                            output_tokens: r.output_tokens,
-                            latency_ms: r.latency_ms,
-                            cost_usd: r.cost_usd,
-                            cached_input_tokens: r.cached_input_tokens,
-                            attempts: r.attempts,
-                        });
-                        summarize_calls += 1;
-                        summarize_tokens += r.input_tokens + r.output_tokens;
-                        condensed = Some(r.text.clone());
-                        istate.short_term = r.text;
-                        iview = builder.build(&istate);
-                        if iview.truncated {
-                            truncated_views += 1;
-                        }
-                    }
-                }
+                // Per-layer: summarize-before-truncate, one cached cheap-model
+                // call per layer that crossed its threshold. No `mut` state to
+                // carry between rounds — the builder's cache owns that.
+                let (iview, reports) = builder.plan_summarized(&istate, &self.context).await;
+                self.fold_layers(&reports, &mut acc);
                 let implementer = ImplementerAgent::new(&self.executor);
                 match implementer
                     .run(AgentCtx {
@@ -326,13 +296,12 @@ impl Orchestrator {
                         }
                     ),
                 };
-                let rview = builder.build(&rstate);
-                if rview.truncated {
-                    // The reviewer's view is budgeted like the implementer's;
-                    // counting it here is what tells stage 2 where context is
-                    // actually being cut.
-                    truncated_views += 1;
-                }
+                // The reviewer is budgeted like everyone else, per layer. Its
+                // short layer holds the artifact and the check output — fresh
+                // evidence, unarmed for summarization by default (see
+                // `policy.rs`), so what it usually needs here is the cut.
+                let (rview, rreports) = builder.plan_summarized(&rstate, &self.context).await;
+                self.fold_layers(&rreports, &mut acc);
                 let reviewer = ReviewerAgent::new(&self.executor);
                 match reviewer
                     .run(AgentCtx {
@@ -429,9 +398,11 @@ impl Orchestrator {
             "passed": passed,
             "retrieved_files": retrieved_files,
             "retrieved": retrieved_json,
-            "summarize_calls": summarize_calls,
-            "summarize_tokens": summarize_tokens,
-            "truncated_views": truncated_views,
+            "summarize_calls": acc.summarize_calls,
+            "summarize_tokens": acc.summarize_tokens,
+            "truncated_views": acc.truncated_views,
+            "layer_summaries": acc.layer_summaries,
+            "layer_truncations": acc.layer_truncations,
             "checks": checks_log,
             "ctx_tokens": plan_view.used_tokens,
         })
@@ -537,6 +508,38 @@ impl Orchestrator {
         out
     }
 
+    /// Fold one view's layer reports into the run's context counters, and
+    /// trace the cheap-model calls they report. A *cached* summary emits no
+    /// `ModelCall` (the round that paid for it already emitted one) but does
+    /// count as a delivered summary for its layer — the two reuse paths are
+    /// counted apart, the same way `reused`/`viewed` are for skills.
+    fn fold_layers(&self, reports: &[LayerReport], acc: &mut LayerAcc) {
+        for r in reports {
+            let i = r.layer.index();
+            if r.truncated {
+                acc.truncated_views += 1;
+                acc.layer_truncations[i] += 1;
+            }
+            if r.summarized {
+                acc.layer_summaries[i] += 1;
+            }
+            if r.summarize.call {
+                self.trace.emit(TraceEvent::ModelCall {
+                    agent: "summarizer".to_string(),
+                    model: self.context.model.clone(),
+                    input_tokens: r.summarize.input_tokens,
+                    output_tokens: r.summarize.output_tokens,
+                    latency_ms: r.summarize.latency_ms,
+                    cost_usd: r.summarize.cost_usd,
+                    cached_input_tokens: r.summarize.cached_input_tokens,
+                    attempts: r.summarize.attempts,
+                });
+                acc.summarize_calls += 1;
+                acc.summarize_tokens += r.summarize.input_tokens + r.summarize.output_tokens;
+            }
+        }
+    }
+
     /// Sum of input+output tokens reported by model calls emitted at or
     /// after `from` (per-task spend, read back from the trace stream).
     fn tokens_since(&self, from: usize) -> u64 {
@@ -604,6 +607,19 @@ impl Orchestrator {
 struct SkillIndex {
     text: String,
     names: Vec<String>,
+}
+
+/// Context accounting for one run, folded from the `LayerReport`s of every
+/// view the round loop built (stage 2). `layer_*` are per `LayerKind::index()`;
+/// `truncated_views` is their sum, kept as its own number because it is the one
+/// the pre-stage-2 reports already carried.
+#[derive(Debug, Default, Clone)]
+struct LayerAcc {
+    truncated_views: u32,
+    layer_truncations: [u32; 3],
+    layer_summaries: [u32; 3],
+    summarize_calls: u64,
+    summarize_tokens: u64,
 }
 
 /// The stable head a prompt gets: the session's conventions, plus the skill

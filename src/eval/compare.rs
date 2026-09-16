@@ -319,6 +319,19 @@ pub fn compare(a: &SuiteReport, b: &SuiteReport) -> Comparison {
         ctx_a.truncated_views as f64,
         ctx_b.truncated_views as f64,
     );
+    // Stage 2: per layer [long, mid, short] — where context was compressed and
+    // where it was cut. Sums keep the table readable; the per-task rows above
+    // and the raw report carry the layer split.
+    push(
+        "layer_summaries",
+        ctx_a.layer_summaries.iter().map(|n| *n as f64).sum(),
+        ctx_b.layer_summaries.iter().map(|n| *n as f64).sum(),
+    );
+    push(
+        "layer_truncations",
+        ctx_a.layer_truncations.iter().map(|n| *n as f64).sum(),
+        ctx_b.layer_truncations.iter().map(|n| *n as f64).sum(),
+    );
     // Skill-store traffic: the arm-level answer to "did an agent write a skill,
     // and did anything later reuse it?".
     push(

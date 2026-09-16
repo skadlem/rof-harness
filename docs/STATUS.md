@@ -3,13 +3,130 @@
 Last verified: 2026-09-14, on this working tree (`git log` has the v1 commit; this file is the
 running handoff).
 
-stage 2 of `docs/PLAN-harness-v2.md` (context policy + cheap Context
-LLM). Stages 0 (observability) and 1 (skills) are **done** and recorded below; stage 1 has one live
-finding worth reading before touching prompts again: agents wrote no skill unless the goal asked for
-one, and the reason is the nudge's own trigger.
+finish stage 2's live acceptance, then stage 3. Stage 2 (per-layer
+context policy) is **built, offline-green and smoke-verified live**, but its acceptance *arm* was
+deliberately not run yet: writing the arm scripts surfaced a design flaw (the summarizer may be asked
+for a full layer's worth of tokens, i.e. a "compression" that is allowed to expand), and a run built
+from a tree that is about to change is a wasted run. Section *Stage 2* below has the fix and the exact
+commands. Stages 0 (observability) and 1 (skills) are done and recorded further down; stage 1's live
+finding still stands (agents wrote no skill unless the goal asked for one, because the nudge's trigger
+is a multi-round *success*).
+
+**Two traps this session paid for, both now known:**
+
+1. **`live-eval.sh` rebuilds the release binary at the start of every run** (`cargo build --release`).
+   Editing the tree while an arm is running therefore changes the binary *between runs of the same
+   arm*. Freeze the tree first — `git worktree add ~/rof-arm-reasoner <commit>` is how the arms below
+   were run — and never edit the arm's own tree mid-arm.
+2. **An arm's driver script must be checked against the label.** The first "reasoner" arm ran with
+   `exec=deepseek-chat` for six runs because the driver forgot `ROF_EXEC_MODEL`; the report's
+   `label.exec_model` is what caught it. Every arm now gets its labels read back before its numbers
+   are believed.
 
 **Measured-claim rule for every arm below:** 3+ runs per arm, same `--limit`, same models, compare
 per-task matched sets — one 6-task run swings ±2 tasks.
+
+## Stage 2: per-layer context policy (2026-09-14, night — built; acceptance arm not run)
+
+| Deliverable | Where |
+|---|---|
+| `LayerKind`, `LayerStrategy`, `LayerPolicy`, `ContextPolicy`, `LayerReport`, `SummaryStat` | `src/context/policy.rs` |
+| `ContextBuilder::{plan, plan_summarized}` + content-keyed summary cache | `src/context/builder.rs` |
+| Per-layer folding → `layer_summaries`/`layer_truncations`, summarizer `ModelCall`s | `engine/orchestrator.rs` |
+| `AppConfig.context: Option<ContextPolicy>` + `context_policy()` (derives from `budgets`) | `config/mod.rs` |
+| `ROF_BUDGET_LONG\|MID\|SHORT`, `ROF_SUMMARIZE_AT` (long+mid; `0.0`/`off` disarms) | `main.rs` |
+| `layer_summaries` / `layer_truncations` in `ContextMetrics` and as `rof compare` rows | `eval/metrics.rs`, `eval/compare.rs` |
+| Offline acceptance: 9 tests (threshold, arming, cache reuse, fallback, `Raw`, indexing, config) | `tests/context_policy.rs` |
+
+Design points, and all six deviations from the plan's sketch are recorded in
+`docs/PLAN-harness-v2.md` § *Stage 2 as built*. The three that matter for anyone touching this code:
+
+- **Order inverted.** v1 summarized the whole prompt *because* it had overflowed, then cut anyway.
+  Now a layer over its `summarize_at` share is compressed by the cheap Context LLM *before* the cut,
+  the compression is cached by the layer's own text, and truncation is what a *failed* call falls
+  back to. The old whole-prompt path is deleted, not kept alongside.
+- **The cache lives in `ContextBuilder`, not `CtxState`.** The orchestrator rebuilds `CtxState` every
+  round, so a cache inside a per-round value caches nothing — which is precisely the case it exists
+  for (a retry must not buy the same summary twice).
+- **Defaults are asymmetric on purpose**: mid (retrieval, the only layer whose size follows the repo)
+  armed at `0.8`; long (the stable head = the provider's cached prefix) and short (artifact + checks +
+  refusals = the evidence a reviewer judges) at `0.0`, never.
+
+Offline: `cargo test` **84 passed** (73 before), clippy 0 warnings, fmt clean, committed as `98ae554`.
+
+**Live smoke** (`hard-two --limit 1 --jobs 1`, `ROF_PLANNER=skip`, `ROF_SUMMARIZE_AT=0.6`
+→ trace and report in `~/rof-runs-s2-smoke/`):
+
+- Exactly one summarize call, on the **mid** layer: `layer_summaries [0,1,0]`,
+  `layer_truncations [0,0,0]`, 3254 in / 207 out tokens traced as
+  `ModelCall{agent:"summarizer"}`, `metrics-method` passed in round 1, est $0.00289.
+- **The default threshold does not fire on this suite.** Retrieval puts ~11.9k chars in the mid layer
+  (~3.0k tokens) against a 16k-char cap — ~76% of budget, i.e. under the 0.8 default. `0.6` is the
+  first setting that fires, which is why the acceptance arm below uses it. Any claim that "stage 2
+  saves tokens" must name the arming; at defaults on these suites the stage is deliberately inert.
+
+**Next, in this order:**
+
+1. **Bound the summary request.** `plan_summarized` currently passes `pol.budget` as the summarize
+   `max_tokens`, so it may ask for up to a full layer's worth of tokens: a compression that is allowed
+   to expand is not one. Ask for half the layer's estimated tokens instead
+   (`raw.chars() / 8`, clamped to `>= 64` and `<= the layer budget`), and pin it with a test that
+   captures `LlmReq::max_tokens` (the counting stub in `tests/context_policy.rs` is the place).
+   Re-run `cargo test`, `cargo clippy --all-targets`, `cargo fmt --check`, commit, and **only then**
+   run arms — see trap 1 above.
+2. **The acceptance arms** (scripts are written and unused: `~/rof-s2-hard2.sh`, `~/rof-s2-repo.sh`).
+   Both arms of each pair are the *same* tree; the only variable is the arming, because at these
+   context sizes everything else stage 2 changed is inert:
+
+   ```bash
+   bash ~/rof-s2-hard2.sh   # hard-two, ROF_PLANNER=skip, 6 runs off + 6 runs ROF_SUMMARIZE_AT=0.6
+   bash ~/rof-s2-repo.sh    # repo-tasks --limit 6 --jobs 2, 3 runs each: before(a0d47a4 worktree) / off / armed
+   ```
+
+   The plan's acceptance is *matched non-inferior and cost/tokens down, summarize calls visible with
+   their tokens*. Read it through `rof compare` against the arms' reports rather than eyeballing, and
+   remember the mid layer carrying whole retrieved files is what the implementer acts on: if arming at
+   0.6 costs matches, the honest outcome is "the default (inert) stays, and the aggressive setting is
+   a measured loss" — not a new default.
+3. **Write the result into this file and into the plan**, then start stage 3 (programmable state:
+   `state/` module, `~/.rof/state.json`, `state.propose` behind the gate, `rof state approve|reject`).
+
+Artifacts left in place for the arm: `~/rof-arm-reasoner` (worktree at the pre-stage-2 tree `a0d47a4`,
+the "before" side), `~/rof-arm-skills` (empty scratch skill store every arm pins via
+`ROF_SKILLS_ROOT`), `~/rof-runs-s2-smoke` (the smoke trace + report). Task copies are deleted after
+each run by `measure-arm.sh`; `~/rof-runs-*/` holds only reports and traces.
+
+## Executor-model arm: a stronger executor did not pay (2026-09-14, night — measured, 6 runs/arm)
+
+Every residual failure class in every earlier round was model-side, so the ranked next lever was a
+stronger executor, not more prompt work. Two arms, identical frozen tree (`a0d47a4`), suite
+`hard-two`, `--jobs 1`, planner **on** (the shipped default), 6 runs each, one variable:
+`ROF_EXEC_MODEL`.
+
+| arm | matched | metrics-method | add-retriever-test | est $/run | in/run | out/run | wall/run |
+|---|---|---|---|---|---|---|---|
+| `deepseek-chat` (6 runs) | **3/12** | 3/6 | 0/6 | $0.0107 | 101k | 5.1k | 87 s |
+| `deepseek-reasoner` (6 runs) | 1/12 | 1/6 | 0/6 | $0.0075* | 49k | 7.3k | 83 s |
+
+\* The est column is one flat price row (deepseek-chat off-peak, 0.15/0.003/0.60 per Mtok) applied to
+every call regardless of model, so it is **not** a cross-model number: `deepseek-reasoner` is priced
+above `deepseek-chat` and its own rates were not verifiable this session (no web access), so its real
+spend is higher than the table. Treat tokens and matched as the comparable quantities.
+
+- **No improvement, and the sign is against the stronger model**: 1/12 vs 3/12 (Fisher p≈0.59 — six
+  runs per arm cannot separate them, so this is "no evidence of a gain", not "proven worse"). The
+  failures are the *same classes*: the reasoner's `metrics-method` run invented a
+  `TraceEvent::ToolCall` field set (`E0063: missing field agent`), exactly the behaviour chat shows,
+  after spending ~43% more output tokens per run to get there.
+- It did use fewer rounds (1.8 vs 3.0 mean on `metrics-method`) and fewer input tokens (49k vs 101k) —
+  so it is not confused, it is just not more correct, and reasoning tokens are billed as output.
+- Raw per-run rows (matched, per-task, tokens, latency, labels):
+  `docs/baselines/2026-09-14-executor-model-arm.json`; reports in `~/rof-runs-chat-baseline/` and
+  `~/rof-runs-reasoner/` (not committed).
+- **Consequence**: do not spend the next round shopping for a bigger executor. The remaining levers
+  are structural — make verification happen *before* the write (the model asserts facts about code it
+  has not read), or give the reviewer the `fs.read` it already holds in the policy. Independent
+  review by a *second* model remains untested (this arm changed the executor for all roles at once).
 
 ## Stage 1: skills — SKILL.md as procedural memory (2026-09-14, night — done)
 
@@ -145,7 +262,7 @@ Acceptance, measured:
 
 | Check | Result |
 |---|---|
-| `cargo test` | 73 passed, 0 failed (52 before stage 0, 57 before stage 1) |
+| `cargo test` | 84 passed, 0 failed (52 before stage 0, 57 before stage 1, 73 before stage 2) |
 | `cargo clippy --all-targets` | 0 warnings |
 | `cargo fmt --check` | clean |
 | `cargo build --release` | green, `target/release/rof` ≈ 5.9 MB |
@@ -483,16 +600,20 @@ the next round, not gaps in this one.
 
 ## Good next steps (ranked)
 
-1. `metrics-method` needs a read/verify behaviour, not context: it is 0/9 across every arm. The
-   cheapest experiments, in order: (a) tell the implementer to reuse an existing helper in the file
-   it edits before writing a new one; (b) let the artifact request reads (`reads: [...]`) and give it
-   one bounded turn with those files before it writes; (c) let the reviewer use the `fs.read` it
-   already holds in the policy. All three are prompt-or-plumbing small; measure on
-   `eval/suites/hard-two.json` first, then confirm on the full suite.
-2. Try a stronger executor model on the same suite (the `RoutingConfig` seam exists). Every failure
-   class in every arm is model-side; the harness now reports them honestly, so the next question is
-   how much of the ceiling is the model.
-3. Independent review: route the reviewer to a second model and measure whether verdicts change.
-4. `writes[]` as structured results + one helper for `apply_patches`/`apply_writes`.
+1. **Stage 2's acceptance arm** — the fix and the two commands are in the *Stage 2* section at the
+   top of this file. Nothing else should run before it: the stage is built and its live behaviour is
+   known, but "does arming the mid layer cost matches?" is unanswered, and the answer decides whether
+   the 0.8 default stands.
+2. **Verification before the write** — `metrics-method`'s residual, and now the one failure class
+   that survived *two* executor models: the model asserts facts about code it has not read
+   (`E0559`/`E0063` invented field sets, `E0592`/`E0428` duplicates, prose instead of a patch). The
+   harness already hands it the file (path map + read-request turn + file-state evidence), so the
+   missing piece is a check the model must pass *before* the artifact is accepted — e.g. the
+   implementer's own `cargo check` result travelling with the artifact, or the reviewer (which holds
+   `fs.read` in the policy but is handed `tools: None`) reading the file it is judging.
+3. **Independent review**: route only the reviewer to a second model and measure whether verdicts
+   change. Distinct from the executor arm above, which swapped the model for every role at once.
+4. `writes[]` as structured results + one helper for `apply_patches`/`apply_writes` (the same 30-line
+   loop exists twice).
 5. Symlink-aware containment in `resolve_under` before any suite is allowed to run with a tool that
-   can create links.
+   can create links (the fix is ~5 lines: canonicalize the parent, compare against the canonical root).
