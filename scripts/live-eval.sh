@@ -13,8 +13,12 @@ SUITE="${1:-eval/suites/repo-tasks.json}"
 RUNS_DIR="${ROF_RUNS_DIR:-$HOME/rof-runs}"
 mkdir -p "$RUNS_DIR"
 
-export ROF_TOKEN="$(grep -m1 '^DEEPSEEK_API_KEY=' "$HOME/.hermes/.env" | cut -d= -f2- | tr -d '"')"
-[ -n "$ROF_TOKEN" ] || { echo "no DEEPSEEK_API_KEY in ~/.hermes/.env" >&2; exit 1; }
+# Token: an existing ROF_TOKEN wins (any provider, e.g. `source /tmp/atria-creds.sh`);
+# otherwise fall back to DeepSeek from ~/.hermes/.env.
+if [ -z "${ROF_TOKEN:-}" ]; then
+  export ROF_TOKEN="$(grep -m1 '^DEEPSEEK_API_KEY=' "$HOME/.hermes/.env" | cut -d= -f2- | tr -d '"')"
+  [ -n "$ROF_TOKEN" ] || { echo "no ROF_TOKEN set and no DEEPSEEK_API_KEY in ~/.hermes/.env" >&2; exit 1; }
+fi
 export ROF_CHAT_BASE="${ROF_CHAT_BASE:-https://api.deepseek.com}"
 export ROF_CTX_MODEL="${ROF_CTX_MODEL:-deepseek-chat}"
 export ROF_EXEC_MODEL="${ROF_EXEC_MODEL:-deepseek-chat}"
