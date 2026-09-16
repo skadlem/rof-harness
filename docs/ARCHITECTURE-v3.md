@@ -193,6 +193,8 @@ struct TaskOutcome {
 
 **Design.** **Recall = (files a task's patches touched) ∩ (files in the retrieved set) / (files the patches touched).** Computed from the git diff (free, given §4.2) against the retrieval log. Ships *before* any retrieval feature — including the graph in §8 — because a recall baseline is the only thing that can say whether graph expansion is worth building at all.
 
+**Implementation (landed).** `ContextMetrics` carries `changed_files` / `recalled_files` counts and a derived `recall()`; `from_run` takes the change set from §4.2's per-task `changed_files` (ground truth — *not* the artifact's `file_state`, which is self-reported and counts refused patches), and intersects it with the run's `retrieved[]`. It prints per task (`recall=recalled/changed`) and aggregates in `rof compare` as a true ratio, not a mean of per-task ratios, so a task touching 1/1 cannot average away one touching 0/100. `retrieved` is run-wide, so a multi-task plan measures each task against the single retrieval that fed the plan — the signal this run supports; per-task retrieval, if it ever exists, is what would sharpen it.
+
 ### 4.5 `engine/router.rs` — `verify_model` slot *(new, config only)*
 
 **Trigger.** "Independent verification" is currently untestable: the reviewer is always the executor.
@@ -204,6 +206,8 @@ struct TaskOutcome {
 **Trigger.** v2 documents the hole: `under()` is lexical, so a symlink inside an allowed dir can escape it. Until this lands, "deny-by-default" is real for paths and performative for symlinks.
 
 **Design.** Canonicalize the parent directory before any write; refuse a symlink escape. Prerequisite for any trusted write-enabled run against an untrusted tree. Ponytail's rule holds: never simplify away a trust boundary.
+
+**Implementation (landed).** `tools::symlink_safe` runs on every read, list and write: it resolves the containing directory against the canonical root (the root itself is the trust anchor and is exempt, so `path: "."` still works), and separately resolves a symlinked final name — a verified directory is not enough, since writing through `/root/link -> /etc/x` still lands in `/etc`. Chains resolve fully when the target exists; a *dangling* link is checked by name rather than trusted, because the write would create its target. A link that resolves back inside the root still reads, so the fix costs nothing legitimate. `copy_tree` already skipped symlinks per entry, so no task copy carries one in.
 
 ## 5. Invariants that must survive v3
 

@@ -234,3 +234,98 @@ async fn git_substrate_is_unreachable_by_any_agent() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// §4.6: `under()` is lexical, so a symlink inside an allowed dir can escape it.
+/// Every read and write must resolve the real path — a link out of the root
+/// leaks data one way and corrupts it the other.
+#[tokio::test]
+async fn symlinks_cannot_escape_the_tool_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!("rof-link-{}", std::process::id()));
+    let outside = std::env::temp_dir().join(format!("rof-link-out-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(root.join("real.md"), "inside").unwrap();
+    std::fs::write(outside.join("secret.md"), "outside").unwrap();
+
+    // A link out of the root, and a link to a dir out of the root.
+    symlink(outside.join("secret.md"), root.join("file.md")).unwrap();
+    symlink(&outside, root.join("dir")).unwrap();
+    // A legitimate link that stays inside the root must still work.
+    symlink(
+        root.join("real.md"),
+        root.join("sub".to_string() + "/ok.md"),
+    )
+    .unwrap();
+
+    let mut reg = ToolRegistry::new(policy_for(root.clone()));
+    reg.register(FsListTool::new(root.clone()));
+    reg.register(FsReadTool::new(root.clone()));
+    reg.register(FsWriteTool::new(root.clone()));
+
+    // Reading a linked file outside the root is an exfil path.
+    let (r, _) = reg
+        .call(
+            "implementer",
+            "fs.read",
+            Some(&root),
+            serde_json::json!({"path": "file.md"}),
+        )
+        .await;
+    assert!(r.is_err(), "a symlink out of the root must not be readable");
+
+    // Writing through one must not create or corrupt anything outside.
+    let (r, _) = reg
+        .call(
+            "implementer",
+            "fs.write",
+            Some(&root),
+            serde_json::json!({"path": "file.md", "content": "pwned"}),
+        )
+        .await;
+    assert!(
+        r.is_err(),
+        "a write through an escaping symlink must be refused"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("secret.md")).unwrap(),
+        "outside",
+        "the write must not have landed outside the root"
+    );
+
+    // A linked directory is the same hole at directory granularity.
+    let (r, _) = reg
+        .call(
+            "implementer",
+            "fs.write",
+            Some(&root),
+            serde_json::json!({"path": "dir/new.md", "content": "pwned"}),
+        )
+        .await;
+    assert!(r.is_err(), "a write under an escaping dir must be refused");
+    assert!(
+        !outside.join("new.md").exists(),
+        "nothing may be created outside the root"
+    );
+
+    // A link that resolves inside the root is not collateral damage.
+    let (r, _) = reg
+        .call(
+            "planner",
+            "fs.read",
+            Some(&root),
+            serde_json::json!({"path": "sub/ok.md"}),
+        )
+        .await;
+    assert_eq!(
+        r.unwrap().output,
+        "inside",
+        "an internal link must still read"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&outside).ok();
+}

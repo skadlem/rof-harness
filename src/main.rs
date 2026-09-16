@@ -371,10 +371,12 @@ async fn main() -> anyhow::Result<()> {
             let rep = runner.run_suite_with_jobs(&suite, jobs).await;
             for t in &rep.tasks {
                 println!(
-                    "  [{}] {} rounds={} {}",
+                    "  [{}] {} rounds={} recall={}/{} {}",
                     if t.matched { "OK" } else { "MISMATCH" },
                     t.name,
                     t.rounds,
+                    t.context.recalled_files,
+                    t.context.changed_files,
                     if t.matched { "" } else { &t.feedback }
                 );
             }

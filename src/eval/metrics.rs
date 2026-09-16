@@ -237,6 +237,15 @@ pub struct ContextMetrics {
     /// what was delivered, not what was paid for here.
     #[serde(default)]
     pub layer_summaries: [u32; 3],
+    /// Files git recorded as changed by this run's attempts (§4.2), i.e. the
+    /// set the recall metric is measured against. Ground truth, unlike the
+    /// artifact's `file_state`, which is self-reported and counts refused
+    /// patches too.
+    pub changed_files: usize,
+    /// Of `changed_files`, present in the retrieved set. `recall()` is the
+    /// ratio; 0.0 when nothing changed (undefined, not zero).
+    #[serde(default)]
+    pub recalled_files: usize,
     /// Per-layer views the strategy had to cut, same indexing.
     #[serde(default)]
     pub layer_truncations: [u32; 3],
@@ -282,6 +291,33 @@ impl ContextMetrics {
             .filter(|(p, _)| touched.contains(p))
             .map(|(_, c)| c)
             .sum();
+        // Recall (§4.4): git's change set vs what retrieval put in front of
+        // the agents. `retrieved` is run-wide, so a multi-task plan measures
+        // each task against the one retrieval — the signal this run supports.
+        let mut changed: Vec<&str> = Vec::new();
+        for t in out
+            .get("tasks")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            for f in t
+                .get("changed_files")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(p) = f.as_str() {
+                    if !changed.contains(&p) {
+                        changed.push(p);
+                    }
+                }
+            }
+        }
+        let recalled = changed
+            .iter()
+            .filter(|p| retrieved.iter().any(|(r, _)| r == *p))
+            .count();
         Self {
             retrieved_files: retrieved.len(),
             retrieved_chars: total as usize,
@@ -291,6 +327,8 @@ impl ContextMetrics {
             } else {
                 referenced as f32 / total as f32
             },
+            changed_files: changed.len(),
+            recalled_files: recalled,
             summarize_calls: out
                 .get("summarize_calls")
                 .and_then(|v| v.as_u64())
@@ -318,6 +356,8 @@ impl ContextMetrics {
             acc.summarize_calls += t.summarize_calls;
             acc.summarize_tokens += t.summarize_tokens;
             acc.truncated_views += t.truncated_views;
+            acc.changed_files += t.changed_files;
+            acc.recalled_files += t.recalled_files;
             for i in 0..3 {
                 acc.layer_summaries[i] += t.layer_summaries[i];
                 acc.layer_truncations[i] += t.layer_truncations[i];
@@ -329,6 +369,18 @@ impl ContextMetrics {
             acc.referenced_chars as f32 / acc.retrieved_chars as f32
         };
         acc
+    }
+
+    /// Recall (§4.4): the share of git-recorded changes whose file retrieval
+    /// had already put in front of the agents. 0.0 when nothing changed —
+    /// undefined, not zero. Reads the counts so a suite aggregate is a true
+    /// ratio, not a mean of per-task ratios.
+    pub fn recall(&self) -> f32 {
+        if self.changed_files == 0 {
+            0.0
+        } else {
+            self.recalled_files as f32 / self.changed_files as f32
+        }
     }
 }
 
@@ -393,6 +445,57 @@ mod tests {
         assert_eq!(r.success_rate(), 1.0);
         assert_eq!(r.utility(), 1.0); // λ=0 by default
         assert_eq!(r.tokens_by_agent.get("implementer"), Some(&800));
+    }
+
+    #[test]
+    fn recall_counts_git_changed_files_against_retrieval() {
+        let out = serde_json::json!({
+            "retrieved": [
+                {"path": "src/a.rs", "chars": 100},
+                {"path": "src/b.rs", "chars": 50},
+            ],
+            "tasks": [
+                {"changed_files": ["src/a.rs", "src/c.rs"]},
+                // A file changed twice across the plan's tasks counts once.
+                {"changed_files": ["src/c.rs", "README.md"]},
+            ],
+        });
+        let m = ContextMetrics::from_run(&out);
+        // git saw 3 distinct files; retrieval had handed over 1 of them.
+        assert_eq!((m.changed_files, m.recalled_files), (3, 1));
+        assert!((m.recall() - 1.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn recall_is_zero_when_nothing_changed() {
+        // A no-write run has an empty change set: the ratio is undefined, and
+        // reporting 0.0 (not a mean over zero tasks) is what the gate sees.
+        let out = serde_json::json!({
+            "retrieved": [{"path": "src/a.rs", "chars": 100}],
+            "tasks": [{"changed_files": []}],
+        });
+        let m = ContextMetrics::from_run(&out);
+        assert_eq!((m.changed_files, m.recalled_files), (0, 0));
+        assert_eq!(m.recall(), 0.0);
+    }
+
+    #[test]
+    fn recall_aggregates_as_a_true_ratio_not_a_mean() {
+        // ponytail: recall() reads the counts, so a suite aggregate is
+        // weighted by files changed — one task touching 1/1 must not average
+        // away a task touching 0/100.
+        let a = ContextMetrics {
+            changed_files: 1,
+            recalled_files: 1,
+            ..Default::default()
+        };
+        let b = ContextMetrics {
+            changed_files: 100,
+            recalled_files: 0,
+            ..Default::default()
+        };
+        let s = ContextMetrics::sum([a, b]);
+        assert!((s.recall() - 1.0 / 101.0).abs() < 1e-6);
     }
 
     #[test]
