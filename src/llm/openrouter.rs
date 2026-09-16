@@ -133,7 +133,7 @@ impl OpenRouterClient {
 
 #[async_trait]
 impl LlmClient for OpenRouterClient {
-    async fn complete(&self, model: &str, req: LlmReq) -> Result<LlmResp, LlmError> {
+    async fn complete(&self, model: &str, mut req: LlmReq) -> Result<LlmResp, LlmError> {
         let t = Instant::now();
         // ponytail: retry lives here, not in every caller. Free tiers 429 often.
         let mut last = LlmError::Transport("no attempts".to_string());
@@ -150,12 +150,23 @@ impl LlmClient for OpenRouterClient {
                     })
                 }
                 Err(e) => {
-                    let retryable = ["429", "500", "502", "503", "504"]
-                        .iter()
-                        .any(|c| e.to_string().contains(c));
+                    let text = e.to_string();
+                    // A truncation is worth one immediate retry: the model's
+                    // own reasoning budget varies per prompt, and a re-roll
+                    // often finishes. It is not worth four slow retries.
+                    let truncated = text.contains(FINISH_LENGTH);
+                    let retryable = truncated
+                        || ["429", "500", "502", "503", "504", "402"]
+                            .iter()
+                            .any(|c| text.contains(c));
                     last = e;
-                    if !retryable {
+                    if !retryable || (truncated && attempt > 0) {
                         break;
+                    }
+                    if truncated {
+                        // ponytail: the only retry worth making is a roomier
+                        // one — a same-size re-roll just truncates again.
+                        req.max_tokens = req.max_tokens.saturating_mul(2);
                     }
                 }
             }
