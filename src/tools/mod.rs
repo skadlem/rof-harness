@@ -1,10 +1,13 @@
-use crate::config::PermissionPolicy;
+use crate::config::{PermissionPolicy, SkillsConfig};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+pub mod skills;
+pub use skills::{SkillsListTool, SkillsManageTool, SkillsViewTool};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutput {
@@ -47,7 +50,13 @@ impl ToolRegistry {
     /// The full v1 toolset in one place, so the CLI and the eval runner
     /// cannot drift apart when a tool is added (live-bitten once already).
     /// The workdir is anchored here; every other grant comes from `policy`.
-    pub fn with_defaults(root: PathBuf, policy: PermissionPolicy) -> Self {
+    ///
+    /// The skills root is deliberately NOT added to `allowed_dirs`: the skill
+    /// tools address skills by name and enforce their own containment, and
+    /// putting the root on the allowlist would hand `fs.write`/`fs.patch` —
+    /// which the implementer holds — a way around the skills write policy
+    /// (Propose by default). One tool, one door.
+    pub fn with_defaults(root: PathBuf, policy: PermissionPolicy, skills: SkillsConfig) -> Self {
         let mut p = policy;
         p.allowed_dirs = vec![root.clone()];
         let mut r = Self::new(p.clone());
@@ -55,8 +64,25 @@ impl ToolRegistry {
         r.register(FsReadTool::new(root.clone()));
         r.register(FsPatchTool::new(root.clone()));
         r.register(FsWriteTool::new(root.clone()));
-        r.register(ProcRunTool::new(root, p.allowed_commands.clone()));
+        r.register(ProcRunTool::new(root.clone(), p.allowed_commands.clone()));
         r.register(HttpGetTool::new(p.allowed_hosts.clone()));
+        // A repo can ship skills with it (`<workdir>/skills/`), read-only.
+        let extra_root = {
+            let d = root.join("skills");
+            d.is_dir().then_some(d)
+        };
+        let skill_root = skills
+            .root
+            .clone()
+            .unwrap_or_else(crate::skills::SkillManager::default_root);
+        let manager = Arc::new(crate::skills::SkillManager::new(
+            skill_root,
+            extra_root,
+            skills.policy,
+        ));
+        r.register(SkillsListTool::new(manager.clone()));
+        r.register(SkillsViewTool::new(manager.clone()));
+        r.register(SkillsManageTool::new(manager));
         r
     }
 
@@ -121,7 +147,7 @@ fn normalize(p: &Path) -> PathBuf {
 // ponytail: lexical containment only, no symlink resolution — a link inside the
 // root is followed out of it. Canonicalize the parent before a write.
 // Component-wise starts_with: /allowed2 never matches /allowed, .. can't escape.
-fn under(root: &Path, cand: &Path) -> bool {
+pub(crate) fn under(root: &Path, cand: &Path) -> bool {
     normalize(cand).starts_with(normalize(root))
 }
 
@@ -255,6 +281,68 @@ fn replace_span(original: &str, start: usize, end: usize, with: &str) -> String 
     s
 }
 
+/// Search/replace one hunk: exact unique match first, else a unique match on
+/// whitespace-collapsed text. Returns the new text plus the replaced span.
+/// Shared by `fs.patch` and the skill manager, so "a patch" means one thing in
+/// this harness and a refused patch reads the same wherever it happened.
+pub fn apply_hunk(
+    original: &str,
+    search: &str,
+    replace: &str,
+) -> Result<(String, usize, usize), String> {
+    // Fast path: exact unique match.
+    let exact: Vec<usize> = original.match_indices(search).map(|(i, _)| i).collect();
+    let (start, end) = if exact.len() == 1 {
+        let s = exact[0];
+        (s, s + search.len())
+    } else if !search.is_empty() && exact.is_empty() {
+        // Tolerant path: match on whitespace-collapsed text.
+        let (nfile, fmap) = normalize_ws(original);
+        let (nsearch, _) = normalize_ws(search);
+        if nsearch.is_empty() {
+            return Err("search is only whitespace".to_string());
+        }
+        let hits: Vec<usize> = nfile.match_indices(&nsearch).map(|(i, _)| i).collect();
+        if hits.is_empty() {
+            return Err("search string not found".to_string());
+        }
+        if hits.len() > 1 {
+            return Err(format!(
+                "search matches {} spans, refusing ambiguous patch",
+                hits.len()
+            ));
+        }
+        let ns = hits[0];
+        let ne = ns + nsearch.len();
+        // Map back to the original span. fmap[i] is the original byte
+        // where normalized byte i came from; if the match edge lands
+        // inside a collapsed run, absorb the rest of that run (it ends
+        // where the next normalized byte's source begins).
+        let s = fmap[ns];
+        let mut e = fmap[ne - 1] + 1;
+        let run_end = if ne < fmap.len() {
+            fmap[ne]
+        } else {
+            original.len()
+        };
+        while e < run_end
+            && e < original.len()
+            && matches!(original.as_bytes()[e], b' ' | b'\t' | b'\n' | b'\r')
+        {
+            e += 1;
+        }
+        (s, e)
+    } else if exact.len() > 1 {
+        return Err(format!(
+            "search matches {} spans, refusing ambiguous patch",
+            exact.len()
+        ));
+    } else {
+        return Err("missing search".to_string());
+    };
+    Ok((replace_span(original, start, end, replace), start, end))
+}
+
 #[async_trait]
 impl Tool for FsPatchTool {
     fn name(&self) -> &'static str {
@@ -286,57 +374,8 @@ impl Tool for FsPatchTool {
         if original.len() > 512 * 1024 {
             return Err(ToolError::Failed("file over 512KB cap".to_string()));
         }
-        // Fast path: exact unique match.
-        let exact: Vec<usize> = original.match_indices(search).map(|(i, _)| i).collect();
-        let (start, end) = if exact.len() == 1 {
-            let s = exact[0];
-            (s, s + search.len())
-        } else if !search.is_empty() && exact.is_empty() {
-            // Tolerant path: match on whitespace-collapsed text.
-            let (nfile, fmap) = normalize_ws(&original);
-            let (nsearch, _) = normalize_ws(search);
-            if nsearch.is_empty() {
-                return Err(ToolError::Failed("search is only whitespace".to_string()));
-            }
-            let hits: Vec<usize> = nfile.match_indices(&nsearch).map(|(i, _)| i).collect();
-            if hits.is_empty() {
-                return Err(ToolError::Failed("search string not found".to_string()));
-            }
-            if hits.len() > 1 {
-                return Err(ToolError::Failed(format!(
-                    "search matches {} spans, refusing ambiguous patch",
-                    hits.len()
-                )));
-            }
-            let ns = hits[0];
-            let ne = ns + nsearch.len();
-            // Map back to the original span. fmap[i] is the original byte
-            // where normalized byte i came from; if the match edge lands
-            // inside a collapsed run, absorb the rest of that run (it ends
-            // where the next normalized byte's source begins).
-            let s = fmap[ns];
-            let mut e = fmap[ne - 1] + 1;
-            let run_end = if ne < fmap.len() {
-                fmap[ne]
-            } else {
-                original.len()
-            };
-            while e < run_end
-                && e < original.len()
-                && matches!(original.as_bytes()[e], b' ' | b'\t' | b'\n' | b'\r')
-            {
-                e += 1;
-            }
-            (s, e)
-        } else if exact.len() > 1 {
-            return Err(ToolError::Failed(format!(
-                "search matches {} spans, refusing ambiguous patch",
-                exact.len()
-            )));
-        } else {
-            return Err(ToolError::Failed("missing search".to_string()));
-        };
-        let updated = replace_span(&original, start, end, replace);
+        let (updated, start, end) =
+            apply_hunk(&original, search, replace).map_err(ToolError::Failed)?;
         std::fs::write(&p, updated).map_err(|e| ToolError::Failed(e.to_string()))?;
         Ok(ToolOutput {
             ok: true,

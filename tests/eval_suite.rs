@@ -1,9 +1,25 @@
 use async_trait::async_trait;
 use rof::config::AppConfig;
-use rof::eval::{EvalSuite, EvalTask, EvaluationRunner};
+use rof::eval::{
+    compare, fnv1a_hex, git_head, ContextMetrics, EvalSuite, EvalTask, EvaluationRunner, RunLabel,
+    SuiteReport, TaskChange, TaskResult,
+};
 use rof::llm::{ContextService, ExecutorService, LlmClient, LlmError, LlmReq, LlmResp};
 use rof::obs::TraceSink;
+use rof::skills::SkillPolicy;
 use std::sync::Arc;
+
+/// Config for a test runner: everything default except the skill store, which
+/// is pinned to a scratch path. `AppConfig::default()` means `~/.rof/skills`,
+/// so an unpinned test would read whatever the developer's machine happens to
+/// have approved — a hidden input that changes prompts and metrics.
+fn test_cfg() -> AppConfig {
+    let mut cfg = AppConfig::default();
+    cfg.skills.root =
+        Some(std::env::temp_dir().join(format!("rof-test-skills-{}", std::process::id())));
+    cfg.skills.policy = SkillPolicy::ReadOnly;
+    cfg
+}
 
 struct Fake;
 
@@ -39,7 +55,7 @@ async fn suite_tracks_per_task_match() {
     let client = Arc::new(Fake);
     let runner = EvaluationRunner::new(
         Arc::new(TraceSink::new()),
-        AppConfig::default(),
+        test_cfg(),
         ContextService::new(client.clone(), "fake-ctx".to_string()),
         ExecutorService::new(client, "fake-exec".to_string(), None),
         root.clone(),
@@ -146,7 +162,7 @@ async fn parallel_tasks_are_isolated_per_task_dir() {
     let client = Arc::new(GoalAware);
     let cfg = AppConfig {
         max_parallel_tasks: 2,
-        ..Default::default()
+        ..test_cfg()
     };
     let runner = EvaluationRunner::new(
         Arc::new(TraceSink::new()),
@@ -263,7 +279,7 @@ async fn harness_rejects_pass_without_writes() {
     let sink = Arc::new(TraceSink::new());
     let runner = EvaluationRunner::new(
         sink.clone(),
-        AppConfig::default(),
+        test_cfg(),
         ContextService::new(client.clone(), "fake-ctx".to_string()),
         ExecutorService::new(client, "fake-exec".to_string(), None),
         root.clone(),
@@ -339,7 +355,7 @@ async fn task_root_is_honoured() {
     let client = Arc::new(Writer);
     let cfg = AppConfig {
         task_root: Some(copies_root.clone()),
-        ..Default::default()
+        ..test_cfg()
     };
     let suite = EvalSuite {
         name: "root".to_string(),
@@ -387,4 +403,337 @@ fn suite_loads_from_json() {
     let s = EvalSuite::load(&path).unwrap();
     assert_eq!(s.name, "sample");
     assert_eq!(s.tasks.len(), 2);
+}
+
+// ---------------------------------------------------------------- stage 0 ---
+// Report labels, per-task context metrics and `rof compare`. All of it is
+// additive: these tests also pin that an old report still loads.
+
+/// A suite of `(name, goal)` tasks, each expecting a write and a pass.
+fn suite_of(name: &str, goals: &[(&str, &str)]) -> EvalSuite {
+    EvalSuite {
+        name: name.to_string(),
+        tasks: goals
+            .iter()
+            .map(|(n, g)| EvalTask {
+                name: n.to_string(),
+                goal: g.to_string(),
+                expect_pass: true,
+                checks: Vec::new(),
+                expect_writes: true,
+                max_tokens: None,
+            })
+            .collect(),
+    }
+}
+
+/// A report that ran against a scratch tree: the `Fake` client writes
+/// `notes.md`, so a goal naming "eval target" retrieves exactly that file.
+async fn run_fake_suite(tag: &str) -> SuiteReport {
+    let root = std::env::temp_dir().join(format!("rof-eval-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("notes.md"), "eval target content").unwrap();
+    let client = Arc::new(Fake);
+    let runner = EvaluationRunner::new(
+        Arc::new(TraceSink::new()),
+        test_cfg(),
+        ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client, "fake-exec".to_string(), None),
+        root.clone(),
+    );
+    let rep = runner
+        .run_suite(&suite_of(tag, &[("work", "eval target")]))
+        .await;
+    cleanup_task_dirs(&["work"]);
+    std::fs::remove_dir_all(&root).ok();
+    rep
+}
+
+/// A report must say which harness, config, suite and model pair produced it —
+/// that is what makes two runs comparable instead of anecdotal.
+#[tokio::test]
+async fn report_carries_a_label_and_its_inputs() {
+    let rep = run_fake_suite("label").await;
+    assert_eq!(rep.label.ctx_model, "fake-ctx");
+    assert_eq!(rep.label.exec_model, "fake-exec");
+    assert_eq!(rep.label.harness_version, env!("CARGO_PKG_VERSION"));
+    assert!(!rep.label.config_hash.is_empty(), "{:?}", rep.label);
+    assert!(!rep.label.suite_hash.is_empty(), "{:?}", rep.label);
+    assert_eq!(
+        rep.label.git_head, "unknown",
+        "a scratch tree is not a git repo: {:?}",
+        rep.label
+    );
+    // The label survives a round trip through the report file, and the hashes
+    // are recomputable by hand (config = the `rof config` dump, verbatim).
+    let cfg = test_cfg();
+    let suite = suite_of("label", &[("work", "eval target")]);
+    assert_eq!(
+        rep.label.config_hash,
+        fnv1a_hex(cfg.to_json().as_bytes()),
+        "config_hash is the canonical config dump, hashed"
+    );
+    assert_eq!(
+        rep.label.suite_hash,
+        fnv1a_hex(serde_json::to_string(&suite).unwrap().as_bytes())
+    );
+    let json = serde_json::to_string(&rep).unwrap();
+    let back: SuiteReport = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.label, rep.label);
+    assert_eq!(back.tasks[0].context, rep.tasks[0].context);
+
+    // Same inputs, same hashes; a changed config or task set is a different
+    // report. `--limit` truncates the suite before it runs, so the label
+    // describes the tasks that actually ran.
+    let root = std::env::temp_dir();
+    let rebuilt = RunLabel::build(&cfg, &suite, &root);
+    assert_eq!(rebuilt.git_head, rep.label.git_head);
+    assert_eq!(rebuilt.config_hash, rep.label.config_hash);
+    assert_eq!(rebuilt.suite_hash, rep.label.suite_hash);
+    assert_eq!(rebuilt.harness_version, rep.label.harness_version);
+    // The model ids name the services the run actually used (`rof eval` wires
+    // both from the same config; this runner was handed fake ones).
+    assert_eq!(rebuilt.ctx_model, "cheap-model");
+    assert_eq!(rep.label.ctx_model, "fake-ctx");
+    let other_cfg = AppConfig {
+        max_review_rounds: 9,
+        ..cfg.clone()
+    };
+    assert_ne!(
+        RunLabel::build(&other_cfg, &suite, &root).config_hash,
+        rep.label.config_hash
+    );
+    let mut two = suite.clone();
+    two.tasks.push(EvalTask {
+        name: "second".to_string(),
+        goal: "eval target".to_string(),
+        expect_pass: true,
+        checks: Vec::new(),
+        expect_writes: true,
+        max_tokens: None,
+    });
+    let mut shorter = two.clone();
+    shorter.tasks.truncate(1);
+    assert_ne!(
+        RunLabel::build(&cfg, &shorter, &root).suite_hash,
+        RunLabel::build(&cfg, &two, &root).suite_hash,
+        "a --limit run is a different task set, so a different label"
+    );
+    // The fallback: a label must never fail a run.
+    assert_eq!(
+        git_head(std::path::Path::new("/no/such/dir/at/all")),
+        "unknown"
+    );
+}
+
+/// Context accounting is folded from data the run already carries: what
+/// retrieval handed over, what the task touched, what summarizing cost.
+#[tokio::test]
+async fn context_metrics_fold_retrieval_against_what_the_task_touched() {
+    let rep = run_fake_suite("ctx").await;
+    let c = &rep.tasks[0].context;
+    assert_eq!(c.retrieved_files, 1, "goal keywords match notes.md: {c:?}");
+    assert!(c.retrieved_chars > 0, "{c:?}");
+    assert_eq!(
+        c.referenced_chars, c.retrieved_chars,
+        "the task wrote the one retrieved file: {c:?}"
+    );
+    assert!((c.relevance_proxy - 1.0).abs() < 1e-6, "{c:?}");
+}
+
+#[test]
+fn context_metrics_count_only_what_matched_and_never_panic_on_an_old_run() {
+    let out = serde_json::json!({
+        "retrieved": [{"path": "src/a.rs", "chars": 100}, {"path": "src/b.rs", "chars": 300}],
+        "tasks": [{"artifact": {"file_state": [
+            {"path": "src/b.rs", "why": "applied", "current_content": "x"},
+            {"path": "src/c.rs", "why": "applied", "current_content": "y"},
+        ]}}],
+        "summarize_calls": 2,
+        "summarize_tokens": 700,
+        "truncated_views": 3,
+    });
+    let m = ContextMetrics::from_run(&out);
+    assert_eq!(m.retrieved_files, 2);
+    assert_eq!(m.retrieved_chars, 400);
+    assert_eq!(m.referenced_chars, 300, "src/c.rs was not retrieved at all");
+    assert!((m.relevance_proxy - 0.75).abs() < 1e-6, "{m:?}");
+    assert_eq!(m.summarize_calls, 2);
+    assert_eq!(m.summarize_tokens, 700);
+    assert_eq!(m.truncated_views, 3);
+    // A run JSON from before these keys existed folds to zeroes, no panic.
+    assert_eq!(
+        ContextMetrics::from_run(&serde_json::json!({})),
+        ContextMetrics::default()
+    );
+}
+
+fn labelled_task(name: &str, matched: bool, rounds: u32, feedback: &str) -> TaskResult {
+    TaskResult {
+        name: name.to_string(),
+        passed: matched,
+        expected: true,
+        matched,
+        rounds,
+        feedback: feedback.to_string(),
+        context: ContextMetrics {
+            retrieved_files: 1,
+            retrieved_chars: 400,
+            referenced_chars: 200,
+            relevance_proxy: 0.5,
+            ..ContextMetrics::default()
+        },
+    }
+}
+
+fn labelled_report(suite_hash: &str, tasks: Vec<TaskResult>) -> SuiteReport {
+    SuiteReport {
+        tasks,
+        label: RunLabel {
+            git_head: "aaaaaaa".to_string(),
+            config_hash: "c0ffee".to_string(),
+            suite_hash: suite_hash.to_string(),
+            ctx_model: "ctx".to_string(),
+            exec_model: "exec".to_string(),
+            harness_version: "0.1.0".to_string(),
+        },
+        ..SuiteReport::default()
+    }
+}
+
+/// `rof compare`: the task that moved, the metric that moved, and the warning
+/// that says whether the two reports are comparable at all.
+#[test]
+fn compare_names_the_tasks_and_metrics_that_moved() {
+    let mut a = labelled_report(
+        "suite-a",
+        vec![
+            labelled_task("winner", true, 1, ""),
+            labelled_task(
+                "breaker",
+                false,
+                2,
+                "patch refused: search string not found",
+            ),
+            labelled_task("gone", true, 1, ""),
+        ],
+    );
+    let mut b = labelled_report(
+        "suite-a",
+        vec![
+            labelled_task("winner", true, 1, ""),
+            labelled_task("breaker", true, 1, ""),
+            labelled_task("new", false, 1, "no writes applied"),
+        ],
+    );
+    a.aggregate.est_cost_usd = 0.010;
+    a.aggregate.est_input_tokens = 1_000;
+    a.aggregate.tool_calls = 10;
+    a.aggregate.tool_ok = 10;
+    b.aggregate.est_cost_usd = 0.020;
+    b.aggregate.est_input_tokens = 800;
+    b.aggregate.tool_calls = 10;
+    b.aggregate.tool_ok = 9;
+
+    let c = compare(&a, &b);
+    assert_eq!((c.matched_a, c.matched_b), (2, 2));
+    assert_eq!(c.gained(), 1, "breaker went fail -> pass");
+    assert_eq!(c.lost(), 0);
+    let change = |name: &str| {
+        c.tasks
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.change())
+            .unwrap()
+    };
+    assert_eq!(change("breaker"), TaskChange::Gained);
+    assert_eq!(change("gone"), TaskChange::OnlyInA);
+    assert_eq!(change("new"), TaskChange::OnlyInB);
+    assert_eq!(change("winner"), TaskChange::Same);
+    assert_eq!(
+        c.changed().len(),
+        3,
+        "one gain, one only-in-a, one only-in-b"
+    );
+
+    // The note explains the move from the side that failed. A task that exists
+    // on one side only did not "move": it has no note.
+    let breaker = c.tasks.iter().find(|t| t.name == "breaker").unwrap();
+    assert!(breaker.note.contains("patch refused"), "{}", breaker.note);
+    let only_b = c.tasks.iter().find(|t| t.name == "new").unwrap();
+    assert!(only_b.note.is_empty(), "{}", only_b.note);
+    let gone = c.tasks.iter().find(|t| t.name == "gone").unwrap();
+    assert!(gone.note.is_empty(), "{}", gone.note);
+
+    let cost = c.metric("est_cost_usd").unwrap();
+    assert!((cost.delta() - 0.010).abs() < 1e-9, "{cost:?}");
+    assert!(cost.changed());
+    assert!(
+        (c.metric("tool_accuracy").unwrap().delta() + 0.1).abs() < 1e-9,
+        "{:?}",
+        c.metric("tool_accuracy")
+    );
+    assert_eq!(c.metric("est_input_tokens").unwrap().delta(), -200.0);
+    assert_eq!(c.metric("relevance_proxy").unwrap().a, 0.5);
+    assert_eq!(c.metric("matched").unwrap().delta(), 0.0);
+
+    // Same suite hash, same config => no comparability warning.
+    assert!(c.notes.is_empty(), "{:?}", c.notes);
+    // A different task set is not an A/B, and says so.
+    let d = compare(&a, &labelled_report("suite-b", b.tasks.clone()));
+    assert!(
+        d.notes.iter().any(|n| n.contains("suite_hash differs")),
+        "{:?}",
+        d.notes
+    );
+
+    // Self-comparison is all zeroes.
+    let z = compare(&a, &a);
+    assert!(z.changed().is_empty());
+    assert!(z.metrics.iter().all(|m| !m.changed()), "{:?}", z.metrics);
+    assert_eq!(z.metric("est_cost_usd").unwrap().delta(), 0.0);
+
+    // The rendering carries the rows a human reads.
+    let text = c.render();
+    for needle in ["breaker", "est_cost_usd", "relevance_proxy", "+0.01000"] {
+        assert!(text.contains(needle), "missing {needle} in:\n{text}");
+    }
+}
+
+/// The committed baseline predates stage 0: it must still load, compare, and
+/// say honestly that it carries no label and no context metrics.
+#[test]
+fn a_pre_stage_0_report_still_loads_and_compares_with_itself() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("docs/baselines/2026-09-14-deepseek-chat-6.json");
+    let rep = SuiteReport::load(&path).unwrap();
+    assert_eq!(rep.tasks.len(), 6);
+    assert!(rep.label.is_unlabeled(), "{:?}", rep.label);
+    assert_eq!(
+        rep.matched(),
+        3,
+        "the committed baseline is 3/6 (docs/STATUS.md)"
+    );
+    assert!(
+        rep.tasks
+            .iter()
+            .all(|t| t.context == ContextMetrics::default()),
+        "no context metrics in a pre-stage-0 report"
+    );
+    let c = compare(&rep, &rep);
+    assert!(c.changed().is_empty());
+    assert!(c.metrics.iter().all(|m| !m.changed()), "{:?}", c.metrics);
+    assert!(
+        c.notes.iter().any(|n| n.contains("unlabeled")),
+        "{:?}",
+        c.notes
+    );
+    assert!(
+        c.notes
+            .iter()
+            .any(|n| n.contains("no retrieved context recorded")),
+        "{:?}",
+        c.notes
+    );
 }

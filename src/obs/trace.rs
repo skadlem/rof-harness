@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Every orchestrator / agent / tool step emits one of these.
 /// The eval layer aggregates cost/latency/reliability from this stream.
@@ -52,20 +52,41 @@ pub enum TraceEvent {
         tokens: u64,
         limit: u64,
     },
+    /// Anything an agent did with the skill store, plus the harness handing a
+    /// skill's text to a model. `op` is one of: `list` (index delivered to an
+    /// agent), `view` (a body the model asked for), `reuse` (a body injected
+    /// because the task named the skill), `propose` / `apply` (a manage op
+    /// that wrote a proposal / changed the store directly).
+    SkillOp {
+        agent: String,
+        op: String,
+        /// Skill name ("" for a plain list).
+        name: String,
+        ok: bool,
+        /// Bytes read or written, when the op has a size.
+        #[serde(default)]
+        bytes: u64,
+    },
 }
 
 /// In-memory event stream, optionally mirrored to a JSONL file so each run
 /// leaves durable, diffable evidence (the meta-harness compares runs).
+///
+/// The file handle is behind an `Arc<Mutex<..>>` shared by every fork: parallel
+/// tasks write through different sinks in one process, and one event must stay
+/// one line. (`writeln!` on a `File` issues two `write` calls — the body and
+/// the newline — so two tasks could interleave into a single corrupt line;
+/// measured live on a `--jobs 2` skill run.)
 pub struct TraceSink {
-    inner: Mutex<(Vec<TraceEvent>, Option<std::fs::File>)>,
-    file_path: Option<PathBuf>,
+    inner: Mutex<Vec<TraceEvent>>,
+    file: Option<(Arc<Mutex<std::fs::File>>, PathBuf)>,
 }
 
 impl TraceSink {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new((Vec::new(), None)),
-            file_path: None,
+            inner: Mutex::new(Vec::new()),
+            file: None,
         }
     }
 
@@ -73,8 +94,8 @@ impl TraceSink {
     pub fn with_file(path: &Path) -> std::io::Result<Self> {
         let file = Self::open(path)?;
         Ok(Self {
-            inner: Mutex::new((Vec::new(), Some(file))),
-            file_path: Some(path.to_path_buf()),
+            inner: Mutex::new(Vec::new()),
+            file: Some((Arc::new(Mutex::new(file)), path.to_path_buf())),
         })
     }
 
@@ -86,42 +107,50 @@ impl TraceSink {
     }
 
     /// Fresh in-memory sink writing to the same file (per-task isolation
-    /// without interleaving the aggregate stream).
+    /// without interleaving the aggregate stream). The file lock is shared, so
+    /// concurrent tasks serialize their writes instead of racing them.
     pub fn fork(&self) -> Self {
-        match &self.file_path {
-            Some(p) => Self::with_file(p).unwrap_or_else(|_| Self::new()),
+        match &self.file {
+            Some((f, p)) => Self {
+                inner: Mutex::new(Vec::new()),
+                file: Some((f.clone(), p.clone())),
+            },
             None => Self::new(),
         }
     }
 
     pub fn emit(&self, ev: TraceEvent) {
-        if let Ok(mut guard) = self.inner.lock() {
-            let (events, file) = &mut *guard;
-            if let Some(f) = file {
-                if let Ok(line) = serde_json::to_string(&ev) {
-                    let _ = writeln!(f, "{line}");
+        if let Some((file, _)) = &self.file {
+            if let Ok(line) = serde_json::to_string(&ev) {
+                if let Ok(mut f) = file.lock() {
+                    // One write per event: body + newline in a single buffer.
+                    let mut buf = line.into_bytes();
+                    buf.push(b'\n');
+                    let _ = f.write_all(&buf);
                 }
             }
-            events.push(ev);
+        }
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.push(ev);
         }
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().map(|g| g.0.len()).unwrap_or(0)
+        self.inner.lock().map(|g| g.len()).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().map(|g| g.0.is_empty()).unwrap_or(true)
+        self.inner.lock().map(|g| g.is_empty()).unwrap_or(true)
     }
 
     pub fn events(&self) -> Vec<TraceEvent> {
-        self.inner.lock().map(|g| g.0.clone()).unwrap_or_default()
+        self.inner.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// In-memory only: the source sink already wrote these lines to file.
     pub fn extend(&self, events: Vec<TraceEvent>) {
         if let Ok(mut guard) = self.inner.lock() {
-            guard.0.extend(events);
+            guard.extend(events);
         }
     }
 }
@@ -182,6 +211,47 @@ mod tests {
             });
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Parallel tasks write through their own forks; one event must stay one
+    /// line. Measured live: `writeln!` on a File issued two writes per event
+    /// (body, newline) and two tasks interleaved into one corrupt line.
+    #[test]
+    fn concurrent_forks_write_one_line_per_event() {
+        let path =
+            std::env::temp_dir().join(format!("rof-trace-race-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let sink = TraceSink::with_file(&path).unwrap();
+        let mut threads = Vec::new();
+        for t in 0..8 {
+            let child = sink.fork();
+            threads.push(std::thread::spawn(move || {
+                for i in 0..50 {
+                    child.emit(TraceEvent::ToolCall {
+                        agent: "implementer".into(),
+                        tool: format!("tool-{i}"),
+                        ok: t % 2 == 0,
+                        latency_ms: i as u64,
+                    });
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            400,
+            "every event is its own line: {}",
+            lines.len()
+        );
+        for l in &lines {
+            serde_json::from_str::<TraceEvent>(l)
+                .unwrap_or_else(|e| panic!("corrupt line: {e}\n{l}"));
+        }
         let _ = std::fs::remove_file(&path);
     }
 }

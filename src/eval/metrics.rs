@@ -35,6 +35,27 @@ pub struct EvalReport {
     pub pricing: PricingConfig,
     /// Weight on cost in `utility` (0 = report-only).
     pub cost_lambda: f64,
+    /// What agents did with the skill store (folded from `SkillOp` events).
+    #[serde(default)]
+    pub skills: SkillMetrics,
+}
+
+/// Skill-store traffic for one run. Only successful ops count: a refused
+/// manage attempt stays visible in the trace (`ok: false`) and in
+/// tool_accuracy, and is not folded here as work done.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SkillMetrics {
+    /// Index deliveries that carried at least one skill — the harness
+    /// prefetches one per agent whose grant covers `skills.list`.
+    pub listed: u64,
+    /// Bodies a model asked for (`skill_views`).
+    pub viewed: u64,
+    /// Manage ops that wrote a proposal.
+    pub proposed: u64,
+    /// Manage ops that changed the store directly (`direct` policy).
+    pub applied: u64,
+    /// Bodies injected because the task named the skill: the reuse signal.
+    pub reused: u64,
 }
 
 impl Default for EvalReport {
@@ -58,6 +79,7 @@ impl Default for EvalReport {
             est_cost_usd: 0.0,
             pricing: PricingConfig::default(),
             cost_lambda: 0.0,
+            skills: SkillMetrics::default(),
         }
     }
 }
@@ -149,8 +171,128 @@ impl EvalReport {
             TraceEvent::ModelError { .. } => {
                 self.model_errors += 1;
             }
+            // Successful skill ops only; a refusal is a trace fact and a
+            // tool_accuracy hit, not work done.
+            TraceEvent::SkillOp { op, ok: true, .. } => match op.as_str() {
+                "list" => self.skills.listed += 1,
+                "view" => self.skills.viewed += 1,
+                "propose" => self.skills.proposed += 1,
+                "apply" => self.skills.applied += 1,
+                "reuse" => self.skills.reused += 1,
+                _ => {}
+            },
             _ => {}
         }
+    }
+}
+
+/// Per-task context accounting, folded from what a run already returns.
+///
+/// `relevance_proxy` is named a *proxy* on purpose: it is the share of
+/// retrieved chars whose file the task then touched, not a judgement that the
+/// context was relevant. Nothing here needs a model call.
+///
+/// Per-layer truncation/summarization counts (`layer_truncations`,
+/// `layer_summaries` in the plan) are deliberately absent until stage 2 gives
+/// them an emitter: a metric field fed by nothing reads as a measured zero.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextMetrics {
+    pub retrieved_files: usize,
+    pub retrieved_chars: usize,
+    /// Retrieved chars whose path the task's artifact touched (`file_state[]`).
+    pub referenced_chars: usize,
+    pub relevance_proxy: f32,
+    /// Summarizer calls made while this task ran (cheap Context LLM).
+    pub summarize_calls: u64,
+    /// Input+output tokens those calls cost.
+    pub summarize_tokens: u64,
+    /// Truncation events in the round loop: a view the builder had to cut
+    /// counts once, and again if it still overflows after summarization. The
+    /// planner's one-shot view is outside the loop and is not counted.
+    pub truncated_views: u32,
+}
+
+impl ContextMetrics {
+    /// Fold one orchestrator return value: `retrieved[]` is what retrieval put
+    /// in front of the agents, `tasks[].artifact.file_state[].path` is what the
+    /// run actually touched.
+    pub fn from_run(out: &serde_json::Value) -> Self {
+        let retrieved: Vec<(&str, u64)> = out
+            .get("retrieved")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| Some((e.get("path")?.as_str()?, e.get("chars")?.as_u64()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut touched: Vec<&str> = Vec::new();
+        let entries = out
+            .get("tasks")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten();
+        for t in entries {
+            let states = t
+                .pointer("/artifact/file_state")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten();
+            for f in states {
+                if let Some(p) = f.get("path").and_then(|v| v.as_str()) {
+                    if !touched.contains(&p) {
+                        touched.push(p);
+                    }
+                }
+            }
+        }
+        let total: u64 = retrieved.iter().map(|(_, c)| c).sum();
+        let referenced: u64 = retrieved
+            .iter()
+            .filter(|(p, _)| touched.contains(p))
+            .map(|(_, c)| c)
+            .sum();
+        Self {
+            retrieved_files: retrieved.len(),
+            retrieved_chars: total as usize,
+            referenced_chars: referenced as usize,
+            relevance_proxy: if total == 0 {
+                0.0
+            } else {
+                referenced as f32 / total as f32
+            },
+            summarize_calls: out
+                .get("summarize_calls")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            summarize_tokens: out
+                .get("summarize_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            truncated_views: out
+                .get("truncated_views")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+        }
+    }
+
+    /// Sums for a suite-level aggregate (the report keeps these per task).
+    pub fn sum(tasks: impl IntoIterator<Item = Self>) -> Self {
+        let mut acc = Self::default();
+        for t in tasks {
+            acc.retrieved_files += t.retrieved_files;
+            acc.retrieved_chars += t.retrieved_chars;
+            acc.referenced_chars += t.referenced_chars;
+            acc.summarize_calls += t.summarize_calls;
+            acc.summarize_tokens += t.summarize_tokens;
+            acc.truncated_views += t.truncated_views;
+        }
+        acc.relevance_proxy = if acc.retrieved_chars == 0 {
+            0.0
+        } else {
+            acc.referenced_chars as f32 / acc.retrieved_chars as f32
+        };
+        acc
     }
 }
 

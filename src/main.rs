@@ -1,8 +1,9 @@
 use rof::config::AppConfig;
 use rof::engine::{ModelRouter, Orchestrator, Role, Session};
-use rof::eval::{EvalSuite, EvaluationRunner};
+use rof::eval::{EvalSuite, EvaluationRunner, SuiteReport};
 use rof::llm::{ContextService, ExecutorService, LlmClient, OpenRouterClient, StubClient};
 use rof::obs::TraceSink;
+use rof::skills::{SkillManager, SkillOp, SkillPolicy};
 use rof::tools::ToolRegistry;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -147,6 +148,18 @@ fn apply_env(cfg: &mut AppConfig) {
     if let Some(r) = get("ROF_TASK_ROOT") {
         cfg.task_root = Some(std::path::PathBuf::from(r.trim()));
     }
+    // SKILL.md store: where it lives and how manage ops land.
+    if let Some(r) = get("ROF_SKILLS_ROOT") {
+        cfg.skills.root = Some(std::path::PathBuf::from(r.trim()));
+    }
+    if let Some(p) = get("ROF_SKILLS_POLICY") {
+        match p.trim().to_ascii_lowercase().as_str() {
+            "readonly" | "read-only" => cfg.skills.policy = SkillPolicy::ReadOnly,
+            "propose" => cfg.skills.policy = SkillPolicy::Propose,
+            "direct" => cfg.skills.policy = SkillPolicy::Direct,
+            other => eprintln!("ignoring ROF_SKILLS_POLICY={other} (readonly|propose|direct)"),
+        }
+    }
 }
 
 fn split_list(s: &str) -> Vec<String> {
@@ -201,7 +214,8 @@ fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
         }
     };
 
-    let registry = ToolRegistry::with_defaults(root.clone(), cfg.permissions.clone());
+    let registry =
+        ToolRegistry::with_defaults(root.clone(), cfg.permissions.clone(), cfg.skills.clone());
     Ok(Setup {
         cfg,
         trace,
@@ -250,6 +264,7 @@ fn print_report(trace: &TraceSink) {
             report.retried_calls, report.max_attempts, report.model_errors
         );
     }
+    print_skills(&report.skills);
 }
 
 #[tokio::main]
@@ -344,13 +359,32 @@ async fn main() -> anyhow::Result<()> {
             if rep.aggregate.model_errors > 0 {
                 println!("per-agent input tokens: see trace (model errors present)");
             }
+            print_skills(&rep.aggregate.skills);
             if let Some(path) = report_arg(&args[2.min(args.len())..]) {
                 // The report is the durable half of a run: the terminal scrolls,
                 // a JSON file can be diffed against the next baseline.
                 std::fs::write(&path, serde_json::to_string_pretty(&rep)?)?;
                 println!("report: {path}");
             }
+            println!("label: {}", rep.label.render());
             Ok(())
+        }
+        // Two report dumps side by side: labelled inputs, matched totals,
+        // per-task movement, metric deltas. No re-run, no model call.
+        Some("compare") => {
+            let (Some(pa), Some(pb)) = (args.get(2), args.get(3)) else {
+                anyhow::bail!("usage: rof compare <report-a.json> <report-b.json>");
+            };
+            let a = SuiteReport::load(std::path::Path::new(pa))?;
+            let b = SuiteReport::load(std::path::Path::new(pb))?;
+            print!("{}", rof::eval::compare(&a, &b).render());
+            Ok(())
+        }
+        // The skill store is a directory of files plus a proposal queue; this
+        // is the human side of it (list / show / approve / reject).
+        Some("skills") => {
+            let cfg = load_config(cfg_path.as_deref())?;
+            skills_cmd(&cfg, &args[2.min(args.len())..])
         }
         Some("run") => {
             let goal = args
@@ -397,4 +431,129 @@ async fn run_goal(goal: &str, config_path: Option<&str>) -> anyhow::Result<()> {
     println!("result: {}", serde_json::to_string_pretty(&out)?);
     print_report(&s.trace);
     Ok(())
+}
+
+/// Skill-store traffic, printed only when the run touched it at all.
+fn print_skills(skills: &rof::eval::SkillMetrics) {
+    if skills.listed + skills.viewed + skills.proposed + skills.applied + skills.reused == 0 {
+        return;
+    }
+    println!(
+        "skills: listed {} viewed {} proposed {} applied {} reused {}",
+        skills.listed, skills.viewed, skills.proposed, skills.applied, skills.reused
+    );
+}
+
+fn policy_name(p: SkillPolicy) -> &'static str {
+    match p {
+        SkillPolicy::ReadOnly => "readonly",
+        SkillPolicy::Propose => "propose",
+        SkillPolicy::Direct => "direct",
+    }
+}
+
+fn op_kind(op: &SkillOp) -> &'static str {
+    match op {
+        SkillOp::Create { .. } => "create",
+        SkillOp::Patch { .. } => "patch",
+        SkillOp::WriteFile { .. } => "write_file",
+        SkillOp::Delete { .. } => "delete",
+    }
+}
+
+/// `rof skills [list|show|approve|reject]` — the human side of the store.
+/// Reads go straight to the manager (same code the gated tools call).
+fn skills_cmd(cfg: &AppConfig, args: &[String]) -> anyhow::Result<()> {
+    let workdir = std::env::var("ROF_WORKDIR")
+        .ok()
+        .filter(|w| !w.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    let root = cfg
+        .skills
+        .root
+        .clone()
+        .unwrap_or_else(SkillManager::default_root);
+    let extra = workdir.map(|w| w.join("skills")).filter(|d| d.is_dir());
+    let mgr = SkillManager::new(root, extra, cfg.skills.policy);
+    match args.first().map(String::as_str) {
+        None | Some("list") => {
+            println!(
+                "root: {} (policy: {})",
+                mgr.root().display(),
+                policy_name(mgr.policy())
+            );
+            let scan = mgr.scan();
+            if scan.skills.is_empty() {
+                println!("skills: none");
+            }
+            for s in &scan.skills {
+                println!("  {} [{}] {}", s.name, s.source, s.description);
+            }
+            for w in &scan.warnings {
+                println!("  ! {w}");
+            }
+            let pending = mgr.proposals();
+            if pending.is_empty() {
+                println!("proposals: none pending");
+            } else {
+                println!("proposals ({} pending):", pending.len());
+                for p in pending {
+                    let why = p.rationale.lines().next().unwrap_or("");
+                    println!(
+                        "  {} {} {} (by {}, at {}) {}",
+                        p.id,
+                        op_kind(&p.op),
+                        p.op.name(),
+                        p.agent,
+                        p.created_at,
+                        why
+                    );
+                }
+            }
+            Ok(())
+        }
+        Some("show") => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("usage: rof skills show <name> [file]"))?;
+            let v = mgr.view(name, args.get(2).map(String::as_str))?;
+            println!(
+                "# {} [{}] {}",
+                v.meta.name, v.meta.source, v.meta.description
+            );
+            if !v.files.is_empty() {
+                let files: Vec<String> = v
+                    .files
+                    .iter()
+                    .map(|f| format!("{} ({}B)", f.rel, f.bytes))
+                    .collect();
+                println!("# files: {}", files.join(", "));
+            }
+            if let Some(f) = &v.file {
+                println!("# file: {f}");
+            }
+            println!("{}", v.body);
+            Ok(())
+        }
+        Some("approve") => {
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("usage: rof skills approve <id>"))?;
+            let (p, change) = mgr.approve(id)?;
+            println!("{} {} ({})", op_kind(&p.op), change.name, change.detail);
+            println!("proposal {} -> {}", p.id, p.status);
+            Ok(())
+        }
+        Some("reject") => {
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("usage: rof skills reject <id> [reason]"))?;
+            let why = args.get(2).map(String::as_str).unwrap_or("");
+            let p = mgr.reject(id, why)?;
+            println!("proposal {} -> {}", p.id, p.status);
+            Ok(())
+        }
+        Some(other) => anyhow::bail!("unknown skills subcommand {other}: list|show|approve|reject"),
+    }
 }

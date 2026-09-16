@@ -5,4 +5,5 @@ pub mod engine;
 pub mod eval;
 pub mod llm;
 pub mod obs;
+pub mod skills;
 pub mod tools;

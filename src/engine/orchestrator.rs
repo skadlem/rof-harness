@@ -51,11 +51,51 @@ impl Orchestrator {
         let snips = retriever.retrieve(&session.goal, self.cfg.retrieval.max_total_chars);
         let retrieved = render(&snips);
         let retrieved_files = snips.len();
+        // Context accounting (stage 0), folded per task by the eval layer. The
+        // retriever's snippets are echoed with their sizes so a report can say
+        // what retrieval handed over (§2.6 `relevance_proxy` denominator).
+        let retrieved_json: Vec<serde_json::Value> = snips
+            .iter()
+            .map(|s| serde_json::json!({ "path": s.path, "chars": s.content.chars().count() }))
+            .collect();
+        // Summarizer traffic and truncation counts, both read off the round
+        // loop below. The planner's one-shot view is outside that loop and is
+        // not counted.
+        let mut summarize_calls: u64 = 0;
+        let mut summarize_tokens: u64 = 0;
+        let mut truncated_views: u32 = 0;
+
+        // Skills, progressive disclosure: the index (names + one-line
+        // descriptions) goes into the stable head of every prompt; a body is
+        // injected only when the task names that skill. Both are reads through
+        // the same gate as everything else — the harness calls
+        // `skills.list`/`skills.view` *as* that agent, so the grant matrix
+        // decides who sees what. These are prompt-construction reads, not
+        // agent tool calls: they emit `SkillOp` and never `ToolCall`, because
+        // folding them into tool_accuracy would quietly inflate it.
+        let planner_skills = self.skill_index(tools, "planner").await;
+        let impl_skills = self.skill_index(tools, "implementer").await;
+        let reviewer_skills = self.skill_index(tools, "reviewer").await;
+        let planner_head = head_with_index(&session.ctx.long_term, &planner_skills.text);
+        let impl_head = head_with_index(&session.ctx.long_term, &impl_skills.text);
+        let reviewer_head = head_with_index(&session.ctx.long_term, &reviewer_skills.text);
+        // The planner only gets bodies when it actually runs: with the planner
+        // skipped there is no planner prompt to put them in, and a `reused`
+        // count that includes a body nobody read would be a lie.
+        let planner_reuse = if self.cfg.planner == "skip" {
+            String::new()
+        } else {
+            self.skill_bodies(tools, "planner", &session.goal, &planner_skills)
+                .await
+        };
 
         // Planner (Context LLM, no tools)
-        let mut state = session.ctx.clone();
-        state.mid_term = format!("goal: {}\n{retrieved}", session.goal);
-        let plan_view = builder.build(&state);
+        let plan_state = CtxState {
+            long_term: planner_head.clone(),
+            mid_term: format!("goal: {}\n{retrieved}{planner_reuse}", session.goal),
+            short_term: session.ctx.short_term.clone(),
+        };
+        let plan_view = builder.build(&plan_state);
         // Planner (Context LLM, no tools). Skippable: for goals that are
         // already task-shaped the call is pure overhead (see ROF_PLANNER).
         let plan_out = if self.cfg.planner == "skip" {
@@ -128,6 +168,24 @@ impl Orchestrator {
             let task_start = self.trace.len();
             let mut budget_hit: Option<u64> = None;
             let mut condensed: Option<String> = None;
+            // Skills this task names, once per task (not per round: a body
+            // delivered five times is one reuse, not five).
+            let impl_reuse = self
+                .skill_bodies(
+                    tools,
+                    "implementer",
+                    &format!("{} {task}", session.goal),
+                    &impl_skills,
+                )
+                .await;
+            let reviewer_reuse = self
+                .skill_bodies(
+                    tools,
+                    "reviewer",
+                    &format!("{} {task}", session.goal),
+                    &reviewer_skills,
+                )
+                .await;
             for round in 1..=rounds {
                 // Token guard: stop before spending another expensive round.
                 let spent = self.tokens_since(task_start);
@@ -142,13 +200,14 @@ impl Orchestrator {
                 }
                 ran = round;
                 let mut istate = CtxState {
-                    long_term: state.long_term.clone(),
+                    long_term: impl_head.clone(),
                     // Stable-first ordering: goal and repo retrieval are
                     // byte-stable across runs, the plan is not, the task text
                     // is per-task. Volatile markers live in short_term so the
-                    // cacheable prefix (this block) stays byte-identical.
+                    // cacheable prefix (this block) stays byte-identical, and
+                    // an injected skill body goes last for the same reason.
                     mid_term: format!(
-                        "goal: {}\n{retrieved}\nplan: {}\nCURRENT TASK ({}/{}) : {task}",
+                        "goal: {}\n{retrieved}\nplan: {}\nCURRENT TASK ({}/{}) : {task}{impl_reuse}",
                         session.goal,
                         plan_json,
                         ti + 1,
@@ -175,9 +234,13 @@ impl Orchestrator {
                 // Budget overflow: compress once per task with the cheap model
                 // instead of letting the builder chop context blindly.
                 if iview.truncated {
+                    truncated_views += 1;
                     if let Some(c) = &condensed {
                         istate.short_term = c.clone();
                         iview = builder.build(&istate);
+                        if iview.truncated {
+                            truncated_views += 1;
+                        }
                     } else if let Ok(r) = self
                         .context
                         .summarize(&iview.prompt, self.cfg.budgets.short_term)
@@ -193,9 +256,14 @@ impl Orchestrator {
                             cached_input_tokens: r.cached_input_tokens,
                             attempts: r.attempts,
                         });
+                        summarize_calls += 1;
+                        summarize_tokens += r.input_tokens + r.output_tokens;
                         condensed = Some(r.text.clone());
                         istate.short_term = r.text;
                         iview = builder.build(&istate);
+                        if iview.truncated {
+                            truncated_views += 1;
+                        }
                     }
                 }
                 let implementer = ImplementerAgent::new(&self.executor);
@@ -243,11 +311,12 @@ impl Orchestrator {
                 refused = file_state_evidence(&artifact);
 
                 let rstate = CtxState {
-                    long_term: state.long_term.clone(),
-                    mid_term: format!("PLAN: {plan_json}\nCURRENT TASK: {task}"),
+                    long_term: reviewer_head.clone(),
+                    mid_term: format!("PLAN: {plan_json}\nCURRENT TASK: {task}{reviewer_reuse}"),
                     short_term: format!(
-                        "ARTIFACT: {}\nEXPECT WRITES: {}\nWRITES MADE: {}\nCHECKS:\n{}",
+                        "ARTIFACT: {}\nSKILL CHANGES: {}\nEXPECT WRITES: {}\nWRITES MADE: {}\nCHECKS:\n{}",
                         serde_json::to_string(&artifact).unwrap_or_default(),
+                        skill_changes_line(&artifact),
                         if session.expect_writes { "yes" } else { "no" },
                         writes_made,
                         if checks_log.is_empty() {
@@ -258,6 +327,12 @@ impl Orchestrator {
                     ),
                 };
                 let rview = builder.build(&rstate);
+                if rview.truncated {
+                    // The reviewer's view is budgeted like the implementer's;
+                    // counting it here is what tells stage 2 where context is
+                    // actually being cut.
+                    truncated_views += 1;
+                }
                 let reviewer = ReviewerAgent::new(&self.executor);
                 match reviewer
                     .run(AgentCtx {
@@ -353,6 +428,10 @@ impl Orchestrator {
             "rounds": total_rounds,
             "passed": passed,
             "retrieved_files": retrieved_files,
+            "retrieved": retrieved_json,
+            "summarize_calls": summarize_calls,
+            "summarize_tokens": summarize_tokens,
+            "truncated_views": truncated_views,
             "checks": checks_log,
             "ctx_tokens": plan_view.used_tokens,
         })
@@ -361,6 +440,101 @@ impl Orchestrator {
     /// Test hook: the configured default ceiling.
     pub fn token_limit_for_test(&self) -> u64 {
         self.cfg.max_tokens_per_task
+    }
+
+    /// The skill index as `agent` may see it. Empty when the grant does not
+    /// cover `skills.list`, when the store is empty, or when the tool fails —
+    /// an agent that may not list skills simply gets no `[SKILLS]` block.
+    /// Emits `SkillOp{op: "list"}` only when there was something to deliver.
+    async fn skill_index(&self, tools: &ToolRegistry, agent: &str) -> SkillIndex {
+        let (r, _) = tools
+            .call(agent, "skills.list", None, serde_json::json!({}))
+            .await;
+        let Ok(o) = r else {
+            return SkillIndex::default();
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&o.output) else {
+            return SkillIndex::default();
+        };
+        let text = v
+            .get("index")
+            .and_then(|i| i.as_str())
+            .unwrap_or("")
+            .to_string();
+        let names: Vec<String> = v
+            .get("skills")
+            .and_then(|s| s.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| Some(s.get("name")?.as_str()?.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !text.trim().is_empty() {
+            self.trace.emit(TraceEvent::SkillOp {
+                agent: agent.to_string(),
+                op: "list".to_string(),
+                name: String::new(),
+                ok: true,
+                bytes: text.len() as u64,
+            });
+        }
+        SkillIndex { text, names }
+    }
+
+    /// Bodies of the skills `text` names, as `agent`, through the gate. This is
+    /// the reuse path: the task says what it wants by name and the recorded
+    /// procedure arrives, the same way the retriever hands over a named file.
+    async fn skill_bodies(
+        &self,
+        tools: &ToolRegistry,
+        agent: &str,
+        text: &str,
+        index: &SkillIndex,
+    ) -> String {
+        // Two is already a lot of procedure for one task; more is a prompt
+        // stuffed with instructions nobody asked for.
+        const MAX_BODIES: usize = 2;
+        let mut out = String::new();
+        let mut taken = 0usize;
+        for name in &index.names {
+            if taken >= MAX_BODIES {
+                break;
+            }
+            if !crate::skills::mentions(text, name) {
+                continue;
+            }
+            let (r, _) = tools
+                .call(
+                    agent,
+                    "skills.view",
+                    None,
+                    serde_json::json!({ "name": name }),
+                )
+                .await;
+            let body = match r {
+                Ok(o) => serde_json::from_str::<serde_json::Value>(&o.output)
+                    .ok()
+                    .and_then(|v| v.get("body").and_then(|b| b.as_str()).map(str::to_string)),
+                Err(_) => None,
+            };
+            let Some(body) = body else {
+                continue;
+            };
+            taken += 1;
+            self.trace.emit(TraceEvent::SkillOp {
+                agent: agent.to_string(),
+                op: "reuse".to_string(),
+                name: name.clone(),
+                ok: true,
+                bytes: body.len() as u64,
+            });
+            out.push_str(&format!(
+                "\nSKILL {name} (recorded procedure — follow it):\n{}\n",
+                body.trim()
+            ));
+        }
+        out
     }
 
     /// Sum of input+output tokens reported by model calls emitted at or
@@ -422,6 +596,47 @@ impl Orchestrator {
         }
         log
     }
+}
+
+/// What a model may see about skills: the rendered index and the names, so a
+/// task's text can be tested against them without re-reading the store.
+#[derive(Debug, Default, Clone)]
+struct SkillIndex {
+    text: String,
+    names: Vec<String>,
+}
+
+/// The stable head a prompt gets: the session's conventions, plus the skill
+/// index when there is one. Byte-stable per task, which is what keeps it in the
+/// provider's cached prefix.
+fn head_with_index(base: &str, index: &str) -> String {
+    if index.trim().is_empty() {
+        return base.to_string();
+    }
+    format!("{base}\n[SKILLS]\n{index}")
+}
+
+/// One line for the reviewer: what the implementer did to the skill store.
+/// Empty work in the skills channel must be as legible as a zero WRITES MADE.
+fn skill_changes_line(artifact: &serde_json::Value) -> String {
+    let entries = artifact
+        .get("skill_changes")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if entries.is_empty() {
+        return "none".to_string();
+    }
+    let parts: Vec<String> = entries
+        .iter()
+        .map(|e| {
+            let outcome = e.get("outcome").and_then(|v| v.as_str()).unwrap_or("?");
+            let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let detail = e.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+            format!("{outcome} {name} ({detail})")
+        })
+        .collect();
+    format!("{} - {}", entries.len(), parts.join("; "))
 }
 
 /// What the next round needs after a patch is refused or applied: the tool's

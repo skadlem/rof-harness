@@ -1,4 +1,4 @@
-use super::metrics::EvalReport;
+use super::metrics::{ContextMetrics, EvalReport};
 use super::suite::{EvalSuite, EvalTask};
 use crate::config::AppConfig;
 use crate::engine::{Orchestrator, Session};
@@ -9,6 +9,85 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// What makes two reports comparable (or visibly incomparable) without reading
+/// the trace: which harness revision ran, with which config, on which suite,
+/// against which model pair.
+///
+/// Hashes are FNV-1a (64-bit) over a canonical JSON dump — enough to separate
+/// "same inputs" from "different inputs" inside one report, and no new
+/// dependency (the plan's sha256 would add one for no extra decision power).
+/// `config_hash` hashes the `rof config` dump verbatim, so it can be
+/// recomputed by hand from that command's output.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunLabel {
+    /// Short HEAD of the tree the suite ran against; "unknown" outside a repo.
+    pub git_head: String,
+    pub config_hash: String,
+    pub suite_hash: String,
+    pub ctx_model: String,
+    pub exec_model: String,
+    pub harness_version: String,
+}
+
+impl RunLabel {
+    pub fn build(cfg: &AppConfig, suite: &EvalSuite, workdir: &Path) -> Self {
+        Self {
+            git_head: git_head(workdir),
+            config_hash: fnv1a_hex(cfg.to_json().as_bytes()),
+            suite_hash: fnv1a_hex(serde_json::to_string(suite).unwrap_or_default().as_bytes()),
+            ctx_model: cfg.routing.context_model.clone(),
+            exec_model: cfg.routing.executor_model.clone(),
+            harness_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    /// True for a report written before labels existed (serde default).
+    pub fn is_unlabeled(&self) -> bool {
+        self.config_hash.is_empty() && self.suite_hash.is_empty() && self.git_head.is_empty()
+    }
+
+    pub fn render(&self) -> String {
+        if self.is_unlabeled() {
+            return "unlabeled (report predates stage 0)".to_string();
+        }
+        format!(
+            "git {} cfg {} suite {} ctx {} exec {} v{}",
+            self.git_head,
+            self.config_hash,
+            self.suite_hash,
+            self.ctx_model,
+            self.exec_model,
+            self.harness_version
+        )
+    }
+}
+
+/// FNV-1a, 64-bit, hex. In-house on purpose: the report only needs to tell
+/// identical inputs from different ones, and a hash is not a security boundary.
+pub fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Short HEAD of `dir` through git; "unknown" when git is absent, the path is
+/// not a repo, or HEAD is unborn. A label must never fail a run.
+pub fn git_head(dir: &Path) -> String {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
     pub name: String,
@@ -17,6 +96,10 @@ pub struct TaskResult {
     pub matched: bool,
     pub rounds: u32,
     pub feedback: String,
+    /// Context accounting for this task (stage 0). Zeroes on a report written
+    /// before the field existed.
+    #[serde(default)]
+    pub context: ContextMetrics,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -24,6 +107,9 @@ pub struct SuiteReport {
     #[serde(default)]
     pub tasks: Vec<TaskResult>,
     pub aggregate: EvalReport,
+    /// Which harness/config/suite/model pair produced this report.
+    #[serde(default)]
+    pub label: RunLabel,
 }
 
 impl SuiteReport {
@@ -36,6 +122,15 @@ impl SuiteReport {
         } else {
             self.matched() as f64 / self.tasks.len() as f64
         }
+    }
+    /// Load a `--report` dump back. Old reports (no label, no per-task context)
+    /// load through the serde defaults, so a baseline stays diffable.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("report {}: {e}", path.display()))?;
+        let rep: Self = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("report {}: {e}", path.display()))?;
+        Ok(rep)
     }
 }
 
@@ -115,7 +210,11 @@ impl EvaluationRunner {
         let sink = Arc::new(self.trace.fork());
         let mut cfg = self.cfg.clone();
         cfg.permissions.allowed_dirs = vec![workdir.clone()];
-        let reg = ToolRegistry::with_defaults(workdir.clone(), cfg.permissions.clone());
+        let reg = ToolRegistry::with_defaults(
+            workdir.clone(),
+            cfg.permissions.clone(),
+            cfg.skills.clone(),
+        );
         let orch = Orchestrator::new(
             cfg,
             sink.clone(),
@@ -161,6 +260,7 @@ impl EvaluationRunner {
             matched: passed == task.expect_pass,
             rounds: out["rounds"].as_u64().unwrap_or(0) as u32,
             feedback,
+            context: ContextMetrics::from_run(&out),
         }
     }
 
@@ -177,6 +277,7 @@ impl EvaluationRunner {
                     matched: !task.expect_pass,
                     rounds: 0,
                     feedback: format!("harness: task-dir copy failed: {e:#}"),
+                    context: ContextMetrics::default(),
                 };
             }
         };
@@ -198,6 +299,7 @@ impl EvaluationRunner {
                 rep.tasks.push(self.run_task_isolated(t.clone()).await);
             }
             rep.aggregate = self.report();
+            rep.label = self.label(suite);
             return rep;
         }
         let sem = Arc::new(tokio::sync::Semaphore::new(jobs));
@@ -222,11 +324,27 @@ impl EvaluationRunner {
                     matched: false,
                     rounds: 0,
                     feedback: format!("harness: task join failed: {e}"),
+                    context: ContextMetrics::default(),
                 }),
             }
         }
         rep.aggregate = self.report();
+        rep.label = self.label(suite);
         rep
+    }
+
+    /// Which harness revision / config / suite / model pair this report is
+    /// about. Hashed from the effective config (post-env) and the suite as it
+    /// ran, so a `--limit` run labels the tasks it actually executed.
+    ///
+    /// The model ids come from the services, not from `cfg.routing`: those are
+    /// the ids actually sent to the provider (`rof eval` wires both from the
+    /// same config, a test or embedder may not).
+    fn label(&self, suite: &EvalSuite) -> RunLabel {
+        let mut l = RunLabel::build(&self.cfg, suite, &self.workdir);
+        l.ctx_model = self.context.model.clone();
+        l.exec_model = self.executor.model.clone();
+        l
     }
 }
 
