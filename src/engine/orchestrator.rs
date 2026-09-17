@@ -729,11 +729,27 @@ impl Orchestrator {
                 }
             }
             let checks_ok = checks_pass(&check_results);
-            passed = (!session.expect_writes || writes_made > 0) && checks_ok;
+            // §4.3 honesty: a task that requires no writes and configures no
+            // check has no oracle in direct mode — the reviewer is absent, so
+            // `checks_pass(&[])` is vacuously true and ANY artifact would
+            // score. That is an unmeasured task, not a pass. Pipeline mode
+            // has the reviewer as its oracle on this class (its rule 3);
+            // direct mode must not invent one.
+            let has_oracle = !check_results.is_empty() || session.expect_writes;
+            passed = has_oracle && (!session.expect_writes || writes_made > 0) && checks_ok;
             if passed {
                 break;
             }
             let file_state = crate::engine::session::file_state_evidence(&artifact);
+            if !has_oracle {
+                // No retry can conjure an oracle, so stop instead of spending
+                // the cap rediscovering that nothing can pass.
+                feedback = "no oracle: this task requires no file change and has no \
+                    configured check, and direct mode has no reviewer to judge the \
+                    artifact — the harness cannot score it, so it does not pass"
+                    .to_string();
+                break;
+            }
             feedback = if writes_made == 0 && session.expect_writes {
                 format!("no file change landed; emit the actual patch or write now{file_state}")
             } else {
