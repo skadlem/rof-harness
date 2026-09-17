@@ -26,6 +26,13 @@ pub struct RunLabel {
     pub suite_hash: String,
     pub ctx_model: String,
     pub exec_model: String,
+    /// §4.5: the judge model. Defaults to exec (self-review); a report that
+    /// predates the field loads as empty and renders as exec, which is what
+    /// it was. The label must render it because `config_hash` alone is not
+    /// human-readable and an arm that swaps only the judge is otherwise
+    /// indistinguishable from a rerun.
+    #[serde(default)]
+    pub verify_model: String,
     pub harness_version: String,
 }
 
@@ -37,6 +44,12 @@ impl RunLabel {
             suite_hash: fnv1a_hex(serde_json::to_string(suite).unwrap_or_default().as_bytes()),
             ctx_model: cfg.routing.context_model.clone(),
             exec_model: cfg.routing.executor_model.clone(),
+            verify_model: cfg
+                .routing
+                .verify_model
+                .clone()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| cfg.routing.executor_model.clone()),
             harness_version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
@@ -50,13 +63,21 @@ impl RunLabel {
         if self.is_unlabeled() {
             return "unlabeled (report predates stage 0)".to_string();
         }
+        // An old report has no verify field; it was self-review, which is
+        // exactly what printing exec there says.
+        let verify = if self.verify_model.is_empty() {
+            &self.exec_model
+        } else {
+            &self.verify_model
+        };
         format!(
-            "git {} cfg {} suite {} ctx {} exec {} v{}",
+            "git {} cfg {} suite {} ctx {} exec {} verify {} v{}",
             self.git_head,
             self.config_hash,
             self.suite_hash,
             self.ctx_model,
             self.exec_model,
+            verify,
             self.harness_version
         )
     }
@@ -153,6 +174,9 @@ pub struct EvaluationRunner {
     cfg: AppConfig,
     context: ContextService,
     executor: ExecutorService,
+    /// §4.5: the judge the label must name. Held separately from `executor`
+    /// because arm #4's whole point is that they differ.
+    verify: ExecutorService,
     workdir: PathBuf,
 }
 
@@ -162,6 +186,7 @@ impl EvaluationRunner {
         cfg: AppConfig,
         context: ContextService,
         executor: ExecutorService,
+        verify: ExecutorService,
         workdir: PathBuf,
     ) -> Self {
         Self {
@@ -169,6 +194,7 @@ impl EvaluationRunner {
             cfg,
             context,
             executor,
+            verify,
             workdir,
         }
     }
@@ -377,6 +403,10 @@ impl EvaluationRunner {
         let mut l = RunLabel::build(&self.cfg, suite, &self.workdir);
         l.ctx_model = self.context.model.clone();
         l.exec_model = self.executor.model.clone();
+        // The label's ground truth is the services actually wired, not the
+        // config's intent: `ROF_VERIFY_MODEL` and the judge's own client are
+        // both resolved in `main`, so the report must say what ran.
+        l.verify_model = self.verify.model.clone();
         l
     }
 }

@@ -123,6 +123,7 @@ fn runner_with(
         Arc::new(TraceSink::new()),
         cfg,
         ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
         ExecutorService::new(client, "fake-exec".to_string(), None),
         e.work.clone(),
     )
@@ -274,6 +275,7 @@ async fn a_skill_view_request_is_honored_in_the_bounded_extra_turn() {
         sink.clone(),
         cfg,
         ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
         ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
         e.work.clone(),
     )

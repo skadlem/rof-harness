@@ -262,6 +262,12 @@ fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
     let (context, executor, verify) = match &real {
         Some(c) => {
             let via = std::env::var("ROF_CHAT_BASE").unwrap_or("openrouter".to_string());
+            // §4.5 arm #4: the judge may sit on a different provider than
+            // the executor. Its own client changes nothing when the env is
+            // unset — same shared client, identical run.
+            let judge = OpenRouterClient::from_verify_env()
+                .map(|j| Arc::new(j) as Arc<dyn LlmClient>)
+                .unwrap_or_else(|| c.clone());
             if verify_model == exec_model {
                 println!("llm: {via} (ctx={ctx_model}, exec={exec_model})");
             } else {
@@ -275,7 +281,7 @@ fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
                     exec_fb.map(str::to_string),
                 ),
                 ExecutorService::new(
-                    c.clone(),
+                    judge,
                     verify_model.to_string(),
                     verify_fb.map(str::to_string),
                 ),
@@ -378,8 +384,14 @@ async fn main() -> anyhow::Result<()> {
             }
             let jobs = cfg.max_parallel_tasks.max(1);
             let s = setup(cfg)?;
-            let runner =
-                EvaluationRunner::new(s.trace.clone(), s.cfg, s.context, s.executor, s.root);
+            let runner = EvaluationRunner::new(
+                s.trace.clone(),
+                s.cfg,
+                s.context,
+                s.executor,
+                s.verify,
+                s.root,
+            );
             println!(
                 "suite: {} ({} tasks, jobs={})",
                 suite.name,

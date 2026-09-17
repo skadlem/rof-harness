@@ -58,6 +58,7 @@ async fn suite_tracks_per_task_match() {
         Arc::new(TraceSink::new()),
         test_cfg(),
         ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
         ExecutorService::new(client, "fake-exec".to_string(), None),
         root.clone(),
     );
@@ -145,6 +146,7 @@ async fn task_dirs_are_removed_by_default() {
             ..test_cfg()
         },
         ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
         ExecutorService::new(client, "fake-exec".to_string(), None),
         root.clone(),
     );
@@ -226,6 +228,7 @@ async fn parallel_tasks_are_isolated_per_task_dir() {
         Arc::new(TraceSink::new()),
         cfg,
         ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
         ExecutorService::new(client, "fake-exec".to_string(), None),
         root.clone(),
     );
@@ -339,6 +342,7 @@ async fn harness_rejects_pass_without_writes() {
         sink.clone(),
         test_cfg(),
         ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
         ExecutorService::new(client, "fake-exec".to_string(), None),
         root.clone(),
     );
@@ -417,6 +421,7 @@ async fn write_gate_counts_the_tree_not_the_claim() {
         sink.clone(),
         test_cfg(),
         ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
         ExecutorService::new(client, "fake-exec".to_string(), None),
         root.clone(),
     );
@@ -473,6 +478,7 @@ async fn a_non_repo_source_still_gets_the_substrate() {
             ..test_cfg()
         },
         ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
         ExecutorService::new(client, "fake-exec".to_string(), None),
         root.clone(),
     );
@@ -582,6 +588,7 @@ async fn task_root_is_honoured() {
         Arc::new(TraceSink::new()),
         cfg,
         ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
         ExecutorService::new(client, "fake-exec".to_string(), None),
         root.clone(),
     );
@@ -649,6 +656,7 @@ async fn run_fake_suite(tag: &str) -> SuiteReport {
         Arc::new(TraceSink::new()),
         test_cfg(),
         ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
         ExecutorService::new(client, "fake-exec".to_string(), None),
         root.clone(),
     );
@@ -667,6 +675,15 @@ async fn report_carries_a_label_and_its_inputs() {
     let rep = run_fake_suite("label").await;
     assert_eq!(rep.label.ctx_model, "fake-ctx");
     assert_eq!(rep.label.exec_model, "fake-exec");
+    // §4.5: the judge is part of the comparability label. The fake runner is
+    // wired self-review, so it must name the executor — never empty, or an
+    // arm that swaps only the judge would be indistinguishable from a rerun.
+    assert_eq!(rep.label.verify_model, "fake-exec");
+    assert!(
+        rep.label.render().contains("verify fake-exec"),
+        "the rendered label must name the judge: {}",
+        rep.label.render()
+    );
     assert_eq!(rep.label.harness_version, env!("CARGO_PKG_VERSION"));
     assert!(!rep.label.config_hash.is_empty(), "{:?}", rep.label);
     assert!(!rep.label.suite_hash.is_empty(), "{:?}", rep.label);
@@ -706,6 +723,21 @@ async fn report_carries_a_label_and_its_inputs() {
     // both from the same config; this runner was handed fake ones).
     assert_eq!(rebuilt.ctx_model, "cheap-model");
     assert_eq!(rep.label.ctx_model, "fake-ctx");
+    // A config that names a judge labels itself: the slot is part of the
+    // comparability surface, and `verify_model` is what an arm changes.
+    let judge_cfg = AppConfig {
+        routing: rof::config::RoutingConfig {
+            verify_model: Some("stealth/union-alpha".to_string()),
+            ..cfg.routing.clone()
+        },
+        ..cfg.clone()
+    };
+    let judged = RunLabel::build(&judge_cfg, &suite, &root);
+    assert_eq!(judged.verify_model, "stealth/union-alpha");
+    assert_eq!(
+        rebuilt.verify_model, "strong-model",
+        "unset verify_model resolves to the executor, never empty"
+    );
     let other_cfg = AppConfig {
         max_review_rounds: 9,
         ..cfg.clone()
@@ -807,6 +839,9 @@ fn labelled_report(suite_hash: &str, tasks: Vec<TaskResult>) -> SuiteReport {
             suite_hash: suite_hash.to_string(),
             ctx_model: "ctx".to_string(),
             exec_model: "exec".to_string(),
+            // §4.5: a report written before the verify field existed loads as
+            // empty and renders as exec — which is what it was (self-review).
+            verify_model: String::new(),
             harness_version: "0.1.0".to_string(),
         },
         ..SuiteReport::default()
