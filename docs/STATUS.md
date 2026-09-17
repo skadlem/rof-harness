@@ -1084,3 +1084,30 @@ exactly the missing one, and there is no round left to add it. The analysis
 tasks have the same shape — read, then answer, then answer again after the
 reviewer has described the missing shape. Arm 8 keeps `ROF_PLANNER=skip` and
 raises `ROF_MAX_ROUNDS` to 3 so both classes get the second chance.
+## Arm 8: a third round does not help, rejected (2026-09-18)
+
+`ROF_PLANNER=skip` + `ROF_MAX_ROUNDS=3`: 13/20, the same as arms 6 and 7, for
+131k more input tokens and 23 model errors. Every task the extra round was meant
+to rescue used it and still failed — `add-retriever-test` (3 rounds),
+`multi-tool-and-grant` (3), `multi-metric-and-trace` (3), and three of the four
+`analysis-*` tasks (3 each) all ended in the same state. `analysis-token-ceiling`
+went the other way. The failing class is not starved for rounds; it spends the
+rounds it has without ever emitting the deliverable. Rounds stay at 2.
+
+## What the remaining failures are (2026-09-18)
+
+A direct probe of `add-retriever-test` (single goal, on a throwaway `/tmp` copy
+of the tree) removed the last harness explanation. The goal names the file and
+the exact test name; the volatile fix serves `src/context/retriever.rs` (14k)
+whole on turn 1; the model then asks for `tests/retrieval.rs`,
+`src/config/mod.rs` and `src/context/assembler.rs` — goal-directed reads, since
+the goal says to follow the repo's test style — and still closes the round with
+an empty `writes` array. Every file it needs is in hand. That is the model
+declining to commit an insertion into a file with no existing test module, not a
+harness gap: the two test tasks that pass (`regression-test-cache-rate`,
+`http-deny-test`) both append into a module that already exists.
+
+So the floor is set by model judgment, and the harness's remaining job is the
+one §0 set out: make the cheap model's good turns survive to delivery. The
+volatile-file fix and the planner skip each did exactly that; a third round
+does not.
