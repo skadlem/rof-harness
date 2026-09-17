@@ -995,3 +995,56 @@ exact name present and reported `WRITES MADE: 0`. The method and its test are
 removed; the task is live again. Cross-checking the whole suite against the
 tree found no other spoiled deliverable (`budget-doc`'s field legitimately
 pre-exists — that task documents it).
+
+## Arm 4: +1, and the analysis prompt did not land (2026-09-18)
+
+Run on `0d16841`: **8/20** (arm 1 and arm 3 were 7/20), still 17 model errors.
+`http-deny-test` converted FAIL→PASS at one round, and every task that names a
+big file stayed fixed (`metrics-model-call-rate`, `summarize-doc`, `budget-doc`,
+`regression-test-cache-rate` all PASS in one round now).
+
+The analysis instruction did **not** move the five `analysis-*` tasks — still
+0/5, and the feedback is unchanged in kind: "the artifact is a progress note,
+not the requested deliverable". The one-line prompt addition is not enough for a
+task whose answer needs an enumeration the model cannot hold in one turn. Those
+five tasks are now the suite's fixed cost and the clearest remaining gap.
+
+`multi-metric-and-trace` is un-spoiled and is now a real task: the reviewer
+reports the core counter is absent from the verified source, i.e. the model is
+failing it honestly instead of being defeated by a pre-committed answer.
+
+## Arm 5: the planner was over-decomposing single changes (2026-09-18)
+
+`tool-count` ran 6 rounds on a task that adds one function and one test. The
+planner (default `always`) splits a goal into subtasks and each subtask gets its
+own bounded implementer→reviewer loop, so a one-file change became several
+narrowly-scoped loops that each read a slice of the file and none felt ownership
+of the whole edit. Every task in this suite is a single small change, which is
+exactly the shape `ROF_PLANNER=skip` exists for. `config_hash` hashes the loaded
+config, so the env override labels itself honestly (`e711d4f03cca97a7` →
+`840fcc06da5754e5`).
+
+**The result.** 12/20, up from 7/20 (arm 1, arm 3) and 8/20 (arm 4), with four
+clean gains and no losses:
+
+| arm | pass | model errors | input tokens | agents |
+|---|---|---|---|---|
+| 1 (`ab6aa34`) | 7/20 | 1 | 444k | impl/planner/reviewer/summarizer |
+| 3 (`63fffd1`) | 7/20 | 21 | 624k | impl/planner/reviewer/summarizer |
+| 4 (`0d16841`) | 8/20 | 17 | 606k | impl/planner/reviewer/summarizer |
+| 5 (`0d16841` + `ROF_PLANNER=skip`) | **12/20** | 15 | **441k** | impl/reviewer only |
+
+The gains are the mechanism, not luck: `workspace-flag` went from delivering 1
+of 4 required pieces in 2 rounds to **all 4 in 1 round** — with the goal as one
+task the implementer owned the whole edit. `tool-count` went from 6 rounds to 1.
+`multi-config-env` converted from a model-error washout to a 1-round pass.
+`analysis-cache-shape` became the first analysis task to pass.
+
+Skipping the planner also removed its call from every task and stopped the
+multi-task structure from overflowing the mid layer: input tokens fell 165k
+(−27%) and the summarizer stopped being called at all, while the cache-hit rate
+*rose* to 10.9% because one task per goal keeps the prompt byte-stable.
+
+**What this costs.** The planner is what would decompose a genuinely large goal;
+this suite has none, so `skip` is right for it and wrong in general. The lever
+stays env-gated (`ROF_PLANNER`) rather than becoming the default.
