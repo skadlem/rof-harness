@@ -682,6 +682,21 @@ pub fn parse_verdict(data: &serde_json::Value, fallback_feedback: &str) -> Verdi
 /// anchor (`why`). Returns the JSON and the chars that no longer travel twice.
 /// A reviewer that needs the text reads `[VERIFIED FILES]`, which is the same
 /// text once, windowed and budgeted.
+/// The model's prose deliverable, when the contract's `artifact` key was
+/// filled. It rides nested at `/result/artifact` inside the envelope the
+/// reviewer is otherwise shown, so a judge reading `ARTIFACT:` saw the
+/// envelope (which files were read, which writes applied) and never the
+/// answer itself. `expect_writes: no` tasks answer in prose; without this
+/// hoist they were unsatisfiable by construction, not by model judgment.
+pub fn answer_of(artifact: &serde_json::Value) -> String {
+    artifact
+        .pointer("/result/artifact")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "(none given)".to_string())
+}
+
 fn strip_file_bodies(artifact: &serde_json::Value) -> (String, usize) {
     let mut slim = artifact.clone();
     let mut stripped = 0usize;
@@ -788,7 +803,7 @@ mod file_state_tests {
 
 #[cfg(test)]
 mod evidence_tests {
-    use super::strip_file_bodies;
+    use super::{answer_of, strip_file_bodies};
     use serde_json::json;
 
     #[test]
@@ -817,6 +832,41 @@ mod evidence_tests {
         let (slim, stripped) = strip_file_bodies(&artifact);
         assert_eq!(stripped, 0);
         assert!(slim.contains("artifact"));
+    }
+
+    /// The contract tells the model `artifact` must BE the answer when no
+    /// write is required, but the answer rode nested at /result/artifact
+    /// while the reviewer's `ARTIFACT:` line showed only the envelope. A
+    /// judge therefore read an answered analysis task as "lists files read",
+    /// which is the failure arm #4 measured on five tasks with an independent
+    /// model. The answer must reach the reviewer.
+    #[test]
+    fn the_prose_answer_is_hoisted_out_of_the_envelope() {
+        let artifact = json!({
+            "result": {
+                "artifact": "TraceEvent::ReviewVerdict, emitted at orchestrator.rs:440; increments review_verdicts.",
+                "reads": ["src/obs/trace.rs", "src/eval/metrics.rs"],
+            },
+            "writes": [],
+        });
+        let answer = answer_of(&artifact);
+        assert!(
+            answer.contains("TraceEvent::ReviewVerdict"),
+            "the model's answer must be reachable: {answer}"
+        );
+        // The defect this fixes is not that the text vanishes — `strip_file_bodies`
+        // keeps `result` verbatim, so the answer is present but buried inside a
+        // JSON envelope alongside the file reads. The reviewer's `ARTIFACT:` line
+        // rendered that blob, and the judge read it as "records which files were
+        // read" — which is the failure arm #4 measured on all five analysis
+        // tasks. The hoist surfaces it as the deliverable.
+        let slim = strip_file_bodies(&artifact).0;
+        assert!(slim.contains("TraceEvent::ReviewVerdict"));
+        assert_eq!(
+            answer_of(&json!({"result": {"artifact": ""}})),
+            "(none given)"
+        );
+        assert_eq!(answer_of(&json!({"result": {}})), "(none given)");
     }
 }
 

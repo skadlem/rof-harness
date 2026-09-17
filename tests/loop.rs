@@ -34,6 +34,8 @@ static SAW_CHECKS: AtomicBool = AtomicBool::new(false);
 static IMPL_SAW_CHECKS: AtomicBool = AtomicBool::new(false);
 /// Set when a reviewer prompt carries the writes expectation + count.
 static SAW_WRITE_EXPECT: AtomicBool = AtomicBool::new(false);
+/// Set when a reviewer prompt carries the model's prose answer.
+static SAW_ANSWER: AtomicBool = AtomicBool::new(false);
 /// Set when the cheap model was asked to compress overflowing context.
 static SAW_SUMMARY: AtomicBool = AtomicBool::new(false);
 /// The implementer prompt of a retry round, kept for assertions.
@@ -213,6 +215,15 @@ impl LlmClient for FakeClient {
         if req.system.contains("reviewer") {
             if req.prompt.contains("VERIFIED FILES:") {
                 *REVIEW_PROMPT.lock().unwrap() = req.prompt.clone();
+            }
+            // §4.5: the prose answer must reach the judge. The contract makes
+            // `artifact` the deliverable when no write is required, but it
+            // travelled nested at /result/artifact inside the envelope the
+            // `ARTIFACT:` line rendered, so the reviewer read an answered
+            // analysis task as a list of files read. The `ANSWER:` line is the
+            // hoist; without it the task class is unsatisfiable by construction.
+            if req.prompt.contains("ANSWER: ") {
+                SAW_ANSWER.store(true, Ordering::SeqCst);
             }
             if req.prompt.contains("VERIFIED FILES:") && req.prompt.contains("beta_fixed") {
                 self.review_saw_verified_file.store(true, Ordering::SeqCst);
@@ -673,6 +684,36 @@ async fn checks_reach_reviewer_as_evidence() {
         "reviewer never saw EXPECT WRITES / WRITES MADE"
     );
     assert_eq!(out["tasks"][0]["writes_made"], 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The prose deliverable must reach the reviewer. The contract tells the model
+/// `artifact` is the answer when no write is required, and arm #4 measured the
+/// consequence with an independent judge on all five analysis tasks: the
+/// reviewer's feedback read "the artifact records which files were read; the
+/// requested findings are nowhere in the deliverable". The answer existed in
+/// the payload, nested at /result/artifact, and the `ARTIFACT:` line rendered
+/// the envelope around it instead.
+#[tokio::test]
+async fn the_prose_answer_reaches_the_reviewer() {
+    let (orch, reg, root) = harness(Arc::new(FakeClient::pass()), "answer", 2);
+    let out = orch
+        .run_loop(
+            &Session::new("report the trace event and the metric field".into())
+                .expecting_writes(false),
+            &reg,
+            &root,
+        )
+        .await;
+    // No file was touched and no check was configured, so the reviewer is the
+    // only oracle — which makes what it can see the whole measurement.
+    assert_eq!(out["tasks"][0]["writes_made"], 0);
+    let prompt = REVIEW_PROMPT.lock().unwrap().clone();
+    assert!(
+        SAW_ANSWER.load(Ordering::SeqCst) && prompt.contains("ANSWER:"),
+        "the reviewer's evidence lacks the prose answer: {}",
+        &prompt[..prompt.len().min(300)]
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

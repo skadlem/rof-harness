@@ -1185,3 +1185,29 @@ the harness's flat DeepSeek table, not money spent. The provider-reported
 $0.00 is the real number. Both models in these arms are free, which is what
 makes the comparison affordable — and the pricing table should not be quoted
 as cost for a model it doesn't describe.
+
+## The analysis class was unsatisfiable by construction — the answer never
+## reached the judge (2026-09-18)
+
+Arm #4's judge feedback read the same on all four failed tasks: "the artifact
+records which files were read; the requested findings are nowhere in the
+deliverable." That is not a model judgment call. The contract tells the model
+`artifact` must BE the answer when no write is required, and a one-model probe
+confirmed the model fills it when the facts are in context — but the implementer
+discards the key. `AgentOutput.data` wraps the model JSON as
+`{"result": <model json>, ...}`, so the answer travelled nested at
+`/result/artifact` while the reviewer's `ARTIFACT:` line rendered the envelope
+around it: which files were read, which writes applied. A judge reading that
+envelope concluded exactly what it said — files read, no answer — and it was
+right about the envelope and wrong about the model.
+
+Fix: `answer_of()` hoists `/result/artifact` into an `ANSWER:` line in the
+reviewer's evidence. Regression test `the_prose_answer_reaches_the_reviewer`
+asserts the reviewer prompt carries it, and is **verified to fail on the pre-fix
+tree** (`ANSWER:` absent) and pass after. Two unit tests cover the pointer and
+its empty cases.
+
+Arm B is left at one rep (13/20, gated 11/15, analysis 2/5) and is not quoted as
+a mean: its second rep was contaminated by the in-flight tree edit this fix
+required, and was killed rather than reported. The single rep's signal is
+directional only.

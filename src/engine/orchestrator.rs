@@ -406,9 +406,16 @@ impl Orchestrator {
                     long_term: reviewer_head.clone(),
                     mid_term: format!("PLAN: {plan_json}\nCURRENT TASK: {task}{reviewer_reuse}"),
                     short_term: format!(
-                        "ARTIFACT: {}\nSKILL CHANGES: {}\nEXPECT WRITES: {}\nWRITES MADE: {}\nCHANGED (git): {}\nCHECKS:\n{}\nVERIFIED FILES:\n{}",
+                        "ARTIFACT: {}\nANSWER: {}\nSKILL CHANGES: {}\nEXPECT WRITES: {}\nWRITES MADE: {}\nCHANGED (git): {}\nCHECKS:\n{}\nVERIFIED FILES:\n{}",
                         // The bodies travel once, under VERIFIED FILES.
                         evidence.artifact,
+                        // The model's prose deliverable. The contract makes
+                        // `artifact` BE the answer when no write is required,
+                        // but it travelled nested at /result/artifact while the
+                        // judge saw only the envelope around it — so an
+                        // analysis task that had been answered looked to the
+                        // reviewer like a list of files read. Hoist it.
+                        crate::engine::session::answer_of(&artifact),
                         crate::engine::session::skill_changes_line(&artifact),
                         if session.expect_writes { "yes" } else { "no" },
                         writes_made,
