@@ -1262,3 +1262,32 @@ first time the gated score moved from a transport fix rather than a prompt or
 routing one. The honest ceiling on this suite with Atria executing remains the
 11-12/15 that self-review arms 5-7 measured; arm 12 matches it without letting
 the executor grade its own work.
+
+## Arm 13: the reliable endpoint is NOT the gated limiter (2026-09-19)
+
+Hypothesis: the 0/6 gated tasks were empty-content artifacts, not model limits.
+Stealth executes (10/10 valid JSON vs Atria's 2/10 on the same probe), same
+judge model as arm 12, same planner, same suite — the endpoint was the only
+variable.
+
+| arm | executor | judge | gated (15) | analysis (5) | errors/rep |
+|---|---|---|---|---|---|
+| 12 | Atria | stealth | **11.3 (76%)** | 0.7 | 18 |
+| 13 | stealth | stealth | 9.7 (65%) | 1.0 | 8-14 |
+
+The hypothesis is **partially right and wrong as an explanation**. Two of the
+three 0/6 tasks now pass at least once (`add-retriever-test` and
+`multi-tool-and-grant`, 1/3 each — they were never pure capability gaps). But
+the gated mean went *down*, 11.3 to 9.7: stealth is a weaker executor on this
+suite than Atria despite being five times more reliable at the transport layer.
+
+So the corrected story: transport reliability was load-bearing on specific
+hard tasks but was never what capped the score. The remaining gated failures
+are the model's real limits — multi-part edits across files and creating a new
+module — and the analysis class is flat at 0.7-1.0/5 on every executor and
+every judge tried, which is a genuine limit rather than a measurement artifact.
+
+**The harness is now measuring something real.** Three false readings were
+found and fixed this session (vacuous `checks_pass(&[])`, the buried prose
+answer, silent empty content), and the ceiling this model family reaches is
+~11.3/15 gated. That is the number to beat, and it is honest.
