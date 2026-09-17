@@ -224,11 +224,27 @@ impl OpenRouterClient {
         // errors sees a cutoff instead of "the model wrote nothing".
         let truncated =
             choice.as_ref().and_then(|c| c.finish_reason.as_deref()) == Some(FINISH_LENGTH);
+        let finish = choice
+            .as_ref()
+            .and_then(|c| c.finish_reason.as_deref())
+            .unwrap_or("")
+            .to_string();
         let text = choice.map(|c| c.message.content).unwrap_or_default();
         if truncated {
             return Err(LlmError::Transport(format!(
                 "output truncated at {} tokens (finish_reason=length); raise max_tokens",
                 req.max_tokens
+            )));
+        }
+        // A reply with no text is not an answer: some compat endpoints ship a
+        // null `content` alongside a `reasoning_content` they never move out
+        // of, and accepting it silently made a degraded call look like a model
+        // that wrote nothing — which is how a whole task class came to read as
+        // "the model does not synthesise". Reported as an error so the retry
+        // loop re-asks and the run counts it.
+        if text.trim().is_empty() {
+            return Err(LlmError::Transport(format!(
+                "empty content from {model} (finish_reason={finish:?}); the endpoint shipped no text"
             )));
         }
         let (inp, out, cost, cached) = body
@@ -297,5 +313,29 @@ mod tests {
 
         std::env::remove_var("ROF_VERIFY_TOKEN");
         std::env::remove_var("ROF_VERIFY_BASE");
+    }
+
+    /// A reply with no text is not an answer. A compat endpoint can ship
+    /// `content: null` with only `reasoning_content` populated; deserialising
+    /// that to an empty string and returning `Ok("")` made a degraded call
+    /// look like a model that chose to write nothing. That misread is what
+    /// turned an endpoint quirk into "the analysis class is a model failure."
+    #[test]
+    fn an_empty_content_reply_is_not_an_answer() {
+        // `content: null` deserialises to an empty string via null_as_empty,
+        // so the wire form and the parsed form must agree on emptiness.
+        let wire = String::from(
+            "{\"choices\":[{\"message\":{\"content\":null},\"finish_reason\":\"stop\"}]}",
+        );
+        let parsed: ChatResp = serde_json::from_str(&wire).expect("null content parses");
+        let text = parsed
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content)
+            .expect("a choice exists");
+        // The invariant the caller relies on: whatever it scores, this is not
+        // a model answer.
+        assert!(text.trim().is_empty(), "content was: {text}");
     }
 }

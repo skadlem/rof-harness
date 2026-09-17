@@ -1211,3 +1211,33 @@ Arm B is left at one rep (13/20, gated 11/15, analysis 2/5) and is not quoted as
 a mean: its second rep was contaminated by the in-flight tree edit this fix
 required, and was killed rather than reported. The single rep's signal is
 directional only.
+
+## Arm 11: the ANSWER hoist is neutral, because the endpoint was the confound
+## (2026-09-18)
+
+Same config as arm 10a (Atria executes, stealth judges, planner skip) on the
+hoisted-answer tree:
+
+| arm | gated (15) | analysis (5) | model errors/rep |
+|---|---|---|---|
+| 10a (no `ANSWER:` line) | 10.0 | 1.0 | 14 |
+| 11 (`ANSWER:` hoist) | 9.3 | 0.7 | 14-18 |
+
+The hoist did its job mechanically: the judge's feedback on
+`analysis-token-ceiling` now reads "ANSWER was '(none given)'" instead of
+"findings are nowhere in the deliverable" — the failure is correctly attributed
+to the model, not the evidence. But the class did not move, because the answers
+are genuinely absent.
+
+**Why, measured.** The Atria endpoint returns `content: null` with only
+`reasoning_content` populated on **7 of 8** identical probes, and that
+`reasoning_content` is exploration babble, not an answer. `null_as_empty`
+deserialised it to `""` and `complete()` returned `Ok("")`, so a degraded call
+was scored as a model that chose to write nothing. That is the third false
+reading this session, and it reframes the analysis class: the model is not
+refusing to synthesise, it is being cut off mid-thought by its endpoint and the
+harness was recording the silence as a decision.
+
+Fix landed: an empty-content reply is now `LlmError`, so the retry loop re-asks
+and the run counts it. This makes the analysis class measurable for the first
+time — its floor is no longer set by a silent transport quirk.
