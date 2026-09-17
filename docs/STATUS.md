@@ -1241,3 +1241,24 @@ harness was recording the silence as a decision.
 Fix landed: an empty-content reply is now `LlmError`, so the retry loop re-asks
 and the run counts it. This makes the analysis class measurable for the first
 time — its floor is no longer set by a silent transport quirk.
+
+## Arm 12: empty-content retries lift the gated class 9.3 → 11.3/15 (2026-09-19)
+
+Identical to arm 11 except a `content: null` reply now retries instead of being
+scored as an empty artifact.
+
+| arm | gated (15) | analysis (5) |
+|---|---|---|
+| 11 (empty accepted) | 9.3 (62%) | 0.7 |
+| **12 (empty retries)** | **11.3 (76%)** | 0.7 |
+
+Per-rep gated: 12, 12, 10. The +2.0/15 is the analysis-independent part of the
+bug — gated tasks were losing whole rounds to silent empty replies, and a retry
+recovers the round. Analysis is flat at 0.7/5 across both arms, so the class is
+a genuine model/endpoint limit and not something the harness was hiding.
+
+**This is the best gated result measured with an independent judge**, and the
+first time the gated score moved from a transport fix rather than a prompt or
+routing one. The honest ceiling on this suite with Atria executing remains the
+11-12/15 that self-review arms 5-7 measured; arm 12 matches it without letting
+the executor grade its own work.
