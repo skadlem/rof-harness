@@ -1144,3 +1144,33 @@ expected writes has no oracle, so it fails with a `no oracle` verdict and stops
 at one round rather than spending the cap rediscovering that nothing can
 score it. A write the model emits anyway does not turn it into a pass. The
 regression test fails on the pre-fix tree (`passed: true`) and passes after.
+## Arm #4: an independent judge does not rescue the analysis class (2026-09-18)
+
+`ROF_VERIFY_MODEL=stealth/union-alpha` on its own OpenRouter client
+(`ROF_VERIFY_TOKEN`/`ROF_VERIFY_BASE`, added for this arm), Atria executing,
+pipeline + planner=skip so the only difference from arms 5-7 is who scores.
+
+| arm | judge | gated (15) | analysis (5) | tokens |
+|---|---|---|---|---|
+| 5-7 | self (Atria) | 11-12 | 1-2 | 404-441k |
+| 10a rep1 | stealth | 9 | **1** | 428k |
+| 10a rep2 | stealth | 11 | **0** | 443k |
+
+The analysis class does not move under independent judging (1/5, 0/5 vs
+self-review's 1-2/5). Two failures that looked like context problems were not:
+the judge's feedback is consistent and specific across all four failed tasks
+("the artifact records which files were read; the requested findings are
+nowhere in the deliverable"). The model does the research and then does not
+write the answer down. That is the same failure the direct-mode probe found,
+now confirmed by a second model that has no incentive to agree with the first.
+
+Conclusion for the reviewer: **its feedback loop buys nothing on gated tasks
+(11/15 with and without it), and as an oracle it changes nothing on the
+analysis class either.** The reviewer is not the lever, on either job. What the
+class needs is on the writing side — an analysis artifact must accumulate its
+findings into the deliverable — not a better judge of an empty one.
+
+The plumbing the arm needed is kept: the judge can now sit on a different
+provider than the executor, and the comparability label names it
+(`verify <model>`), because an arm that swaps only the judge is otherwise
+indistinguishable from a rerun.
