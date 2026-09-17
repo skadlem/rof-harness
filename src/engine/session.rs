@@ -68,6 +68,12 @@ impl Session {
         self
     }
 
+    /// Analysis-only goals set this to false; coding goals leave it at "yes".
+    pub fn with_expect_writes(mut self, expect: bool) -> Self {
+        self.expect_writes = expect;
+        self
+    }
+
     pub fn with_token_limit(mut self, limit: Option<u64>) -> Self {
         self.max_tokens = limit;
         self

@@ -1111,3 +1111,36 @@ So the floor is set by model judgment, and the harness's remaining job is the
 one §0 set out: make the cheap model's good turns survive to delivery. The
 volatile-file fix and the planner skip each did exactly that; a third round
 does not.
+## Direct mode is not an improvement — 5 of its 16 were vacuous (2026-09-18)
+
+`ROF_MODE=direct` removes the reviewer as well as the planner, so the suite's
+five analysis tasks (no writes required, no configured check) lost their only
+oracle. Direct mode computes `passed` as `(!expect_writes || writes>0) &&
+checks_pass(&results)`, and `checks_pass(&[])` is vacuously true — so all five
+passed unconditionally at rounds=1, having changed no file and run no check.
+The model could have emitted `{"artifact": "todo"}` and scored.
+
+The arm reported 16/20 twice. Splitting the suite by whether a task has any
+oracle at all gives the honest picture:
+
+| arm | mode | raw | ungated (5) | gated (15) |
+|---|---|---|---|---|
+| 1,3,4 | pipeline | 7,7,8 | 1,0,0 | 6,7,8 |
+| 5,6,7 | planner skip | 12,13,13 | 1,1,2 | 11,12,11 |
+| 8 | skip + 3 rounds | 13 | 1 | 12 |
+| d1,d2 | **direct** | **16,16** | **5,5** | **11,11** |
+
+Direct mode's gated score (11/15) is *equal to* the planner-skip baseline's.
+Every point of the apparent gain is vacuity. Two conclusions, both measured:
+
+1. **The reviewer's feedback loop buys nothing on gated tasks** — 11/15 either
+   way. Its retry prose is not the lever; the checks and the write gate are.
+2. **The reviewer was load-bearing as an oracle**, not as a feedback source.
+   It is the only thing that can score a task with no check and no expected
+   write. Remove it and those tasks stop being measured.
+
+Fix landed (`orchestrator.rs`): a direct-mode task with no checks and no
+expected writes has no oracle, so it fails with a `no oracle` verdict and stops
+at one round rather than spending the cap rediscovering that nothing can
+score it. A write the model emits anyway does not turn it into a pass. The
+regression test fails on the pre-fix tree (`passed: true`) and passes after.

@@ -436,6 +436,41 @@ async fn direct_mode_retries_with_failed_check_feedback() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// §4.3 honesty: a task that requires no writes and configures no check has
+/// no oracle in direct mode — the reviewer is absent, so `checks_pass(&[])`
+/// is vacuously true and any artifact would score. That is an unmeasured
+/// task, not a pass. Discovered when a live arm reported 16/20 where 5 points
+/// were exactly this vacuity.
+#[tokio::test]
+async fn direct_mode_rejects_a_task_with_no_oracle() {
+    let client = Arc::new(FakeClient::pass());
+    let (orch, reg, root) = harness_with(client.clone(), "direct-no-oracle", 2, |cfg| {
+        cfg.execution = "direct".to_string();
+    });
+    std::fs::write(root.join("a.txt"), "before\n").unwrap();
+    // No checks, and the session does not expect writes: nothing can score it.
+    let out = orch
+        .run_loop(
+            &Session::new("analyze a.txt".into())
+                .with_checks(vec![])
+                .with_expect_writes(false),
+            &reg,
+            &root,
+        )
+        .await;
+
+    assert_eq!(out["passed"], false);
+    // It stops at once: another round cannot conjure an oracle.
+    assert_eq!(out["rounds"], 1);
+    assert!(out["tasks"][0]["feedback"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("no oracle"));
+    // And it did not take the write the model emitted anyway as a pass.
+    assert_eq!(out["tasks"][0]["writes_made"], 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// §4.3: the verdict is a field read on `CheckResult`, not a substring of the
 /// rendered log. A check that passes may quote "STATUS: FAILED" from a
 /// previous error it fixed; the old `checks_log.contains(...)` would flip the
