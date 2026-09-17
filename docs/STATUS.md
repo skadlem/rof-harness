@@ -1177,3 +1177,11 @@ The plumbing the arm needed is kept: the judge can now sit on a different
 provider than the executor, and the comparability label names it
 (`verify <model>`), because an arm that swaps only the judge is otherwise
 indistinguishable from a rerun.
+
+Arm B (roles swapped: stealth executes, Atria judges) rep 1 = 13/20 raw, gated
+11/15, analysis 2/5. Cost note: `stealth/union-alpha` is free on OpenRouter
+(prompt=0, completion=0 per `/v1/models`), so the "est $0.17 (table)" line is
+the harness's flat DeepSeek table, not money spent. The provider-reported
+$0.00 is the real number. Both models in these arms are free, which is what
+makes the comparison affordable — and the pricing table should not be quoted
+as cost for a model it doesn't describe.
