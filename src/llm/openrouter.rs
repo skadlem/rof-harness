@@ -102,10 +102,31 @@ impl OpenRouterClient {
     /// Qwen DashScope compat mode, ...). Neutral env names; map your
     /// provider key to ROF_TOKEN and the base URL to ROF_CHAT_BASE.
     pub fn from_compat_env() -> Option<Self> {
-        let token = std::env::var("ROF_TOKEN").ok().filter(|t| !t.is_empty())?;
+        let token = std::env::var("ROF_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())?;
         let base = std::env::var("ROF_CHAT_BASE")
             .ok()
-            .filter(|t| !t.is_empty())?;
+            .filter(|t| !t.trim().is_empty())?;
+        Some(Self {
+            token,
+            base,
+            http: reqwest::Client::new(),
+        })
+    }
+
+    /// The judge on a different provider than the executor (§4.5 arm #4).
+    /// `ROF_VERIFY_TOKEN` + `ROF_VERIFY_BASE` name their own client so a
+    /// self-review A/B can become an independent one without any other
+    /// change; absent either, the caller falls back to the shared client and
+    /// the run is identical to before.
+    pub fn from_verify_env() -> Option<Self> {
+        let token = std::env::var("ROF_VERIFY_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())?;
+        let base = std::env::var("ROF_VERIFY_BASE")
+            .ok()
+            .filter(|t| !t.trim().is_empty())?;
         Some(Self {
             token,
             base,
@@ -247,5 +268,34 @@ mod tests {
         assert_eq!(b.model, "anthropic/claude-x");
         assert_eq!(b.messages.len(), 2);
         assert_eq!(b.messages[0].role, "system");
+    }
+
+    /// §4.5 arm #4: the judge gets its own client only when both the token
+    /// and the base are present, so the run is unchanged when the slot is not
+    /// in use. Whitespace-only is absent, matching the other env parsers.
+    #[test]
+    fn verify_env_requires_token_and_base() {
+        std::env::remove_var("ROF_VERIFY_TOKEN");
+        std::env::remove_var("ROF_VERIFY_BASE");
+        assert!(OpenRouterClient::from_verify_env().is_none());
+
+        std::env::set_var("ROF_VERIFY_TOKEN", "   ");
+        std::env::set_var("ROF_VERIFY_BASE", "https://judge.example/v1");
+        assert!(
+            OpenRouterClient::from_verify_env().is_none(),
+            "a whitespace-only token must not build a client"
+        );
+
+        std::env::set_var("ROF_VERIFY_TOKEN", "secret");
+        let j = OpenRouterClient::from_verify_env().expect("token + base builds the judge client");
+        assert_eq!(j.token, "secret");
+        assert_eq!(j.base, "https://judge.example/v1");
+        assert_ne!(
+            j.base, DEFAULT_BASE,
+            "the judge is not the default endpoint"
+        );
+
+        std::env::remove_var("ROF_VERIFY_TOKEN");
+        std::env::remove_var("ROF_VERIFY_BASE");
     }
 }
