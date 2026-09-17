@@ -87,6 +87,12 @@ actually touched), `relevance_proxy` (the ratio — a proxy, not a judgement), p
 duplicate carried into a prompt the §4.1 assembler refused to deliver twice). Reports written
 before these fields existed still load: the fields default to zero.
 
+`docs/STATUS.md` records the measured arms and the bugs they found, including the two that were
+not fixes: an eager-files rewrite that turned out to duplicate retrieval already in the prompt, and
+a third review round that cost tokens without moving a task. The headline result is `ROF_PLANNER=skip`
+on this suite, where every task is a single change — three reps at 12.7/20 against 7.3/20 with the
+planner on, at 200k fewer input tokens.
+
 ## Skills
 
 Procedural memory, in the agentskills.io shape: `~/.rof/skills/<name>/SKILL.md` with YAML-ish
