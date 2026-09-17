@@ -1155,14 +1155,17 @@ pipeline + planner=skip so the only difference from arms 5-7 is who scores.
 | 5-7 | self (Atria) | 11-12 | 1-2 | 404-441k |
 | 10a rep1 | stealth | 9 | **1** | 428k |
 | 10a rep2 | stealth | 11 | **0** | 443k |
+| 10a rep3 | stealth | 10 | **2** | 395k |
+| **10a mean** | **stealth** | **10.0** | **1.0** | **422k** |
 
-The analysis class does not move under independent judging (1/5, 0/5 vs
-self-review's 1-2/5). Two failures that looked like context problems were not:
-the judge's feedback is consistent and specific across all four failed tasks
-("the artifact records which files were read; the requested findings are
-nowhere in the deliverable"). The model does the research and then does not
-write the answer down. That is the same failure the direct-mode probe found,
-now confirmed by a second model that has no incentive to agree with the first.
+The analysis class does not move under independent judging (1.0/5 over three
+reps vs self-review's 1-2/5). Two failures that looked like context problems
+were not: the judge's feedback is consistent and specific across all four
+failed tasks ("the artifact records which files were read; the requested
+findings are nowhere in the deliverable"). The model does the research and then
+does not write the answer down. That is the same failure the direct-mode probe
+found, now confirmed by a second model that has no incentive to agree with the
+first.
 
 Conclusion for the reviewer: **its feedback loop buys nothing on gated tasks
 (11/15 with and without it), and as an oracle it changes nothing on the
