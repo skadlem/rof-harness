@@ -94,6 +94,23 @@ a third review round that cost tokens without moving a task. The headline result
 on this suite, where every task is a single change — three reps at 12.7/20 against 7.3/20 with the
 planner on, at 200k fewer input tokens.
 
+The suite total is only quotable with its split, because five analysis tasks carry no deterministic
+oracle and the reviewer was their only judge. As of the last arms the honest numbers are:
+
+| arm | judge | gated (15) | analysis (5) |
+|---|---|---|---|
+| planner on | self | 6-8 | 0-1 |
+| `ROF_PLANNER=skip` | self | 11-12 | 1-2 |
+| `skip` + independent | `stealth/union-alpha` | **11.3 (76%)** | 0.7 |
+
+Three findings changed what the numbers mean, and each was caught by decomposing the measurement
+rather than trusting the aggregate: a direct-mode run that scored 16/20 was passing the five
+oracle-less tasks vacuously (`checks_pass(&[])` is true); the analysis class was unsatisfiable
+because the model's prose answer travelled nested where the judge never read it; and the endpoint
+returns `content: null` on 7 of 8 probes, which the harness had been scoring as a model that chose
+to write nothing. The first is now a fast `no oracle` failure, the second an `ANSWER:` line, the
+third a retry.
+
 ## Skills
 
 Procedural memory, in the agentskills.io shape: `~/.rof/skills/<name>/SKILL.md` with YAML-ish
