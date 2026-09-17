@@ -945,3 +945,53 @@ wired an eager-files path in the implementer. Reverting it and probing the
 orchestrator's retrieval had been serving it all along, just elided. The
 measured difference was the elision, not the turn shape. The eager scaffold was
 reverted; only the volatile-delivery part survived.
+
+## Arm 3: the volatile fix landed, the endpoint did not (2026-09-18)
+
+Run on `63fffd1` (20 tasks, `--jobs 2`): 7/20 again, but **21 model errors**
+against 1 in arm 1, so the headline is not comparable to arm 1. Atria's
+endpoint returned 502s through the run; `multi-config-env` spent all 7 rounds
+on them and its artifact came back an API error.
+
+Where the endpoint let it run, the fix worked on exactly the tasks that name a
+big file:
+
+| task | arm 1 (12k caps) | arm 3 (volatile named files) |
+|---|---|---|
+| `metrics-model-call-rate` (metrics.rs, 20k chars) | FAIL, 3 rounds | **PASS, 1 round** |
+| `summarize-doc` | FAIL, 5 rounds | **PASS, 1 round** |
+| `budget-doc` | FAIL (ran `cargo check`, not `cargo test`) | **PASS, 1 round** |
+| `regression-test-cache-rate` | PASS | PASS, 1 round |
+
+Two of those conversions are the measured effect of serving a goal-named file
+whole below the layers instead of elided through the mid layer. The rest of the
+gain was swallowed by the 5 analysis tasks (still 0/5) and by the endpoint.
+
+## The analysis class: a report that is not a report (2026-09-18)
+
+All five `analysis-*` tasks fail the same way in all three runs, and it is a
+different failure from the write tasks. The artifact is a *progress report*:
+"enumeration in progress", "the report is not yet produced", "two things still
+to trace". The reviewer's feedback is model-perfect and basically hands it the
+answer shape, and the model still returns a progress note next round.
+
+The cause is the prompt, not the context: `IMPLEMENTER_SYSTEM` told the model
+everything about patches, writes, reads and skills, and nothing about the case
+where the deliverable *is* prose. For `WRITES REQUIRED: no` the model behaved
+like a write task that had not reached its writing turn yet — and with
+`max_review_rounds: 2` there is often no such turn. The instruction now names
+that case: the artifact must be the answer, with quoted strings and a
+file:line for every claim, never a plan to research.
+
+## A second spoiled task (2026-09-18)
+
+`multi-metric-and-trace` asks for a `tool_failures` counter on `EvalReport`,
+incremented in `fold` and printed in the summary. The diagnostic method
+`pub fn tool_failures()` — written by hand while chasing the truncation bug —
+was still in `src/eval/metrics.rs`, so the task's headline deliverable was
+already committed. Worse, it is a *derived* method (`tool_calls - tool_ok`),
+not the stored counter the task asks for, so a model reading the file found the
+exact name present and reported `WRITES MADE: 0`. The method and its test are
+removed; the task is live again. Cross-checking the whole suite against the
+tree found no other spoiled deliverable (`budget-doc`'s field legitimately
+pre-exists — that task documents it).

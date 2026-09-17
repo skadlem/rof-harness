@@ -122,12 +122,11 @@ impl EvalReport {
         }
     }
 
-    /// Tool calls that did not succeed. The trace records only the call
-    /// count and how many were ok, so a failure is what is left over;
-    /// saturating so an over-counted ok column cannot underflow.
-    pub fn tool_failures(&self) -> usize {
-        self.tool_calls.saturating_sub(self.tool_ok)
-    }
+    // ponytail: `tool_failures` is deliberately NOT in this tree. A suite task
+    // asks for a `tool_failures` counter added to EvalReport and incremented
+    // in `fold`; a method with that exact name was hand-written here during
+    // diagnosis and committed, which spoiled the task and misled the model
+    // into reporting 0 writes. Removed so the task is live again.
 
     /// Share of billed input tokens that were cache hits.
     pub fn cache_hit_rate(&self) -> f64 {
@@ -462,19 +461,6 @@ mod tests {
         assert_eq!(r.success_rate(), 1.0);
         assert_eq!(r.utility(), 1.0); // λ=0 by default
         assert_eq!(r.tokens_by_agent.get("implementer"), Some(&800));
-    }
-
-    #[test]
-    fn tool_failures_are_the_calls_that_did_not_succeed() {
-        let mut r = EvalReport::default();
-        assert_eq!(r.tool_failures(), 0); // no calls at all
-        r.tool_calls = 5;
-        r.tool_ok = 5;
-        assert_eq!(r.tool_failures(), 0); // every call succeeded
-        r.tool_ok = 3;
-        assert_eq!(r.tool_failures(), 2); // exact failure count
-        r.tool_ok = 6; // malformed: more oks than calls
-        assert_eq!(r.tool_failures(), 0);
     }
 
     #[test]
