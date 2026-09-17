@@ -1048,3 +1048,39 @@ multi-task structure from overflowing the mid layer: input tokens fell 165k
 **What this costs.** The planner is what would decompose a genuinely large goal;
 this suite has none, so `skip` is right for it and wrong in general. The lever
 stays env-gated (`ROF_PLANNER`) rather than becoming the default.
+## Arms 5-7: three reps, the planner result holds (2026-09-18)
+
+Three independent runs of `0d16841` with `ROF_PLANNER=skip` against three runs
+with the planner on:
+
+| arm | config | pass | model errors | input tokens |
+|---|---|---|---|---|
+| 1 (`ab6aa34`) | planner on | 7/20 | 1 | 444k |
+| 3 (`63fffd1`) | planner on | 7/20 | 21 | 624k |
+| 4 (`0d16841`) | planner on | 8/20 | 17 | 606k |
+| 5 | planner skip | **12/20** | 15 | 441k |
+| 6 | planner skip | **13/20** | 15 | 423k |
+| 7 | planner skip | **13/20** | 15 | 404k |
+
+Planner on: 7.3/20 (37%). Planner skip: 12.7/20 (**63%**). No arm lost a task the
+skip arm then failed, and the token bill fell 200k while the cache-hit rate held.
+
+Two of the five analysis tasks have now passed under the skip arm
+(`analysis-cache-shape` in arms 5-7, `analysis-token-ceiling` in arm 7), so the
+class is not impassable — it is partly a function of how many rounds a
+single-task goal actually gets.
+
+The stable failures across all three skip reps are `add-retriever-test`, the
+three remaining `analysis-*` tasks, and the two `multi-*` tasks that need
+several coordinated edits. Both of the latter fail by delivering *most* of the
+pieces — `multi-tool-and-grant` adds the tool and registers it but leaves the
+planner grant out — which is a rounds problem, not a context problem.
+
+## Arm 8: a third round for the multi-part edits (2026-09-18)
+
+With the goal as one task, `max_review_rounds` is now the binding limit on a
+multi-part edit: the implementer delivers most of the pieces, the reviewer names
+exactly the missing one, and there is no round left to add it. The analysis
+tasks have the same shape — read, then answer, then answer again after the
+reviewer has described the missing shape. Arm 8 keeps `ROF_PLANNER=skip` and
+raises `ROF_MAX_ROUNDS` to 3 so both classes get the second chance.
