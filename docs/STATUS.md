@@ -1291,3 +1291,39 @@ every judge tried, which is a genuine limit rather than a measurement artifact.
 found and fixed this session (vacuous `checks_pass(&[])`, the buried prose
 answer, silent empty content), and the ceiling this model family reaches is
 ~11.3/15 gated. That is the number to beat, and it is honest.
+
+## Crossbench: the first like-for-like comparison (2026-09-19)
+
+A new suite written to be judged by no one: ten small Python tasks, each with a
+deterministic shell oracle and no analysis class at all. All four agents were
+driven on the same starting repo, the same goal strings, the same free model
+(`nvidia/nemotron-3-super-120b-a12b:free` on OpenRouter), 3 reps each.
+
+| agent | score | rate |
+|---|---|---|
+| pi | 22/30 | **0.73** |
+| hermes | 19/30 | 0.63 |
+| rof | 14/30 | 0.47 |
+
+rof is **third of three** against pi and hermes on the same model. The gap is
+not the endpoint this time — all three share it — so it is the harness.
+
+Two findings changed what these numbers mean, and both were driver bugs that
+would have produced a false ranking:
+
+1. **A single rep measures nothing.** The same task, env and prompt passed 4/6
+   times on rof alone; temperature nondeterminism is the dominant term. Every
+   number here is a 3-rep mean, and the spread between reps is still wide
+   (0-3/3 on several tasks for every agent).
+2. **Each agent silently worked in the wrong place until pinned.** Hermes's file
+   tools key off `TERMINAL_CWD`, not the process cwd or `--in`, so it edited
+   `$HOME/lib.py` while reporting success — and its real config pointed at an
+   exhausted DeepSeek billing account, needing a temporary OpenRouter pin.
+   pi answers in prose and never uses its edit tool without `--approve`. rof
+   needed `ROF_WORKDIR` anchored to the task dir. In all three cases the agent
+   *reported* completing a task it had not touched, which is exactly the failure
+   mode this session has been hunting in the harness itself.
+
+The tasks all agents fail identically (`parse-csv-row`, `string-format`,
+`fix-mutation-bug`) are oracle failures or genuinely hard, not agent-specific;
+the differentiators are `reverse-words`, `to-snake-case`, `implement-fizzbuzz`.
