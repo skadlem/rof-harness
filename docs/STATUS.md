@@ -1292,38 +1292,42 @@ found and fixed this session (vacuous `checks_pass(&[])`, the buried prose
 answer, silent empty content), and the ceiling this model family reaches is
 ~11.3/15 gated. That is the number to beat, and it is honest.
 
-## Crossbench: the first like-for-like comparison (2026-09-19)
+## Crossbench: SUPERSEDED — the free key was exhausted (2026-09-19)
 
-A new suite written to be judged by no one: ten small Python tasks, each with a
-deterministic shell oracle and no analysis class at all. All four agents were
-driven on the same starting repo, the same goal strings, the same free model
-(`nvidia/nemotron-3-super-120b-a12b:free` on OpenRouter), 3 reps each.
+**This result is wrong and must not be quoted.** A 3-rep run over rof, hermes
+and pi on the same free OpenRouter model produced:
 
 | agent | score | rate |
 |---|---|---|
-| pi | 22/30 | **0.73** |
+| pi | 22/30 | 0.73 |
 | hermes | 19/30 | 0.63 |
 | rof | 14/30 | 0.47 |
 
-rof is **third of three** against pi and hermes on the same model. The gap is
-not the endpoint this time — all three share it — so it is the harness.
+rof ran *first*, with quota remaining; hermes and pi ran *after* it. The key
+reports `total_credits: 10, total_usage: 10.25` (exhausted) and the free-model
+quota reads `limit 1000, remaining 0` (resets 08:00 UTC). So the two agents that
+scored higher did so on a rate-limited endpoint, and rof's deficit is partly an
+ordering artifact. rof's 0.47 is the only number measured with quota left, and
+even that is a single 3-rep pass over a nondeterministic model.
 
-Two findings changed what these numbers mean, and both were driver bugs that
-would have produced a false ranking:
+The useful output is the *method*, not the table:
 
-1. **A single rep measures nothing.** The same task, env and prompt passed 4/6
-   times on rof alone; temperature nondeterminism is the dominant term. Every
-   number here is a 3-rep mean, and the spread between reps is still wide
-   (0-3/3 on several tasks for every agent).
-2. **Each agent silently worked in the wrong place until pinned.** Hermes's file
-   tools key off `TERMINAL_CWD`, not the process cwd or `--in`, so it edited
-   `$HOME/lib.py` while reporting success — and its real config pointed at an
-   exhausted DeepSeek billing account, needing a temporary OpenRouter pin.
-   pi answers in prose and never uses its edit tool without `--approve`. rof
-   needed `ROF_WORKDIR` anchored to the task dir. In all three cases the agent
-   *reported* completing a task it had not touched, which is exactly the failure
-   mode this session has been hunting in the harness itself.
-
-The tasks all agents fail identically (`parse-csv-row`, `string-format`,
-`fix-mutation-bug`) are oracle failures or genuinely hard, not agent-specific;
-the differentiators are `reverse-words`, `to-snake-case`, `implement-fizzbuzz`.
+- **A deterministic-oracle cross-agent benchmark is runnable here.** All four
+  agents are installed (hermes, pi, claude, rof) and each can be driven
+  non-interactively on the same starting repo and goal strings, scored by a
+  shell command no judge sees.
+- **A single rep measures nothing** — the same task and env passed 4/6 times on
+  rof alone. Temperature nondeterminism dominates; every number needs reps.
+- **Each agent silently worked in the wrong place until pinned.** Hermes file
+  tools key off `TERMINAL_CWD` (not `--in` or process cwd), so it edited
+  `$HOME/lib.py` and reported success; pi answers in prose and never uses its
+  edit tool without `--approve`; rof needs `ROF_WORKDIR` anchored to the task
+  dir. In all three cases the agent *reported completing a task it had not
+  touched* — the same failure mode this session has been hunting in the harness.
+- **A rate limit reads as a capability gap.** rof makes several model calls per
+  task (context + executor + reviewer + retries) where pi makes one per edit, so
+  it exhausts a shared daily quota faster and its later tasks fail with
+  `all models in fallback chain failed` — which is a transport condition, not a
+  model or harness one. Any cross-agent comparison must record per-agent request
+  counts and quota state, or the agent that talks most loses for the wrong
+  reason.
