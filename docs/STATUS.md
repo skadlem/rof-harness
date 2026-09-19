@@ -1440,7 +1440,7 @@ The valid things established by this run:
   for all three harnesses at no cost, so the OpenRouter daily cap can no longer
   decide an outcome.
 
-## Multi-file suite, 3 reps: rof 14/18, hermes 12/18, pi 11/18
+## Multi-file suite, 3 reps: rof 15/18, hermes 15/18, pi 14/18 (tie)
 
 The harder suite demanded by the null result above is built and run. Ten files
 with real structure (config/store/models/api/validators/utils/report plus tests),
@@ -1449,19 +1449,20 @@ planting so one task's bug cannot break another task's oracle.
 
 | task | hermes | pi | rof |
 |---|---|---|---|
-| mf-rename-key | PPP 3/3 | P.P 2/3 | .PP 2/3 |
-| mf-add-validator | PPP 3/3 | PP. 2/3 | PPP 3/3 |
-| mf-fix-import-cycle | ..P 1/3 | PP. 2/3 | .PP 2/3 |
-| mf-new-endpoint | .PP 2/3 | P.. 1/3 | PPP 3/3 |
-| mf-dead-code | ..P 1/3 | P.. 1/3 | PPP 3/3 |
-| mf-test-coverage | P.P 2/3 | PPP 3/3 | .P. 1/3 |
-| **total** | **12/18** | **11/18** | **14/18** |
+| mf-rename-key | PPP 3/3 | P.P 2/3 | PPP 3/3 |
+| mf-add-validator | PPP 3/3 | PPP 3/3 | .PP 2/3 |
+| mf-fix-import-cycle | P.P 2/3 | PPP 3/3 | PPP 3/3 |
+| mf-new-endpoint | PPP 3/3 | P.P 2/3 | PPP 3/3 |
+| mf-dead-code | P.P 2/3 | P.P 2/3 | PPP 3/3 |
+| mf-test-coverage | P.P 2/3 | PP. 2/3 | .P. 1/3 |
+| **total** | **15/18** | **14/18** | **15/18** |
 
-**This is a three-way near-tie, and it must not be quoted as a rof win.** The
-spread is three tasks out of eighteen, and every task has at least one agent
-failing it at least once — per-task variance between reps is as large as the
-between-agent spread. rof's per-rep scores were 3, 6, 5; pi's were 6, 3, 2. Any
-ordering drawn from that is noise.
+**This is a three-way tie, and it must not be quoted as a rof win.** The spread
+is one task out of eighteen — smaller than the rep-to-rep variance within a
+single agent. This is the second time the corrected number has come down as a
+measurement defect was found (see "the no-op failure mode" below), which is
+itself the lesson: an apparent gap that closes when the driver is fixed was a
+driver artifact, not a capability difference.
 
 What the suite *did* establish, in order of confidence:
 
@@ -1469,15 +1470,16 @@ What the suite *did* establish, in order of confidence:
    one gives no task a clean 3/3 across all three agents. The failures are real
    capability failures, not harness misconfiguration.
 2. **The failures are per-task, not per-agent.** No agent owns a task class.
-   mf-dead-code looks like a rof strength (3/3) and a hermes/pi weakness (1/3
-   each); mf-test-coverage is inverted (pi 3/3, rof 1/3). That pattern says the
-   remaining differences are about which specific edits each harness happens to
-   make reliably, not a general capability gap.
+   mf-dead-code looks like a rof strength (3/3) and a hermes/pi weakness (2/3
+   each); mf-test-coverage is the one task every agent fails at least one rep of
+   (1/3, 2/3, 2/3). That pattern says the remaining differences are about which
+   specific edits each harness happens to make reliably, not a general
+capability gap.
 3. **No harness is handicapped anymore.** The wiring fixes from the single-file
    run held: same model, same repos, same oracles, no quota involvement (18
    model calls per agent over the whole run, well under any limit).
 
-**The honest ceiling on Atria-Dawn-Preview is roughly two-thirds of a
+**The honest ceiling on Atria-Dawn-Preview is roughly five-sixths of a
 multi-file task suite, for every harness tested.** That matches the gated
 ceiling measured earlier (~11.3/15, arm 12) with a different model on a
 different suite: the limiter is the model, not the harness. Improving rof's
@@ -1505,7 +1507,91 @@ both-directions oracle check, none by inspection:
    Fixed by asserting an order-independent invariant and clearing `__pycache__`
    before every oracle run.
 
-The recurring lesson, now four times in this session: **an oracle that passes
+### The no-op failure mode: a rate limit in disguise (fifth defect)
+
+The first version of the multi-file table read rof 14, hermes 12, pi 11. It was
+wrong, and the cause was a new failure class that no oracle catches because it
+is not an oracle problem at all.
+
+The symptom: an agent finishes in 19–23 seconds having changed **zero** files,
+produces empty stdout, and the oracle correctly reports FAIL — because the seed
+repo is unfixed. Diffing the work directory against a fresh seed showed no
+differences at all beyond caches. Re-running the identical task through the
+identical code path succeeded in 77 seconds with a correct edit.
+
+The cause was transient pressure on the Atria endpoint during a burst run: the
+agent's first request failed and the harness exited cleanly without retrying.
+A 429 or a dropped connection reads, to a scoring oracle, exactly like a
+capability gap. The first table had **eight** such runs baked into it — pi's
+rep 3 was recorded as 2/6 when a clean re-run gives 5/6.
+
+The fix is in the driver, not the oracle: after scoring a FAIL, diff the work
+directory against a fresh seed; if the agent changed nothing, it never really
+ran, so re-seed and retry (up to three times). An empty-diff FAIL is a transport
+artifact and is never recorded as a capability measurement.
+
+**The lesson: a failure with no file changes is not a failure to do the task.**
+This is the sixth false reading of the session and it is the most dangerous one,
+because it is invisible — the oracle is correct, the harness exits cleanly, and
+the only evidence is that nothing happened. Diff-before-you-score is now a hard
+rule in the driver.
+
+### The recurring lesson
+
+The recurring lesson, now six times in this session: **an oracle that passes
 for a reason you have not checked is not an oracle.** Vacuous, unreachable,
-order-dependent and bytecode-stale each looked like an agent failure until the
-verifier was run on the seed and the reference solution in both orders.
+order-dependent, bytecode-stale, and now no-op — each looked like an agent
+failure until the verifier was run on the seed and the reference solution in
+both orders, or the work directory was diffed against a fresh seed.
+
+## External evidence: what the field says about harness deltas (2026-09-19)
+
+Three external sources were read before deciding what to do next, and they
+reframe what "beating the field" can even mean on this substrate.
+
+**Arena.ai's HarnessTax study** (21 model-harness pairs, 7 models, 3 harnesses:
+Claude Code, Codex CLI, pi — on SWE-bench Lite and Terminal-Bench 2.0) found that
+harness choice has **little effect on task success rate** — ±2% on SWE-bench
+Lite, ±5% on Terminal-Bench — but a **large effect on cost**: the same model at
+similar success rates for up to 5× the spend. A minimal harness (pi: read,
+write, edit, bash) was competitive with vendor harnesses.
+
+The 15/15/14 result above is exactly what that study predicts for the
+success-rate axis: on a matched model and matched tasks, harness differences
+wash out. The finding that *does* separate harnesses — cost — is not measurable
+here, because Atria is free and every harness reports $0.
+
+**Benchgen's 2026 guide** surveys harness-focused benchmarks and reports much
+larger gaps: Harness-Bench (106 tasks × 6 harnesses × 8 models, 5,088
+trajectories) found a 23.8-point gap between the best and worst harness, and —
+most relevant here — **36% of failures were schema/output-contract violations,
+not reasoning errors.** SkillsBench 1.1 found curated skills lift resolution
+33.9% → 50.5% while self-generated skills *hurt* by 8–11.5 points. AgentLens
+found up to 23.2% of "passes" are lucky blind retries, and rankings shift by up
+to 5 positions under process-adjusted scoring.
+
+The schema-violation number is the actionable one for rof: it says a third of
+the remaining failures may be *contract* failures the harness can fix rather
+than reasoning failures it cannot. That directly contradicts the arm-13
+conclusion that the remaining gated failures are pure model limits, and it is
+testable: the `mf-test-coverage` column (1/3, 2/3, 2/3 across all three
+harnesses) is the one task class that fails for everyone, and its failures are
+contract-shaped — the seeded test suite is green while asserting buggy
+behaviour, so the agent sees nothing wrong and changes nothing. Fixing that is
+a harness opportunity (surface "this test asserts known-wrong behaviour"), not
+a model upgrade.
+
+**The HN thread** on the Arena study added the sharpest concrete mechanism:
+models fail on tools that *resemble but differ from* tools they were trained on
+— an `EditFile` with an `old_content` argument gets called with `old_string`
+because that is the shape in the training traces. OpenCode registers different
+edit tools by model family for exactly this reason. Commentators also noted the
+harness matters more for smaller models, which need context management
+offloaded to the harness, and that the harness tax is largely system-prompt
+size.
+
+**The implication for rof:** the success-rate axis is close to saturated on this
+model, so the next lever is either (a) the contract-violation class, where a
+harness can still earn points a model cannot, or (b) cost/token efficiency,
+which is the axis the field actually separates on but which a free endpoint
+cannot measure. Direction (a) is the one available here.
