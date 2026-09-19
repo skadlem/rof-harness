@@ -1439,3 +1439,73 @@ The valid things established by this run:
 - Atria supports a full agent loop (multi-turn tool use, file edits, reasoning)
   for all three harnesses at no cost, so the OpenRouter daily cap can no longer
   decide an outcome.
+
+## Multi-file suite, 3 reps: rof 14/18, hermes 12/18, pi 11/18
+
+The harder suite demanded by the null result above is built and run. Ten files
+with real structure (config/store/models/api/validators/utils/report plus tests),
+planted defects that require reading more than one file, and per-task defect
+planting so one task's bug cannot break another task's oracle.
+
+| task | hermes | pi | rof |
+|---|---|---|---|
+| mf-rename-key | PPP 3/3 | P.P 2/3 | .PP 2/3 |
+| mf-add-validator | PPP 3/3 | PP. 2/3 | PPP 3/3 |
+| mf-fix-import-cycle | ..P 1/3 | PP. 2/3 | .PP 2/3 |
+| mf-new-endpoint | .PP 2/3 | P.. 1/3 | PPP 3/3 |
+| mf-dead-code | ..P 1/3 | P.. 1/3 | PPP 3/3 |
+| mf-test-coverage | P.P 2/3 | PPP 3/3 | .P. 1/3 |
+| **total** | **12/18** | **11/18** | **14/18** |
+
+**This is a three-way near-tie, and it must not be quoted as a rof win.** The
+spread is three tasks out of eighteen, and every task has at least one agent
+failing it at least once — per-task variance between reps is as large as the
+between-agent spread. rof's per-rep scores were 3, 6, 5; pi's were 6, 3, 2. Any
+ordering drawn from that is noise.
+
+What the suite *did* establish, in order of confidence:
+
+1. **The suite discriminates at last.** The single-file suite gave 10/10/10; this
+   one gives no task a clean 3/3 across all three agents. The failures are real
+   capability failures, not harness misconfiguration.
+2. **The failures are per-task, not per-agent.** No agent owns a task class.
+   mf-dead-code looks like a rof strength (3/3) and a hermes/pi weakness (1/3
+   each); mf-test-coverage is inverted (pi 3/3, rof 1/3). That pattern says the
+   remaining differences are about which specific edits each harness happens to
+   make reliably, not a general capability gap.
+3. **No harness is handicapped anymore.** The wiring fixes from the single-file
+   run held: same model, same repos, same oracles, no quota involvement (18
+   model calls per agent over the whole run, well under any limit).
+
+**The honest ceiling on Atria-Dawn-Preview is roughly two-thirds of a
+multi-file task suite, for every harness tested.** That matches the gated
+ceiling measured earlier (~11.3/15, arm 12) with a different model on a
+different suite: the limiter is the model, not the harness. Improving rof's
+context selection is worth attempting and is measurable now, but it should be
+expected to move a task or two, not to separate rof from the field.
+
+### Three benchmark defects the verifier caught before any agent ran
+
+Each of these would have produced a false table. All were caught by the
+both-directions oracle check, none by inspection:
+
+1. **A planted circular import broke the whole package.** The cycle ran through
+   the package `__init__`, so pytest collection failed on *every* task and all
+   six oracles reported UNREACHABLE for the wrong reason. Fixed by isolating the
+   defect to a module nothing else imports, and planting defects per task.
+2. **Two tasks were vacuous after per-task planting.** Moving defects into a
+   plant map left mf-rename-key and mf-new-endpoint with nothing wrong on the
+   seed, so doing nothing passed. Fixed by planting the *absence* of the
+   feature as the defect.
+3. **Cross-test pollution, then stale bytecode.** A regression test asserting
+   `total()==0` failed because an earlier test in the same process had already
+   added records; and once fixed, the oracle still failed because the verifier
+   rewrites files within one second and Python's 1-second mtime check ran the
+   *old* `.pyc` — the traceback showed the new source against the old behaviour.
+   Fixed by asserting an order-independent invariant and clearing `__pycache__`
+   before every oracle run.
+
+The recurring lesson, now four times in this session: **an oracle that passes
+for a reason you have not checked is not an oracle.** Vacuous, unreachable,
+order-dependent and bytecode-stale each looked like an agent failure until the
+verifier was run on the seed and the reference solution in both orders.
