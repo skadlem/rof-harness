@@ -1402,3 +1402,40 @@ to contaminate the comparison.
 directions: the seeded, unmodified repo *fails* it (no vacuous tasks — one such
 task was caught and fixed), and the reference solution *passes* it (no
 unreachable oracle — one unsatisfiable goal was caught and fixed).
+
+## Single-rep full-suite result: all three agents 10/10
+
+| agent | score | model calls | wall time |
+|---|---|---|---|
+| hermes | 10/10 | 10 | ~19 min |
+| pi | 10/10 | 10 | ~10 min |
+| rof | 10/10 | 10 | ~14 min |
+
+**This is the honest headline, and it is a null result for the benchmark as
+designed.** Once each harness was stopped from getting in its own way (see the
+five failure modes above), all three solved every task on the same model. The
+suite is too easy to discriminate between harnesses: ten tiny single-file tasks
+in a two-function repo, where the whole context fits in the prompt with room to
+spare.
+
+The differentiators that mattered were all *harnesses getting out of their own
+way* — `TERMINAL_CWD`, reasoning level, `ROF_WORKDIR`, `--approve` — not any
+harness's real capability. None of rof's distinctive machinery was exercised:
+the context assembler, retriever and windowing are irrelevant when the repo is
+one small file. A benchmark cannot measure a context-selection advantage on a
+repo with nothing to select from.
+
+**Conclusion: the benchmark must get harder, in the specific way that exercises
+rof's actual design.** A multi-file repo with a real structure — where finding
+the right file, reading enough but not too much, and keeping several edits
+consistent across files is the task — is what separates harnesses here. That is
+the next build.
+
+The valid things established by this run:
+- The method is sound: identical repos, identical goals, identical model, one
+  quota-free endpoint, deterministic oracles verified both directions.
+- All three agents are correctly wired and none is handicapped by a
+  misconfiguration anymore. Any future difference will be real.
+- Atria supports a full agent loop (multi-turn tool use, file edits, reasoning)
+  for all three harnesses at no cost, so the OpenRouter daily cap can no longer
+  decide an outcome.
