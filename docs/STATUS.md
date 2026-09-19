@@ -1340,16 +1340,18 @@ endpoint can no longer be the substrate for a cross-agent run. `Atria-Dawn-Previ
 all — and OpenAI-shaped, so all three agents can be pointed at the same model
 without a daily cap deciding the outcome.
 
-Getting each agent onto it exposed four transport-level failure modes. Each one,
+Getting each agent onto it exposed five transport-level failure modes. Each one,
 unhandled, makes the agent look *less capable* rather than misconfigured:
 
-- **Atria answers a `reasoning_effort` request with empty content.** Direct probe:
-  plain request returns `"OK"`, but adding `reasoning_effort: max` (or `low`, or a
-  `reasoning` key) returns `content: null` with a 200. Hermes sends
-  `reasoning_effort: max` by default, so every hermes call came back empty and the
-  run failed with a 422/empty-content error that read like "the model can't edit
-  files". Fix: `--reasoning none`. This is the same class of bug arm 12 patched in
-  the harness — an empty model response is never a signal about capability.
+- **Atria emits `reasoning_content` and charges it against `max_tokens`.** A request
+  with a small `max_tokens` returns `content: null` with a populated
+  `reasoning_content` and `finish_reason: stop` — the model spent its whole budget
+  reasoning and never produced an answer. With `max_tokens: 2000` the same request
+  returns `content: "OK"`. So an "Atria returns empty content" reading is almost
+  always a token-budget reading. This is the same class of bug arm 12 patched in
+  the harness — an empty model response is never a signal about capability, and it
+  is not one here either: tools, reasoning and content all work once the budget is
+  adequate.
 - **Atria's streaming endpoint is broken.** `stream: true` returns a non-JSON body
   (decode failure / 422). Any agent that streams by default needs streaming
   disabled, or every call fails.
@@ -1362,12 +1364,41 @@ unhandled, makes the agent look *less capable* rather than misconfigured:
 - **Hermes file tools resolve cwd from `TERMINAL_CWD`**, not `--in` and not the
   process cwd. Without it the agent searches `$HOME`, reports the file missing,
   and offers to look in an unrelated repo.
+- **Turning reasoning off in Hermes silently cripples it, and the failure reads as
+  a model limit.** A/B over the full 10-task suite, same model, same tasks, same
+  every other setting: `--reasoning none` scores **3/10**, `--reasoning medium`
+  scores **10/10**. With reasoning off the model still fixes the three existing
+  functions but fails all seven *add-a-new-function* tasks — and reports each one
+  as complete. This was diagnosed the wrong way round first: an early 422 was
+  blamed on `reasoning_effort` and `--reasoning none` was adopted as the fix. The
+  real cause of the empty content was the `max_tokens` budget above, not reasoning.
+  Left uncorrected this would have manufactured a false "rof beats hermes" result
+  out of a flag. Reasoning stays on.
 
 All of that was diagnosed against a local recorder that echoes the exact request
 body the agent sends — the only reliable way to see what an agent actually puts
 on the wire, since the failure is a 200 with an empty payload rather than an error.
 
-**Blocked on the Atria token being re-supplied.** The key lived only in `/tmp`,
-which was wiped by an external process mid-session; the endpoint and model name
-survive in `~/.hermes/config.yaml` (`custom_providers`) but the token is in no
-home-dir or repo file.
+**The token now lives at `~/.config/atria-key` (mode 600)** — it was originally only
+in `/tmp`, which an external process wiped mid-session, destroying the crossbench
+suite and every run artifact with it. The benchmark will be rebuilt under a durable
+path.
+
+## Cross-agent result on Atria (10-task suite, 1 rep)
+
+| agent | score | notes |
+|---|---|---|
+| hermes | 10/10 | `--reasoning medium`; 3/10 with `--reasoning none` |
+| pi | pending | — |
+| rof | pending | — |
+
+The 10/10 is a **single rep against a suite this small**, so it is a floor on
+hermes' capability here, not a ceiling. It is reported because the
+reasoning-level delta it exposed (3/10 vs 10/10, identical everything else) is
+large enough to be real at any rep count, and because the wrong setting was about
+to contaminate the comparison.
+
+**Suite integrity was verified before any agent ran.** Every oracle passes both
+directions: the seeded, unmodified repo *fails* it (no vacuous tasks — one such
+task was caught and fixed), and the reference solution *passes* it (no
+unreachable oracle — one unsatisfiable goal was caught and fixed).
