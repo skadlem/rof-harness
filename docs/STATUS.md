@@ -1595,3 +1595,54 @@ model, so the next lever is either (a) the contract-violation class, where a
 harness can still earn points a model cannot, or (b) cost/token efficiency,
 which is the axis the field actually separates on but which a free endpoint
 cannot measure. Direction (a) is the one available here.
+
+## Terminal-Bench 4.0 is runnable locally (2026-09-20)
+
+The external-evidence round pointed at Terminal-Bench 4.0 as the field-standard
+suite, so I checked whether it is actually usable on this machine with the
+quota-free Atria model. It is.
+
+**Requirements that turned out to be non-blocking:**
+
+- The README says tasks "require GPUs" and the docs push Modal. In practice
+  **8 of 68 tasks declare `gpus = 1`; the other 60 declare `gpus = 0`**. A
+  60-task CPU subset is available.
+- Modal is not needed: **`docker` is a supported local sandbox** (`-e docker`),
+  Docker is available here, and `harbor` installed cleanly via
+  `uv tool install 'harbor[docker]'` (the extra name is wrong in the docs —
+  `docker` is not a valid extra, but the local runtime needs no extra
+  dependency, only the docker CLI).
+- The oracle agent passes on both a sample task and a real Terminal-Bench task
+  (`interleaved-vigenere`), which validates the sandbox, the verifier, and the
+  task packaging end to end.
+
+**rof is wired in as a Harbor custom agent** (`RofAgent`, an installed agent
+that copies the release binary into the sandbox and runs it in `/app`). Two
+integration bugs were found and fixed by reading Harbor's *installed* source,
+not the published docs — the docs reverse the API:
+
+1. **The exec helpers live on the agent, not the environment.** The docs show
+   `environment.exec_as_root(...)`; the real signature is
+   `self.exec_as_root(environment, ...)`. File upload is the opposite way round
+   (`environment.upload_file`).
+2. **The task images have no `git` binary and `/app` is not a repo.** rof's
+   rollback substrate requires both. The agent now installs git and lets rof's
+   `ensure()` do `git init` + one commit.
+
+rof then solved `hello-world` (reward 1.0) end to end inside a Harbor sandbox.
+
+**The remaining blocker is a build issue, not a design one:** the release
+binary is built on the host (glibc 2.43) but the Terminal-Bench task images are
+Debian bookworm (glibc 2.36), so the binary fails with
+`GLIBC_2.39 not found` — traced to two symbols, `pidfd_getpid` and
+`pidfd_spawnp`, which Rust std pulls in for process spawning on newer kernels.
+A bookworm-glibc build is in progress; if that works, rof can run the full
+CPU-only subset of Terminal-Bench 4.0 on Atria.
+
+**Why this matters:** the internal multi-file suite tops out around 5/6 for
+every harness, which means it cannot separate rof from the field at the
+resolution that would show a real improvement. Terminal-Bench 4.0 is the suite
+the field actually compares on, it has 60 runnable CPU tasks here, and its
+resolution rates for frontier models are 12–58% — so there is headroom for a
+small model to show a harness-driven difference rather than saturating at the
+top like the internal suite does.
