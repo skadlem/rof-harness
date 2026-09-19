@@ -183,8 +183,22 @@ fn symlink_safe(root: &Path, target: &Path) -> Result<(), ToolError> {
     let parent = target.parent().unwrap_or(root);
     // Writes create no parent dirs, so this exists for every real call; a
     // failure means a dangling link in the path, and that path is not writable.
-    let canon = std::fs::canonicalize(parent)
-        .map_err(|e| ToolError::Denied(format!("path is not resolvable: {e}")))?;
+    //
+    // A missing parent is *not* a security denial: it is a recoverable
+    // contract error, and reporting it as one made the model treat a fixable
+    // write as permanently refused -- then claim success anyway. Say which.
+    let canon = match std::fs::canonicalize(parent) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ToolError::Denied(format!(
+                "parent directory does not exist: create {} first, then re-issue the write",
+                parent.display()
+            )))
+        }
+        Err(e) => {
+            return Err(ToolError::Denied(format!("path is not resolvable: {e}")))
+        }
+    };
     if !canon.starts_with(&canon_root) {
         return Err(ToolError::Denied(
             "symlink escapes the tool root".to_string(),
