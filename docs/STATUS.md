@@ -1331,3 +1331,43 @@ The useful output is the *method*, not the table:
   model or harness one. Any cross-agent comparison must record per-agent request
   counts and quota state, or the agent that talks most loses for the wrong
   reason.
+
+## Atria as the comparison substrate (in progress)
+
+The OpenRouter free key is exhausted and resets 08:00 UTC, so a quota-capped
+endpoint can no longer be the substrate for a cross-agent run. `Atria-Dawn-Preview`
+(endpoint `https://api.atria-asi.ai/v1`) is quota-free — no rate-limit headers at
+all — and OpenAI-shaped, so all three agents can be pointed at the same model
+without a daily cap deciding the outcome.
+
+Getting each agent onto it exposed four transport-level failure modes. Each one,
+unhandled, makes the agent look *less capable* rather than misconfigured:
+
+- **Atria answers a `reasoning_effort` request with empty content.** Direct probe:
+  plain request returns `"OK"`, but adding `reasoning_effort: max` (or `low`, or a
+  `reasoning` key) returns `content: null` with a 200. Hermes sends
+  `reasoning_effort: max` by default, so every hermes call came back empty and the
+  run failed with a 422/empty-content error that read like "the model can't edit
+  files". Fix: `--reasoning none`. This is the same class of bug arm 12 patched in
+  the harness — an empty model response is never a signal about capability.
+- **Atria's streaming endpoint is broken.** `stream: true` returns a non-JSON body
+  (decode failure / 422). Any agent that streams by default needs streaming
+  disabled, or every call fails.
+- **Hermes has a supported custom-provider path**, but it is not `provider:
+  openrouter` + `base_url`. `_openrouter_should_use_pool` deliberately *drops* the
+  credential pool whenever a custom `base_url` is set, so pointing the `openrouter`
+  provider at Atria silently falls back to `OPENAI_API_KEY` against the OpenRouter
+  host and 401s. The supported path is a `custom_providers:` entry with `key_env`
+  (key read at runtime from the named env var) and `provider: custom:atria`.
+- **Hermes file tools resolve cwd from `TERMINAL_CWD`**, not `--in` and not the
+  process cwd. Without it the agent searches `$HOME`, reports the file missing,
+  and offers to look in an unrelated repo.
+
+All of that was diagnosed against a local recorder that echoes the exact request
+body the agent sends — the only reliable way to see what an agent actually puts
+on the wire, since the failure is a 200 with an empty payload rather than an error.
+
+**Blocked on the Atria token being re-supplied.** The key lived only in `/tmp`,
+which was wiped by an external process mid-session; the endpoint and model name
+survive in `~/.hermes/config.yaml` (`custom_providers`) but the token is in no
+home-dir or repo file.
