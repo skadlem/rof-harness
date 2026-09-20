@@ -137,6 +137,18 @@ impl EvalReport {
         }
     }
 
+    /// Tokens the endpoint actually charges for: uncached input plus output.
+    /// `est_input_tokens` alone is not a cost figure on endpoints with prompt
+    /// caching, where a 30k-token system prompt can cost almost nothing once
+    /// warm. This is the number that separates two harnesses that tie on
+    /// success, so it is reported alongside the score rather than derived by
+    /// hand.
+    pub fn billed_tokens(&self) -> u64 {
+        self.est_input_tokens
+            .saturating_sub(self.cached_input_tokens)
+            .saturating_add(self.est_output_tokens)
+    }
+
     /// success − λ·estimated_cost. With λ=0 this is pure success rate and the
     /// cost columns decide ties (lexicographic), which is the default stance.
     pub fn utility(&self) -> f64 {
@@ -531,5 +543,25 @@ mod tests {
         r.record_task(false);
         assert_eq!((r.tasks, r.passed), (2, 1));
         assert_eq!(r.success_rate(), 0.5);
+    }
+
+    #[test]
+    fn billed_tokens_excludes_cached_input() {
+        // A 30k-token system prompt that is fully cached must not read as
+        // 30k of cost: the endpoint charges the uncached share. Two harnesses
+        // that tie on success are separated by this figure, so a saturating
+        // or unseparated implementation would hide the only axis that moved.
+        let mut r = EvalReport::default();
+        r.fold(&TraceEvent::ModelCall {
+            agent: "implementer".into(),
+            model: "test".into(),
+            input_tokens: 30_000,
+            output_tokens: 1_000,
+            latency_ms: 0,
+            cost_usd: None,
+            cached_input_tokens: 29_000,
+            attempts: 1,
+        });
+        assert_eq!(r.billed_tokens(), 2_000);
     }
 }

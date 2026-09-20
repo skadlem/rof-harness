@@ -317,11 +317,12 @@ fn print_report(trace: &TraceSink, passed: bool) {
     }
     report.record_task(passed);
     println!(
-        "trace events: {} | tool accuracy: {:.0}% | tokens in/out: {}/{} | cache-hit input: {:.0}% | latency: {}ms",
+        "trace events: {} | tool accuracy: {:.0}% | tokens in/out: {}/{} | billed: {} | cache-hit input: {:.0}% | latency: {}ms",
         trace.len(),
         report.tool_accuracy() * 100.0,
         report.est_input_tokens,
         report.est_output_tokens,
+        report.billed_tokens(),
         report.cache_hit_rate() * 100.0,
         report.total_latency_ms,
     );
@@ -411,13 +412,14 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             println!(
-                "matched {}/{} ({:.0}%) | tool accuracy: {:.0}% | tokens in/out {}/{} | cache-hit {:.0}% | utility {:.3}",
+                "matched {}/{} ({:.0}%) | tool accuracy: {:.0}% | tokens in/out {}/{} | billed {} | cache-hit {:.0}% | utility {:.3}",
                 rep.matched(),
                 rep.tasks.len(),
                 rep.success_rate() * 100.0,
                 rep.aggregate.tool_accuracy() * 100.0,
                 rep.aggregate.est_input_tokens,
                 rep.aggregate.est_output_tokens,
+                rep.aggregate.billed_tokens(),
                 rep.aggregate.cache_hit_rate() * 100.0,
                 rep.aggregate.utility(),
             );

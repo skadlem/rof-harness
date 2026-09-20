@@ -2603,3 +2603,48 @@ test fails on the pre-cap tree with the intended message.
 (item 1) and token accounting (item 4). The `enable_thinking` rung is inert
 above the threshold but harmless below it, so it stays rather than being
 removed — the measurement bounds it, it does not forbid it.
+
+## The cost axis is measurable, and it is where rof separates (2026-09-21)
+
+The `535d481` decision to abandon cost accounting was wrong: it was a
+Harbor-path artifact, not a property of the endpoint. Atria returns a full
+`usage` block on every response (`prompt_tokens`, `completion_tokens`,
+`prompt_tokens_details.cached_tokens`, `completion_tokens_details.reasoning_tokens`),
+and `openrouter.rs` already parsed it.
+
+A wire-level proxy that bills what the endpoint bills measured both harnesses
+on the whole multi-file suite, same model, same seeds, same goals, same oracle,
+three reps each. Both agents pass 18/18 — the score is still saturated — but
+the billed-token cost is not:
+
+| task | rof (3 reps) | hermes (3 reps) | ratio |
+|---|---|---|---|
+| mf-add-validator | 7,552 / 8,819 / 7,628 | 38,508 / 42,375 / 52,164 | 5.5x |
+| mf-dead-code | 10,685 / 2,030 / 2,111 | 121,678 / 45,118 / 40,175 | 14.0x |
+| mf-fix-import-cycle | 14,510 / 13,950 / 10,606 | 7,521 / 60,371 / 11,181 | 2.0x |
+| mf-new-endpoint | 3,977 / 2,189 / 2,346 | 22,218 / 20,444 / 24,212 | 7.9x |
+| mf-rename-key | 4,303 / 3,936 / 2,240 | 79,904 / 21,603 / 44,361 | 13.9x |
+| mf-test-coverage | 15,354 / 15,246 / 14,835 | 24,083 / 64,752 / 8,835 | 2.1x |
+| **mean per task** | **7,906** | **40,528** | **5.1x** |
+
+The separation holds on every task and every rep (worst case 2.0x, best 14x).
+This is the Arena.ai HarnessTax prediction confirmed by direct measurement:
+harness choice moves cost by multiples while success stays flat.
+
+Two details the first reading got wrong, both corrected by measuring rather
+than by reasoning:
+
+- hermes sends a ~31k-character system prompt on every call, so its raw input
+  is ~80k tokens per task. But 99% of that is a cache hit once warm, so its
+  *billed* cost is a tenth of the raw figure. Comparing raw input would have
+  overstated hermes's cost by 10x in rof's favour — the same error class as the
+  scoring correction, in the opposite direction.
+- a cold cache pays the full system prompt once: hermes's first call of a
+  session bills ~16k tokens where the second bills ~1.4k. The reported ratios
+  are per-session and include that cold start, so they are the honest
+  end-to-end figure rather than the warm-cache best case.
+
+`EvalReport::billed_tokens()` now reports uncached input plus output as a
+first-class metric, mutation-verified, because it is the only axis on which
+the harnesses currently differ and it was previously derivable only by hand
+from two separately-printed numbers.
