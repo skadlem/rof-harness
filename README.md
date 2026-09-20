@@ -113,11 +113,22 @@ weak. The gap implicates the harness path, and the exhaustion quirk we already f
 (`content: null`, `reasoning_content=37683`) on large prompts is the prime suspect. It is
 recorded as an open problem, not a settled ceiling.
 
-**The suite is saturated and no longer separates the harnesses.** With all three at or
-within two of the ceiling, the multi-file suite has nothing left to discriminate: a future
-arm that moves nothing will still score ~18, so the suite cannot be the instrument for the
-next claim. Widening it (larger repos, indirect call chains, cross-file consistency) is now
-a prerequisite for measurement, not a nice-to-have.
+**The suite is saturated on score — but not on cost.** With all three at or
+within two of the ceiling, the multi-file suite has nothing left to discriminate
+on *success*: a future arm that moves nothing will still score ~18. Widening it
+(larger repos, indirect call chains, cross-file consistency) is now a
+prerequisite for a score claim, not a nice-to-have.
+
+Cost is the axis that still separates rof from hermes at equal success. Both
+pass 18/18 on the same model, seeds, goals, and oracle, measured through one
+wire proxy that bills what the endpoint bills: **rof averages 7,906 billed
+tokens per task, hermes 40,528 — a 5.1x gap that holds on every task and every
+rep** (worst case 2.0x, best 14x). Billed means uncached input plus output:
+hermes re-sends a ~31k-character system prompt per call, but 99% of it is a
+cache hit once warm, so raw input would have overstated its cost by 10x. This
+confirms the Arena.ai HarnessTax prediction — harness choice moves cost by
+multiples while success stays flat — and it is the first axis on which rof
+measurably leads since the score saturated.
 
 **Correction, 2026-09-21.** This section previously read "rof 17/18 vs hermes 15/18 and pi
 14/18, the separation is `mf-dead-code`, which rof passes 3/3 and both others 2/3."
