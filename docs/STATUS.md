@@ -1934,3 +1934,112 @@ with its variance attached.
 frontier, all three score zero. rof's lead exists where the task difficulty is
 calibrated to the model — which is exactly the design intent of v3 §0:
 flash-class cost, frontier-adjacent completion. Both facts are true at once.
+
+## Research: SoL-Pi (arXiv 2609.20519) — what we can actually use (2026-09-20)
+
+[SoL-Pi: Recursively Scaling Auto-Research Loops for Efficient Agent Harness](https://arxiv.org/html/2609.20519)
+is the closest published work to what this harness is for. It runs an RSI-inspired
+search at the *harness* layer — ~152 proposed directions, ~535 executable
+environments, 3,000+ runs, 60,000+ agent-environment interactions — and four
+mechanisms survive selection. It is built as an extension of Pi, which is one of
+the two agents we already compare against, so the mechanisms are directly
+addressed at a harness shaped like ours.
+
+### What they claim, and the part we should trust
+
+The headline is **token traffic −44.7–49.0% and API cost about −1/3 while keeping
+94% of Pi's score**, and it transfers from GPT-5.6 Sol to Opus 5 without
+re-search. That is the efficiency story, and it is measured on EdgeBench.
+
+**But the Terminal-Bench 4 table is the one that matters for us, and it cuts the
+other way.** On 63 CPU-only tbench tasks: Codex 18 solved, Pi 18 solved,
+**SoL-Pi 15 solved**. SoL-Pi is *cheaper per solved task* ($14.07 vs $15.91) but
+solves **fewer** of them. This is the single most important number for our
+position: we just measured that all three of our agents score 0/8 on the CPU
+tbench tasks, so a stack that trades three solved tasks for cost savings is
+exactly the wrong trade for us right now. **We should not adopt the full stack.**
+Our constraint is capability at the model ceiling, not cost per task.
+
+There is also a methodological caution they cite (Wang et al., arXiv 2607.12227):
+harness-evolution gains on held-out tasks are often limited, and improvements are
+overstated when search tasks and evaluation tasks overlap. SoL-Pi's own answer is
+strict isolation — EdgeBench is held out, results never feed back. That matches
+our arm discipline (frozen tree, matched outcomes, negative controls).
+
+### The four mechanisms, mapped onto this harness
+
+I checked the source for each one. Here is what already exists and what is genuinely new.
+
+**1. Action Fusion — combine an edit with its follow-up command into one request.**
+Pi edits a file, then issues a separate command to test it: three model round
+trips. Fusion makes both one request. **We already have half of this by design**:
+our implementer's `run_tests_summary` runs the suite *inside the same turn* the
+writes land in, with no extra round trip. The difference is ours is fixed
+(always pytest on writes), theirs is model-selected (`follow_up_command` in the
+tool schema, "commands that require inspecting the mutation result remain
+separate"). Making it model-selected is a schema change, not an architecture
+change. **Verdict: cheap to try, and the paper says it is the *score* leader on
+Opus 5 (44.8 → 50.5), which is the capability direction we care about — not the
+cost direction.**
+
+**2. Online Context Compact — compact at plan-step boundaries, gated by projected
+savings.** Instead of compacting near the context limit, it compacts when a plan
+step completes, and only if projected input savings exceed the cache-rewrite
+cost. **This is the one we need least.** rof is not a long-horizon chat loop — it
+is a bounded pipeline (planner → implementer → reviewer, fixed rounds), and §4.1
+already owns the budget explicitly via `VolatileBudget` with `fit()` halving
+windows until they fit. We have no prompt cache to amortize against. **Verdict:
+skip.** The underlying idea (compaction gated on projected savings, not on
+proximity to the limit) is sound, but the precondition that makes it pay — a
+long-running session with a cached prefix — does not exist here.
+
+**3. ObservationPack — stop re-sending large tool outputs.** Send a >10 KiB result
+in full for the first two requests, then replace it with a handle + 1 KB head/tail
+excerpt; the agent can page exact chunks on demand. **This is a real gap.** Our
+`file_state` carries whole file text, and `read.output` goes into context as-is;
+`condense_output` filters lines for the reviewer but the *re-read path* still
+re-sends full bodies. The paper's version of this was the **score leader on
+GPT-5.6 Sol (44.8 → 47.2)**. **Verdict: the most promising single mechanism for
+us, and for the same reason it was theirs — it reduces repeated input without
+losing information, because the handle keeps it retrievable.**
+
+**4. Evidence-Preserving Reducer — a cheap model summarizes logs with a verified
+receipt, falling back to the original.** For ≥4 KiB build/test logs from a known
+command set; checks schema, source hash, exit status, exact quotes, size. **We
+have a simpler, cheaper version already**: `condense_output` is a *deterministic*
+line filter, and `run_tests_summary` already extracts only the failing
+assertions. Theirs is strictly more powerful (semantic extraction) but costs an
+extra model call per log and requires a second model. **Verdict: we already
+captured the deterministic part. The remaining value is the verified-receipt
+discipline — source hash + exact quotes + fallback — which is a good
+correctness pattern for our existing filter if we ever need richer summaries.**
+
+### What I am actually recommending
+
+Two things, in this order:
+
+1. **ObservationPack-style observation handles on the re-read path** (mechanism 3).
+   This is the highest-value change: it was the capability leader on the search
+   backend, it targets repeated input which is exactly what our multi-round
+   re-asks amplify, and it preserves information via the handle rather than
+   discarding it. It is also testable in isolation on the mf suite, which is the
+   only suite calibrated to our model.
+
+2. **Model-selected follow-up command on writes** (mechanism 1), because the
+   fixed pytest invocation we have now is a special case of it, and because it
+   was the capability leader on the held-out backend. Small diff: one optional
+   field on the implementer's JSON contract.
+
+**Both are capability mechanisms, not cost mechanisms.** That is the deliberate
+inversion of the paper's headline. Their Terminal-Bench result is the evidence
+for why: the full efficiency stack solved three *fewer* tasks, and we are
+score-limited, not cost-limited. If we are going to copy anything from SoL-Pi,
+copy the two mechanisms that raised the score, and leave the two that lowered it.
+
+**What we should not copy:** the auto-research search loop itself. It cost them
+3,000+ runs and 60,000+ interactions on a paid frontier model. Our substrate is a
+free quota Atria that cannot clear a single tbench 4.0 task, and we have already
+established that a single rep measures nothing — the search would be optimizing
+against noise. Our arm discipline (frozen tree, ≥3 reps, negative control,
+config_hash diff) is the version of their isolation discipline we can actually
+afford.
