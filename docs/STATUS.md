@@ -1778,3 +1778,51 @@ making it fatal.
 best of 15/18 needs the same 3-rep discipline applied to hermes and pi before
 any ordering claim — and `mf-test-coverage` is a *rof-shaped* opportunity, so a
 full cross-agent rerun is the next measurement, not a conclusion.
+
+## Terminal-Bench 4.0: the comparison that had never actually run (2026-09-20)
+
+Direct answer to a fair question: **no cross-harness comparison on Terminal-Bench
+existed before this point.** What existed was plumbing — `RofAgent` wired in, one
+`hello-world` run since lost to a /tmp wipe — and the 15/15/14 tie was on the
+in-house multi-file suite, not on a public benchmark. The four Harbor jobs on
+disk were all `interleaved-vigenere` debug runs.
+
+That changed. `hermes` and `pi` are **built-in Harbor agents**, so the missing
+half of the comparison needed no custom agent — only a working route to Atria.
+
+**Three real blockers found and fixed in Harbor's bundled `hermes` agent**
+(patches saved at `~/.local/share/tbench/hermes-agent-patched.py`):
+
+1. `get_version_command` and `install()` call `hermes version`, which is not a
+   command in hermes v0.21.3 (`hermes --version` is). The trial errored during
+   setup before the agent ever started — reading as a capability gap.
+2. `_NATIVE_PROVIDERS` has no `atria` entry, so hermes fell back to OpenRouter
+   and died at **HTTP 401: Missing Authentication header**. The OpenRouter key
+   is exhausted; this was a routing failure, not a quota one.
+3. `_build_config_yaml` emitted a flat `model:`/`provider:` layout that hermes
+   0.21 flags as stale, and had no way to express a custom endpoint. Atria is
+   only reachable as `provider: custom:atria` with a `custom_providers` entry
+   and `key_env: ATRIA_API_KEY` — verified working with a direct `hermes` call
+   before touching Harbor.
+
+**First like-for-like tbench data point** (same task, same model, same key,
+`payments-pipeline-fix`, 600s agent timeout):
+
+| agent | reward | errored |
+|---|---|---|
+| hermes | 0.0 | 0 |
+| rof | 0.0 | 0 |
+
+This is a **tie on a task both failed**, and it must be reported as such. It is
+not evidence that either harness is worse — `payments-pipeline-fix` asks for
+worker-startup tuning with overdraft-ordering correctness under respawn, and
+both agents produced something the grader rejected. What it *is* evidence of:
+the pipeline now measures real agents instead of erroring, which is the
+prerequisite for any comparison. A 0/0 on one task ranks nothing.
+
+**Honest limits of this measurement:** one task, one rep, both agents score 0.
+The token counts came back `null` — Harbor's hermes trajectory conversion reads
+usage from the session export, and Atria's usage fields are not where it looks,
+so the cost axis is still unmeasured here. And `layout-config-recreation2`, the
+task `--n-tasks 1` selects first, is an 8-hour vision task; task selection is
+material and `--n-tasks 1` is not a representative sample of anything.
