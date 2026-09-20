@@ -2095,3 +2095,94 @@ score leader on the held-out Opus 5 backend. Its fixed half already exists here
 as `run_tests_summary`; making the follow-up command model-selected instead of
 hard-coded to pytest is a real, small change that does not depend on any premise
 about context size. That is the next arm, if any.
+
+## The judgment call: what to do about quality and token-efficiency (2026-09-20)
+
+Asked directly what the right call is. Here is the answer, and it is not another
+mechanism from a paper.
+
+### Token-efficiency is currently not a thing we can improve, because we do not measure it
+
+This is the load-bearing fact. Every efficiency claim in the SoL-Pi paper rests
+on `usage` fields — prompt tokens, completion tokens, cache read/write. **Atria
+returns none of them.** `input_tokens` is 0 on every call; the trace's
+`ModelCall.input_tokens` is therefore always 0; Harbor's hermes converter
+returns `null` for the same reason. Two independent measurement paths are dead
+at the endpoint.
+
+So the efficiency axis has no numbers, and the ObservationPack measurement above
+only worked because I substituted char counts on prompts I construct myself. That
+substitute is fine for *input* (I build every prompt) and useless for *output*
+(the endpoint's reasoning spend is invisible unless it tells us).
+
+**Any token-efficiency work is therefore blocked on measurement, not on
+mechanisms.** Optimizing an unmeasured axis is how you ship a no-op arm and
+report it as a win — the exact failure this project exists to avoid.
+
+### But the one place we DO know tokens are wasted is output, and it is measurable
+
+The truncation error already reports `content=N chars; reasoning_content=M chars`
+(`openrouter.rs:337`). That is a real output-efficiency measurement, captured by
+accident, never aggregated. On the real implementer prompt we measured
+`content=0, reasoning_content=37683` — the endpoint burned 37,683 chars of hidden
+reasoning and shipped nothing. **That is a 100% waste of the output budget, and
+it is simultaneously a quality failure** (the task fails with no content) and an
+efficiency failure (the whole budget went to invisible thinking).
+
+This is the one place quality and token-efficiency point the same direction, and
+it is already observable. It is also the failure the four-rung ladder was built
+for — and the ladder is verified working but was a no-op on the mf suite because
+those prompts are small enough that the class never fires.
+
+**One untried knob remains on that path.** `enable_thinking: false` is not wired
+into `ChatReq` (it supports only `reasoning` and `chat_template_kwargs`). The
+curl A/B found it produced **11,233 chars of content on the ~7 KB implementer
+prompt where every other shape produced 0** — the only request shape that
+returned substantive content at that prompt size. It still finished `length`, so
+it is not a complete fix, but it is the strongest single signal in the whole A/B
+and it has never been tried through the harness. That is a real, small,
+hypothesis-driven change with a measured prior.
+
+### And for quality, the honest state is: we are at the model's ceiling on the public benchmark, and one task short of a claim on the private one
+
+- tbench 4.0: all three agents 0/8. Ceiling is the model. Harness work does not
+  move this until a stronger substrate exists.
+- mf suite: rof 17/18 vs hermes 15, pi 14. **The separation is one task,
+  `mf-dead-code`** (rof 3/3, both others 2/3), and rep-2 dipped to 3/6 for both
+  opponents independently. That is a lead, not a result.
+
+So quality work that would actually mean something is: **diagnose why hermes and
+pi each lose one rep of `mf-dead-code` and whether a harness lever would close
+it.** "Find two uncalled helpers and remove them" is a removal task — it needs
+whole-repo call analysis, which is exactly what a retrieval layer is for, and
+both opponents fail it once in three. If that failure is a *retrieval* failure,
+§4.4's recall work has a lever; if it is a model-judgment failure, nothing here
+moves it. **Nobody has looked.**
+
+### The call
+
+In order:
+
+1. **Wire `enable_thinking` into `ChatReq`** as a fifth ladder rung, behind the
+   same `#[serde(skip_serializing_if)]` discipline so a first attempt stays
+   byte-identical. Prior: the only request shape that returned real content on
+   the hard prompt. Cost: a handful of lines. This is the single highest-value
+   *quality* change available, and it is the only *efficiency* change with a
+   measured prior, because it targets the 100%-waste output path.
+
+2. **Aggregate the output-efficiency measurement** that already exists in the
+   truncation error into the trace, so `content`/`reasoning_content` char counts
+   are recorded per call instead of only on failure. Until the endpoint gives us
+   `usage`, this *is* the efficiency axis. Without it every efficiency claim is
+   unmeasurable and should be refused.
+
+3. **Diagnose `mf-dead-code`** from the stored runs — what did hermes and pi
+   actually do on the rep they lost? Cheap, no model calls, and it decides
+   whether the remaining quality gap is retrieval-shaped or model-shaped.
+
+**What I am explicitly not recommending:** more mechanisms from SoL-Pi. Two of
+four are structurally inapplicable (no prompt cache, no accumulating history),
+and the remaining two are one already-half-built and one blocked on a substrate
+we do not have. The research moved us by ruling things out, which is progress,
+but the next gain is not in that paper — it is in the output-waste measurement we
+already capture and have never read.
