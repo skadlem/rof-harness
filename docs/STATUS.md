@@ -1646,3 +1646,62 @@ the field actually compares on, it has 60 runnable CPU tasks here, and its
 resolution rates for frontier models are 12–58% — so there is headroom for a
 small model to show a harness-driven difference rather than saturating at the
 top like the internal suite does.
+
+## The reasoning-budget ladder, and what it found (2026-09-20, live, Atria)
+
+`interleaved-vigenere` is the first Terminal-Bench task rof attempted that has
+a large implementer prompt (the real `/app/data/` corpus puts ~7KB in the user
+turn). On that task rof produced **zero writes** and the artifact was a single
+error line. Root-caused by following the diagnostic chain rather than guessing:
+
+1. **`LlmError::AllFailed` discarded the cause.** Every failure read "chain
+   failed" with no reason. The variant now carries the primary error, which is
+   the only reason this bug class was findable at all.
+2. **The cause is `reasoning_content`.** The endpoint ships `content: null`
+   with `finish_reason: length` because the model spent the whole `max_tokens`
+   budget on hidden reasoning (22k–31k chars) and never started the answer.
+3. **Doubling `max_tokens` is exactly wrong.** At 8192 the reasoning was 27k
+   chars; at 16384 it grew to 64,608 and content was still 0. Reasoning
+   expands to fill the budget.
+4. **The `reasoning: false` knob only works on small prompts.** It is ignored
+   on the real implementer payload — measured by curl against the same
+   endpoint, same key, same model.
+5. **`chat_template_kwargs.reasoning_effort: "low"` is the knob the template
+   honours**, and it works at any prompt size *when the endpoint chooses to
+   honour it* — but that choice is nondeterministic. Three identical requests
+   gave content 4072, 2953 and 0 on successive calls.
+
+The fix is a **four-rung ladder** in `OpenRouterClient::complete`, each rung
+reshaping the request instead of re-rolling the same shape: plain →
+`reasoning_effort: low` → `reasoning: false` → roomier (2× `max_tokens`,
+reasoning back on). The truncation and empty-content paths both climb it, and
+the retry budget is bounded so an unreachable answer still terminates.
+
+**Honest result: the ladder is verified working and the task still fails.**
+Instrumented live, the four attempts climbed exactly as designed
+(low → off → roomier at 16384) and all four truncated with `content=0`. On
+this prompt the endpoint cannot emit the artifact at any knob setting right
+now. That is an endpoint/model limit, not a harness limit — the harness now
+does everything the retry layer can do, and the failure surfaces with a full
+diagnostic instead of a silent no-op.
+
+This is the same lesson as the no-op retry fix: **the harness's job is to make
+the failure legible, not to make it disappear.** Before these fixes the run
+read as "the model cannot write a cipher tool"; after them it reads as "the
+endpoint spent 27k tokens on reasoning and shipped nothing at four request
+shapes", which is a different and actionable fact.
+
+What did land and is measured:
+- `LlmError::AllFailed` carries the primary error (was discarded).
+- Empty content is retried; truncation and reasoning-exhaustion climb the
+  ladder; all bounded, 3 unit tests fail on the pre-fix classification.
+- `ChatReq` gained `reasoning` and `chat_template_kwargs`, both
+  `skip_serializing_if = None`, so a first attempt is byte-identical to before
+  either knob existed.
+- The implementer's re-ask after `reads` now carries a `[RE-ASK]` marker:
+  requested files are in context, do not emit `reads` again. Without it the
+  model defers a second time and stops, which reads as a model that cannot
+  implement when it only could not tell it had what it asked for.
+- `symlink_safe` distinguishes a missing parent directory from a security
+  denial, so a write to a new file in a nonexistent dir says "create the
+  directory first" instead of the permanent-sounding "path is not resolvable".

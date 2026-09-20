@@ -195,9 +195,7 @@ fn symlink_safe(root: &Path, target: &Path) -> Result<(), ToolError> {
                 parent.display()
             )))
         }
-        Err(e) => {
-            return Err(ToolError::Denied(format!("path is not resolvable: {e}")))
-        }
+        Err(e) => return Err(ToolError::Denied(format!("path is not resolvable: {e}"))),
     };
     if !canon.starts_with(&canon_root) {
         return Err(ToolError::Denied(

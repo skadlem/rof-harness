@@ -34,6 +34,9 @@ impl Agent for ReviewerAgent<'_> {
                 .to_string(),
             prompt: ctx.view.prompt.clone(),
             max_tokens: 4096,
+            reasoning_off: false,
+            reasoning_low: false,
+            roomier: false,
         };
         let resp = self
             .llm
