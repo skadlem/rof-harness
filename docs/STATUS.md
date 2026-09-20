@@ -1705,3 +1705,32 @@ What did land and is measured:
 - `symlink_safe` distinguishes a missing parent directory from a security
   denial, so a write to a new file in a nonexistent dir says "create the
   directory first" instead of the permanent-sounding "path is not resolvable".
+
+## Arm: the ladder, measured on the multi-file suite (2026-09-20, 3 reps)
+
+The reasoning-budget ladder was armed and the multi-file suite re-run, same
+3 reps, same `config_hash`-diffed tree, same driver. The suite's prompts are
+small enough that the reasoning-budget class never fires — so this arm was
+never going to move it, and it did not:
+
+| rep | before (`21de3ec`) | after (`a184bb3`) |
+|---|---|---|
+| 1 | 4/6 | 6/6 |
+| 2 | 6/6 | 3/6 |
+| 3 | 5/6 | 4/6 |
+| **total** | **15/18** | **13/18** |
+
+**This is a no-op within noise, and it must be reported as one.** The spread is
+2 tasks out of 18 against a within-agent rep swing that has measured 3→6→5.
+The corrected call is: the ladder fixes a failure class the internal suite
+does not exercise, and the one task that does exercise it (`interleaved-vigenere`)
+has an endpoint that cannot emit the artifact at any of the four request
+shapes. Both directions were measured rather than assumed.
+
+The failures the suite *does* have are a different class, confirmed by reading
+every failure tail: `mf-rename-key` r3 wrote 1 file and the oracle rejected the
+edit; `mf-add-validator` r2 wrote 0 with tool accuracy 100% and no transport
+error; `mf-test-coverage` wrote 2 files that did not fix the seeded bug. None
+is a chain failure, none is a truncation, none is an empty-content no-op. They
+are the model editing wrong, which is what the contract-violation hypothesis
+predicts and what the next lever targets.
