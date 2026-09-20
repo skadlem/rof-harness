@@ -106,7 +106,12 @@ oracle and the reviewer was their only judge. As of the last arms the honest num
 Multi-file suite (6 tasks × 3 reps, Atria): **rof 18/18, hermes 18/18, pi 16/18.**
 These are the verified numbers, and they replaced an earlier claim that was wrong — see
 below. On Terminal-Bench 4.0 all three score 0.0 on 8 of 8 CPU tasks at 15- and 30-minute
-caps — the ceiling there is the model, not the harness, and it is recorded as such.
+caps. **That floor is no longer attributed to the model** — see the correction below, but
+in short: Atria is a 744B GLM-5 MoE that scores 78.3 on Terminal-Bench 2.1, so a model
+competent on this benchmark family does not fall to zero across eight tasks because it is
+weak. The gap implicates the harness path, and the exhaustion quirk we already found
+(`content: null`, `reasoning_content=37683`) on large prompts is the prime suspect. It is
+recorded as an open problem, not a settled ceiling.
 
 **The suite is saturated and no longer separates the harnesses.** With all three at or
 within two of the ceiling, the multi-file suite has nothing left to discriminate: a future
