@@ -5,6 +5,7 @@ use crate::llm::LlmReq;
 use crate::obs::TraceEvent;
 use crate::tools::ToolRegistry;
 use async_trait::async_trait;
+use std::path::Path;
 
 /// The implementer's contract. `reads` is the one way it can *look something
 /// up* before writing: emit `{"reads": [...]}` and nothing else, get those files
@@ -212,6 +213,14 @@ impl ImplementerAgent<'_> {
         let (w2, s2) = self.apply_writes(&ctx, &data).await;
         writes.extend(w2);
         state.extend(s2);
+        // A correct fix can still fail the suite: a seeded test may assert
+        // the *buggy* value, so "keep the existing tests passing" is
+        // sometimes impossible until that assertion is corrected, and the
+        // model cannot see it — the implementer has no `proc.run`. Run the
+        // suite here and surface the failure in the artifact, which is the
+        // only channel the model has to learn its edit broke an assertion
+        // that encodes the bug rather than the fix.
+        let test_report = self.run_tests(&ctx, &writes).await;
         // Skill ops go through the same registry as every other side effect.
         // In the default `Propose` policy they land as proposals, never as
         // edits to the store.
@@ -229,9 +238,69 @@ impl ImplementerAgent<'_> {
                 "writes": writes,
                 "file_state": state,
                 "skill_changes": skill_changes,
+                "test_report": test_report,
             }),
         })
     }
+}
+
+/// Run the repo's own test suite after writes land, so a fix that breaks a
+/// seeded assertion is visible to the model instead of silent. The
+/// implementer has no `proc.run` tool, and the failing assertion is often the
+/// one that encodes the bug — `assert total() == 22` in a suite that was green
+/// precisely because the bug was present. Without this the model's artifact is
+/// correct and the oracle still rejects it, and nothing in the loop says why.
+/// Only runs when the policy allowlists the command, so a configuration that
+/// grants the implementer no shell is unchanged.
+fn run_tests_summary(root: &Path, allowed: &[String]) -> Option<String> {
+    // Compose the invocation from what the policy actually grants: a bare
+    // `python3` is the common case (`ROF_ALLOW_CMDS=python3`), and the
+    // runner must not require an exact `pytest` grant the configuration
+    // has no reason to name.
+    let has_py = allowed.iter().any(|a| a == "python3");
+    let cmd = allowed
+        .iter()
+        .find(|a| {
+            a.starts_with("python3 -m pytest")
+                || a.starts_with("pytest")
+                || a.as_str() == "python3 -m pytest"
+        })
+        .cloned()
+        .or_else(|| {
+            if has_py {
+                Some("python3 -m pytest tests/ -q".to_string())
+            } else {
+                None
+            }
+        })?;
+    let mut parts = cmd.split_whitespace();
+    let bin = parts.next()?;
+    let out = std::process::Command::new(bin)
+        .args(parts)
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    // The line that names the rejected value is the actionable one; the
+    // surrounding summary is enough context without the whole dump.
+    let mut report = body
+        .lines()
+        .filter(|l| l.contains("assert") || l.contains("AssertionError") || l.contains("failed"))
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if report.is_empty() {
+        report = err.lines().take(4).collect::<Vec<_>>().join("\n");
+    }
+    Some(format!(
+        "the test suite is now red. A test may assert the value the bug produced \
+         rather than the fixed one; if so, correct that assertion to the fixed \
+         value. Failing:\n{report}"
+    ))
 }
 
 /// A file an artifact asked to read. The content is delivered whole: the
@@ -532,6 +601,18 @@ impl ImplementerAgent<'_> {
     /// text as it is *now*, because the mid-term retrieval is a pre-round
     /// snapshot — a retry that only sees it re-applies an edit that already
     /// landed (measured: duplicate definitions, E0592/E0428).
+    /// Run the repo's test suite after writes, when the policy allows it. See
+    /// `run_tests_summary`: the point is to surface a seeded assertion that
+    /// encodes the bug, not to judge the fix.
+    async fn run_tests(&self, ctx: &AgentCtx<'_>, writes: &[String]) -> Option<String> {
+        if writes.is_empty() {
+            return None;
+        }
+        let root = ctx.workdir?;
+        let allowed = ctx.tools.map(|t| t.allowed_commands()).unwrap_or_default();
+        run_tests_summary(root, &allowed)
+    }
+
     async fn apply_patches(
         &self,
         ctx: &AgentCtx<'_>,
@@ -683,7 +764,7 @@ impl ImplementerAgent<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::reask_prompt;
+    use super::*;
 
     /// The re-ask marker stops a second `reads` deferral, and it must survive
     /// being appended to any prompt: a marker that silently vanished, or that
@@ -698,5 +779,91 @@ mod tests {
         // The requested file text survives.
         assert!(p.contains("--- src/lib.rs"));
         assert!(!p.contains("[RE-ASK][RE-ASK]"), "no duplication");
+    }
+
+    /// The post-write test run surfaces a seeded assertion that encodes the
+    /// bug — `assert total() == 22` in a suite that was green because the bug
+    /// was present — which the model otherwise cannot see and the oracle then
+    /// rejects a correct fix for.
+    #[test]
+    fn a_red_suite_reports_the_rejected_assertion() {
+        let dir = temp_dir_for("red-suite");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("store.py"),
+            "_RECORDS = []\ndef total():\n    return sum(r for r in _RECORDS)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tests/test_store.py"),
+            "from store import total\ndef test_buggy():\n    assert total() == 22\n",
+        )
+        .unwrap();
+        let report = run_tests_summary(&dir, &["python3".to_string()]);
+        // No pytest installed is an environment gap, not a seeded-assertion
+        // failure: the runner must stay silent rather than report one as the
+        // other.
+        if which_pytest() {
+            let r = report.expect("a red suite must be reported");
+            assert!(r.contains("assert"), "the report names the assertion: {r}");
+            assert!(r.contains("22"), "and the value it rejected: {r}");
+        } else {
+            assert!(report.is_none(), "no pytest means no report, not an error");
+        }
+    }
+
+    /// A green suite is not a report: the signal must only appear when a
+    /// seeded assertion actually rejects the fix.
+    #[test]
+    fn a_green_suite_reports_nothing() {
+        let dir = temp_dir_for("green-suite");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("store.py"),
+            "_RECORDS = []\ndef total():\n    return sum(r for r in _RECORDS)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tests/test_store.py"),
+            "from store import total\ndef test_fixed():\n    assert total() == 0\n",
+        )
+        .unwrap();
+        if which_pytest() {
+            assert_eq!(
+                run_tests_summary(&dir, &["python3".to_string()]),
+                None,
+                "a green suite is silent"
+            );
+        }
+    }
+
+    /// No allowed command, no run: a configuration that grants the
+    /// implementer no shell must behave exactly as before.
+    #[test]
+    fn no_allowed_command_means_no_run() {
+        let dir = temp_dir_for("no-shell");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("store.py"), "x = 1\n").unwrap();
+        assert_eq!(
+            run_tests_summary(&dir, &[]),
+            None,
+            "nothing is granted, nothing runs"
+        );
+    }
+
+    fn which_pytest() -> bool {
+        std::process::Command::new("python3")
+            .arg("-m")
+            .arg("pytest")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn temp_dir_for(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("rof-impl-test-{name}-{}", std::process::id()));
+        p
     }
 }

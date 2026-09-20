@@ -658,6 +658,15 @@ pub fn file_state_evidence(artifact: &serde_json::Value) -> String {
             ));
         }
     }
+    // The post-write test run: a red suite is the one signal that says the
+    // edit was right and an assertion encodes the bug rather than the fix.
+    // It has to ride along with the file evidence or the retry's prompt never
+    // learns it, and the same correct fix is refused twice.
+    if let Some(report) = artifact.get("test_report").and_then(|v| v.as_str()) {
+        if !report.is_empty() {
+            out.push_str(&format!("\nTEST REPORT: {report}\n"));
+        }
+    }
     out
 }
 
@@ -751,6 +760,36 @@ mod condense_tests {
 
 #[cfg(test)]
 mod file_state_tests {
+    /// A red test report rides along with the file evidence, so a retry sees
+    /// the assertion it broke — and a green one is not invented.
+    #[test]
+    fn a_test_report_is_carried_to_the_retry() {
+        let artifact = serde_json::json!({
+            "file_state": [],
+            "test_report": "the suite is red; assert total() == 22 fails",
+        });
+        let ev = file_state_evidence(&artifact);
+        assert!(
+            ev.contains("TEST REPORT"),
+            "the report must reach the retry: {ev}"
+        );
+        assert!(ev.contains("total() == 22"));
+    }
+
+    /// An absent or empty report adds nothing, so a run without the runner
+    /// is byte-for-byte unchanged.
+    #[test]
+    fn no_test_report_adds_nothing() {
+        let artifact = serde_json::json!({"file_state": []});
+        assert_eq!(file_state_evidence(&artifact), "");
+        let artifact = serde_json::json!({"file_state": [], "test_report": ""});
+        assert_eq!(
+            file_state_evidence(&artifact),
+            "",
+            "an empty report is not carried"
+        );
+    }
+
     use super::file_state_evidence;
 
     #[test]

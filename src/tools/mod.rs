@@ -47,6 +47,14 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), Arc::new(tool));
     }
 
+    /// The commands a `proc.run` may name. Used by the implementer's
+    /// post-write test run: it only fires for a command the policy already
+    /// grants, so a configuration that gives the implementer no shell is
+    /// unchanged.
+    pub fn allowed_commands(&self) -> Vec<String> {
+        self.policy.allowed_commands.clone()
+    }
+
     /// The full v1 toolset in one place, so the CLI and the eval runner
     /// cannot drift apart when a tool is added (live-bitten once already).
     /// The workdir is anchored here; every other grant comes from `policy`.
