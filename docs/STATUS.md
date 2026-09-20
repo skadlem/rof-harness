@@ -2043,3 +2043,55 @@ established that a single rep measures nothing — the search would be optimizin
 against noise. Our arm discipline (frozen tree, ≥3 reps, negative control,
 config_hash diff) is the version of their isolation discipline we can actually
 afford.
+
+## ObservationPack arm: MEASURED, NOT BUILT — the premise does not hold (2026-09-20)
+
+The SoL-Pi research recommended an ObservationPack-style handle on the re-read
+path as the top mechanism. Before implementing it I instrumented the harness to
+dump every prompt the implementer sends and measured one representative mf task
+(`mf-test-coverage`, the one that exercises the re-read and retry paths most).
+
+**The premise fails.** ObservationPack exists to stop large tool outputs being
+re-sent in full on later requests. In rof there is nothing large and not much
+re-sent:
+
+| turn | prompt chars | what accumulated |
+|---|---|---|
+| 0 | 703 | goal + layers, no file body |
+| 1 | 1,334 | + the requested `store.py` body (~600 chars) |
+| 2 | 2,284 | + reviewer feedback + test report |
+| 3 | 3,251 | same as 2, the retry |
+
+The whole four-turn exchange costs **15,436 chars total**, and the largest file
+body anywhere is ~600 chars. There is no >10 KiB observation to handle, and the
+one body that recurs appears twice, not "from the third request onward." A
+mechanism whose trigger condition never fires is a no-op by construction.
+
+**Why the architectures differ, and why the paper's number didn't transfer.**
+Pi is a long-horizon chat loop: observations accumulate into a growing history,
+so a big result genuinely pays for a seat in every later request. rof is a
+bounded pipeline of 2 rounds, and each turn rebuilds context from scratch via
+`ContextAssembler` under an explicit `VolatileBudget` — §4.1 already caps the
+repeated-input class, with `eliminated_chars` counting what it cut (767 chars in
+this run). The mechanism SoL-Pi needed was invented for a cost structure rof
+does not have.
+
+**This is the second mechanism of four that does not apply**, and it changes the
+recommendation. Online Context Compact was inapplicable because there is no
+prompt cache; ObservationPack is inapplicable because there is no accumulating
+history. Both fail for the same root cause: **rof is not a long-horizon loop.**
+Half of SoL-Pi's retained mechanisms address overhead that only exists in one.
+
+**Method note.** The measurement was only possible by instrumenting the harness,
+because Atria returns no `usage` fields — `input_tokens` comes back 0 on every
+call, so the trace cannot see prompt sizes. I added a temporary prompt dump to
+`ask_with_system`, measured, and reverted it (working tree clean). Token
+accounting remains the unmeasured axis it was; char counting on the prompt is the
+substitute, and it is adequate at this scale.
+
+**What is left standing from the research: Action Fusion**, the one mechanism
+that targets *capability* rather than long-horizon cost, and the one that was the
+score leader on the held-out Opus 5 backend. Its fixed half already exists here
+as `run_tests_summary`; making the follow-up command model-selected instead of
+hard-coded to pytest is a real, small change that does not depend on any premise
+about context size. That is the next arm, if any.
