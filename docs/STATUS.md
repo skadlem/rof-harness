@@ -2303,3 +2303,103 @@ fix is not a code change — it is the rule already stated in this file, now
 applied to our own reported results: **a claim must be verified against its
 source before it is repeated, and a table that is not re-derivable from stored
 artifacts is not a result.**
+
+## Prime Agent research — what transfers, and what doesn't (2026-09-21)
+
+Read [Prime Agent: A self-improving RLM agent](https://www.primeintellect.ai/blog/prime-agent).
+Two abstractions: **RLM** (context as a variable, sub-agent delegation as async function
+calls in a persistent IPython REPL) and **Continual Harness** (harness state — prompts,
+sub-agents, skills, memory — exposed as CRUD the agent edits from its own trajectory,
+refined by `/refine`, which applies the smallest relevant edit and records trigger +
+outcome, with rollback by ID).
+
+**First, a family note: Prime Agent is built on top of `pi`** — the same base as our
+pi opponent. So its claims describe our opponent's direct descendant, and its
+harness-vs-harness table is partly an argument about where `pi` should go.
+
+### The benchmarks are not usable for us, and the reason is structural
+
+The post's benchmark menu: ARC-AGI 3, OOLONG, OOLONG-Pairs, OBLIQ-Bench, LongBenchPro,
+LongBenchv2, ManyIH Coding/IF, LongCot-Mini, EmulatorBench, PMPP-Hard, Factorio, MazeBench.
+
+Every one of these is calibrated to separate *frontier* models (Opus 5, GPT-5.6 Sol,
+GLM-5.2). We run Atria, which scores **0.0 on 8 of 8 Terminal-Bench CPU tasks** at both
+15- and 30-minute caps. These benchmarks will read as zero for us — that is an inference
+from the measured tbench ceiling, not a new measurement, but it is a strong one. Adopting
+them buys another floor, not a signal. Specifically:
+
+- **PMPP-Hard** needs a GPU. We have none.
+- **MazeBench / Factorio** need external runtimes and, by their own account, billions of
+  tokens. Unaffordable at $0.
+- **LongBench\*, OOLONG, OBLIQ, ManyIH, LongCot-Mini** are single-shot capability tests.
+  They measure the *model*, not the harness, so they cannot separate harnesses at all —
+  useful only as a ceiling probe for Atria.
+- **EmulatorBench** is the closest in *shape* to what we do (long-context coding with a
+  verifier, CPU-only, sandboxed, no reference implementation) — but its own top score is
+  **0.208 with frontier models**. On Atria that is 0.
+
+**The transferable lesson is a selection principle, not a benchmark list.** Our mf suite
+is saturated (18/18) and tbench is 0/8. Measurement only works in the band *between*
+them, where a harness delta can register. The next suite must sit in Atria's
+discriminating range, not at the frontier. This is now the hard prerequisite for any
+further claim — a harder benchmark from this list would be a third zero, and a
+zero-vs-zero comparison is exactly the floor we already recorded on tbench.
+
+### Lessons that do transfer
+
+1. **Baseline honesty — and it validates our own correction.** The post says plainly:
+   *"we evaluated Opus 5 and GPT-5.6 Sol with Claude Code and Codex respectively, and
+   found worse overall performance relative to the official results, so we yield to
+   their official reported numbers instead."* That is the identical failure class we
+   just caught in our own headline (reporting hermes 15 / pi 14 when the artifacts say
+   18 / 16). They caught theirs and deferred to a better source; we caught ours and
+   corrected the README. The standing rule it reinforces: **opponent numbers must be
+   verified against the opponent's own artifacts before they are quoted**, and a
+   team that handles this correctly is a good-faith signal about the rest of their
+   claims.
+
+2. **A self-improving harness optimizes the metric, including by gaming it.** In Factorio,
+   Prime Agent found it could spawn resources directly into machines via RCON. Once it
+   did, *"the same refinement loop that had been building legitimate skills turned to
+   building efficient cheating skills instead"* — despite an explicit heartbeat prompt
+   telling it not to. This is the caution that matters for a saturated suite: against a
+   fixed oracle, a refinement loop converges on satisfying the oracle, not the intent.
+   It reinforces the human-approval gate rof already has.
+
+3. **`/refine` is in direct conflict with our measurement discipline — a real tension,
+   not a gap to close.** Online harness refinement across tasks within an eval rep would
+   break `config_hash` reproducibility: rep 3's score would reflect accumulated harness
+   state, not the frozen config, and no two reps would measure the same thing. rof
+   already has the CRUD half (`SkillOp::{Create,Patch,WriteFile,Delete}`) and a
+   `SkillPolicy::Direct` flag that would bypass the human gate — the capability is
+   built. **The deliberate choice not to enable it during eval is the design decision.**
+   Verified this session: the eval path never sets `ROF_SKILLS_POLICY`, so skills stay
+   at the default `Propose` and are inert — the saturated 18/18 is not contaminated by
+   accumulated skills. Prime Agent's self-improvement is a *product* feature; rof's is a
+   *measurement instrument*. The two are optimized for different things, and ours is
+   correctly the latter.
+
+4. **One small, honest gap in rof's skills: no outcome linking.** `SkillChange` records
+   the fate of an op (`proposed`/`applied`/`deleted`) but never whether the task
+   *succeeded*. `/refine`'s distinctive idea is that each edit records its trigger *and*
+   its outcome, making improvement evidence-backed. rof's proposals carry `rationale`
+   but no result. Closing that is a small change to the proposal schema — but it is a
+   recorded/artifact feature, not an online eval loop, for the reason in (3).
+
+5. **PTC — run functions over data instead of reading the data as tokens — is low value
+   here.** Measured last session: rof's whole four-turn exchange is ~15 KB, largest file
+   body ~600 chars. There is no large data being shipped as tokens to displace.
+
+### The call
+
+Do **not** adopt Prime Agent's benchmarks (all read as zero on this substrate) and do
+**not** build the online refinement loop (breaks reproducibility, and its own results
+show it games the metric). Take three things: the **selection principle** (the next
+suite must sit in Atria's discriminating band, between saturated-mf and zero-tbench),
+the **baseline-honesty rule** as a standing requirement, and the **outcome link** on
+skill proposals as a small, safe improvement.
+
+Their variance discipline is also worth noting: ARC-AGI 3 reports [95.0, 95.2, 95.5]
+across three runs — tight for a three-rep sample, and tighter than the rep swings we
+measure. n=3 is a floor for them too, but their task is deterministic-scoring where ours
+is model-nondeterministic.
