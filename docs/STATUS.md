@@ -2480,3 +2480,79 @@ the substrate instead of measuring it.** Two major conclusions in two days
 turned out to be artifacts of assumptions I had not checked. The rule is already
 written down; it now applies to claims about the model as much as to claims
 about the harness.
+
+## Second correction: the exhaustion quirk is real but rof sidesteps it — the tbench failure is correctness (2026-09-21)
+
+The previous correction said the exhaustion quirk was the "prime suspect" for the tbench
+zeros. **That was also wrong, and I verified it by running rof directly on a stored task.**
+
+**What is true and now measured precisely.** The exhaustion quirk is real, and it is a
+hard endpoint property, not a config issue. Bisecting user-prompt size against the real
+wal-recovery files, `max_tokens: 8192`:
+
+| user prompt (chars) | finish | content | reasoning | reasoning_tokens |
+|---|---|---|---|---|
+| 8,000 | length | 36,892 | 1,201 | 271 |
+| 12,000 | length | 32,465 | 78 | 14 |
+| **13,000** | stop | **233** | 2,293 | 543 |
+| 14,000 | length | **0** | 34,810 | 8192 |
+| 24,000 | length | **0** | 34,856 | 8192 |
+
+Content emission collapses between 12,000 and 14,000 chars. Above the threshold the model
+reasons until it has spent *every* completion token and ships nothing. And **none of the
+switches stop it**: `reasoning: false` (content=0, rt=8192), `enable_thinking: false`
+(content=0, rt=8192), `chat_template_kwargs: reasoning_effort: low` (content=0, rt=8192).
+**Worse, `roomier` actively hurts**: at `max_tokens: 16384` the reasoning *doubled* to
+72,059 chars and content was still 0. The reasoning expands to fill any budget. The
+`roomier` rung and the `enable_thinking` rung are both inert above the threshold — the
+ladder's upper rungs are dead weight on exactly the failure they were built for.
+
+**Why it is not rof's failure.** I ran the deployed binary against the stored
+wal-recovery task with the wire proxy logging every request. rof's actual prompts were
+**916–1,480 chars** (synthetic goal) and **7,022–8,395 chars** (real instruction) — always
+below the threshold. rof pulls files on demand via `reads` instead of dumping the repo, so
+the wall is never approached. With the real instruction rof **edited all 10 modules**.
+The zero-output jobs in the matrix were something else entirely: `tb-probe-rof-shadow-relay`
+died on `AgentTimeoutError ... timed out after 900.0 seconds`, a timeout, not exhaustion.
+
+**So the real tbench failure is correctness, not content emission.** Running the task's
+own test suite against rof's output: **25 tests failed.** The work is real and substantial
+— every module touched — and it is still wrong. That is the same conclusion the artifact
+diffing reached at `d5d0bc4`, now confirmed against the model's own benchmark: a 744B
+GLM-5 model that scores 78.3 on Terminal-Bench 2.1 produces real edits on a 6-hour expert
+task and gets them wrong inside rof's bounded 2–4 turn loop.
+
+**The token axis is measurable after all.** The endpoint returns full `usage`
+(`prompt_tokens`, `completion_tokens`, `reasoning_tokens`, `cached_tokens`), and
+`openrouter.rs` already parses it — the local run reported `tokens in/out: 3874/3844,
+cache-hit input: 46%`. The earlier claim that `input_tokens` is always 0 was measured
+through Harbor, where the trajectory conversion drops it. Direct calls carry it. This
+reopens the efficiency measurement and invalidates the "cost axis is unmeasurable"
+decision.
+
+**One live hazard the threshold does create.** `volatile_budget()` = `short.budget * 4`
+= 6,000 × 4 = **24,000 chars**, which is 11,000 chars *above* the safe threshold. Today
+the `[REPO FILES]` layer only ever holds goal-named files, so it stays small — but if a
+future arm widens that layer toward budget (exactly the direction the suite-widening plan
+points), content emission will die silently. A 24,000-char cap is a footgun calibrated
+against a token budget, not against this endpoint's real emission limit.
+
+### The chain, stated plainly
+
+Three claims in two days, each built on an assumption I did not check: "Atria is weak"
+(false — 744B GLM-5, 78.3 on TB 2.1), "exhaustion explains the tbench zeros" (false — rof
+never approaches the threshold), "token accounting is impossible" (false — the endpoint
+returns usage and the parser already reads it). Each was overturned by one direct
+measurement. The discipline that would have caught all three is the one already written
+down: **measure the substrate before building a conclusion on it.**
+
+### Revised call
+
+1. The tbench ceiling is a **correctness** problem on a 6-hour task inside a bounded loop,
+   not an emission problem. That is much harder to fix with a harness lever, and it is
+   where expectations should be set.
+2. **Demote the `roomier` and `enable_thinking` rungs** — both are proven inert above the
+   threshold, and `roomier` doubles the wasted reasoning. They are cost, not insurance.
+3. **The suite-widening plan must respect the ~13,000 char emission threshold** as a hard
+   ceiling, not the 24,000 char token-derived budget.
+4. **Reopen token accounting** — measure cost directly; the endpoint supports it.
