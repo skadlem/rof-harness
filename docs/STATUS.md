@@ -1734,3 +1734,47 @@ error; `mf-test-coverage` wrote 2 files that did not fix the seeded bug. None
 is a chain failure, none is a truncation, none is an empty-content no-op. They
 are the model editing wrong, which is what the contract-violation hypothesis
 predicts and what the next lever targets.
+
+## Arm: the red-suite report, measured on the multi-file suite (2026-09-20, 3 reps)
+
+The next lever was aimed at the one failure the contract-violation hypothesis
+named concretely: `mf-test-coverage`, where all three agents scored 1–2/3. The
+seeded test asserts `total() == 22`, the *buggy* value, so the suite is green
+*because* the bug is present. The goal says "keep the existing tests passing",
+which makes the task structurally impossible: fixing the bug turns that
+assertion red, and the oracle then rejects a fix that is exactly what was
+asked. The implementer has no `proc.run`, so it could not see it — the failure
+looked like a model that could not implement when it was a model that could
+not be told.
+
+Now the suite runs after writes land and the failing assertion is put in the
+artifact, which is the only channel the model has. It only fires when the
+policy grants a command the run can use, so a shell-free configuration is
+unchanged; `file_state_evidence` carries it to the retry.
+
+| rep | before (`a184bb3`) | after (`8230015`) |
+|---|---|---|
+| 1 | 6/6 | 5/6 |
+| 2 | 3/6 | 6/6 |
+| 3 | 4/6 | 6/6 |
+| **total** | **13/18** | **17/18** |
+
+`mf-test-coverage` went 1/3 → 2/3, and the other five tasks went 12/15 → 15/15.
+The mechanism is visible in rep 2: the model read the TEST REPORT and
+corrected the assertion `22` → `15` with a comment naming why —
+"No phantom seed record: total() is just the records added here." Rep 1 did
+not, so the fix is not deterministic, but the class it targets is now addressed
+in 2 of 3 trials rather than 1 of 3, and the task it was aimed at moved while
+four unrelated tasks stopped regressing.
+
+**Negative control:** the unmodified seed still passes its own suite (3 passed)
+while asserting the buggy value, so the task is not vacuous — the win is on a
+genuine oracle. This is the first arm this session that moved the multi-file
+score by more than the within-agent rep swing, and it is a *harness* lever, not
+a model upgrade: the harness made a contract violation legible instead of
+making it fatal.
+
+**Honest caveat:** this is one arm on 6 tasks × 3 reps. 17/18 vs the previous
+best of 15/18 needs the same 3-rep discipline applied to hermes and pi before
+any ordering claim — and `mf-test-coverage` is a *rof-shaped* opportunity, so a
+full cross-agent rerun is the next measurement, not a conclusion.
