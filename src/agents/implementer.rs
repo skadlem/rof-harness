@@ -200,7 +200,9 @@ impl ImplementerAgent<'_> {
                         parts
                     }
                 };
-                data = self.ask_with_system(&ctx, &parts.full(), system).await?;
+                data = self
+                    .ask_with_system(&ctx, &reask_prompt(&parts.full()), system)
+                    .await?;
             }
         }
         // Patches first, then whole-file writes (a write to the same path wins).
@@ -246,6 +248,36 @@ struct ReqSkill {
     body: String,
 }
 
+/// The re-ask after `reads`. The requested files are now in context, but
+/// nothing in the prompt says so, so a model that was asked to write can
+/// answer with `reads` a second time and stop — a deferral that looks like a
+/// model that cannot implement, when it only could not tell it already had
+/// what it asked for. This marker closes that loop: name what it has and
+/// state the obligation. Appended, not prepended, so the goal text the model
+/// keys on stays first.
+fn reask_prompt(base: &str) -> String {
+    format!(
+        "{base}\n\n[RE-ASK] The files you requested are now in context above. Do not \
+         emit `reads` again: this turn must contain the patches or writes the \
+         goal requires."
+    )
+}
+
+/// The re-ask marker stops a second `reads` deferral, and it must survive
+/// being appended to any prompt: a marker that silently vanished, or that
+/// reordered the goal text, would leave the deferral loop in place.
+#[test]
+fn the_reask_marker_names_the_files_and_forbids_another_read() {
+    let p = reask_prompt("GOAL: write the tool\n--- src/lib.rs\nfn main() {}");
+    assert!(p.contains("[RE-ASK]"), "the marker must be present");
+    assert!(p.contains("Do not emit `reads` again"));
+    // The goal stays first — the model keys on it.
+    assert!(p.starts_with("GOAL: write the tool"));
+    // The requested file text survives.
+    assert!(p.contains("--- src/lib.rs"));
+    assert!(!p.contains("[RE-ASK][RE-ASK]"), "no duplication");
+}
+
 /// The files an artifact asked to read.
 fn read_requests(data: &serde_json::Value) -> Vec<String> {
     const MAX: usize = 3;
@@ -285,6 +317,9 @@ impl ImplementerAgent<'_> {
                 system: system.to_string(),
                 prompt: prompt.to_string(),
                 max_tokens: 8192,
+                reasoning_off: false,
+                reasoning_low: false,
+                roomier: false,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -643,5 +678,25 @@ impl ImplementerAgent<'_> {
             }
         }
         (done, state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reask_prompt;
+
+    /// The re-ask marker stops a second `reads` deferral, and it must survive
+    /// being appended to any prompt: a marker that silently vanished, or that
+    /// reordered the goal text, would leave the deferral loop in place.
+    #[test]
+    fn the_reask_marker_names_the_files_and_forbids_another_read() {
+        let p = reask_prompt("GOAL: write the tool\n--- src/lib.rs\nfn main() {}");
+        assert!(p.contains("[RE-ASK]"), "the marker must be present");
+        assert!(p.contains("Do not emit `reads` again"));
+        // The goal stays first — the model keys on it.
+        assert!(p.starts_with("GOAL: write the tool"));
+        // The requested file text survives.
+        assert!(p.contains("--- src/lib.rs"));
+        assert!(!p.contains("[RE-ASK][RE-ASK]"), "no duplication");
     }
 }

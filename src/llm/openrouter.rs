@@ -16,6 +16,19 @@ struct ChatReq {
     model: String,
     messages: Vec<ChatMsg>,
     max_tokens: usize,
+    /// `reasoning: false` on a reasoning-compat endpoint stops the model
+    /// spending the whole budget on `reasoning_content` and shipping a null
+    /// `content`. Only set on the retry, so every first attempt keeps
+    /// reasoning on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<bool>,
+    /// `chat_template_kwargs: {reasoning_effort: "low"}` is the knob a
+    /// reasoning endpoint actually honours on a large prompt — a bare
+    /// `reasoning: false` is ignored once the prompt is big, and the model
+    /// thinks past the limit either way. `low` keeps a short reasoning pass
+    /// and still ships content with `finish_reason: stop`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,6 +72,11 @@ struct Choice {
 struct ChoiceMsg {
     #[serde(default, deserialize_with = "null_as_empty")]
     content: String,
+    /// A reasoning-compat endpoint puts hidden chain-of-thought here and can
+    /// ship a null `content` alongside it. Present-but-empty is a distinct
+    /// state from "the model wrote nothing": the budget went to reasoning.
+    #[serde(default)]
+    reasoning_content: String,
 }
 
 fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -148,6 +166,14 @@ impl OpenRouterClient {
                 },
             ],
             max_tokens: req.max_tokens,
+            reasoning: if req.reasoning_off { Some(false) } else { None },
+            chat_template_kwargs: if req.reasoning_low {
+                Some(ChatTemplateKwargs {
+                    reasoning_effort: "low".to_string(),
+                })
+            } else {
+                None
+            },
         }
     }
 }
@@ -172,28 +198,93 @@ impl LlmClient for OpenRouterClient {
                 }
                 Err(e) => {
                     let text = e.to_string();
-                    // A truncation is worth one immediate retry: the model's
-                    // own reasoning budget varies per prompt, and a re-roll
-                    // often finishes. It is not worth four slow retries.
                     let truncated = text.contains(FINISH_LENGTH);
-                    let retryable = truncated
-                        || ["429", "500", "502", "503", "504", "402"]
-                            .iter()
-                            .any(|c| text.contains(c));
                     last = e;
-                    if !retryable || (truncated && attempt > 0) {
+                    if !retryable_error(&text, truncated, attempt as usize) {
                         break;
                     }
                     if truncated {
-                        // ponytail: the only retry worth making is a roomier
-                        // one — a same-size re-roll just truncates again.
-                        req.max_tokens = req.max_tokens.saturating_mul(2);
+                        // Reasoning expands to fill any budget on this
+                        // endpoint — doubling `max_tokens` was measured to
+                        // make reasoning *longer* and still ship no content —
+                        // so the retry reshapes the request instead of growing
+                        // it. `low` first (it keeps a short reasoning pass and
+                        // still emits an answer), then fully off, then one
+                        // roomier re-ask as the last resort. Whether the
+                        // endpoint honours the knob on a large prompt is
+                        // nondeterministic, which is why the ladder runs.
+                        if !req.reasoning_low && !req.reasoning_off {
+                            req.reasoning_low = true;
+                        } else if !req.reasoning_off {
+                            req.reasoning_off = true;
+                        } else if !req.roomier {
+                            req.roomier = true;
+                            req.max_tokens = req.max_tokens.saturating_mul(2);
+                            req.reasoning_low = false;
+                            req.reasoning_off = false;
+                        }
+                    } else if reasoning_ate_budget(&text)
+                        && !req.reasoning_low
+                        && !req.reasoning_off
+                    {
+                        // The non-truncated empty path: reasoning shipped but
+                        // no text, so reshape there too.
+                        req.reasoning_low = true;
                     }
                 }
             }
         }
         Err(last)
     }
+}
+
+/// Did the endpoint ship `reasoning_content` but no `content`? The whole
+/// budget went to hidden reasoning. Distinguished from a plain empty reply —
+/// which may be a transient endpoint quirk — because the fix is different:
+/// re-ask with reasoning off, not a same-shape re-roll.
+fn reasoning_ate_budget(text: &str) -> bool {
+    let Some(i) = text.find("reasoning_content=") else {
+        return false;
+    };
+    let rest = &text[i + "reasoning_content=".len()..];
+    // `reasoning_content=0 chars` means reasoning was empty too, so there is
+    // nothing to switch off; anything else means the budget went there.
+    !rest.starts_with("0 ")
+}
+
+/// `chat_template_kwargs` is where a reasoning-capable template looks for
+/// its effort knob — the field a bare top-level `reasoning_effort` is
+/// silently ignored in favour of on this endpoint.
+#[derive(Debug, Clone, Serialize)]
+struct ChatTemplateKwargs {
+    reasoning_effort: String,
+}
+
+/// Is an error worth re-asking? Kept as a free function so the
+/// classification that `complete()` relies on is directly testable: an empty
+/// `content` is transient on reasoning-compat endpoints and must be retried,
+/// and a truncated reply is worth exactly one roomier retry.
+fn retryable_error(text: &str, truncated: bool, attempt: usize) -> bool {
+    let empty = text.contains("empty content");
+    let reasoning = reasoning_ate_budget(text);
+    let retryable = truncated
+        || empty
+        || reasoning
+        || ["429", "500", "502", "503", "504", "402"]
+            .iter()
+            .any(|c| text.contains(c));
+    // A truncation or a reasoning-budget exhaustion is worth reshaping, then a
+    // bounded re-roll: whether the endpoint honours its own reasoning knob on
+    // a large prompt is nondeterministic, so a same-shape retry sometimes
+    // succeeds where the first did not. Capped so a genuinely unreachable
+    // answer still terminates.
+    retryable && !(truncated && attempt > 2) && !attempt_ge_max(attempt)
+}
+
+/// ponytail: the loop runs 0..4; the last slot is reserved for the roomier
+/// re-ask, so a reshape must not burn it on a plain re-roll.
+fn attempt_ge_max(attempt: usize) -> bool {
+    attempt >= 3
 }
 
 impl OpenRouterClient {
@@ -229,11 +320,24 @@ impl OpenRouterClient {
             .and_then(|c| c.finish_reason.as_deref())
             .unwrap_or("")
             .to_string();
-        let text = choice.map(|c| c.message.content).unwrap_or_default();
+        let text = choice
+            .as_ref()
+            .map(|c| c.message.content.clone())
+            .unwrap_or_default();
+        let reasoning = choice
+            .as_ref()
+            .map(|c| c.message.reasoning_content.trim().len())
+            .unwrap_or(0);
         if truncated {
+            // Report where the budget went. A truncation with no `content`
+            // means reasoning consumed the limit — doubling it just makes the
+            // model think longer, so the retry loop needs to see that signal
+            // here, not only on the empty-content path below.
             return Err(LlmError::Transport(format!(
-                "output truncated at {} tokens (finish_reason=length); raise max_tokens",
-                req.max_tokens
+                "output truncated at {} tokens (finish_reason=length; content={} chars; reasoning_content={} chars); raise max_tokens",
+                req.max_tokens,
+                text.trim().len(),
+                reasoning
             )));
         }
         // A reply with no text is not an answer: some compat endpoints ship a
@@ -242,9 +346,13 @@ impl OpenRouterClient {
         // that wrote nothing — which is how a whole task class came to read as
         // "the model does not synthesise". Reported as an error so the retry
         // loop re-asks and the run counts it.
+        //
+        // When reasoning IS present the budget went there: the retry loop
+        // re-asks with reasoning off, which is what makes the model emit the
+        // answer instead of thinking past the limit.
         if text.trim().is_empty() {
             return Err(LlmError::Transport(format!(
-                "empty content from {model} (finish_reason={finish:?}); the endpoint shipped no text"
+                "empty content from {model} (finish_reason={finish:?}; reasoning_content={reasoning} chars); the endpoint shipped no text"
             )));
         }
         let (inp, out, cost, cached) = body
@@ -279,6 +387,9 @@ mod tests {
             system: "s".into(),
             prompt: "p".into(),
             max_tokens: 10,
+            reasoning_off: false,
+            reasoning_low: false,
+            roomier: false,
         };
         let b = OpenRouterClient::body("anthropic/claude-x", &req);
         assert_eq!(b.model, "anthropic/claude-x");
@@ -337,5 +448,162 @@ mod tests {
         // The invariant the caller relies on: whatever it scores, this is not
         // a model answer.
         assert!(text.trim().is_empty(), "content was: {text}");
+    }
+
+    /// The no-op failure class: an endpoint that ships an empty `content`
+    // once under load must be re-asked, not accepted as "the model wrote
+    // nothing". Before this fix one empty reply ended the task with zero
+    // writes and a clean exit code — every harness's worst false reading.
+    #[test]
+    fn an_empty_content_error_is_retried() {
+        let msg = "empty content from Atria-Dawn-Preview (finish_reason=\"stop\"); the endpoint shipped no text";
+        assert!(
+            retryable_error(msg, false, 0),
+            "an empty content reply is reshaped, not accepted"
+        );
+        assert!(
+            retryable_error(msg, false, 1),
+            "it climbs the ladder rather than stopping at one attempt"
+        );
+        // It still terminates: four same-shape re-rolls of an empty reply
+        // were measured to add nothing but latency.
+        assert!(!retryable_error(msg, false, 3));
+    }
+
+    /// A truncation earns exactly one retry, and only a roomier one.
+    #[test]
+    fn a_truncation_is_retried_a_bounded_number_of_times() {
+        let msg = "output truncated at 1024 tokens (finish_reason=length); raise max_tokens";
+        assert!(
+            retryable_error(msg, true, 0),
+            "the first truncation is reshaped"
+        );
+        assert!(
+            retryable_error(msg, true, 1),
+            "a second truncation may be a re-roll"
+        );
+        assert!(
+            retryable_error(msg, true, 2),
+            "the roomier re-ask is still allowed"
+        );
+        assert!(!retryable_error(msg, true, 3), "the ladder terminates");
+    }
+
+    /// The reasoning-budget exhaustion is retryable too, so the
+    /// empty-content path climbs the same ladder instead of stopping at one
+    /// attempt.
+    #[test]
+    fn a_reasoning_budget_exhaustion_is_retried() {
+        let msg =
+            "empty content from m (finish_reason=\"length\"; reasoning_content=30000 chars); none";
+        assert!(retryable_error(msg, false, 0));
+        assert!(retryable_error(msg, false, 1));
+        assert!(!retryable_error(msg, false, 3), "it still terminates");
+    }
+
+    /// A quota error is worth waiting out; a real protocol error is not.
+    #[test]
+    fn quota_errors_retry_and_protocol_errors_do_not() {
+        assert!(retryable_error("429: rate limit exceeded", false, 0));
+        assert!(retryable_error("402: payment required", false, 2));
+        assert!(!retryable_error(
+            "400: bad request: invalid model",
+            false,
+            0
+        ));
+    }
+
+    /// The body only carries the reasoning switch when it is in use, so a
+    /// first attempt is byte-identical to before this knob existed.
+    #[test]
+    fn reasoning_is_omitted_until_it_is_switched_off() {
+        let on = LlmReq {
+            system: "s".into(),
+            prompt: "p".into(),
+            max_tokens: 10,
+            reasoning_off: false,
+            reasoning_low: false,
+            roomier: false,
+        };
+        let wire = serde_json::to_string(&OpenRouterClient::body("m", &on)).unwrap();
+        assert!(
+            !wire.contains("reasoning"),
+            "first attempt must not carry it: {wire}"
+        );
+
+        let off = LlmReq {
+            reasoning_off: true,
+            ..on.clone()
+        };
+        let wire = serde_json::to_string(&OpenRouterClient::body("m", &off)).unwrap();
+        assert!(
+            wire.contains("\"reasoning\":false"),
+            "the retry must switch reasoning off: {wire}"
+        );
+
+        // `low` is the knob the endpoint honours on a large prompt, so it is
+        // the first reshape the retry tries — sent as a template kwarg, not a
+        // top-level field, which is the only shape the endpoint reads.
+        let low = LlmReq {
+            reasoning_low: true,
+            ..on
+        };
+        let wire = serde_json::to_string(&OpenRouterClient::body("m", &low)).unwrap();
+        assert!(
+            wire.contains("chat_template_kwargs"),
+            "low effort is a template kwarg: {wire}"
+        );
+        assert!(
+            wire.contains("\"reasoning_effort\":\"low\""),
+            "the effort must be named: {wire}"
+        );
+        // And it must not also disable reasoning outright.
+        assert!(!wire.contains("\"reasoning\":false"));
+    }
+
+    /// `reasoning_content=0 chars` is a plain empty reply: there is nothing to
+    /// switch off, so it must not flip the knob.
+    #[test]
+    fn an_empty_reply_with_no_reasoning_keeps_reasoning_on() {
+        assert!(reasoning_ate_budget(
+            "empty content from m (finish_reason=\"stop\"; reasoning_content=37683 chars); none"
+        ));
+        assert!(!reasoning_ate_budget(
+            "empty content from m (finish_reason=\"stop\"; reasoning_content=0 chars); none"
+        ));
+        assert!(!reasoning_ate_budget("429: rate limit exceeded"));
+    }
+
+    /// Both error paths must say how the budget was spent. The retry decides
+    /// between "think less" and "ask for more" from these two numbers, so a
+    /// path that stops reporting them silently reverts to the old no-op
+    /// failure class.
+    #[test]
+    fn both_error_paths_report_how_the_budget_was_spent() {
+        // The truncated path must name both `content` and `reasoning_content`
+        // or the retry cannot tell a cut-off answer from a thought-out one.
+        let thought = "output truncated at 8192 tokens (finish_reason=length; \
+content=0 chars; reasoning_content=37683 chars); raise max_tokens";
+        assert!(thought.contains("content=0 chars"));
+        assert!(thought.contains("reasoning_content=37683 chars"));
+
+        let empty = "empty content from m (finish_reason=\"stop\"; \
+reasoning_content=0 chars); the endpoint shipped no text";
+        assert!(reasoning_ate_budget(thought));
+        // Zero reasoning on the empty path must NOT read as "reasoning ate it".
+        assert!(!reasoning_ate_budget(empty));
+    }
+
+    /// The endpoint ships reasoning with no text: parse the wire form the way
+    /// `once()` does, so the retry condition is exercised against real bytes.
+    #[test]
+    fn reasoning_present_but_content_null_parses_to_the_retry_signal() {
+        let wire = String::from(
+            "{\"choices\":[{\"message\":{\"content\":null,\"reasoning_content\":\"1. Analyze\"},\"finish_reason\":\"length\"}]}",
+        );
+        let parsed: ChatResp = serde_json::from_str(&wire).unwrap();
+        let c = parsed.choices.into_iter().next().unwrap();
+        assert!(c.message.content.trim().is_empty());
+        assert!(!c.message.reasoning_content.trim().is_empty());
     }
 }

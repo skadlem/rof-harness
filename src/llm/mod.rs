@@ -10,6 +10,24 @@ pub struct LlmReq {
     pub system: String,
     pub prompt: String,
     pub max_tokens: usize,
+    /// Retry switch: a reasoning-compat endpoint that spent the whole budget
+    /// on `reasoning_content` and shipped no text is re-asked with reasoning
+    /// off. Off by default so reasoning models keep their reasoning on every
+    /// call that produces an answer.
+    #[serde(default)]
+    pub reasoning_off: bool,
+    /// Retry switch, tried before `reasoning_off`: ask the template for a
+    /// *short* reasoning pass instead of none. A bare `reasoning: false` is
+    /// ignored by the endpoint once the prompt is large, while
+    /// `chat_template_kwargs.reasoning_effort = "low"` is honoured at any
+    /// size and still ships content.
+    #[serde(default)]
+    pub reasoning_low: bool,
+    /// Retry switch, the last rung: the ladder has reshaped the request twice
+    /// and the endpoint still spent the budget on reasoning, so the final
+    /// attempt asks for more room with reasoning back on.
+    #[serde(default)]
+    pub roomier: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,8 +51,11 @@ pub struct LlmResp {
 pub enum LlmError {
     #[error("transport: {0}")]
     Transport(String),
-    #[error("all models in fallback chain failed")]
-    AllFailed,
+    /// The primary and every fallback failed. Carries the last primary error
+    /// so a run that produced nothing says *why* — "the chain failed" alone
+    /// is not a diagnosis and hid the reasoning-budget bug for weeks.
+    #[error("all models in fallback chain failed; last error: {0}")]
+    AllFailed(String),
 }
 
 #[async_trait]
@@ -77,6 +98,9 @@ impl ContextService {
             ),
             prompt: text.to_string(),
             max_tokens: max_tokens + Self::REASONING_HEADROOM,
+            reasoning_off: false,
+            reasoning_low: false,
+            roomier: false,
         })
         .await
     }
@@ -102,9 +126,9 @@ impl ExecutorService {
     pub async fn complete(&self, req: LlmReq) -> Result<LlmResp, LlmError> {
         match self.client.complete(&self.model, req.clone()).await {
             Ok(r) => Ok(r),
-            Err(_) => match &self.fallback {
+            Err(e) => match &self.fallback {
                 Some(fb) => self.client.complete(fb, req).await,
-                None => Err(LlmError::AllFailed),
+                None => Err(LlmError::AllFailed(e.to_string())),
             },
         }
     }
