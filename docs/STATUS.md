@@ -2403,3 +2403,80 @@ Their variance discipline is also worth noting: ARC-AGI 3 reports [95.0, 95.2, 9
 across three runs — tight for a three-rep sample, and tighter than the rep swings we
 measure. n=3 is a floor for them too, but their task is deterministic-scoring where ours
 is model-nondeterministic.
+
+## CORRECTION: Atria is frontier-class, and the tbench "model ceiling" conclusion is wrong (2026-09-21)
+
+I had been describing Atria as a "free weak model" and building conclusions on
+that. **That was never verified, and it is false.** The Atria-Dawn-Preview README
+states it plainly:
+
+> developed by the **Shanghai Artificial Intelligence Laboratory**. Built on the
+> **744B-parameter MoE GLM-5** … Instruct model, 256K context.
+
+The model's own evaluation table, against frontier baselines:
+
+| Benchmark | Atria Dawn | GLM 5.3 | GPT 5.6 sol | Opus 5 |
+|---|---|---|---|---|
+| **Terminal-Bench 2.1** | **78.3** | 85.4 | 85.1 | **90.2** |
+| SWE-bench Pro | 59.6 | 60.3 | 61.4 | **74.7** |
+| MLE-bench Lite | 86.2 | 80.8 | **88.9** | 88.0 |
+| BrowseComp | **92.5** | – | 92.2 | 90.8 |
+| BFCL v4 | **77.0** | 74.1 | – | – |
+
+**This breaks the Terminal-Bench conclusion I recorded.** The model scores **78.3
+on Terminal-Bench 2.1** — mid-pack among frontier models on exactly the benchmark
+family we tested. Through our harnesses it scored **0.0 on 8 of 8 Terminal-Bench
+4.0 CPU tasks.** A model that is competent on Terminal-Bench does not fall to zero
+across eight tasks because it is weak. The 78.3 → 0.0 gap implicates the *harness
+path*, not the model.
+
+Two honest caveats, which bound but do not remove the problem:
+
+1. **Terminal-Bench 2.1 is not 4.0.** Different version, likely harder. The
+   comparison is not apples-to-apples, so this does not prove a bug — it
+   withdraws my proof that there was none.
+2. **Our eight tasks were self-selected** CPU-only tasks, not a representative
+   sample, and some may be genuinely very hard.
+
+But the decisive detail is that **all three harnesses scored zero while sharing
+one thing: the same `api.atria-asi.ai` endpoint.** A quirk at the endpoint layer
+would sink all three identically and look like a capability gap in each. And we
+already know of exactly such a quirk — the `content: null` / `finish_reason:
+length` / `reasoning_content=37683` budget exhaustion on large prompts.
+
+**That changes what the `enable_thinking` ladder is for, and it was measured on
+the wrong substrate.** We tested it on the mf suite and called it a no-op — but
+mf prompts are 2–5 KB, small enough that the exhaustion never fires, so the
+test could not have shown anything else. The exhaustion is a *large-prompt*
+failure, and Terminal-Bench prompts are large. The ladder may be precisely the
+fix, and it has never been tried where it matters. My no-op claim is valid for
+mf and says nothing about tbench.
+
+### What this does to the benchmark recommendation
+
+The Prime Agent benchmarks are back in play, and the GLM-5.2 column of their
+table is now a reasonable prior for Atria's band rather than a prediction of
+zero. **EmulatorBench** is the standout match: agentic long-context coding with
+a verifier, CPU-only, sandboxed, and GLM-5.2 scored a nonzero **0.208** — the
+same task shape as Terminal-Bench, at a difficulty where a frontier model is
+not at the floor. That is a benchmark our harness differences could actually
+register on.
+
+### The call, revised
+
+1. **Re-test the `enable_thinking` ladder on Terminal-Bench**, not mf. If the
+   exhaustion is the failure, this is where it shows. This is the highest-value
+   experiment available — it targets the one mechanism we have for a failure
+   class we know exists on large prompts.
+2. **EmulatorBench** as the discriminating suite, replacing the saturated mf
+   suite and the zeroed tbench subset.
+3. Stop describing Atria as weak, everywhere. The README's "the ceiling there is
+   the model, not the harness" line is wrong and is being corrected in this
+   same commit.
+
+The methodological failure is the same one as the hermes/pi correction and the
+SoL-Pi mechanism checks: **I built a conclusion on an unverified assumption about
+the substrate instead of measuring it.** Two major conclusions in two days
+turned out to be artifacts of assumptions I had not checked. The rule is already
+written down; it now applies to claims about the model as much as to claims
+about the harness.
