@@ -1,6 +1,6 @@
 # Status
 
-Last verified: 2026-09-16, on this working tree. v3 components §4.2 (tree-state
+Last verified: 2026-09-21, on this working tree. v3 components §4.2 (tree-state
 substrate + direct mode), §4.3 (structured outcomes + `RoundServices`), §4.1
 (the one budget owner below the layers), §4.4 (recall), §4.6 (symlink
 containment) and §4.5 (the `verify_model` routing slot) are all landed; see
@@ -2556,3 +2556,50 @@ down: **measure the substrate before building a conclusion on it.**
 3. **The suite-widening plan must respect the ~13,000 char emission threshold** as a hard
    ceiling, not the 24,000 char token-derived budget.
 4. **Reopen token accounting** — measure cost directly; the endpoint supports it.
+
+## Both measured fixes landed (2026-09-21, this tree)
+
+The two actions above that were harness levers are now code, each
+mutation-verified against the pre-fix tree.
+
+**The roomier rung is gated on content.** `reshape_for_truncation` takes the
+chars the truncated reply actually shipped and returns whether any rung can
+help. The truncation error already reported `content=N chars;
+reasoning_content=M chars`, so the decision reads a number the endpoint gave
+us rather than guessing. Rungs 1-3 (`reasoning_effort: low` →
+`enable_thinking: false` → `reasoning: false`) still fire unconditionally —
+below the threshold those are exactly the shapes that let content through.
+Only rung 4, the doubled budget, now requires `content > 0`: a truncation that
+shipped nothing spent the whole budget on reasoning, and the measurement says
+a bigger budget makes the reasoning bigger (72,059 chars at 16,384) while
+content stays empty. When no rung applies the function returns `false` and
+`complete()` stops instead of paying for a guaranteed-empty call. The
+8,000-char-prompt case — 36,892 chars of real content, still growing — still
+gets roomier, which is the case it was built for.
+
+**The volatile budget is capped at the emission threshold.** The §4.1 budget
+and the reviewer's evidence window both derived `short.budget * 4` = 24,000
+chars, which is ~11,000 above the largest prompt size this endpoint still
+answers. They now share `volatile_budget_for()`, capped at
+`EMISSION_THRESHOLD` (12,000 — the largest measured size that shipped content,
+one step below the 13,000 that already degraded). This is a ceiling, not a
+replacement: a small configured budget still passes through. The cap had not
+been reached by any real task (the repo layer holds goal-named files, 7-8.4
+KB), so this is insurance for the suite-widening plan, which points directly at
+widening that layer — it was a footgun calibrated against tokens rather than
+against the endpoint.
+
+Both changes moved existing tests, which is the honest signal that they
+changed behavior, not just bookkeeping. Two loop tests asserted a 20,000-char
+requested file arrives whole under the 24,000 budget; that is the exact case
+the measurement refutes, since shipping it whole puts the prompt above the
+emission threshold where content goes to zero. Their fixtures now sit at ~9.4k
+chars, under the cap, so they still test the property they name — a file that
+*fits* arrives whole — and a new test covers the other side of the boundary: a
+file above the threshold is windowed, and the prompt stays under it. That new
+test fails on the pre-cap tree with the intended message.
+
+**What is still open from the revised call:** the tbench correctness ceiling
+(item 1) and token accounting (item 4). The `enable_thinking` rung is inert
+above the threshold but harmless below it, so it stays rather than being
+removed — the measurement bounds it, it does not forbid it.

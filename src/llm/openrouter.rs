@@ -221,7 +221,10 @@ impl LlmClient for OpenRouterClient {
                         // so the retry reshapes the request instead of growing
                         // it. The order matters and lives in one place:
                         // `reshape_for_truncation`.
-                        reshape_for_truncation(&mut req);
+                        let content = truncated_content_chars(&text);
+                        if !reshape_for_truncation(&mut req, content) {
+                            break;
+                        }
                     } else if reasoning_ate_budget(&text)
                         && !req.reasoning_low
                         && !req.thinking_off
@@ -292,6 +295,16 @@ fn attempt_ge_max(attempt: usize) -> bool {
 /// `max_tokens` was measured to make reasoning *longer* and still ship no
 /// content — so a truncated reply is *reshaped*, not given more room.
 ///
+/// `content_chars` is how much real text the truncated reply shipped,
+/// extracted from the error that reported the truncation. It decides the
+/// fate of the last rung: roomier is justified only when a genuine answer
+/// was cut off (measured: 8,000-char prompt, 36,892 chars of content, still
+/// growing). When `content_chars` is 0 the budget went entirely to reasoning,
+/// and the doubled budget was measured to double the reasoning to 72,059
+/// chars while shipping nothing. So the rung stays off in that case and the
+/// ladder reports that no shape can help, which lets the retry loop stop
+/// instead of paying for a guaranteed-empty call.
+///
 /// Order is the point: the shapes least likely to cost quality come first, so
 /// a call that fails early keeps as much reasoning as the endpoint will
 /// honour.
@@ -300,25 +313,52 @@ fn attempt_ge_max(attempt: usize) -> bool {
 /// 2. `enable_thinking: false` — the vLLM switch, and the only shape that
 ///    returned real content on the large implementer prompt.
 /// 3. `reasoning: false` — honoured on small prompts, ignored on large ones.
-/// 4. roomier — reasoning back on with twice the budget, the last resort.
+/// 4. roomier — reasoning back on with twice the budget, the last resort,
+///    and only when the truncation actually shipped content.
 ///
 /// Which knob the endpoint honours at a given prompt size is
 /// nondeterministic, which is why the ladder keeps climbing instead of
 /// stopping at the first reshape.
-fn reshape_for_truncation(req: &mut LlmReq) {
+///
+/// Returns whether a reshape was applied. `false` means every rung is spent
+/// or the remaining one is known not to help, so the caller should stop.
+fn reshape_for_truncation(req: &mut LlmReq, content_chars: usize) -> bool {
     if !req.reasoning_low && !req.thinking_off && !req.reasoning_off {
         req.reasoning_low = true;
+        true
     } else if !req.thinking_off && !req.reasoning_off {
         req.thinking_off = true;
+        true
     } else if !req.reasoning_off {
         req.reasoning_off = true;
-    } else if !req.roomier {
+        true
+    } else if !req.roomier && content_chars > 0 {
         req.roomier = true;
         req.max_tokens = req.max_tokens.saturating_mul(2);
         req.reasoning_low = false;
         req.thinking_off = false;
         req.reasoning_off = false;
+        true
+    } else {
+        false
     }
+}
+
+/// How much real text a truncated reply shipped, read back out of the error
+/// that `once()` built. The truncation error reports
+/// `content=N chars; reasoning_content=M chars` precisely so this decision
+/// does not have to guess: reasoning that consumed the whole budget is a
+/// different failure from an answer that ran out of room, and the ladder's
+/// last rung is only correct for one of them.
+fn truncated_content_chars(text: &str) -> usize {
+    let Some(i) = text.find("content=") else {
+        return 0;
+    };
+    let rest = &text[i + "content=".len()..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().unwrap_or(0)
 }
 
 impl OpenRouterClient {
@@ -653,29 +693,93 @@ mod tests {
             thinking_off: false,
             roomier: false,
         };
+        // A real answer that ran out of room, so the roomier rung is
+        // justified at the top of the climb.
+        let content = 36_892;
 
         // Rung 1: plain -> low effort.
-        reshape_for_truncation(&mut req);
+        assert!(reshape_for_truncation(&mut req, content));
         assert!(req.reasoning_low && !req.thinking_off && !req.reasoning_off);
         // Rung 2: low -> enable_thinking off.
-        reshape_for_truncation(&mut req);
+        assert!(reshape_for_truncation(&mut req, content));
         assert!(
             req.thinking_off && !req.reasoning_off && !req.roomier,
             "enable_thinking must come before reasoning: false"
         );
         // Rung 3: -> reasoning off.
-        reshape_for_truncation(&mut req);
+        assert!(reshape_for_truncation(&mut req, content));
         assert!(req.reasoning_off && !req.roomier);
         // Rung 4: the roomier re-ask, which turns reasoning back on.
-        reshape_for_truncation(&mut req);
+        assert!(reshape_for_truncation(&mut req, content));
         assert!(req.roomier);
         assert_eq!(req.max_tokens, 2000, "roomier doubles the budget");
         assert!(!req.reasoning_low && !req.thinking_off && !req.reasoning_off);
-        // Nothing left to climb to: the shape is stable, and the budget is
-        // not doubled a second time.
-        reshape_for_truncation(&mut req);
-        assert!(req.roomier);
-        assert_eq!(req.max_tokens, 2000);
+        // The budget is not doubled a second time: roomier is sticky, so a
+        // further reshape cycles back to `low` rather than growing again. The
+        // retry loop never asks for that sixth shape — `attempt_ge_max` caps
+        // it — but the budget must still not grow unboundedly.
+        assert!(reshape_for_truncation(&mut req, content));
+        assert!(req.roomier, "roomier is never unset");
+        assert_eq!(req.max_tokens, 2000, "the budget must not double again");
+    }
+
+    /// The roomier rung is only for a real answer that was cut off. A
+    /// truncation that shipped no content spent its whole budget on
+    /// reasoning, and the doubled budget was measured to double the
+    /// reasoning (72,059 chars) while still shipping nothing — so the rung
+    /// must not fire, and the ladder must say so, which is what lets the
+    /// retry loop stop instead of paying for the empty call.
+    #[test]
+    fn a_contentless_truncation_never_becomes_roomier() {
+        let mut req = LlmReq {
+            system: "s".into(),
+            prompt: "p".into(),
+            max_tokens: 8192,
+            reasoning_off: false,
+            reasoning_low: false,
+            thinking_off: false,
+            roomier: false,
+        };
+        // The lower rungs are still worth trying: reasoning off may be the
+        // shape that lets content through.
+        assert!(reshape_for_truncation(&mut req, 0));
+        assert!(req.reasoning_low);
+        assert!(reshape_for_truncation(&mut req, 0));
+        assert!(req.thinking_off);
+        assert!(reshape_for_truncation(&mut req, 0));
+        assert!(req.reasoning_off);
+        // But roomier is closed: no content was ever shipped.
+        assert!(
+            !reshape_for_truncation(&mut req, 0),
+            "roomier must not fire on a contentless truncation"
+        );
+        assert!(!req.roomier);
+        assert_eq!(
+            req.max_tokens, 8192,
+            "the budget must not double when no content was shipped"
+        );
+    }
+
+    /// The ladder decides from the numbers the error reports, so the extractor
+    /// must read exactly what `once()` writes — and must not be fooled by the
+    /// `reasoning_content=` field that follows it in the same message.
+    #[test]
+    fn the_content_length_is_read_from_the_truncation_error() {
+        assert_eq!(
+            truncated_content_chars(
+                "output truncated at 8192 tokens (finish_reason=length; content=36892 chars; reasoning_content=14 chars); raise max_tokens"
+            ),
+            36_892
+        );
+        assert_eq!(
+            truncated_content_chars(
+                "output truncated at 8192 tokens (finish_reason=length; content=0 chars; reasoning_content=34810 chars); raise max_tokens"
+            ),
+            0
+        );
+        // A message that carries no count is not a truncation the ladder can
+        // reason about, so it reads as no content rather than as a guess.
+        assert_eq!(truncated_content_chars("429: rate limit exceeded"), 0);
     }
 
     /// `reasoning_content=0 chars` is a plain empty reply: there is nothing to

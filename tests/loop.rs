@@ -1001,11 +1001,17 @@ async fn a_requested_file_below_the_volatile_budget_is_delivered_whole() {
     // re-request is deduped, so the hole was a dead end and the task failed
     // with "WRITES MADE is 0". The cap is the volatile budget, so a file that
     // fits it arrives whole.
+    //
+    // That budget is the emission threshold (12k), not the old token-derived
+    // 24k: this endpoint stops emitting content above ~13k chars of user
+    // prompt, so a file that does not fit must be windowed rather than shipped
+    // whole. `fits` is a measured property, so the fixture sits under it.
     let (orch, reg, root) = harness(Arc::new(FakeClient::read_then_write()), "whole", 2);
     std::fs::write(root.join("a.txt"), "alpha\nbeta_real_line\ngamma\n").unwrap();
-    // 20k chars with a marker the head+tail split used to cut out.
+    // ~9.4k chars with a marker the head+tail split used to cut out: under the
+    // 12k cap, so the whole file must arrive.
     let mut big = String::new();
-    for _ in 0..490 {
+    for _ in 0..230 {
         big.push_str("padding line that fills the window budget\n");
     }
     let mid = big.len() / 2;
@@ -1025,18 +1031,67 @@ async fn a_requested_file_below_the_volatile_budget_is_delivered_whole() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // deliberate: the READ_TEST_ORDER guard is the serializer
+async fn a_file_above_the_emission_threshold_is_windowed_not_shipped_whole() {
+    let _o = READ_TEST_ORDER.lock().unwrap();
+    IMPL_READ_CALLS.store(0, Ordering::SeqCst);
+    // The counterpart to the test above, and the reason the volatile budget is
+    // the emission threshold rather than the token-derived 24k. A requested
+    // file larger than the threshold cannot be shipped whole: the prompt
+    // would cross ~13k chars and the endpoint then spends the whole completion
+    // budget on reasoning and ships no content at all, which measured worse
+    // than an elided middle (an empty reply ends the round with no write;
+    // a windowed one at least hands the model the anchors). Doubling
+    // `max_tokens` does not rescue it — the reasoning doubles too. So the
+    // assembler windows the file and keeps the prompt under the threshold.
+    let (orch, reg, root) = harness(Arc::new(FakeClient::read_then_write()), "over", 2);
+    std::fs::write(root.join("a.txt"), "alpha\nbeta_real_line\ngamma\n").unwrap();
+    // ~20k chars, deliberately above the 12k emission threshold.
+    let mut big = String::new();
+    for _ in 0..490 {
+        big.push_str("padding line that fills the window budget\n");
+    }
+    let mid = big.len() / 2;
+    big.insert_str(mid, "MIDDLE_MARKER_LINE\n");
+    std::fs::write(root.join("schema.txt"), big).unwrap();
+
+    let out = orch.run_loop(&Session::new("g".into()), &reg, &root).await;
+    let seen = IMPL_READ_PROMPT.lock().unwrap().clone();
+    assert!(
+        !seen.contains("MIDDLE_MARKER_LINE"),
+        "a file above the emission threshold was shipped whole, which would \
+         push the prompt past the point where this endpoint emits any content"
+    );
+    assert!(
+        seen.len() < 12_000,
+        "the volatile layer must keep the prompt under the emission threshold, \
+         got {} chars",
+        seen.len()
+    );
+    assert_eq!(out["passed"], true);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: the READ_TEST_ORDER guard is the serializer
 async fn a_file_the_goal_names_arrives_whole_below_the_layers() {
-    // The mid layer caps at 16k chars and summarizes above 12.8k, so a 20k
+    // The mid layer caps at 16k chars and summarizes above 12.8k, so a
     // source file the goal names used to arrive as head+elided-tail: the
     // struct, `Default` and `fold` lived in the hole, and the task then died
-    // at "WRITES MADE is 0". Below the layers the volatile budget (24k) holds
-    // it whole, and the mid layer no longer carries the same file twice.
+    // at "WRITES MADE is 0". Below the layers the volatile budget holds it
+    // whole, and the mid layer no longer carries the same file twice.
+    //
+    // That budget is the measured emission threshold (12k), not the old
+    // token-derived 24k: above ~13k chars of user prompt this endpoint ships
+    // no content at all, so a file too large to fit is windowed instead of
+    // shipped whole. The fixture stays under the threshold so "whole" is the
+    // property under test rather than a size the endpoint cannot serve.
     let _o = READ_TEST_ORDER.lock().unwrap();
     IMPL_READ_CALLS.store(0, Ordering::SeqCst);
     let (orch, reg, root) = harness(Arc::new(FakeClient::read_then_write()), "named", 2);
     std::fs::write(root.join("a.txt"), "alpha\nbeta_real_line\ngamma\n").unwrap();
+    // ~9.4k chars, under the 12k emission threshold.
     let mut big = String::new();
-    for _ in 0..490 {
+    for _ in 0..230 {
         big.push_str("padding line that fills the window budget\n");
     }
     let mid = big.len() / 2;
