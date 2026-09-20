@@ -2186,3 +2186,60 @@ and the remaining two are one already-half-built and one blocked on a substrate
 we do not have. The research moved us by ruling things out, which is progress,
 but the next gain is not in that paper — it is in the output-waste measurement we
 already capture and have never read.
+
+## The `enable_thinking` arm: wired, verified, and a NO-OP on the mf suite (2026-09-20)
+
+I implemented recommendation #1 from the judgment call above: a fifth ladder
+rung. `LlmReq.thinking_off` carries it, `ChatReq.enable_thinking` puts
+`"enable_thinking":false` on the wire, and `reshape_for_truncation` is the new
+single source of truth for the climb order:
+
+    plain -> reasoning_effort:low -> enable_thinking:false -> reasoning:false -> roomier
+
+First attempts stay byte-identical (the field is `skip_serializing_if =
+Option::is_none`), so nothing changes unless a truncation happens.
+
+**Measured: a no-op, and I can prove it rather than infer it.** Three reps of
+`mf-test-coverage` — the task with the most turns and the most output, the one
+most likely to stress the budget — all passed, all with **exactly 1 model call
+each.** One call means no retry, which means the ladder was never entered, which
+means the new rung was never reached. A mechanism whose trigger never fires
+cannot be what moved the score.
+
+`mf-test-coverage` did go 2/3 -> 3/3. That is variance, not the rung: the rep
+that flipped is one rep out of three, this task's history already swung
+`.PP`, and the rung provably did not execute. Recording it as a gain would be
+exactly the failure this project exists to avoid.
+
+**The pathology also did not reproduce.** I re-tested all four shapes against
+the live endpoint on the largest stored prompt (5,217 bytes) and on a
+deliberately reasoning-heavy 2.5 KB prompt: every shape, including plain,
+returned `finish=stop` with real content. `content=0; reasoning_content=37683`
+was real when it was measured, but the endpoint is not exhibiting it now. So
+the premise that made this the highest-value recommendation is weaker than it
+looked — I built the rung on a prior that is not currently firing.
+
+**What I am keeping, and why.** The rung stays, because it costs nothing on a
+first attempt and the class was genuinely observed earlier in this project. But
+it is now correctly labelled: unexercised insurance, not a measured improvement.
+Its real test bed is large-prompt work, which on this substrate means
+Terminal-Bench — where all three agents already score 0.
+
+**The actual win this session was in the tests, not the feature.** My first
+version of the order test used a `climb()` helper that was a *copy* of the
+ladder. A mutation test (swapping rungs 2 and 3) **passed**, because the test
+was asserting against its own mirror, not the implementation — a tautology that
+would have silently blessed any reordering. I extracted `reshape_for_truncation`
+so the retry and the test share one function, re-ran the mutation, and it now
+fails with the intended message. The lesson is the same one that keeps
+appearing: **a test that passes against a copy of the behavior proves nothing
+about the behavior.** Verify the test can fail before trusting that it can pass.
+
+### Score table
+
+| arm | tree | mf-test-coverage (3 reps) | ladder fired? |
+|---|---|---|---|
+| baseline | `8230015` | `.PP` 2/3 | — |
+| + `enable_thinking` rung | this tree | `PPP` 3/3 | **no — 1 call per run** |
+
+The 3/3 is recorded as variance. The rung is recorded as unexercised.

@@ -23,6 +23,14 @@ pub struct LlmReq {
     /// size and still ships content.
     #[serde(default)]
     pub reasoning_low: bool,
+    /// Retry switch, the rung after `low` and before `reasoning_off`:
+    /// `enable_thinking: false` is the vLLM template knob, and the only
+    /// request shape that returned substantive content on the large
+    /// implementer prompt where `reasoning: false` is ignored outright.
+    /// Kept distinct from `reasoning_off` because the two switches are
+    /// honoured on different prompt sizes, so both are worth a rung.
+    #[serde(default)]
+    pub thinking_off: bool,
     /// Retry switch, the last rung: the ladder has reshaped the request twice
     /// and the endpoint still spent the budget on reasoning, so the final
     /// attempt asks for more room with reasoning back on.
@@ -101,6 +109,7 @@ impl ContextService {
             reasoning_off: false,
             reasoning_low: false,
             roomier: false,
+            thinking_off: false,
         })
         .await
     }

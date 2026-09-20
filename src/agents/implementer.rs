@@ -389,6 +389,7 @@ impl ImplementerAgent<'_> {
                 reasoning_off: false,
                 reasoning_low: false,
                 roomier: false,
+                thinking_off: false,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
