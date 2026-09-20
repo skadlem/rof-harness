@@ -29,6 +29,12 @@ struct ChatReq {
     /// and still ships content with `finish_reason: stop`.
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// `enable_thinking: false` is the vLLM template switch. It is the one
+    /// shape that shipped real content on the ~7 KB implementer prompt,
+    /// where `reasoning: false` is ignored and `reasoning_effort` still
+    /// exhausts the budget. Only set on the retry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -174,6 +180,7 @@ impl OpenRouterClient {
             } else {
                 None
             },
+            enable_thinking: if req.thinking_off { Some(false) } else { None },
         }
     }
 }
@@ -184,7 +191,11 @@ impl LlmClient for OpenRouterClient {
         let t = Instant::now();
         // ponytail: retry lives here, not in every caller. Free tiers 429 often.
         let mut last = LlmError::Transport("no attempts".to_string());
-        for attempt in 0..4 {
+        // Five shapes: the plain request, then four reshapes — low effort,
+        // the vLLM thinking switch, reasoning off, and a roomier re-ask. The
+        // loop bound and the rung order must stay in step: see
+        // `attempt_ge_max`.
+        for attempt in 0..5 {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
             }
@@ -208,23 +219,12 @@ impl LlmClient for OpenRouterClient {
                         // endpoint — doubling `max_tokens` was measured to
                         // make reasoning *longer* and still ship no content —
                         // so the retry reshapes the request instead of growing
-                        // it. `low` first (it keeps a short reasoning pass and
-                        // still emits an answer), then fully off, then one
-                        // roomier re-ask as the last resort. Whether the
-                        // endpoint honours the knob on a large prompt is
-                        // nondeterministic, which is why the ladder runs.
-                        if !req.reasoning_low && !req.reasoning_off {
-                            req.reasoning_low = true;
-                        } else if !req.reasoning_off {
-                            req.reasoning_off = true;
-                        } else if !req.roomier {
-                            req.roomier = true;
-                            req.max_tokens = req.max_tokens.saturating_mul(2);
-                            req.reasoning_low = false;
-                            req.reasoning_off = false;
-                        }
+                        // it. The order matters and lives in one place:
+                        // `reshape_for_truncation`.
+                        reshape_for_truncation(&mut req);
                     } else if reasoning_ate_budget(&text)
                         && !req.reasoning_low
+                        && !req.thinking_off
                         && !req.reasoning_off
                     {
                         // The non-truncated empty path: reasoning shipped but
@@ -278,13 +278,47 @@ fn retryable_error(text: &str, truncated: bool, attempt: usize) -> bool {
     // a large prompt is nondeterministic, so a same-shape retry sometimes
     // succeeds where the first did not. Capped so a genuinely unreachable
     // answer still terminates.
-    retryable && !(truncated && attempt > 2) && !attempt_ge_max(attempt)
+    retryable && !(truncated && attempt > 3) && !attempt_ge_max(attempt)
 }
 
-/// ponytail: the loop runs 0..4; the last slot is reserved for the roomier
+/// ponytail: the loop runs 0..5; the last slot is reserved for the roomier
 /// re-ask, so a reshape must not burn it on a plain re-roll.
 fn attempt_ge_max(attempt: usize) -> bool {
-    attempt >= 3
+    attempt >= 4
+}
+
+/// The truncation ladder, as one function so the retry and its test cannot
+/// drift. Reasoning expands to fill any budget on this endpoint — doubling
+/// `max_tokens` was measured to make reasoning *longer* and still ship no
+/// content — so a truncated reply is *reshaped*, not given more room.
+///
+/// Order is the point: the shapes least likely to cost quality come first, so
+/// a call that fails early keeps as much reasoning as the endpoint will
+/// honour.
+/// 1. `reasoning_effort: low` — keeps a short reasoning pass and still ships
+///    content.
+/// 2. `enable_thinking: false` — the vLLM switch, and the only shape that
+///    returned real content on the large implementer prompt.
+/// 3. `reasoning: false` — honoured on small prompts, ignored on large ones.
+/// 4. roomier — reasoning back on with twice the budget, the last resort.
+///
+/// Which knob the endpoint honours at a given prompt size is
+/// nondeterministic, which is why the ladder keeps climbing instead of
+/// stopping at the first reshape.
+fn reshape_for_truncation(req: &mut LlmReq) {
+    if !req.reasoning_low && !req.thinking_off && !req.reasoning_off {
+        req.reasoning_low = true;
+    } else if !req.thinking_off && !req.reasoning_off {
+        req.thinking_off = true;
+    } else if !req.reasoning_off {
+        req.reasoning_off = true;
+    } else if !req.roomier {
+        req.roomier = true;
+        req.max_tokens = req.max_tokens.saturating_mul(2);
+        req.reasoning_low = false;
+        req.thinking_off = false;
+        req.reasoning_off = false;
+    }
 }
 
 impl OpenRouterClient {
@@ -390,6 +424,7 @@ mod tests {
             reasoning_off: false,
             reasoning_low: false,
             roomier: false,
+            thinking_off: false,
         };
         let b = OpenRouterClient::body("anthropic/claude-x", &req);
         assert_eq!(b.model, "anthropic/claude-x");
@@ -465,9 +500,10 @@ mod tests {
             retryable_error(msg, false, 1),
             "it climbs the ladder rather than stopping at one attempt"
         );
-        // It still terminates: four same-shape re-rolls of an empty reply
-        // were measured to add nothing but latency.
-        assert!(!retryable_error(msg, false, 3));
+        // It still terminates: repeated same-shape re-rolls of an empty
+        // reply were measured to add nothing but latency. Five attempts now,
+        // not four — the ladder gained the `enable_thinking` rung.
+        assert!(!retryable_error(msg, false, 4));
     }
 
     /// A truncation earns exactly one retry, and only a roomier one.
@@ -484,9 +520,13 @@ mod tests {
         );
         assert!(
             retryable_error(msg, true, 2),
+            "the thinking switch is still allowed"
+        );
+        assert!(
+            retryable_error(msg, true, 3),
             "the roomier re-ask is still allowed"
         );
-        assert!(!retryable_error(msg, true, 3), "the ladder terminates");
+        assert!(!retryable_error(msg, true, 4), "the ladder terminates");
     }
 
     /// The reasoning-budget exhaustion is retryable too, so the
@@ -498,7 +538,7 @@ mod tests {
             "empty content from m (finish_reason=\"length\"; reasoning_content=30000 chars); none";
         assert!(retryable_error(msg, false, 0));
         assert!(retryable_error(msg, false, 1));
-        assert!(!retryable_error(msg, false, 3), "it still terminates");
+        assert!(!retryable_error(msg, false, 4), "it still terminates");
     }
 
     /// A quota error is worth waiting out; a real protocol error is not.
@@ -524,6 +564,7 @@ mod tests {
             reasoning_off: false,
             reasoning_low: false,
             roomier: false,
+            thinking_off: false,
         };
         let wire = serde_json::to_string(&OpenRouterClient::body("m", &on)).unwrap();
         assert!(
@@ -559,6 +600,82 @@ mod tests {
         );
         // And it must not also disable reasoning outright.
         assert!(!wire.contains("\"reasoning\":false"));
+    }
+
+    /// The `enable_thinking` rung: on the large implementer prompt it was the
+    /// only shape that shipped real content, so it earns a rung of its own
+    /// between `low` and `reasoning: false`. It must appear on the wire, and a
+    /// first attempt must not carry it.
+    #[test]
+    fn enable_thinking_is_the_second_rung_and_is_omitted_until_used() {
+        let base = LlmReq {
+            system: "s".into(),
+            prompt: "p".into(),
+            max_tokens: 10,
+            reasoning_off: false,
+            reasoning_low: false,
+            thinking_off: false,
+            roomier: false,
+        };
+        // A first attempt stays byte-identical to before this rung existed.
+        let wire = serde_json::to_string(&OpenRouterClient::body("m", &base)).unwrap();
+        assert!(!wire.contains("enable_thinking"), "first attempt: {wire}");
+
+        let off = LlmReq {
+            thinking_off: true,
+            ..base.clone()
+        };
+        let wire = serde_json::to_string(&OpenRouterClient::body("m", &off)).unwrap();
+        assert!(
+            wire.contains("\"enable_thinking\":false"),
+            "the retry must switch thinking off: {wire}"
+        );
+        // It must not also flip the reasoning switch, so the two rungs stay
+        // distinguishable on the wire and the endpoint sees one change at a
+        // time — the A/B that motivated this rung isolated exactly this param.
+        assert!(!wire.contains("\"reasoning\":false"));
+        assert!(!wire.contains("chat_template_kwargs"));
+    }
+
+    /// The climb order, end to end: a truncation must walk `low`, then
+    /// `enable_thinking`, then `reasoning`, then the roomier re-ask, and stop.
+    /// Ordering is the whole point of the ladder — the shapes least likely to
+    /// cost quality come first, so a caller that fails early still keeps as
+    /// much reasoning as the endpoint will honour.
+    #[test]
+    fn a_truncation_climbs_the_rungs_in_order() {
+        let mut req = LlmReq {
+            system: "s".into(),
+            prompt: "p".into(),
+            max_tokens: 1000,
+            reasoning_off: false,
+            reasoning_low: false,
+            thinking_off: false,
+            roomier: false,
+        };
+
+        // Rung 1: plain -> low effort.
+        reshape_for_truncation(&mut req);
+        assert!(req.reasoning_low && !req.thinking_off && !req.reasoning_off);
+        // Rung 2: low -> enable_thinking off.
+        reshape_for_truncation(&mut req);
+        assert!(
+            req.thinking_off && !req.reasoning_off && !req.roomier,
+            "enable_thinking must come before reasoning: false"
+        );
+        // Rung 3: -> reasoning off.
+        reshape_for_truncation(&mut req);
+        assert!(req.reasoning_off && !req.roomier);
+        // Rung 4: the roomier re-ask, which turns reasoning back on.
+        reshape_for_truncation(&mut req);
+        assert!(req.roomier);
+        assert_eq!(req.max_tokens, 2000, "roomier doubles the budget");
+        assert!(!req.reasoning_low && !req.thinking_off && !req.reasoning_off);
+        // Nothing left to climb to: the shape is stable, and the budget is
+        // not doubled a second time.
+        reshape_for_truncation(&mut req);
+        assert!(req.roomier);
+        assert_eq!(req.max_tokens, 2000);
     }
 
     /// `reasoning_content=0 chars` is a plain empty reply: there is nothing to

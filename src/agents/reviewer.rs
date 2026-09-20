@@ -37,6 +37,7 @@ impl Agent for ReviewerAgent<'_> {
             reasoning_off: false,
             reasoning_low: false,
             roomier: false,
+            thinking_off: false,
         };
         let resp = self
             .llm
