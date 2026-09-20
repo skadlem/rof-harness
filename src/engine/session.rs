@@ -11,6 +11,36 @@ use std::sync::Arc;
 /// change, not one symbol.
 const EVIDENCE_WINDOW: usize = 24_000;
 
+/// The largest user prompt, in chars, at which this endpoint still emits
+/// content. Measured directly against the stored `wal-recovery-ordering`
+/// task files (`8192` completion tokens throughout): content collapsed from
+/// 32,465 chars at a 12,000-char prompt to 233 at 13,000 and to **zero** at
+/// 14,000, with the whole completion budget going to `reasoning_content`.
+/// Above the threshold the model thinks until the budget is spent and ships
+/// nothing — and doubling the budget doubled the reasoning to 72,059 chars
+/// while content stayed empty, so no `max_tokens` increase recovers it.
+///
+/// This is an endpoint property, not a token-budget derivation, so it is a
+/// hard ceiling on anything that assembles a prompt: the volatile budget and
+/// the evidence window both derive from `short.budget * 4` (24,000 chars at
+/// the default 6,000 tokens), which is 11,000 chars above the threshold and
+/// would break every call it governs if the layer were ever allowed to fill.
+/// Today the repo layer only ever holds goal-named files, so the cap is not
+/// reached — but the suite-widening plan points exactly at widening it.
+/// 12,000 is the largest measured size that still shipped content, so it is
+/// the value used rather than the 13,000 that already degraded.
+pub(crate) const EMISSION_THRESHOLD: usize = 12_000;
+
+/// The volatile budget for a short layer of `budget` tokens. The layer is
+/// counted in tokens and the assembler spends chars, hence the factor of four;
+/// the result is capped at [`EMISSION_THRESHOLD`] because that ceiling is an
+/// endpoint property the token derivation cannot see. One function so both
+/// consumers — the implementer's requested-file cap and the reviewer's
+/// evidence window — cannot drift apart.
+pub(crate) fn volatile_budget_for(budget_tokens: usize) -> usize {
+    (budget_tokens * 4).min(EMISSION_THRESHOLD)
+}
+
 /// One touched file's text as the implementer left it, plus the region the
 /// reviewer's window should centre on.
 struct Carried {
@@ -296,7 +326,7 @@ impl<'a> RoundServices<'a> {
             }
         }
 
-        let cap = self.cfg.context_policy().short.budget * 4;
+        let cap = volatile_budget_for(self.cfg.context_policy().short.budget);
         let mut asm = ContextAssembler::new("", cap);
         for c in &carried {
             asm.add(ContextItem {
@@ -445,8 +475,13 @@ impl<'a> RoundServices<'a> {
     /// The chars the §4.1 assembler may spend below the layers. The short
     /// layer's cap, because that is where these parts were being silently cut
     /// before there was an owner for them.
+    ///
+    /// Capped at [`EMISSION_THRESHOLD`]: the budget is derived from tokens, but
+    /// this endpoint stops emitting content above a measured prompt size, so a
+    /// budget larger than the threshold buys nothing and silently breaks every
+    /// call it governs. See the arm at `7cf52af`.
     pub fn volatile_budget(&self) -> usize {
-        self.cfg.context_policy().short.budget * 4
+        volatile_budget_for(self.cfg.context_policy().short.budget)
     }
 
     /// The stable head a prompt gets: the session's conventions, plus the
@@ -911,7 +946,10 @@ mod evidence_tests {
 
 #[cfg(test)]
 mod budget_tests {
-    use super::{checks_pass, render_checks, Budget, CheckResult};
+    use super::{
+        checks_pass, render_checks, volatile_budget_for, Budget, CheckResult, EMISSION_THRESHOLD,
+    };
+    use crate::config::AppConfig;
     use crate::obs::{TraceEvent, TraceSink};
     use std::sync::Arc;
 
@@ -954,6 +992,47 @@ mod budget_tests {
         };
         assert!(!checks_pass(&[ok.clone(), bad]));
         assert!(checks_pass(&[]), "no checks configured is a pass");
+    }
+
+    /// The shipped defaults derive a 24,000-char volatile budget from a
+    /// 6,000-token short layer (`budget * 4`). That is 11,000 chars above the
+    /// emission threshold this endpoint was measured to enforce, so the cap
+    /// must bind: without it, a task whose repo layer fills toward budget
+    /// stops emitting content entirely, and no `max_tokens` increase
+    /// recovers it (the reasoning expands to fill whatever it is given).
+    #[test]
+    fn the_volatile_budget_cannot_exceed_the_emission_threshold() {
+        let cfg = AppConfig::default();
+        let tokens = cfg.context_policy().short.budget;
+        assert_eq!(
+            tokens * 4,
+            24_000,
+            "the shipped default still derives the oversized budget"
+        );
+        assert!(
+            tokens * 4 > EMISSION_THRESHOLD,
+            "this test is vacuous if the cap no longer binds"
+        );
+        // The real assertion: the function the two consumers call must return
+        // the capped value, not the derivation.
+        assert_eq!(
+            volatile_budget_for(tokens),
+            EMISSION_THRESHOLD,
+            "the cap must bind when the derivation exceeds it"
+        );
+    }
+
+    /// The cap is a ceiling, not a replacement: a small configured budget must
+    /// still pass through, so a lean task keeps the room it asked for.
+    #[test]
+    fn a_small_volatile_budget_passes_through_the_cap() {
+        assert_eq!(volatile_budget_for(500), 2_000);
+        assert_eq!(volatile_budget_for(0), 0);
+        // Exactly at the threshold: the boundary belongs to the capped side.
+        assert_eq!(
+            volatile_budget_for(EMISSION_THRESHOLD / 4),
+            EMISSION_THRESHOLD
+        );
     }
 
     #[test]
