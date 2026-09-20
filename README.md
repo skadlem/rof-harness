@@ -103,9 +103,15 @@ oracle and the reviewer was their only judge. As of the last arms the honest num
 | `ROF_PLANNER=skip` | self | 11-12 | 1-2 |
 | `skip` + independent | `stealth/union-alpha` | **11.3 (76%)** | 0.7 |
 
-Multi-file suite (6 tasks × 3 reps, Atria): rof **17/18** after the red-suite
-arm — a seeded test asserting the *buggy* value was rejecting correct fixes;
-the harness now surfaces the failing assertion to the model (`8230015`).
+Multi-file suite (6 tasks × 3 reps, Atria): rof **17/18** vs hermes **15/18** and pi
+**14/18** — all three re-run like-for-like on the `8230015` tree. The separation
+is `mf-dead-code`, which rof passes 3/3 and both others 2/3. On Terminal-Bench 4.0
+all three score 0.0 on 8 of 8 CPU tasks at 15- and 30-minute caps — the ceiling
+there is the model, not the harness, and it is recorded as such.
+
+The 17/18 comes from the red-suite arm: a seeded test asserted the *buggy* value
+and was rejecting correct fixes; the harness now surfaces the failing assertion to
+the model (`8230015`).
 
 Three findings changed what the numbers mean, and each was caught by decomposing the measurement
 rather than trusting the aggregate: a direct-mode run that scored 16/20 was passing the five
