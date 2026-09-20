@@ -1891,3 +1891,46 @@ comparison. Today it measures a floor of zero.
 levers actually show. Re-run hermes and pi there against the `8230015` tree so
 the 17/18 is compared like-for-like — that is the honest test of whether the
 red-suite arm is a rof-specific gain or a property of the task.
+
+## The like-for-like multi-file rerun: no longer a tie (2026-09-20, 3 reps)
+
+The tbench comparison cannot discriminate on Atria — 8/8 CPU tasks at zero — so
+the informative measurement had to be the in-house suite, run like-for-like
+against the `8230015` tree. That means re-running hermes and pi, not quoting the
+old numbers, because rof's score moved while theirs had not.
+
+All three agents, same 6 tasks, 3 reps, same model, same key, same oracle:
+
+| task | hermes | pi | rof |
+|---|---|---|---|
+| mf-rename-key | PPP 3/3 | P.P 2/3 | PPP 3/3 |
+| mf-add-validator | PPP 3/3 | PPP 3/3 | PPP 3/3 |
+| mf-fix-import-cycle | P.P 2/3 | PPP 3/3 | PPP 3/3 |
+| mf-new-endpoint | PPP 3/3 | P.P 2/3 | PPP 3/3 |
+| mf-dead-code | P.P 2/3 | P.P 2/3 | PPP 3/3 |
+| mf-test-coverage | P.P 2/3 | PP. 2/3 | .PP 2/3 |
+| **total** | **15/18** | **14/18** | **17/18** |
+
+rof is **+2 over hermes and +3 over pi**. The single task that separates them is
+`mf-dead-code`, which rof passes 3/3 and both others pass 2/3 — and rof's one
+remaining failure class is `mf-test-coverage`, where it passes 2/3 like both
+others.
+
+**The oracle was re-validated before any of this was believed.** The unmodified
+seed still passes its own suite (3 passed) while asserting the buggy value, and
+`mf_verify.py` still reports `seed fails, reference passes` for all six tasks.
+The 6/6 that pi posted on rep 1 is real: it fixed the seeded assertion `22` →
+`15`, added `test_store_fresh.py`, and cleared every other task.
+
+**What this does and does not license.** It is the first measurement this session
+where rof leads by more than the within-agent rep swing, on a calibrated suite,
+against agents re-run on the same tree. It does **not** license a general claim
+that rof is the better harness: 6 tasks and 3 reps is a small sample, the
+separation rests on one task, and the rep-2 dip (3/6 for both hermes and pi)
+shows how much run-to-run variance there is. It is a lead on one suite, recorded
+with its variance attached.
+
+**And it must be read against the tbench result.** On a public benchmark at the
+frontier, all three score zero. rof's lead exists where the task difficulty is
+calibrated to the model — which is exactly the design intent of v3 §0:
+flash-class cost, frontier-adjacent completion. Both facts are true at once.
