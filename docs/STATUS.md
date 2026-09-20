@@ -1826,3 +1826,68 @@ usage from the session export, and Atria's usage fields are not where it looks,
 so the cost axis is still unmeasured here. And `layout-config-recreation2`, the
 task `--n-tasks 1` selects first, is an 8-hour vision task; task selection is
 material and `--n-tasks 1` is not a representative sample of anything.
+
+### The task set does not discriminate: 0/0/0 across six CPU tasks (2026-09-20)
+
+The matrix runner (`~/.local/share/tbench/tb-matrix.sh`) runs the three agents in
+parallel with per-run job names — three agents launched in the same second
+collide on Harbor's timestamped job dir and one dies with `FileExistsError`.
+
+Calibration on `production-planning` (1 rep, 15-min agent cap):
+
+| agent | reward | errored |
+|---|---|---|
+| rof | 0.0 | 0 |
+| hermes | 0.0 | 1 |
+| pi | 0.0 | 0 |
+
+rof probes on the remaining CPU tasks, 15-min cap: `ctr-optimization` 0.0,
+`session-window-debug` 0.0, `shadow-relay` 0.0, `bun-sourcemap-leak` 0.0.
+
+**These are genuine task failures, not plumbing failures.** `session-window-debug`
+shows the mechanism: rof modified `sessions.py`, `merger.py`, `gc.py`, `emitter.py`
+and `types.py` — substantive edits to exactly the modules the task names — and the
+verifier still rejected the result. rof works; the task is hard.
+
+**One incidental Harbor finding**, recorded because it looks like a bug until it is
+read: every run logs `docker compose cp failed ... invalid output path: directory
+... does not exist` five or more times. Harbor retries via tar stream and the copy
+lands, so it is noise in the log, not a failed run. It is identical with and
+without my `--job-name` override, so it is pre-existing.
+
+**The honest conclusion so far: six tasks, six zeroes for every agent.** Either
+the agent cap is too short for this task class, or Atria-Dawn-Preview cannot clear
+the tbench 4.0 bar at all — which would be the *model*, not the harness, and would
+make the whole comparison uninformative on this benchmark. Two 30-min-cap probes
+are running to separate those two hypotheses.
+
+### The 30-minute probes settle it: the ceiling is the model (2026-09-20)
+
+Two probes at a doubled agent cap (30 min) also scored 0.0:
+`interleaved-vigenere` 0.0, `wal-recovery-ordering` 0.0. rof edited **15 files**
+across the WAL subsystem — `wal.py`, `wal_index.py`, `serializer.py`,
+`segment_manager.py`, `recovery.py`, `log_writer.py`, `metrics.py` and more —
+substantive work on the right modules, and the verifier still rejected it.
+
+**That is the answer, and it is not close to the harness.** Eight of eight CPU
+tasks, at 15-minute and 30-minute caps, all zero. Doubling the budget did not
+move any score, which separates "not enough time" from "not enough model" —
+Atria-Dawn-Preview cannot clear the Terminal-Bench 4.0 bar, and no harness change
+fixes that.
+
+So the tbench comparison is **uninformative on this substrate**, and saying
+otherwise would be the exact failure mode the whole project exists to avoid. The
+informative comparison remains the in-house multi-file suite, where the task
+difficulty is calibrated to the model — 17/18 rof after the red-suite arm, with
+hermes and pi at 15/18 and 14/18 on the pre-red-suite tree.
+
+**What this does establish:** the tbench *pipeline* is now correct and measures
+real agents. Three blockers were fixed (stale `hermes version`, no `atria`
+provider route, flat config layout), all three agents run clean, and results
+harvest correctly. The moment a stronger model is available, this is a runnable
+comparison. Today it measures a floor of zero.
+
+**Next measurement that could discriminate:** the in-house suite is where rof's
+levers actually show. Re-run hermes and pi there against the `8230015` tree so
+the 17/18 is compared like-for-like — that is the honest test of whether the
+red-suite arm is a rof-specific gain or a property of the task.
