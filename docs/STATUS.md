@@ -2243,3 +2243,63 @@ about the behavior.** Verify the test can fail before trusting that it can pass.
 | + `enable_thinking` rung | this tree | `PPP` 3/3 | **no — 1 call per run** |
 
 The 3/3 is recorded as variance. The rung is recorded as unexercised.
+
+## CORRECTION: the three-way result was a recording error (2026-09-21)
+
+The README claimed rof 17/18 vs hermes 15/18 vs pi 14/18, with the separation on
+`mf-dead-code` (rof 3/3, both others 2/3). **That claim did not survive
+verification against the run's own artifacts, and it has been corrected.**
+
+I went to diagnose why hermes and pi each lost a rep of `mf-dead-code`. The
+stored work dirs were intact — source files carry mtimes inside the original run
+window (22:58–00:02), so they are authentic and unmodified. I re-scored all 54
+cells with the same oracle and compared against the stored result files:
+
+- **The result files and the independent re-score agree on all 54 cells.** Not
+  most — all of them.
+- Both say **hermes 18/18 and pi 16/18**, and `mf-dead-code` is passed 3/3 by
+  all three agents.
+
+So the separation never existed. Hermes does remove the dead code in the rep it
+was recorded as failing — the oracle says `PASS` on inspection of the untouched
+work dir. The recorded 15/14 was wrong, and so was the story built on it.
+
+**Two errors of opposite sign confirm the scoring was unreliable, not merely
+noisy.** `pi r3/mf-add-validator` was recorded PASS, but `add({'name':'','amount':1})`
+is accepted — the fix is incomplete, a false positive. `hermes r2/mf-dead-code`
+was recorded FAIL for a fix that is correct, a false negative. A scorer that
+errs in both directions cannot be trusted in either.
+
+**I also destroyed part of rof's own evidence.** While measuring the
+`enable_thinking` arm I ran `run.py rof mf mf-test-coverage` for three reps.
+That invocation overwrites the result file for the whole rep, so rof's three
+result files now hold only that one task. rof's work dirs survive — 15 cells
+from the like-for-like run re-score 15/15, plus 3 for the re-run — but the
+record is no longer intact. The instrument that produced the headline was
+damaged by the measurement I made on it.
+
+### What is actually true now
+
+| agent | verified score | note |
+|---|---|---|
+| rof | 18/18 | 15 cells intact from the like-for-like run + 3 re-run today |
+| hermes | 18/18 | untouched artifacts, cross-verified two ways |
+| pi | 16/18 | loses `mf-add-validator` r3 (incomplete) and `mf-test-coverage` r2 |
+
+**The suite is saturated.** All three are at or within two of the ceiling, so
+the multi-file suite no longer discriminates. Whatever the next arm is, this
+suite will score ~18 for it whether it helps or not — it has become an
+instrument that cannot register the effect it is being asked to measure. This
+moves "widen the mf suite" from a nice-to-have to a hard prerequisite for any
+further claim.
+
+### The lesson
+
+The headline number was never checked against the artifacts it came from. A
+result was written down, a narrative was attached to it ("the separation is
+`mf-dead-code`"), and it propagated into the README unverified. When I finally
+looked at the underlying work dirs, the narrative dissolved in minutes. The
+fix is not a code change — it is the rule already stated in this file, now
+applied to our own reported results: **a claim must be verified against its
+source before it is repeated, and a table that is not re-derivable from stored
+artifacts is not a result.**

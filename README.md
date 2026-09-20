@@ -103,13 +103,27 @@ oracle and the reviewer was their only judge. As of the last arms the honest num
 | `ROF_PLANNER=skip` | self | 11-12 | 1-2 |
 | `skip` + independent | `stealth/union-alpha` | **11.3 (76%)** | 0.7 |
 
-Multi-file suite (6 tasks × 3 reps, Atria): rof **17/18** vs hermes **15/18** and pi
-**14/18** — all three re-run like-for-like on the `8230015` tree. The separation
-is `mf-dead-code`, which rof passes 3/3 and both others 2/3. On Terminal-Bench 4.0
-all three score 0.0 on 8 of 8 CPU tasks at 15- and 30-minute caps — the ceiling
-there is the model, not the harness, and it is recorded as such.
+Multi-file suite (6 tasks × 3 reps, Atria): **rof 18/18, hermes 18/18, pi 16/18.**
+These are the verified numbers, and they replaced an earlier claim that was wrong — see
+below. On Terminal-Bench 4.0 all three score 0.0 on 8 of 8 CPU tasks at 15- and 30-minute
+caps — the ceiling there is the model, not the harness, and it is recorded as such.
 
-The 17/18 comes from the red-suite arm: a seeded test asserted the *buggy* value
+**The suite is saturated and no longer separates the harnesses.** With all three at or
+within two of the ceiling, the multi-file suite has nothing left to discriminate: a future
+arm that moves nothing will still score ~18, so the suite cannot be the instrument for the
+next claim. Widening it (larger repos, indirect call chains, cross-file consistency) is now
+a prerequisite for measurement, not a nice-to-have.
+
+**Correction, 2026-09-21.** This section previously read "rof 17/18 vs hermes 15/18 and pi
+14/18, the separation is `mf-dead-code`, which rof passes 3/3 and both others 2/3."
+**That claim did not survive verification against the run's own artifacts.** Re-scoring all
+54 stored work dirs — with source files untouched since the original run window — agrees
+with the stored result files on every single cell, and both say hermes 18/18 and pi 16/18,
+with `mf-dead-code` passed 3/3 by *all three* agents. There was no separation on that task;
+the lead it appeared to give rof was a recording error, never checked against the artifacts
+it came from. The corrected numbers above are what the stored evidence actually supports.
+
+The 18/18 comes from the red-suite arm: a seeded test asserted the *buggy* value
 and was rejecting correct fixes; the harness now surfaces the failing assertion to
 the model (`8230015`).
 
