@@ -2800,3 +2800,13 @@ and requires the suite to have actually run.
 
 The endpoint began returning 502s under sustained probing, so the band probe
 is measured but not yet run end to end through all three harnesses.
+
+---
+
+## Entry point for the next session
+
+`/home/madiyar/.local/share/SESSION-NEXT.md` is the bootstrap: the four
+no-op fixes, the measured click yield table, the exact next action, the
+durable artifact paths, and the standing traps. All session artifacts were
+moved out of `/tmp` to `/home/madiyar/.local/share/` because `/tmp` is wiped
+between sessions.
