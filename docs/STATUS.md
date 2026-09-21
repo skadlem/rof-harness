@@ -2759,3 +2759,44 @@ same floor. The discriminating-band probe is not a nice-to-have; it is the
 only thing that decides whether a generated task measures anything. Probe on
 the easy side of the band first, and tune toward the model's own ceiling
 rather than assuming one.
+
+## 2026-09-21 — click yields 4/8 kept, and three more ways a red suite goes blank
+
+The repo-selection hypothesis held. `pallets__click` at `fde47b4b` has 612
+passing tests to python-dotenv's 149, and 8 generated bugs across 8 distinct
+`src/` files produced **4 kept and 4 vacuous** against dotenv's 1/12 — a 4x
+yield improvement from choosing a repo on test density, with no other change.
+The kept set is spread over difficulty: bug06 breaks exactly one test,
+bug05 six, bug07 twenty-two, bug02 thirty-five. A deliberate round-robin over
+the candidate files fixed the alphabetical single-file clustering the dotenv
+probe had.
+
+Piloting bug06 (the `pass_context` argument-order swap, one test failing)
+through rof found three more instances of the same failure class, each fixed:
+
+1. **The re-ask promised files the assembler discarded.** Three requested
+   files sharing one 12k volatile budget overflowed, and the marker said they
+   were "in context above" when they were gone. Requested files are now
+   optional, so an overflow degrades to a narrower window instead of a
+   discard.
+2. **A repeated read was honored every round.** A model trained to read
+   before it patches asks for files the prompt already shows it, one round at
+   a time, until the task times out at 1,500s across seven implementer turns.
+   A request for a path whose content is already in the prompt is now refused.
+3. **A collection error reported as a blank suite.** pytest 9 rejects click's
+   `parametrize` style at import, so the suite printed no `failed` line, the
+   filter found nothing, and the model read "no signal" while the suite was
+   red. Collection errors are now named as "did not run" rather than swallowed.
+
+A direct endpoint probe isolated the real lever. Given the whole file in
+context, Atria emits a correct one-patch fix in 14s. Given the same file under
+rof's real system prompt, it answers `reads` instead. Naming what is already
+in context is what moves the answer from a deferral to the patch.
+
+One measurement error caught and corrected: the click soundness gate counted
+`"xfailed"` as `"failed"` on a substring match, so a clean 612-pass baseline
+was classified as red for all eight bugs. The gate now counts real failures
+and requires the suite to have actually run.
+
+The endpoint began returning 502s under sustained probing, so the band probe
+is measured but not yet run end to end through all three harnesses.
