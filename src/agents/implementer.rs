@@ -69,6 +69,11 @@ impl ImplementerAgent<'_> {
         let map = ctx.workdir.map(Self::file_map).unwrap_or_default();
         let files_seen = map.lines().count();
         let mut asm = ContextAssembler::new(&ctx.view.prompt, ctx.volatile_budget);
+        // The paths whose *content* is in the prompt. A request for one of
+        // these is the read-before-patch reflex, and honoring it costs a
+        // round that produces no patch. The [REPO FILES] map below is only a
+        // path listing — seeding from it would refuse a read the model needs.
+        let mut already: Vec<String> = Vec::new();
         asm.add(ContextItem {
             key: ItemKey {
                 path: "<repo-files>".to_string(),
@@ -76,10 +81,13 @@ impl ImplementerAgent<'_> {
                 role: "implementer".to_string(),
             },
             label: "[REPO FILES]".to_string(),
-            text: map,
+            text: map.clone(),
             fidelity: Fidelity::Drop,
             must_include: false,
         });
+        // The map is the list of paths already in the prompt. Cloned rather
+        // than moved so the read-request filter below can refuse a request
+        // for a file the model was already shown.
         // §4.1: a file the goal names by path is a whole-file answer, so it
         // rides below the layers where the volatile budget (24k chars) can
         // actually hold it. The mid layer caps at 16k and summarizes above
@@ -98,7 +106,9 @@ impl ImplementerAgent<'_> {
                 workdir.to_path_buf(),
                 crate::config::RetrievalConfig::default(),
             );
-            for (path, content) in r.named_file_contents(&ctx.view.prompt) {
+            let goal_named = r.named_file_contents(&ctx.view.prompt);
+            already.extend(goal_named.iter().map(|(p, _)| p.clone()));
+            for (path, content) in goal_named {
                 asm.add(ContextItem {
                     key: ItemKey {
                         path: path.clone(),
@@ -130,7 +140,25 @@ impl ImplementerAgent<'_> {
         // more: the request is only honored when the artifact proposed no
         // change at all, and a second request is ignored because by then the
         // requested text is already in the prompt.
-        let wanted = read_requests(&data);
+        //
+        // The ignore half is enforced here, not by the marker's prose. A model
+        // that asks for `reads` on every round burns a full round per request
+        // and never patches — measured at 1,500s on the click `pass_context`
+        // bug across seven implementer turns. The marker tells it to stop; the
+        // gate makes it stick: files already delivered this task are not
+        // delivered again, so a repeated request costs nothing and the model
+        // must spend the turn on the patch.
+        // A repeated request is refused here, not in the marker's prose: the
+        // marker says not to ask again and the model asks anyway, once per
+        // round, until the task times out.
+        // round, until the task times out. Seeded from the goal-named files
+        // whose content is actually in the prompt; a path that is only in the
+        // [REPO FILES] listing above is a name the model has not read, and
+        // refusing it would deny the evidence the fix needs.
+        let wanted = read_requests(&data)
+            .into_iter()
+            .filter(|p| !already.iter().any(|d| d == p))
+            .collect::<Vec<_>>();
         let wanted_skills = skill_view_requests(&data);
         if (!wanted.is_empty() || !wanted_skills.is_empty())
             && data.get("patches").is_none()
@@ -142,6 +170,7 @@ impl ImplementerAgent<'_> {
                 // and otherwise the assembler's own: a requested file is a
                 // whole-file answer, so the window falls back to head+tail
                 // when no anchor is named.
+                let path_for_delivered = f.path.clone();
                 let label = if f.content.starts_with("--- ") {
                     String::new()
                 } else {
@@ -177,6 +206,7 @@ impl ImplementerAgent<'_> {
                     },
                     must_include: false,
                 });
+                already.push(path_for_delivered);
                 got_any = true;
             }
             for s in self.skill_bodies(&ctx, &wanted_skills).await {
@@ -215,7 +245,11 @@ impl ImplementerAgent<'_> {
                     }
                 };
                 data = self
-                    .ask_with_system(&ctx, &reask_with_cuts(&parts.full(), &cuts), system)
+                    .ask_with_system(
+                        &ctx,
+                        &reask_with_delivery(&parts.full(), &already, &cuts),
+                        system,
+                    )
                     .await?;
             }
         }
@@ -317,6 +351,23 @@ fn run_tests_summary(root: &Path, allowed: &[String]) -> Option<String> {
     }
     let body = String::from_utf8_lossy(&out.stdout);
     let err = String::from_utf8_lossy(&out.stderr);
+    // A suite that errors at collection prints "ERROR collecting" and a
+    // "1 error during collection" bar, and none of it matches the filters
+    // below — so the model is handed a blank report and reads "no signal"
+    // while the suite is red. That is the failure that hid the click bug for
+    // five rounds: pytest 9 rejects the repo's parametrize style at import.
+    // Surface it by name rather than as silence.
+    let collection_error = body
+        .lines()
+        .filter(|l| l.contains("ERROR collecting") || l.contains("error during collection"))
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !collection_error.is_empty() {
+        return Some(format!(
+            "the test suite did not run: it errored during collection, so no test \n             result reflects the code. This is an environment problem, not a \n             passing suite — the failure is likely an import or a pytest-version \n             incompatibility. Collection errors:\n{collection_error}"
+        ));
+    }
     // The line that names the rejected value is the actionable one; the
     // surrounding summary is enough context without the whole dump.
     let mut report = body
@@ -358,7 +409,7 @@ struct ReqSkill {
 /// keys on stays first.
 #[cfg(test)]
 fn reask_prompt(base: &str) -> String {
-    reask_with_cuts(base, &[])
+    reask_with_delivery(base, &[], &[])
 }
 
 /// The variant that also names what the assembler could not fit. Without this
@@ -367,20 +418,31 @@ fn reask_prompt(base: &str) -> String {
 /// asks for them again and loops until the rounds run out. That loop read as
 /// a model that cannot implement; it was a model that was never shown the
 /// evidence the marker promised.
-fn reask_with_cuts(base: &str, cuts: &[String]) -> String {
+fn reask_with_delivery(base: &str, delivered: &[String], cuts: &[String]) -> String {
     let mut p = format!(
         "{base}\n\n[RE-ASK] The files you requested are now in context above. Do not \
          emit `reads` again: this turn must contain the patches or writes the \
          goal requires."
     );
+    if !delivered.is_empty() {
+        // ponytail: bound to a let because rustc 1.98.1 miscounts the
+        // delimiters in `push_str(&format!(...))` over a multiline string and
+        // reports an unmatched brace that is not present in the source.
+        let named = format!(
+            " Files already in your context, shown above: {}. Do not request them.",
+            delivered.join(", ")
+        );
+        p.push_str(&named);
+    }
     if !cuts.is_empty() {
         // The honest half of the marker: what did not fit, so the model can
         // narrow its request instead of re-asking the same overflow.
-        p.push_str(&format!(
+        let cut = format!(
             " Files that did not fit the context budget and are NOT in context: \
-             {} — request a narrower view or proceed without them.",
+             {} -- request a narrower view or proceed without them.",
             cuts.join(", ")
-        ));
+        );
+        p.push_str(&cut);
     }
     p
 }
@@ -406,8 +468,9 @@ fn the_reask_marker_names_the_files_and_forbids_another_read() {
 /// fix exists to close.
 #[test]
 fn the_reask_marker_names_what_was_cut_instead_of_promising_it() {
-    let p = reask_with_cuts(
+    let p = reask_with_delivery(
         "GOAL: fix the parser",
+        &[],
         &[
             "src/dotenv/parser.py".to_string(),
             "src/dotenv/main.py".to_string(),
@@ -428,7 +491,7 @@ fn the_reask_marker_names_what_was_cut_instead_of_promising_it() {
 /// the model is told nothing about cuts when nothing was cut.
 #[test]
 fn the_reask_marker_without_cuts_is_the_plain_marker() {
-    let p = reask_with_cuts("GOAL: fix the parser", &[]);
+    let p = reask_with_delivery("GOAL: fix the parser", &[], &[]);
     assert!(p.contains("[RE-ASK]"));
     assert!(!p.contains("NOT in context"), "no phantom cuts");
 }
@@ -992,6 +1055,35 @@ mod tests {
                 !body.is_empty(),
                 "without src on the path the suite errors at collection and the \
                  report is blank, hiding a red suite from the model: {r}"
+            );
+        }
+    }
+
+    /// A suite that errors at collection prints no `failed` line, so the
+    /// filter yields a blank report and the model reads "no signal" while the
+    /// suite is red. This is the failure that hid the click bug: pytest 9
+    /// rejects the repo's parametrize style at import time. The report must
+    /// name the collection error, not swallow it.
+    #[test]
+    fn a_suite_that_errors_at_collection_is_reported_not_blank() {
+        let dir = temp_dir_for("collect-error");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        // Not an assertion failure — an ImportError at collection time.
+        std::fs::write(
+            dir.join("tests/test_import.py"),
+            "from does_not_exist import anything\ndef test_x():\n    pass\n",
+        )
+        .unwrap();
+        if which_pytest() {
+            let r = run_tests_summary(&dir, &["python3".to_string()])
+                .expect("a suite that cannot be collected must still be reported");
+            assert!(
+                r.contains("did not run") && r.contains("collection"),
+                "a collection error must be surfaced by name, not as a blank \n                 Failing section: {r}"
+            );
+            assert!(
+                !r.contains("Failing:"),
+                "a suite that never ran has no failing tests to name: {r}"
             );
         }
     }
