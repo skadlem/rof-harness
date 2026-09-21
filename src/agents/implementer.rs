@@ -120,6 +120,11 @@ impl ImplementerAgent<'_> {
             Assembly::Ok(parts) | Assembly::SelectionFailure { parts, .. } => parts.full(),
         };
         let mut data = self.ask_with_system(&ctx, &prompt, system).await?;
+        // Paths the model asked for that did not fit the volatile budget even
+        // at the narrowest window. Carried to the re-ask so the marker never
+        // claims a file is in context when the assembler discarded it — a
+        // model told its evidence arrived will patch text it never saw.
+        let mut cuts: Vec<String> = Vec::new();
         // A model that must not guess asks for the files it needs ("reads"),
         // or for a recorded procedure ("skill_views"). One extra turn, never
         // more: the request is only honored when the artifact proposed no
@@ -158,11 +163,19 @@ impl ImplementerAgent<'_> {
                     // patch text it has not seen, so the hole was a dead end —
                     // and its re-request was deduped. Only a file over budget
                     // takes a window, centred on what the goal names.
+                    //
+                    // ponytail: optional, like the goal-named map above. A
+                    // requested file that does not fit becomes a narrower
+                    // window, not a discarded one: three files sharing one
+                    // 12k budget overflowed as `must_include`, and the model
+                    // was then told the files were in context when they were
+                    // gone — a loop that read as a model that cannot
+                    // implement. Partial evidence beats a lie.
                     fidelity: Fidelity::Windowed {
                         anchor: ctx.view.prompt.to_string(),
                         cap: ctx.volatile_budget,
                     },
-                    must_include: true,
+                    must_include: false,
                 });
                 got_any = true;
             }
@@ -182,27 +195,27 @@ impl ImplementerAgent<'_> {
             }
             if got_any {
                 let parts = match asm.assemble() {
-                    Assembly::Ok(parts) => parts,
+                    Assembly::Ok(parts) => {
+                        cuts.clear();
+                        parts
+                    }
                     // A requested file that does not fit even at the narrowest
                     // window: the model asked for it to settle a fact it will
                     // now have to reason without. Named, not silently cut.
                     Assembly::SelectionFailure { parts, excess } => {
+                        cuts = excess.into_iter().map(|i| i.key.path).collect::<Vec<_>>();
                         ctx.trace.emit(TraceEvent::ModelError {
                             agent: "context".to_string(),
                             error: format!(
                                 "requested files too large for the volatile budget: {}",
-                                excess
-                                    .into_iter()
-                                    .map(|i| i.key.path)
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
+                                cuts.join(", ")
                             ),
                         });
                         parts
                     }
                 };
                 data = self
-                    .ask_with_system(&ctx, &reask_prompt(&parts.full()), system)
+                    .ask_with_system(&ctx, &reask_with_cuts(&parts.full(), &cuts), system)
                     .await?;
             }
         }
@@ -343,12 +356,33 @@ struct ReqSkill {
 /// what it asked for. This marker closes that loop: name what it has and
 /// state the obligation. Appended, not prepended, so the goal text the model
 /// keys on stays first.
+#[cfg(test)]
 fn reask_prompt(base: &str) -> String {
-    format!(
+    reask_with_cuts(base, &[])
+}
+
+/// The variant that also names what the assembler could not fit. Without this
+/// the marker is a lie the model acts on: it is told the files it asked for
+/// are in context, so it patches text it never saw — or, recognizing the gap,
+/// asks for them again and loops until the rounds run out. That loop read as
+/// a model that cannot implement; it was a model that was never shown the
+/// evidence the marker promised.
+fn reask_with_cuts(base: &str, cuts: &[String]) -> String {
+    let mut p = format!(
         "{base}\n\n[RE-ASK] The files you requested are now in context above. Do not \
          emit `reads` again: this turn must contain the patches or writes the \
          goal requires."
-    )
+    );
+    if !cuts.is_empty() {
+        // The honest half of the marker: what did not fit, so the model can
+        // narrow its request instead of re-asking the same overflow.
+        p.push_str(&format!(
+            " Files that did not fit the context budget and are NOT in context: \
+             {} — request a narrower view or proceed without them.",
+            cuts.join(", ")
+        ));
+    }
+    p
 }
 
 /// The re-ask marker stops a second `reads` deferral, and it must survive
@@ -364,6 +398,39 @@ fn the_reask_marker_names_the_files_and_forbids_another_read() {
     // The requested file text survives.
     assert!(p.contains("--- src/lib.rs"));
     assert!(!p.contains("[RE-ASK][RE-ASK]"), "no duplication");
+}
+
+/// The marker must not promise evidence the assembler discarded. Without the
+/// cut list the re-ask is a lie the model acts on: it patches text it never
+/// saw, or loops on `reads` until the rounds run out — the loop this whole
+/// fix exists to close.
+#[test]
+fn the_reask_marker_names_what_was_cut_instead_of_promising_it() {
+    let p = reask_with_cuts(
+        "GOAL: fix the parser",
+        &[
+            "src/dotenv/parser.py".to_string(),
+            "src/dotenv/main.py".to_string(),
+        ],
+    );
+    assert!(p.contains("[RE-ASK]"), "the marker must be present");
+    assert!(
+        p.contains("src/dotenv/parser.py") && p.contains("src/dotenv/main.py"),
+        "the cut files are named so the model can narrow its request"
+    );
+    assert!(
+        p.contains("NOT in context"),
+        "the marker must withdraw the promise, not repeat it"
+    );
+}
+
+/// The empty cut list is the common case, and it must not change the marker —
+/// the model is told nothing about cuts when nothing was cut.
+#[test]
+fn the_reask_marker_without_cuts_is_the_plain_marker() {
+    let p = reask_with_cuts("GOAL: fix the parser", &[]);
+    assert!(p.contains("[RE-ASK]"));
+    assert!(!p.contains("NOT in context"), "no phantom cuts");
 }
 
 /// The files an artifact asked to read.
