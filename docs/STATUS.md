@@ -2687,3 +2687,44 @@ in the cost step); `swebench` is an optional extra and its newest version remove
 `tree_sitter_*` adapters import every language eagerly, as do `litellm`,
 `jinja2` and `astor`. Artifacts and drivers are at
 `~/.local/share/rof-widening/`.
+
+## 2026-09-21 — the no-op failure reproduced and two real bugs fixed
+
+Piloting the one kept SWE-smith task (the off-by-one in python-dotenv's
+`parse_variables`, 35 tests failing) reproduced the Terminal-Bench failure in
+miniature and, unlike Terminal-Bench, exposed the cause. For four consecutive
+reps rof read the source, correctly refused to invent a patch, changed nothing,
+and **exited 0** — a no-op that no caller could distinguish from success.
+
+The pilot oracle was first invalidated by a trap worth recording: an editable
+install of the same package elsewhere on the path made pytest import a *different
+clone* than the one rof edited, scoring an untouched tree as 149 passed. The
+oracle now pins `PYTHONPATH` to the repo under test and asserts the import path
+matches before scoring.
+
+Two real bugs, each verified to fail on the pre-fix tree:
+
+1. **The test suite was gated on non-empty writes.** `run_tests` returned `None`
+   when the implementer wrote nothing. The implementer has no `proc.run` tool, so
+   the suite is its only window onto the failure: the model will not patch a
+   failure it cannot see, writes nothing, and the report never fires. A
+   deadlock. The gate is removed.
+2. **A `src/`-layout package was not importable from the repo root.** With the
+   gate gone the report came back empty — pytest errored at collection and the
+   failure lines never existed, which read to the model as "no signal" while the
+   real suite was red. `run_tests_summary` now puts `src/` on `PYTHONPATH` when
+   the layout calls for it.
+3. **`main` returned `Ok(())` regardless of the reviewer verdict.** A failed task
+   now exits 3, so Harbor, CI, and comparison scripts can see the difference.
+
+With both fixes the failure signal reaches the model: `Failing:` now carries
+`assert (0, 'x=a b \n') == (0, 'x=a b c\n')` at `test_cli.py:37`, and the
+reviewer pinpoints the regression ("the CLI list path drops the last character")
+and names the correct files. rof still does not emit the patch at `max_review_rounds`
+= 2, and raising it runs into the 50k per-task token cap — so the remaining gap is
+the round/token budget for read-then-patch, not the failure signal.
+
+One test-writing lesson, the third instance of it now: the first version of the
+src-layout test passed vacuously because the fixed header prose contains the
+word "assert", which was exactly what the assertion checked for. The check now
+strips the header and requires a real failure line.
