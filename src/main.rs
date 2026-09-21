@@ -524,7 +524,14 @@ async fn run_goal(goal: &str, config_path: Option<&str>) -> anyhow::Result<()> {
         .await;
     println!("goal: {goal}");
     println!("result: {}", serde_json::to_string_pretty(&out)?);
-    print_report(&s.trace, out["passed"].as_bool().unwrap_or(false));
+    let passed = out["passed"].as_bool().unwrap_or(false);
+    print_report(&s.trace, passed);
+    // A harness that exits 0 on a failed task is invisible to every caller:
+    // Harbor, CI, and a comparison script all read the exit code first. The
+    // verdict is already computed; this only refuses to discard it.
+    if !passed {
+        std::process::exit(3);
+    }
     Ok(())
 }
 
