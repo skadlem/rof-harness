@@ -275,9 +275,28 @@ fn run_tests_summary(root: &Path, allowed: &[String]) -> Option<String> {
         })?;
     let mut parts = cmd.split_whitespace();
     let bin = parts.next()?;
+    // A `src/`-layout package is not importable from the repo root unless its
+    // src dir is on the path: the suite then errors at *collection* and the
+    // report comes back empty, which reads to the model as "no signal" rather
+    // than "red suite". Add it when the layout calls for it, matching what a
+    // developer would get from an installed editable package.
+    let src_layout = root.join("src").is_dir();
     let out = std::process::Command::new(bin)
         .args(parts)
         .current_dir(root)
+        .env("PYTHONPATH", {
+            let base = std::env::var("PYTHONPATH").unwrap_or_default();
+            if src_layout {
+                let src = root.join("src");
+                if base.is_empty() {
+                    src.to_string_lossy().into_owned()
+                } else {
+                    format!("{}:{}", src.display(), base)
+                }
+            } else {
+                base
+            }
+        })
         .output()
         .ok()?;
     if out.status.success() {
@@ -602,13 +621,16 @@ impl ImplementerAgent<'_> {
     /// text as it is *now*, because the mid-term retrieval is a pre-round
     /// snapshot — a retry that only sees it re-applies an edit that already
     /// landed (measured: duplicate definitions, E0592/E0428).
-    /// Run the repo's test suite after writes, when the policy allows it. See
+    /// Run the repo's test suite when the policy allows it. See
     /// `run_tests_summary`: the point is to surface a seeded assertion that
     /// encodes the bug, not to judge the fix.
-    async fn run_tests(&self, ctx: &AgentCtx<'_>, writes: &[String]) -> Option<String> {
-        if writes.is_empty() {
-            return None;
-        }
+    ///
+    /// This is deliberately *not* gated on non-empty `writes`. The implementer
+    /// has no `proc.run` tool, so the suite is the only channel it has to see
+    /// the failure it is asked to fix. Gating it on writes deadlocks the loop:
+    /// the model will not invent a patch for a failure it cannot see, writes
+    /// nothing, and the report never fires.
+    async fn run_tests(&self, ctx: &AgentCtx<'_>, _writes: &[String]) -> Option<String> {
         let root = ctx.workdir?;
         let allowed = ctx.tools.map(|t| t.allowed_commands()).unwrap_or_default();
         run_tests_summary(root, &allowed)
@@ -850,6 +872,61 @@ mod tests {
             None,
             "nothing is granted, nothing runs"
         );
+    }
+
+    /// The red suite must be reported even when nothing has been written yet.
+    /// The implementer has no `proc.run` tool, so the suite is its only window
+    /// onto the failure. Gating it on non-empty writes creates a deadlock: the
+    /// model will not patch a failure it cannot see, writes nothing, and the
+    /// report never fires — measured on a real SWE-smith task, where rof read
+    /// the source, correctly refused to invent a patch, and left the suite red
+    /// for four consecutive reps.
+    #[test]
+    fn a_red_suite_reports_without_writes() {
+        let dir = temp_dir_for("red-no-writes");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("store.py"), "def total():\n    return 22\n").unwrap();
+        std::fs::write(
+            dir.join("tests/test_store.py"),
+            "from store import total\ndef test_broken():\n    assert total() == 0\n",
+        )
+        .unwrap();
+        if which_pytest() {
+            let r = run_tests_summary(&dir, &["python3".to_string()])
+                .expect("a red suite is reported with no writes on disk");
+            assert!(r.contains("assert"), "the report names the assertion: {r}");
+        }
+    }
+
+    /// A `src/`-layout package is not importable from the repo root without its
+    /// src dir on the path. The suite then errors at collection and the report
+    /// comes back empty, which the model reads as "no signal" while the real
+    /// suite is red — the exact failure that hid the regression for five reps
+    /// on python-dotenv.
+    #[test]
+    fn a_src_layout_suite_is_importable() {
+        let dir = temp_dir_for("src-layout");
+        std::fs::create_dir_all(dir.join("src/pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("src/pkg/__init__.py"), "").unwrap();
+        std::fs::write(dir.join("src/pkg/core.py"), "def total():\n    return 22\n").unwrap();
+        std::fs::write(
+            dir.join("tests/test_core.py"),
+            "from pkg.core import total\ndef test_broken():\n    assert total() == 0\n",
+        )
+        .unwrap();
+        if which_pytest() {
+            let r = run_tests_summary(&dir, &["python3".to_string()])
+                .expect("a red src-layout suite must be reported, not silently blank");
+            // The header prose contains the word "assert", so it cannot be the
+            // thing this checks: strip it and require a real failure line.
+            let body = r.split("Failing:\n").nth(1).unwrap_or("");
+            assert!(
+                !body.is_empty(),
+                "without src on the path the suite errors at collection and the \
+                 report is blank, hiding a red suite from the model: {r}"
+            );
+        }
     }
 
     fn which_pytest() -> bool {
