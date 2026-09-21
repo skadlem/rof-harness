@@ -2728,3 +2728,34 @@ One test-writing lesson, the third instance of it now: the first version of the
 src-layout test passed vacuously because the fixed header prose contains the
 word "assert", which was exactly what the assertion checked for. The check now
 strips the header and requires a real failure line.
+
+## 2026-09-21 — the pilot's wall is a reasoning-budget ceiling, not a harness gap
+
+With the re-ask honesty fix landed, the pilot loop changed shape. The
+`requested files too large` error no longer fires, the implementer's input
+tokens rise as file content actually lands, and the model now produces
+6,479-token turns. It still writes no patch. Direct endpoint probes say why,
+and it is not rof.
+
+On the dotenv off-by-one, with the real file in context, at every `max_tokens`
+from 1,024 to 16,384, with `reasoning: false` and with
+`enable_thinking: false`, Atria returns `content: null` and
+`finish_reason: length`. Reasoning consumes the entire output budget and
+content never ships. Reasoning length scales with `max_tokens` (3.7k chars at
+1,024 tokens, 15.7k at 4,096, 31.5k at 8,192) — the model does not terminate
+reasoning on this bug, it is truncated by the budget.
+
+The control is what makes this a ceiling rather than a formatting problem. On
+a simple key rename with the same system prompt and schema, the same model
+returns 272 chars of content, `finish_reason: stop`, and a valid `patches`
+array. The model can emit the patch format. It is the reasoning depth of
+*this* bug that never converges.
+
+Implication for the suite plan: difficulty is the discriminating axis, and the
+band matters. A task this model cannot finish reasoning about is not a task
+that separates harnesses on Atria — it is a task where every harness scores
+zero, and the 1/12 kept yield on python-dotenv was already pointing at the
+same floor. The discriminating-band probe is not a nice-to-have; it is the
+only thing that decides whether a generated task measures anything. Probe on
+the easy side of the band first, and tune toward the model's own ceiling
+rather than assuming one.
