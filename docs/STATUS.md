@@ -2648,3 +2648,42 @@ than by reasoning:
 first-class metric, mutation-verified, because it is the only axis on which
 the harnesses currently differ and it was previously derivable only by hand
 from two separately-printed numbers.
+
+## 2026-09-21 — the widening instrument is built and validated
+
+The mf suite discriminates on cost but is saturated on score, so a score claim
+needs a wider suite that sits in Atria's discriminating band. Research
+(`docs/RESEARCH-suite-widening.md`) surveyed the candidates and rejected two:
+
+- **SWE-bench Verified** is disqualified by its own auditor: 59.4% of an audited
+  subset have tests that reject functionally correct submissions, and every
+  frontier model tested could reproduce the gold patch, i.e. the set is in
+  training data. This is the contamination caution made concrete.
+- **EmulatorBench** sits in the right band (GLM-5.2 at 0.208) but is not
+  released as an installable package; only its design is reusable.
+
+**SWE-smith** is the instrument, and it now works here end-to-end on Atria —
+verified, not assumed. On `theskumar__python-dotenv.2b8635b7`:
+
+- 12/12 candidate entities produced an applicable diff, 8-89s each;
+- the soundness gate (apply to the real repo at the pinned commit, run the
+  suite, keep only what breaks a test on a green baseline of 149 passed)
+  **kept 1 and rejected 11 as vacuous**;
+- the one kept task is an off-by-one in `parse_variables` (`len(value) - 1`
+  hoisted as a fake performance refactor) that breaks a real unit test.
+
+That 1/12 yield is the finding that shapes the next step: **the binding
+constraint on suite generation is the target repo's own test coverage**, not
+model quality. python-dotenv's 149 tests do not exercise most of `variables.py`,
+so most injected bugs break nothing. Repo choice must be made on test density
+and yield measured per repo before committing.
+
+Three silent-failure blockers were found and solved, each of which killed every
+run with no error: litellm's cost calculator raises for any model absent from
+its price map (register a zero-cost `Atria-Dawn-Preview` entry in
+`litellm.model_cost` — the generation call itself succeeds in 2.6s, the crash is
+in the cost step); `swebench` is an optional extra and its newest version removed
+`DOCKER_USER` (install `swesmith[all]`, pin `swebench==3.0.17`); and the
+`tree_sitter_*` adapters import every language eagerly, as do `litellm`,
+`jinja2` and `astor`. Artifacts and drivers are at
+`~/.local/share/rof-widening/`.
