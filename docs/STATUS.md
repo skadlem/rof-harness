@@ -2870,3 +2870,12 @@ the summarize-path test now arms explicitly (opt-in coverage kept).
 
 Verified: full `cargo test` green (88 unit + 17 binaries), clippy `-D warnings`
 clean, fmt clean, release builds. Live re-probe pending on the user's key.
+
+## 2026-09-23 — first live Go task: 1/1 (header fix + model ID confirmed)
+
+`scripts/live-go.sh ... --limit 1 --jobs 1` on `deepseek-flash`: `[OK]
+doc-comment rounds=1 recall=1/1`, billed 14,849 (12,390 in / 2,459 out),
+planner ran on the executor (3,427 in), cold cache. This confirms the session
+header fix, the `deepseek-flash` = V4.1 Flash mapping, and the single-model
+deterministic default end to end. Report: `~/rof-runs/report-0923-0724.json`.
+Still open: full 6-task baseline (×3 reps), then v4 knob arms.
