@@ -246,12 +246,14 @@ impl EvaluationRunner {
             cfg.permissions.clone(),
             cfg.skills.clone(),
         );
+        // v4 fix: the eval path wired the executor twice, silently dropping
+        // the verify slot (§4.5) — ROF_VERIFY_MODEL never reached suite runs.
         let orch = Orchestrator::new(
             cfg,
             sink.clone(),
             self.context.clone(),
             self.executor.clone(),
-            self.executor.clone(),
+            self.verify.clone(),
         );
         let out = orch
             .run_loop(
@@ -372,13 +374,17 @@ impl EvaluationRunner {
         for h in handles {
             match h.await {
                 Ok(r) => rep.tasks.push(r),
+                // v4: a join/timeout cancellation is inconclusive, not failed —
+                // the work tree may hold a passing patch (2609.11987: 22/81
+                // cancelled runs had already produced one). Name it so no
+                // caller reads a timeout as a capability verdict.
                 Err(e) => rep.tasks.push(TaskResult {
                     name: "<join>".to_string(),
                     passed: false,
                     expected: true,
                     matched: false,
                     rounds: 0,
-                    feedback: format!("harness: task join failed: {e}"),
+                    feedback: format!("harness: task join failed (inconclusive, not failed): {e}"),
                     context: ContextMetrics::default(),
                     checks: Vec::new(),
                 }),

@@ -65,6 +65,10 @@ A suite run never touches `ROF_WORKDIR`: every task runs in its own copy
 | `ROF_SKILLS_POLICY` | `readonly` / `propose` (default) / `direct` — how a manage op lands |
 | `ROF_GOAL_QUALITY` | `yes`/`true`/`1` — run the local goal-quality pre-check and put its note in the planner prompt (off by default; changes prompt content) |
 | `ROF_AUTO_POKE` | `yes`/`true`/`1` — buy one extra implementer round when a task fails at its round cap (off by default; changes rounds) |
+| `ROF_EXPLORER` | `yes`/`true`/`1` — one read-only exploration pass before implement, key files join the volatile tail (off by default) |
+| `ROF_ATTEMPTS` | `1`-`5` — independent task attempts, cheapest-pass wins (default 1 = historical run) |
+| `ROF_VERIFY_GUARD` | `yes`/`true`/`1` — one post-hoc independent-judge pass; a veto fails the attempt (off by default) |
+| `ROF_ALLOW_PREFIXES` | comma-separated `proc.run` prefixes (`cargo test` covers `cargo test foo`, never `cargo test-evil`) |
 
 Precedence: defaults < config file < environment < CLI flags. `rof eval <suite> --report out.json`
 writes the suite report (per-task verdicts + feedback, folded metrics) next to the trace, so a

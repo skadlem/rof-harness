@@ -1,3 +1,4 @@
+pub mod explorer;
 pub mod implementer;
 pub mod planner;
 pub mod reviewer;
@@ -6,6 +7,7 @@ use crate::llm::{ContextService, ExecutorService};
 use crate::obs::TraceSink;
 use crate::tools::ToolRegistry;
 use async_trait::async_trait;
+pub use explorer::{explorer_report_for_test, ExplorerAgent, ExplorerReport, KeyFile, Quote};
 pub use implementer::ImplementerAgent;
 pub use planner::{AgentOutput, Plan, PlannerAgent};
 pub use reviewer::{ReviewerAgent, Verdict};

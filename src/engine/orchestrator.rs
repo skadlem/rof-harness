@@ -127,11 +127,17 @@ impl Orchestrator {
         let planner_skills = svc.skill_index("planner").await;
         let impl_skills = svc.skill_index("implementer").await;
         let reviewer_skills = svc.skill_index("reviewer").await;
-        let planner_head =
-            RoundServices::head_with_index(&session.ctx.long_term, &planner_skills.text);
-        let impl_head = RoundServices::head_with_index(&session.ctx.long_term, &impl_skills.text);
-        let reviewer_head =
-            RoundServices::head_with_index(&session.ctx.long_term, &reviewer_skills.text);
+        // v4 memory (pipeline mode): same stable-head prepend as direct mode.
+        // Empty when no memory files exist, so the default run is unchanged.
+        let mem_text = crate::context::memory::render(&crate::context::memory::load(workdir));
+        let long_with_mem = if mem_text.trim().is_empty() {
+            session.ctx.long_term.clone()
+        } else {
+            format!("{mem_text}{}", session.ctx.long_term)
+        };
+        let planner_head = RoundServices::head_with_index(&long_with_mem, &planner_skills.text);
+        let impl_head = RoundServices::head_with_index(&long_with_mem, &impl_skills.text);
+        let reviewer_head = RoundServices::head_with_index(&long_with_mem, &reviewer_skills.text);
         // The planner only gets bodies when it actually runs: with the planner
         // skipped there is no planner prompt to put them in, and a `reused`
         // count that includes a body nobody read would be a lie.
@@ -641,201 +647,304 @@ impl Orchestrator {
         // all three used to be written into `run_loop` only, so a direct run
         // silently saw no skills, no note and no poke.
         let impl_skills = svc.skill_index("implementer").await;
-        let impl_head = RoundServices::head_with_index(&session.ctx.long_term, &impl_skills.text);
+        // v4 memory: project + user conventions ride the stable head.
+        // Empty when no memory files exist, so the default run is unchanged.
+        let mem = crate::context::memory::load(workdir);
+        let mem_text = crate::context::memory::render(&mem);
+        let long_with_mem = if mem_text.trim().is_empty() {
+            session.ctx.long_term.clone()
+        } else {
+            format!("{}{}", mem_text, session.ctx.long_term)
+        };
+        let impl_head = RoundServices::head_with_index(&long_with_mem, &impl_skills.text);
         let goal_note = svc.goal_note(&session.goal);
-        let mut poked = false;
-        let mut round = 1u32;
-        let mut cap = max_rounds;
-        while round <= cap {
-            rounds = round;
-            // Token guard: O(1) — the sink totals at the emit choke point.
-            if let Some(spent) = budget.exceeded() {
-                self.trace.emit(TraceEvent::BudgetExceeded {
-                    task: session.goal.clone(),
-                    tokens: spent,
-                    limit,
-                });
-                feedback = format!("aborted: token budget exceeded ({spent} > {limit})");
-                break;
+        // v4 explorer: one read-only pass before implement (off by default).
+        // Its key files join the volatile tail via `retrieved`, never raw dumps.
+        let mut retrieved = retrieved;
+        if self.cfg.explorer {
+            let rep = crate::agents::ExplorerAgent::explore(
+                &session.goal,
+                workdir,
+                svc.tools,
+                &self.trace,
+            )
+            .await;
+            if !rep.key_files.is_empty() {
+                let names: Vec<String> = rep.key_files.iter().map(|k| k.path.clone()).collect();
+                retrieved.push_str(&format!("\nexplorer key files: {}", names.join(", ")));
             }
-            // The baseline this attempt starts from and rolls back to (§4.2).
-            if let Err(e) = tree.baseline() {
-                self.trace.emit(TraceEvent::ModelError {
-                    agent: "tree".to_string(),
-                    error: e.to_string(),
-                });
-                feedback = format!("harness: git baseline failed: {e}");
-                break;
-            }
-            let state = CtxState {
-                long_term: impl_head.clone(),
-                mid_term: format!(
-                    "GOAL: {}\n{retrieved}\n{}{}",
-                    session.goal,
-                    goal_note
-                        .as_deref()
-                        .map(|n| format!("GOAL QUALITY NOTE: {n}\n"))
-                        .unwrap_or_default(),
-                    if feedback.is_empty() {
-                        String::new()
-                    } else {
-                        format!("PREVIOUS ATTEMPT:\n{feedback}\n")
-                    }
-                ),
-                short_term: format!(
-                    "WRITES REQUIRED: {}\nDIRECT ROUND {round}/{cap}",
-                    if session.expect_writes { "yes" } else { "no" }
-                ),
-            };
-            let (view, reports) = builder.plan_summarized(&state, &self.context).await;
-            self.fold_layers(&reports, &mut acc);
-            let agent = ImplementerAgent::new(&self.executor);
-            match agent
-                .run_direct(AgentCtx {
-                    view: &view,
-                    context: None,
-                    executor: Some(&self.executor),
-                    tools: Some(svc.tools),
-                    workdir: Some(workdir),
-                    trace: &self.trace,
-                    volatile_budget: svc.volatile_budget(),
-                })
-                .await
-            {
-                Ok(output) => artifact = output.data,
-                Err(e) => {
-                    self.trace.emit(TraceEvent::ModelError {
-                        agent: "executor".to_string(),
-                        error: e.to_string(),
-                    });
-                    feedback = e.to_string();
-                    break;
-                }
-            }
-            let task_checks = svc.run_checks(session, workdir).await;
-            checks_log = render_checks(&task_checks);
-            check_results = task_checks;
-            // Write gate (§4.2): git's change set is the count, not the
-            // artifact's self-report; the same names feed recall (§4.4).
-            let diff = match tree.diff() {
-                Ok(diff) => diff,
-                Err(e) => {
-                    self.trace.emit(TraceEvent::ModelError {
-                        agent: "tree".to_string(),
-                        error: e.to_string(),
-                    });
-                    feedback = format!("harness: git diff failed: {e}");
-                    break;
-                }
-            };
-            writes_made = diff.changed();
-            diff_stat = diff.stat.clone();
-            for name in &diff.names {
-                if !changed_files.iter().any(|seen: &String| seen == name) {
-                    changed_files.push(name.clone());
-                }
-            }
-            let checks_ok = checks_pass(&check_results);
-            // §4.3 honesty: a task that requires no writes and configures no
-            // check has no oracle in direct mode — the reviewer is absent, so
-            // `checks_pass(&[])` is vacuously true and ANY artifact would
-            // score. That is an unmeasured task, not a pass. Pipeline mode
-            // has the reviewer as its oracle on this class (its rule 3);
-            // direct mode must not invent one.
-            let has_oracle = !check_results.is_empty() || session.expect_writes;
-            passed = has_oracle && (!session.expect_writes || writes_made > 0) && checks_ok;
-            if passed {
-                break;
-            }
-            let file_state = crate::engine::session::file_state_evidence(&artifact);
-            if !has_oracle {
-                // No retry can conjure an oracle, so stop instead of spending
-                // the cap rediscovering that nothing can pass.
-                feedback = "no oracle: this task requires no file change and has no \
-                    configured check, and direct mode has no reviewer to judge the \
-                    artifact — the harness cannot score it, so it does not pass"
-                    .to_string();
-                break;
-            }
-            feedback = if writes_made == 0 && session.expect_writes {
-                format!("no file change landed; emit the actual patch or write now{file_state}")
-            } else {
-                format!(
-                    "the configured check failed; fix the change and retry.\nCHECK OUTPUT:\n{}{}",
-                    checks_log, file_state
-                )
-            };
-            // §4.3: the same bounded auto-poke the pipeline loop has — a
-            // direct run used to stop at the cap even when the failure shape
-            // said "instruction problem".
-            if !poked
-                && self.cfg.auto_poke
-                && round == cap
-                && crate::eval::goal_quality::should_auto_poke(
-                    passed,
-                    round,
-                    writes_made,
-                    session.expect_writes,
-                    budget.exceeded().is_some(),
-                )
-            {
-                poked = true;
-                cap += 1;
-                let reason = crate::eval::goal_quality::poke_reason(
-                    round,
-                    writes_made,
-                    session.expect_writes,
-                );
-                self.trace.emit(TraceEvent::AutoPoke {
-                    task: session.goal.clone(),
-                    reason: reason.clone(),
-                });
-                feedback = format!("{feedback}\n{reason}");
-            }
-            // §4.2: a failed attempt is discarded when a retry follows; the
-            // last round keeps its state in the copy for reading.
-            if round < cap {
-                self.trace.emit(TraceEvent::StateTransition {
-                    from: "direct_executing".to_string(),
-                    to: "rolled_back".to_string(),
-                });
+        }
+        // v4 attempts: N independent round-sequences, cheapest-pass wins.
+        // Default 1 = the historical single-sequence run, bit for bit.
+        let attempts = self.cfg.attempts.clamp(1, 5);
+        let mut best_json: Option<serde_json::Value> = None;
+        let mut best_billed: u64 = u64::MAX;
+        let mut attempt_no = 0usize;
+        while attempt_no < attempts {
+            attempt_no += 1;
+            self.trace.emit(TraceEvent::StateTransition {
+                from: "attempt_pending".to_string(),
+                to: format!("attempt_{attempt_no}"),
+            });
+            // Fresh per-attempt state; the tree rolls back between attempts
+            // so each sequence starts from the baseline.
+            if attempt_no > 1 {
                 if let Err(e) = tree.rollback() {
                     self.trace.emit(TraceEvent::ModelError {
                         agent: "tree".to_string(),
-                        error: format!("rollback failed (continuing): {e}"),
+                        error: format!("attempt rollback failed (continuing): {e}"),
                     });
                 }
+                feedback = String::new();
+                artifact = serde_json::Value::Null;
+                writes_made = 0;
+                changed_files = Vec::new();
+                diff_stat = String::new();
+                passed = false;
+                rounds = 0;
             }
-            round += 1;
-        }
+            let mut poked = false;
+            let mut round = 1u32;
+            let mut cap = max_rounds;
+            while round <= cap {
+                rounds = round;
+                // Token guard: O(1) — the sink totals at the emit choke point.
+                if let Some(spent) = budget.exceeded() {
+                    self.trace.emit(TraceEvent::BudgetExceeded {
+                        task: session.goal.clone(),
+                        tokens: spent,
+                        limit,
+                    });
+                    feedback = format!("aborted: token budget exceeded ({spent} > {limit})");
+                    break;
+                }
+                // The baseline this attempt starts from and rolls back to (§4.2).
+                if let Err(e) = tree.baseline() {
+                    self.trace.emit(TraceEvent::ModelError {
+                        agent: "tree".to_string(),
+                        error: e.to_string(),
+                    });
+                    feedback = format!("harness: git baseline failed: {e}");
+                    break;
+                }
+                let state = CtxState {
+                    long_term: impl_head.clone(),
+                    mid_term: format!(
+                        "GOAL: {}\n{retrieved}\n{}{}",
+                        session.goal,
+                        goal_note
+                            .as_deref()
+                            .map(|n| format!("GOAL QUALITY NOTE: {n}\n"))
+                            .unwrap_or_default(),
+                        if feedback.is_empty() {
+                            String::new()
+                        } else {
+                            format!("PREVIOUS ATTEMPT:\n{feedback}\n")
+                        }
+                    ),
+                    short_term: format!(
+                        "WRITES REQUIRED: {}\nDIRECT ROUND {round}/{cap}",
+                        if session.expect_writes { "yes" } else { "no" }
+                    ),
+                };
+                let (view, reports) = builder.plan_summarized(&state, &self.context).await;
+                self.fold_layers(&reports, &mut acc);
+                let agent = ImplementerAgent::new(&self.executor);
+                match agent
+                    .run_direct(AgentCtx {
+                        view: &view,
+                        context: None,
+                        executor: Some(&self.executor),
+                        tools: Some(svc.tools),
+                        workdir: Some(workdir),
+                        trace: &self.trace,
+                        volatile_budget: svc.volatile_budget(),
+                    })
+                    .await
+                {
+                    Ok(output) => artifact = output.data,
+                    Err(e) => {
+                        self.trace.emit(TraceEvent::ModelError {
+                            agent: "executor".to_string(),
+                            error: e.to_string(),
+                        });
+                        feedback = e.to_string();
+                        break;
+                    }
+                }
+                let task_checks = svc.run_checks(session, workdir).await;
+                checks_log = render_checks(&task_checks);
+                check_results = task_checks;
+                // Write gate (§4.2): git's change set is the count, not the
+                // artifact's self-report; the same names feed recall (§4.4).
+                let diff = match tree.diff() {
+                    Ok(diff) => diff,
+                    Err(e) => {
+                        self.trace.emit(TraceEvent::ModelError {
+                            agent: "tree".to_string(),
+                            error: e.to_string(),
+                        });
+                        feedback = format!("harness: git diff failed: {e}");
+                        break;
+                    }
+                };
+                writes_made = diff.changed();
+                diff_stat = diff.stat.clone();
+                for name in &diff.names {
+                    if !changed_files.iter().any(|seen: &String| seen == name) {
+                        changed_files.push(name.clone());
+                    }
+                }
+                let checks_ok = checks_pass(&check_results);
+                // §4.3 honesty: a task that requires no writes and configures no
+                // check has no oracle in direct mode — the reviewer is absent, so
+                // `checks_pass(&[])` is vacuously true and ANY artifact would
+                // score. That is an unmeasured task, not a pass. Pipeline mode
+                // has the reviewer as its oracle on this class (its rule 3);
+                // direct mode must not invent one.
+                let has_oracle = !check_results.is_empty() || session.expect_writes;
+                passed = has_oracle && (!session.expect_writes || writes_made > 0) && checks_ok;
+                if passed {
+                    break;
+                }
+                let file_state = crate::engine::session::file_state_evidence(&artifact);
+                if !has_oracle {
+                    // No retry can conjure an oracle, so stop instead of spending
+                    // the cap rediscovering that nothing can pass.
+                    feedback = "no oracle: this task requires no file change and has no \
+                    configured check, and direct mode has no reviewer to judge the \
+                    artifact — the harness cannot score it, so it does not pass"
+                        .to_string();
+                    break;
+                }
+                feedback = if writes_made == 0 && session.expect_writes {
+                    format!("no file change landed; emit the actual patch or write now{file_state}")
+                } else {
+                    format!(
+                    "the configured check failed; fix the change and retry.\nCHECK OUTPUT:\n{}{}",
+                    checks_log, file_state
+                )
+                };
+                // §4.3: the same bounded auto-poke the pipeline loop has — a
+                // direct run used to stop at the cap even when the failure shape
+                // said "instruction problem".
+                if !poked
+                    && self.cfg.auto_poke
+                    && round == cap
+                    && crate::eval::goal_quality::should_auto_poke(
+                        passed,
+                        round,
+                        writes_made,
+                        session.expect_writes,
+                        budget.exceeded().is_some(),
+                    )
+                {
+                    poked = true;
+                    cap += 1;
+                    let reason = crate::eval::goal_quality::poke_reason(
+                        round,
+                        writes_made,
+                        session.expect_writes,
+                    );
+                    self.trace.emit(TraceEvent::AutoPoke {
+                        task: session.goal.clone(),
+                        reason: reason.clone(),
+                    });
+                    feedback = format!("{feedback}\n{reason}");
+                }
+                // §4.2: a failed attempt is discarded when a retry follows; the
+                // last round keeps its state in the copy for reading.
+                if round < cap {
+                    self.trace.emit(TraceEvent::StateTransition {
+                        from: "direct_executing".to_string(),
+                        to: "rolled_back".to_string(),
+                    });
+                    if let Err(e) = tree.rollback() {
+                        self.trace.emit(TraceEvent::ModelError {
+                            agent: "tree".to_string(),
+                            error: format!("rollback failed (continuing): {e}"),
+                        });
+                    }
+                }
+                round += 1;
+            }
+            // v4 verify guard: one post-hoc independent-judge pass over a task
+            // the inner loop scored as pass. A veto turns the attempt back into
+            // a failure with the veto note as feedback (off by default).
+            if passed {
+                if let Some(veto) = svc
+                    .verify_guard(&session.goal, &artifact, &check_results)
+                    .await
+                {
+                    self.trace.emit(TraceEvent::StateTransition {
+                        from: "verifying".to_string(),
+                        to: "implementing".to_string(),
+                    });
+                    passed = false;
+                    feedback = veto;
+                }
+            }
+            // Cheapest-pass wins; a failure only replaces "nothing yet".
+            // Sequential attempts bill in order, so the first pass is the cheapest.
+            let billed_now = self.trace.total_tokens();
+            if passed && best_json.is_none() {
+                best_billed = billed_now;
+                best_json = Some(serde_json::json!({
+                    "tasks": [{
+                        "task": session.goal,
+                        "passed": passed,
+                        "rounds": rounds,
+                        "writes_made": writes_made,
+                        "changed_files": changed_files,
+                        "diff_stat": diff_stat,
+                        "artifact": artifact,
+                        "check_results": check_results,
+                        "feedback": feedback,
+                    }],
+                    "rounds": rounds,
+                    "passed": passed,
+                    "retrieved": retrieved_json,
+                    "checks": checks_log,
+                }));
+                break;
+            }
+            if attempt_no >= attempts {
+                best_billed = billed_now;
+                best_json = Some(serde_json::json!({
+                    "tasks": [{
+                        "task": session.goal,
+                        "passed": passed,
+                        "rounds": rounds,
+                        "writes_made": writes_made,
+                        "changed_files": changed_files,
+                        "diff_stat": diff_stat,
+                        "artifact": artifact,
+                        "check_results": check_results,
+                        "feedback": feedback,
+                    }],
+                    "rounds": rounds,
+                    "passed": passed,
+                    "retrieved": retrieved_json,
+                    "checks": checks_log,
+                }));
+            }
+        } // end attempts loop
+        let _ = best_billed;
 
         self.trace.emit(TraceEvent::StateTransition {
             from: "direct_executing".to_string(),
             to: "done".to_string(),
         });
-        serde_json::json!({
-            "tasks": [{
-                "task": session.goal,
-                "passed": passed,
-                "rounds": rounds,
-                "writes_made": writes_made,
-                "changed_files": changed_files,
-                "diff_stat": diff_stat,
-                "artifact": artifact,
-                "check_results": check_results,
-                "feedback": feedback,
-            }],
-            "rounds": rounds,
-            "passed": passed,
-            "retrieved": retrieved_json,
-            "summarize_calls": acc.summarize_calls,
-            "summarize_tokens": acc.summarize_tokens,
-            "truncated_views": acc.truncated_views,
-            "layer_summaries": acc.layer_summaries,
-            "layer_truncations": acc.layer_truncations,
-            "eliminated_chars": acc.eliminated_chars,
-            "checks": checks_log,
-        })
+        // The per-attempt snapshot above carries tasks/rounds/passed; fold
+        // the accumulator counters into it so reports keep their fields.
+        let mut out = best_json.unwrap_or_else(|| serde_json::json!({"passed": false}));
+        out["summarize_calls"] = serde_json::json!(acc.summarize_calls);
+        out["summarize_tokens"] = serde_json::json!(acc.summarize_tokens);
+        out["truncated_views"] = serde_json::json!(acc.truncated_views);
+        out["layer_summaries"] = serde_json::json!(acc.layer_summaries);
+        out["layer_truncations"] = serde_json::json!(acc.layer_truncations);
+        out["eliminated_chars"] = serde_json::json!(acc.eliminated_chars);
+        out
     }
 
     /// Test hook: the configured default ceiling.
