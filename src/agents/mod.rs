@@ -8,7 +8,7 @@ use crate::obs::TraceSink;
 use crate::tools::ToolRegistry;
 use async_trait::async_trait;
 pub use explorer::{explorer_report_for_test, ExplorerAgent, ExplorerReport, KeyFile, Quote};
-pub use implementer::ImplementerAgent;
+pub use implementer::{thinking_flags_for_test, ImplementerAgent};
 pub use planner::{AgentOutput, Plan, PlannerAgent};
 pub use reviewer::{ReviewerAgent, Verdict};
 use std::path::Path;
