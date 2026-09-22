@@ -197,6 +197,51 @@ impl<'a> RoundServices<'a> {
         out
     }
 
+    /// v4 outer verify guard. Off unless `verify_guard` is set: one Reviewer
+    /// call on the verify model over the artifact + checks. Returns
+    /// `Some(veto_note)` when the judge fails the task, else `None` (uphold).
+    /// Pure policy except the one model call; no trace schema change (the
+    /// caller traces the veto as a StateTransition it already emits).
+    pub async fn verify_guard(
+        &self,
+        task: &str,
+        artifact: &serde_json::Value,
+        checks: &[CheckResult],
+    ) -> Option<String> {
+        if !self.cfg.verify_guard {
+            return None;
+        }
+        use crate::agents::Agent;
+        let reviewer = crate::agents::ReviewerAgent::new(self.verify);
+        let view = crate::context::CtxView {
+            prompt: format!(
+                "VERIFY-GUARD task: {task}\nARTIFACT: {}\nCHECKS:\n{}",
+                crate::engine::session::answer_of(artifact),
+                render_checks(checks)
+            ),
+            used_tokens: 0,
+            truncated: false,
+        };
+        let out = reviewer
+            .run(crate::agents::AgentCtx {
+                view: &view,
+                context: None,
+                executor: Some(self.verify),
+                tools: Some(self.tools),
+                workdir: None,
+                trace: self.trace,
+                volatile_budget: 0,
+            })
+            .await
+            .ok()?;
+        let v: crate::agents::Verdict = serde_json::from_value(out.data).ok()?;
+        if v.pass {
+            None
+        } else {
+            Some(veto_note_for_test(task, &v.feedback))
+        }
+    }
+
     /// The skill index as `agent` may see it. Empty when the grant does not
     /// cover `skills.list`, when the store is empty, or when the tool fails —
     /// an agent that may not list skills simply gets no `[SKILLS]` block.
@@ -552,6 +597,11 @@ pub fn render_checks(checks: &[CheckResult]) -> String {
 /// configured is a pass (the suite's expectation decides what that means).
 pub fn checks_pass(checks: &[CheckResult]) -> bool {
     checks.iter().all(|c| c.passed)
+}
+
+/// v4 outer verify guard: stable veto-note shape for traces and tests.
+pub fn veto_note_for_test(task: &str, note: &str) -> String {
+    format!("verify veto on {task}: {note}")
 }
 
 /// Keeps the lines a reviewer can act on and drops build noise. Raw

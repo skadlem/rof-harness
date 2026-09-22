@@ -55,6 +55,10 @@ pub struct PermissionPolicy {
     pub agents_tools: BTreeMap<String, Vec<String>>,
     /// Exact command strings proc.run may execute. Empty = deny all (default).
     pub allowed_commands: Vec<String>,
+    /// Prefix allowlist for proc.run (v4 shell freedom): a command is allowed
+    /// when it equals a prefix or starts with `prefix + " "`. Empty = no prefixes.
+    #[serde(default)]
+    pub allowed_prefixes: Vec<String>,
     /// Hostnames http.get may reach. Empty = deny all (default).
     pub allowed_hosts: Vec<String>,
 }
@@ -76,6 +80,16 @@ impl Default for PermissionPolicy {
             ],
         );
         // reviewer verifies by running allowlisted checks; it never writes
+        // v4 explorer: read-only context gathering in an isolated pass.
+        agents_tools.insert(
+            "explorer".to_string(),
+            vec![
+                "fs.list".to_string(),
+                "fs.read".to_string(),
+                "skills.list".to_string(),
+                "skills.view".to_string(),
+            ],
+        );
         agents_tools.insert(
             "reviewer".to_string(),
             vec![
@@ -105,6 +119,7 @@ impl Default for PermissionPolicy {
             allowed_dirs: Vec::new(),
             agents_tools,
             allowed_commands: Vec::new(),
+            allowed_prefixes: Vec::new(),
             allowed_hosts: Vec::new(),
         }
     }
@@ -233,9 +248,22 @@ pub struct AppConfig {
     /// rounds a live arm executes.
     #[serde(default)]
     pub auto_poke: bool,
+    /// v4: isolated read-only exploration pass before implement (ROF_EXPLORER=yes). Off by default.
+    #[serde(default)]
+    pub explorer: bool,
+    /// v4: independent task attempts, cheapest-pass wins (ROF_ATTEMPTS=N, 1..=5). Default 1 = current behavior.
+    #[serde(default = "one_attempt")]
+    pub attempts: usize,
+    /// v4: outer verify guard after inner pass (ROF_VERIFY_GUARD=yes). Off by default.
+    #[serde(default)]
+    pub verify_guard: bool,
 }
 
 fn one_job() -> usize {
+    1
+}
+
+fn one_attempt() -> usize {
     1
 }
 
@@ -298,6 +326,9 @@ impl Default for AppConfig {
             // rounds executed), so they are opt-in A/B'able switches.
             goal_quality: false,
             auto_poke: false,
+            explorer: false,
+            attempts: 1,
+            verify_guard: false,
         }
     }
 }

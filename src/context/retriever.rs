@@ -53,6 +53,25 @@ impl Retriever {
                 out.push(s);
             }
         }
+        // v4: deterministic symbol expansion — files defining a goal-named
+        // symbol ride right after goal-named paths, before keyword scoring.
+        // No embeddings; bounded to 2 extra slots so the char budget still holds.
+        let syms = super::symbols::index_workdir(&self.root, 500);
+        for rel in super::symbols::expand(&self.root, query, &syms)
+            .iter()
+            .take(2)
+        {
+            if out.len() >= self.cfg.max_snippets {
+                break;
+            }
+            let p = self.root.join(rel);
+            if named.contains(&p) || out.iter().any(|s: &Snippet| &s.path == rel) {
+                continue;
+            }
+            if let Some(s) = self.snippet(&p, query, budget_chars, &mut used) {
+                out.push(s);
+            }
+        }
         if keys.is_empty() {
             return out;
         }

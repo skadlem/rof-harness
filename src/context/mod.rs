@@ -1,10 +1,13 @@
 pub mod assembler;
 pub mod builder;
+pub mod memory;
 pub mod policy;
 pub mod retriever;
 pub mod state;
+pub mod symbols;
 pub use assembler::{Assembly, ContextAssembler, ContextItem, Fidelity, ItemKey, PromptParts};
 pub use builder::ContextBuilder;
+pub use memory::{load as load_memory, render as render_memory, Memory};
 pub use policy::{ContextPolicy, LayerKind, LayerPolicy, LayerReport, LayerStrategy, SummaryStat};
 pub use retriever::{render, window_on, Retriever, Snippet};
 pub use state::{CtxState, CtxView};

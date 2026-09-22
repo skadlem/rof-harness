@@ -2810,3 +2810,36 @@ no-op fixes, the measured click yield table, the exact next action, the
 durable artifact paths, and the standing traps. All session artifacts were
 moved out of `/tmp` to `/home/madiyar/.local/share/` because `/tmp` is wiped
 between sessions.
+
+---
+
+## 2026-09-22 — v4: six bets behind off-by-default knobs (all landed, stub-verified)
+
+Design (`docs/superpowers/specs/2026-09-22-rof-v4-design.md`) and plan
+(`docs/superpowers/plans/2026-09-22-rof-v4-plan.md`): keep the honesty substrate
+and the 5.1× billed lead, add one mechanism from each frontier winner.
+
+1. **Explorer** (`src/agents/explorer.rs`, `ROF_EXPLORER`): read-only pass, key
+   files join the volatile tail. Traced `exploring→explored`.
+2. **Symbols** (`src/context/symbols.rs`): regex def-index (Rust + Python) +
+   1-hop use/import expansion, merged after goal-named paths, capped at 2 slots.
+   No embeddings — the field voted no (2609.00006).
+3. **Attempts** (`ROF_ATTEMPTS=1-5`): independent round-sequences with rollback
+   between, cheapest-pass wins. Default 1 = bit-identical run.
+4. **Verify guard** (`ROF_VERIFY_GUARD`): one post-hoc judge pass; veto fails the
+   attempt. Join/timeout failures now read `inconclusive, not failed`.
+5. **Memory** (`src/context/memory.rs`): `<workdir>/AGENTS.md` + `~/.rof/LESSONS.md`
+   (4k caps) prepended to the stable head in both modes; empty = unchanged.
+6. **Shell prefixes + arena**: `ROF_ALLOW_PREFIXES` boundary-matched
+   (`cargo test` ⊃ `cargo test foo`, ⊄ `cargo test-evil`); `rof arena <suite>`
+   is eval plus one chart line (`arena: suite= matched= billed= per_task_billed=`).
+
+Also fixed: the eval path wired the executor twice, dropping the §4.5 verify
+slot — `ROF_VERIFY_MODEL` never reached suite runs. Now `self.verify`.
+
+Verified: full `cargo test` green twice (88 unit + 16 binaries incl. 4 new v4
+suites), `cargo clippy -- -D warnings` clean, `cargo fmt --check` clean,
+stub end-to-end (smoke suite, direct+explorer+attempts=2+guard, arena line).
+One flake seen once (`context_metrics_fold...` under full parallel `cargo test`,
+passes alone and on repeat) — pre-existing pid-shared temp pattern, not the
+retrieval change (bisected: fails/passes independent of the edit).

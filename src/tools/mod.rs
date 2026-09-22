@@ -72,7 +72,10 @@ impl ToolRegistry {
         r.register(FsReadTool::new(root.clone()));
         r.register(FsPatchTool::new(root.clone()));
         r.register(FsWriteTool::new(root.clone()));
-        r.register(ProcRunTool::new(root.clone(), p.allowed_commands.clone()));
+        r.register(
+            ProcRunTool::new(root.clone(), p.allowed_commands.clone())
+                .with_prefixes(p.allowed_prefixes.clone()),
+        );
         r.register(HttpGetTool::new(p.allowed_hosts.clone()));
         // A repo can ship skills with it (`<workdir>/skills/`), read-only.
         let extra_root = {
@@ -544,11 +547,36 @@ impl Tool for HttpGetTool {
 pub struct ProcRunTool {
     root: PathBuf,
     allowed: Vec<String>,
+    allowed_prefixes: Vec<String>,
 }
 impl ProcRunTool {
     pub fn new(root: PathBuf, allowed: Vec<String>) -> Self {
-        Self { root, allowed }
+        Self {
+            root,
+            allowed,
+            allowed_prefixes: Vec::new(),
+        }
     }
+    pub fn with_prefixes(mut self, prefixes: Vec<String>) -> Self {
+        self.allowed_prefixes = prefixes;
+        self
+    }
+}
+
+/// v4 shell freedom: exact match OR `prefix + " "` boundary match.
+/// `cargo test-evil` must NOT match prefix `cargo test`.
+pub fn prefix_allowed(prefixes: &[String], cmd: &str) -> bool {
+    prefixes.iter().any(|p| {
+        let p = p.trim();
+        !p.is_empty() && (cmd == p || cmd.starts_with(&format!("{p} ")))
+    })
+}
+
+#[cfg(test)]
+fn _unused() {}
+/// Test helper (stable path for integration tests).
+pub fn prefix_allowed_for_test(prefixes: &[String], cmd: &str) -> bool {
+    prefix_allowed(prefixes, cmd)
 }
 
 #[async_trait]
@@ -561,8 +589,10 @@ impl Tool for ProcRunTool {
             .get("cmd")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::Failed("missing cmd".to_string()))?;
-        // Exact match: the caller cannot invent flags or chain a second command.
-        if !self.allowed.iter().any(|a| a == cmd) {
+        // Exact match, or a v4 prefix boundary match (`cargo test` covers
+        // `cargo test foo` but never `cargo test-evil`). Chaining (`;`, `&&`,
+        // `|`) is still impossible: the whole string must start with prefix.
+        if !self.allowed.iter().any(|a| a == cmd) && !prefix_allowed(&self.allowed_prefixes, cmd) {
             return Err(ToolError::Denied(format!("command not allowlisted: {cmd}")));
         }
         let mut parts = cmd.split_whitespace();

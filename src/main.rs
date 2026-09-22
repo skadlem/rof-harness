@@ -114,6 +114,22 @@ fn apply_env(cfg: &mut AppConfig) {
     if let Some(hosts) = get("ROF_ALLOW_HOSTS") {
         cfg.permissions.allowed_hosts = split_list(&hosts);
     }
+    // v4 shell freedom: prefix allowlist for proc.run (comma separated).
+    if let Some(prefixes) = get("ROF_ALLOW_PREFIXES") {
+        cfg.permissions.allowed_prefixes = split_list(&prefixes);
+    }
+    // v4 knobs (all off-by-default; defaults preserve current behavior).
+    if let Some(v) = get("ROF_EXPLORER") {
+        cfg.explorer = matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1");
+    }
+    if let Some(n) = get("ROF_ATTEMPTS") {
+        if let Ok(k) = n.trim().parse::<usize>() {
+            cfg.attempts = k.clamp(1, 5);
+        }
+    }
+    if let Some(v) = get("ROF_VERIFY_GUARD") {
+        cfg.verify_guard = matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1");
+    }
     if let Some(t) = get("ROF_MAX_TASK_TOKENS") {
         if let Ok(n) = t.trim().parse::<u64>() {
             cfg.max_tokens_per_task = n;
@@ -357,7 +373,19 @@ fn print_report(trace: &TraceSink, passed: bool) {
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let cfg_path = config_arg(&args[2.min(args.len())..]);
-    match args.get(1).map(String::as_str) {
+    // v4 arena: `rof arena <suite>` runs the eval path and adds a chart-ready
+    // score+billed line. Same run, same report; cross-harness diffs reuse
+    // `rof compare a.json b.json`. No new infra.
+    let arena_mode = args.get(1).map(String::as_str) == Some("arena");
+    if arena_mode {
+        println!("arena: score+billed mode (same run as eval, plus one chart line)");
+    }
+    let cmd: Option<&str> = if arena_mode {
+        Some("eval")
+    } else {
+        args.get(1).map(String::as_str)
+    };
+    match cmd {
         // Effective config as canonical JSON: save it, diff it, A/B it.
         Some("config") => {
             let cfg = load_config(cfg_path.as_deref())?;
@@ -462,6 +490,23 @@ async fn main() -> anyhow::Result<()> {
                 println!("report: {path}");
             }
             println!("label: {}", rep.label.render());
+            if arena_mode {
+                // One grepable line for docs and charts: score, billed cost,
+                // and the label that makes the run comparable.
+                println!(
+                    "arena: suite={} matched={}/{} billed={} per_task_billed={} label={}",
+                    suite.name,
+                    rep.matched(),
+                    rep.tasks.len(),
+                    rep.aggregate.billed_tokens(),
+                    if rep.tasks.is_empty() {
+                        0
+                    } else {
+                        rep.aggregate.billed_tokens() / rep.tasks.len() as u64
+                    },
+                    rep.label.render()
+                );
+            }
             Ok(())
         }
         // Two report dumps side by side: labelled inputs, matched totals,
