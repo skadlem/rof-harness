@@ -36,7 +36,9 @@ pub struct RoutingConfig {
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            context_model: "cheap-model".to_string(),
+            // Empty = follow the executor (single-model default). Explicit
+            // configs keep whatever they state; `ROF_CTX_MODEL` still wins.
+            context_model: String::new(),
             executor_model: "strong-model".to_string(),
             executor_fallback: None,
             verify_model: None,

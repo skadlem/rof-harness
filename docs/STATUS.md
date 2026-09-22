@@ -2843,3 +2843,30 @@ stub end-to-end (smoke suite, direct+explorer+attempts=2+guard, arena line).
 One flake seen once (`context_metrics_fold...` under full parallel `cargo test`,
 passes alone and on repeat) — pre-existing pid-shared temp pattern, not the
 retrieval change (bisected: fails/passes independent of the edit).
+
+---
+
+## 2026-09-23 — Go header fix + deterministic-by-default (option A)
+
+**Go blocked every call, now fixed.** The 6-task Go probe connected
+(`llm: ...zen/go/v1`) but errored all 6 tasks at rounds=0: Go 400s without
+`x-opencode-session` (`MissingSessionID`). `OpenRouterClient` now mints a
+per-client session UUID, sends it only to `*opencode.ai` bases (other
+providers byte-identical), and identifies as `rof/<version>` per Go's client
+rules — the same fix Hermes and Pi already ship. Model ID `deepseek-flash`
+was never reached, so it is still unconfirmed; the docs table says it is
+V4.1 Flash.
+
+**Context is deterministic by default (option A, reversible).** The review
+concluded neither LLM context call earned its keep: planner 7.3/20 vs 12.7/20
+skipped, mid summarizer 8/12 → 2/12 — plus generated summaries bust the cached
+prefix and poison comparability. Changes: empty `context_model` follows the
+executor (single-model default; explicit `ROF_CTX_MODEL` still wins, label
+resolves what ran); `DEFAULT_MID_SUMMARIZE_AT` 0.8 → 0.0 (`ROF_SUMMARIZE_AT`
+opts back in); planner runs on the executor model by routing, no type change.
+Four tests that encoded the old defaults were updated to assert the new ones;
+the summarize-path test now arms explicitly (opt-in coverage kept).
+`scripts/live-go.sh` already pins both slots to `deepseek-flash`.
+
+Verified: full `cargo test` green (88 unit + 17 binaries), clippy `-D warnings`
+clean, fmt clean, release builds. Live re-probe pending on the user's key.

@@ -38,11 +38,19 @@ pub struct RunLabel {
 
 impl RunLabel {
     pub fn build(cfg: &AppConfig, suite: &EvalSuite, workdir: &Path) -> Self {
+        // An empty context slot follows the executor (single-model default),
+        // so the label resolves it the same way the router does: the label
+        // names what ran, and two configs that run identically label identically.
+        let ctx_model = if cfg.routing.context_model.trim().is_empty() {
+            cfg.routing.executor_model.clone()
+        } else {
+            cfg.routing.context_model.clone()
+        };
         Self {
             git_head: git_head(workdir),
             config_hash: fnv1a_hex(cfg.to_json().as_bytes()),
             suite_hash: fnv1a_hex(serde_json::to_string(suite).unwrap_or_default().as_bytes()),
-            ctx_model: cfg.routing.context_model.clone(),
+            ctx_model,
             exec_model: cfg.routing.executor_model.clone(),
             verify_model: cfg
                 .routing

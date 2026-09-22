@@ -104,14 +104,52 @@ pub struct OpenRouterClient {
     token: String,
     base: String,
     http: reqwest::Client,
+    /// Stable per-client conversation id for providers that route on it
+    /// (OpenCode Go requires `x-opencode-session`; see `session_header`).
+    /// Minted per client, so one rof process is one session.
+    session: String,
+}
+
+/// `Some((name, value))` when `base` is an OpenCode endpoint, else `None` —
+/// other providers never see the header, so their runs are byte-identical.
+fn session_header_value(base: &str, session: &str) -> Option<(String, String)> {
+    if base.contains("opencode.ai") {
+        Some(("x-opencode-session".to_string(), session.to_string()))
+    } else {
+        None
+    }
+}
+
+/// Test helper: the header decision without a client.
+pub fn session_header_for_test(base: &str, session: &str) -> Option<(String, String)> {
+    session_header_value(base, session)
+}
+
+/// Test helper: one fresh session id, as a client would mint it.
+pub fn client_session_for_test() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 impl OpenRouterClient {
+    fn http_client() -> reqwest::Client {
+        // Go asks clients to identify themselves instead of riding a generic
+        // HTTP-library name; harmless everywhere else.
+        reqwest::Client::builder()
+            .user_agent(format!("rof/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+
+    fn session_header(&self) -> Option<(String, String)> {
+        session_header_value(&self.base, &self.session)
+    }
+
     pub fn new(token: String) -> Self {
         Self {
             token,
             base: DEFAULT_BASE.to_string(),
-            http: reqwest::Client::new(),
+            http: Self::http_client(),
+            session: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -135,7 +173,8 @@ impl OpenRouterClient {
         Some(Self {
             token,
             base,
-            http: reqwest::Client::new(),
+            http: Self::http_client(),
+            session: uuid::Uuid::new_v4().to_string(),
         })
     }
 
@@ -154,7 +193,8 @@ impl OpenRouterClient {
         Some(Self {
             token,
             base,
-            http: reqwest::Client::new(),
+            http: Self::http_client(),
+            session: uuid::Uuid::new_v4().to_string(),
         })
     }
 
@@ -363,12 +403,18 @@ fn truncated_content_chars(text: &str) -> usize {
 
 impl OpenRouterClient {
     async fn once(&self, model: &str, req: &LlmReq) -> Result<LlmResp, LlmError> {
-        let res = self
+        let mut call = self
             .http
             .post(format!("{}/chat/completions", self.base))
             .bearer_auth(&self.token)
             .header("HTTP-Referer", "rof-harness")
-            .header("X-Title", "rof-harness")
+            .header("X-Title", "rof-harness");
+        // OpenCode Go routes on this; absent everywhere else (see
+        // `session_header_value`), so non-Go runs are unchanged.
+        if let Some((name, value)) = self.session_header() {
+            call = call.header(name, value);
+        }
+        let res = call
             .json(&Self::body(model, req))
             .send()
             .await

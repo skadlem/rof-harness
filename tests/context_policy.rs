@@ -245,8 +245,9 @@ async fn reports_are_indexed_long_mid_short() {
 
 #[test]
 fn budgets_derive_the_policy_and_a_context_block_wins() {
-    // A pre-stage-2 config file states budgets and nothing else: it must keep
-    // meaning exactly what it said (same budgets, mid armed by default).
+    // A pre-stage-2 config file states budgets and nothing else: same budgets,
+    // and mid unarmed — the determinism review retired the armed default
+    // (the arm cost 8/12 → 2/12). Explicit `summarize_at` still wins below.
     let dir = std::env::temp_dir().join(format!("rof-ctx-policy-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let old = dir.join("old.json");
@@ -260,7 +261,7 @@ fn budgets_derive_the_policy_and_a_context_block_wins() {
     assert_eq!(p.long.budget, 111);
     assert_eq!(p.mid.budget, 222);
     assert_eq!(p.short.budget, 333);
-    assert!(p.mid.summarize_at > 0.0, "mid is armed by default");
+    assert_eq!(p.mid.summarize_at, 0.0, "mid is unarmed by default");
     assert_eq!(p.long.summarize_at, 0.0);
 
     // A file that states `context` decides, budgets included — and survives a
