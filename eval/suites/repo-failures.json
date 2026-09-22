@@ -1,0 +1,21 @@
+{
+  "name": "repo-failures-go",
+  "tasks": [
+    {
+      "name": "add-retriever-test",
+      "goal": "In src/context/retriever.rs, add a `#[cfg(test)] mod tests` block containing one unit test named `skips_hidden_files` asserting that a file named `.env` is not returned by Retriever::retrieve. Follow the style of the other test modules in this repo.",
+      "checks": [
+        "cargo test"
+      ],
+      "expect_writes": true
+    },
+    {
+      "name": "metrics-model-call-rate",
+      "goal": "In src/eval/metrics.rs, add a public field `model_calls: u64` to EvalReport incremented once per folded ModelCall event, and a public method `cost_reporting_rate(&self) -> f64` returning cost_samples as a share of model_calls (0.0 when model_calls is 0). Add a unit test in the existing test module asserting 0.0 for a fresh report and 0.5 after folding two ModelCall events where only one reports cost_usd.",
+      "checks": [
+        "cargo test"
+      ],
+      "expect_writes": true
+    }
+  ]
+}
