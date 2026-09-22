@@ -2879,3 +2879,26 @@ planner ran on the executor (3,427 in), cold cache. This confirms the session
 header fix, the `deepseek-flash` = V4.1 Flash mapping, and the single-model
 deterministic default end to end. Report: `~/rof-runs/report-0923-0724.json`.
 Still open: full 6-task baseline (×3 reps), then v4 knob arms.
+
+## 2026-09-23 — Go baseline 4/6 (67%), two failure modes, both known classes
+
+`scripts/live-go.sh repo-tasks --limit 6 --jobs 2` on `deepseek-flash`
+(single-model, deterministic defaults): 4/6, billed 126,340 (~21k/task),
+cache-hit 19% cold, tool accuracy 100%, skills reused 10. Report:
+`~/rof-runs/report-0923-0726.json`. Passes: doc-comment (1rd), tool-count
+(1rd), procrun-doc (2rd), trace-doc (1rd).
+
+1. **add-retriever-test** — reasoning-exhaustion truncation (reasoning 33,397
+   chars, content 0) before any edit landed. The retry ladder fired (1 retried
+   call) and still failed: the model does not converge reasoning on this task,
+   same class as the Atria dotenv pilot. Escalation-after-failure cannot fix a
+   model that never terminates — the arm must start thought-off, not end there.
+   No env knob exists yet; proposed: `ROF_THINKING=off/low/on` (default on).
+2. **metrics-model-call-rate** — describe-instead-of-do across 4 rounds: the
+   artifact narrated a patch (`insert self.model_calls += 1`) without emitting
+   `patches[]`/`writes[]`. The designed fix already exists: `ROF_ATTEMPTS`
+   fresh sequences. Proposed arm next.
+
+Quota discipline: Go enforces per-model 5h/weekly/monthly $ caps, so arms run
+on `eval/suites/repo-failures.json` (just these 2 tasks), not full reps, until
+a lever moves one of them.
