@@ -721,7 +721,8 @@ async fn report_carries_a_label_and_its_inputs() {
     assert_eq!(rebuilt.harness_version, rep.label.harness_version);
     // The model ids name the services the run actually used (`rof eval` wires
     // both from the same config; this runner was handed fake ones).
-    assert_eq!(rebuilt.ctx_model, "cheap-model");
+    // Empty context slot follows the executor: the label names what ran.
+    assert_eq!(rebuilt.ctx_model, "strong-model");
     assert_eq!(rep.label.ctx_model, "fake-ctx");
     // A config that names a judge labels itself: the slot is part of the
     // comparability surface, and `verify_model` is what an arm changes.

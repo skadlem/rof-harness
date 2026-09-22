@@ -25,10 +25,11 @@ pub enum Role {
 ///
 /// Resolution semantics (see [`ModelRouter::resolve`]):
 ///
-/// * `Role::Context` always returns `context_model` and **never** falls
-///   back. Context covers the cheap, high-frequency phases (planning,
-///   retrieval, summarization); silently upgrading to a stronger model
-///   there would change cost/latency characteristics without an opt-in.
+/// * `Role::Context` returns `context_model` when set, else the executor
+///   model (single-model default). An empty context slot means "plan on the
+///   model that executes" — the arms never showed a cheap planner earning
+///   its keep, and the hardest judgment call should not go to the weakest
+///   model. Set `ROF_CTX_MODEL` for an explicit two-tier A/B.
 /// * `Role::Executor` returns `executor_model` plus the configured
 ///   `fallback` (if any) as its secondary candidate. This is the strong
 ///   model doing real work, so having a fallback chain is desirable.
@@ -75,14 +76,20 @@ impl ModelRouter {
 
     /// (primary, fallback) for the requested `role`.
     ///
-    /// * `Role::Context` -> `(context_model, None)`: no fallback by design.
+    /// * `Role::Context` -> `(context_model or executor_model, None)`.
     /// * `Role::Executor` -> `(executor_model, fallback)`: the configured
     ///   fallback chain, or `None` when none is configured.
     /// * `Role::Verify` -> `(verify_model or executor_model, fallback)`:
     ///   an unset verify slot is self-review on the executor model.
     pub fn resolve(&self, role: Role) -> (&str, Option<&str>) {
         match role {
-            Role::Context => (&self.context_model, None),
+            Role::Context => {
+                if self.context_model.trim().is_empty() {
+                    (&self.executor_model, None)
+                } else {
+                    (&self.context_model, None)
+                }
+            }
             Role::Executor => (&self.executor_model, self.fallback.as_deref()),
             Role::Verify => (
                 self.verify_model.as_deref().unwrap_or(&self.executor_model),

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 pub mod openrouter;
-pub use openrouter::OpenRouterClient;
+pub use openrouter::{client_session_for_test, session_header_for_test, OpenRouterClient};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;

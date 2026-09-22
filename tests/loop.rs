@@ -832,12 +832,15 @@ async fn token_budget_stops_a_task_before_the_next_round() {
 #[tokio::test]
 async fn overflowing_context_is_compressed_by_the_cheap_model() {
     // A long goal against a 30-token mid-term budget puts the mid layer (goal +
-    // retrieval + plan) far over its threshold, so it must route through
-    // ContextService::summarize instead of blind chopping. (v1 compressed the
-    // whole prompt *after* it had overflowed; stage 2 compresses one layer
-    // *before* the cut, and truncation is only the fallback.)
+    // retrieval + plan) far over its threshold, so an *explicitly armed* layer
+    // must route through ContextService::summarize instead of blind chopping.
+    // (Summarizing is opt-in since the determinism review retired the armed
+    // default — the arm cost 8/12 → 2/12. This test covers the opt-in path.)
     let (orch, reg, root) = harness_with(Arc::new(FakeClient::pass()), "summ", 2, |cfg| {
         cfg.budgets.mid_term = 30;
+        let mut p = cfg.context_policy();
+        p.layer_mut(rof::context::LayerKind::Mid).summarize_at = 0.8;
+        cfg.context = Some(p);
     });
     let out = orch
         .run_loop(

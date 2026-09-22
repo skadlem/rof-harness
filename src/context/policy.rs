@@ -13,12 +13,14 @@
 //! summarized alone, the result is cached by content, and truncation is what a
 //! *failed* summarization falls back to.
 //!
-//! Defaults are deliberately asymmetric. The mid layer (retrieval) is armed at
-//! `DEFAULT_MID_SUMMARIZE_AT`: it is the only layer whose size is a function of
-//! the repo rather than of the conversation. The long layer is the stable head
-//! (conventions + skill index) and the short layer is the volatile evidence a
-//! reviewer judges (artifact, checks, refusals) — compressing either one drops
-//! exactly the detail the agents act on, so both default to `0.0` (never).
+//! Defaults are deterministic: all three layers truncate, none summarize.
+//! The mid layer used to be armed at `DEFAULT_MID_SUMMARIZE_AT`, but the arm
+//! cost 8/12 → 2/12 — and a generated summary is not byte-stable, so it busts
+//! the cached prefix and poisons comparability. The constant stays as the
+//! opt-in value (`ROF_SUMMARIZE_AT`), not the default. The long layer is the
+//! stable head (conventions + skill index) and the short layer is the volatile
+//! evidence a reviewer judges (artifact, checks, refusals) — compressing
+//! either one drops exactly the detail the agents act on.
 
 use crate::config::TokenBudgets;
 use serde::{Deserialize, Serialize};
@@ -26,8 +28,11 @@ use serde::{Deserialize, Serialize};
 /// Below this many chars a summary call costs more than the text it removes.
 pub const MIN_SUMMARY_CHARS: usize = 1200;
 
-/// The mid layer (retrieval) is armed by default at 80% of its budget.
-pub const DEFAULT_MID_SUMMARIZE_AT: f32 = 0.8;
+/// The mid layer's summarize threshold. Default 0.0 (never): mid-layer
+/// summarization measured 8/12 → 2/12, and generated summaries are not
+/// byte-stable, so they bust the cached prefix and poison comparability.
+/// `ROF_SUMMARIZE_AT` opts back in for an A/B; explicit values are untouched.
+pub const DEFAULT_MID_SUMMARIZE_AT: f32 = 0.0;
 
 /// Which layer of the prompt. Order is the order they are joined in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -205,7 +210,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn old_budgets_derive_a_policy_with_only_mid_armed() {
+    fn old_budgets_derive_a_policy_with_nothing_armed_by_default() {
         let b = TokenBudgets {
             long_term: 1000,
             mid_term: 2000,
@@ -216,18 +221,21 @@ mod tests {
         assert_eq!(p.chars_cap(LayerKind::Mid), 8000);
         assert_eq!(p.chars_cap(LayerKind::Short), 12000);
         assert_eq!(p.layer(LayerKind::Long).summarize_at, 0.0);
-        assert!(p.layer(LayerKind::Mid).summarize_at > 0.0);
+        assert_eq!(p.layer(LayerKind::Mid).summarize_at, 0.0);
         assert_eq!(p.layer(LayerKind::Short).summarize_at, 0.0);
     }
 
     #[test]
     fn threshold_is_share_of_budget_and_needs_a_minimum_size() {
-        let p = ContextPolicy::from(&TokenBudgets {
+        let mut p = ContextPolicy::from(&TokenBudgets {
             long_term: 2000,
             mid_term: 1000,
             short_term: 6000,
         });
+        // The mechanics, with an explicitly armed mid layer (the default is
+        // now 0.0 — see `old_budgets_derive_a_policy_with_nothing_armed`).
         // mid cap = 4000 chars, armed at 0.8 -> 3200 chars
+        p.layer_mut(LayerKind::Mid).summarize_at = 0.8;
         assert!(!p.wants_summary(LayerKind::Mid, 3199));
         assert!(p.wants_summary(LayerKind::Mid, 3201));
         // never for an unarmed layer, however big

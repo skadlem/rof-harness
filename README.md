@@ -50,7 +50,8 @@ A suite run never touches `ROF_WORKDIR`: every task runs in its own copy
 |---|---|
 | `ROF_CONFIG` | config file path (same as `--config`) |
 | `ROF_WORKDIR` | target tree, copied per task; the permission allowlist is anchored here |
-| `ROF_CTX_MODEL` / `ROF_EXEC_MODEL` / `ROF_EXEC_FALLBACK` / `ROF_VERIFY_MODEL` | model routing without recompiling; verify defaults to exec (self-review) |
+| `ROF_CTX_MODEL` / `ROF_EXEC_MODEL` / `ROF_EXEC_FALLBACK` / `ROF_VERIFY_MODEL` | model routing without recompiling; empty/unset ctx follows exec (single-model default), verify defaults to exec (self-review) |
+| `ROF_SUMMARIZE_AT` | `0.0`-`1.0` or `off` — opt back into mid-layer summarization for an A/B (default `off`: the arm cost 8/12 → 2/12) |
 | `ROF_VERIFY_TOKEN` / `ROF_VERIFY_BASE` | the judge on a *different provider* than the executor (arm #4); unset = the shared client, run unchanged |
 | `ROF_ALLOW_CMDS` | comma-separated exact command allowlist (empty = deny all) |
 | `ROF_ALLOW_HOSTS` | comma-separated host allowlist for `http.get` (empty = deny all) |
