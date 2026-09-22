@@ -262,38 +262,71 @@ impl Orchestrator {
                     &reviewer_skills,
                 )
                 .await;
-            // Round cap; the auto-poke below may extend it by exactly one
-            // which is why this is a `while` and not a range.
-            let mut rounds = rounds;
-            let mut round = 1u32;
-            let mut poked = false;
-            while round <= rounds {
-                // Token guard: stop before spending another expensive round.
-                // O(1) — the sink totals at the emit choke point (§4.3).
-                if let Some(spent) = budget.exceeded() {
-                    self.trace.emit(TraceEvent::BudgetExceeded {
-                        task: task.clone(),
-                        tokens: spent,
-                        limit,
-                    });
-                    budget_hit = Some(spent);
-                    break;
-                }
-                ran = round;
-                // The baseline this attempt starts from and rolls back to
-                // (§4.2), committed before the implementer touches anything.
-                if let Err(e) = tree.baseline() {
-                    self.trace.emit(TraceEvent::ModelError {
-                        agent: "tree".to_string(),
-                        error: e.to_string(),
-                    });
+            // v4 attempts: independent round-sequences per task, first pass
+            // wins (sequential, so first is cheapest). Default 1 = the
+            // historical single sequence. Each attempt rolls back to the
+            // baseline, so sequences never see each other's trees.
+            let attempts = self.cfg.attempts.clamp(1, 5);
+            let mut attempt_no = 0usize;
+            while attempt_no < attempts {
+                attempt_no += 1;
+                self.trace.emit(TraceEvent::StateTransition {
+                    from: "attempt_pending".to_string(),
+                    to: format!("attempt_{attempt_no}"),
+                });
+                if attempt_no > 1 {
+                    if let Err(e) = tree.rollback() {
+                        self.trace.emit(TraceEvent::ModelError {
+                            agent: "tree".to_string(),
+                            error: format!("attempt rollback failed (continuing): {e}"),
+                        });
+                    }
+                    feedback = String::new();
+                    refused = String::new();
+                    artifact = serde_json::Value::Null;
+                    changed_files = Vec::new();
+                    diff_stat = String::new();
+                    check_results = Vec::new();
                     verdict = Verdict {
                         pass: false,
-                        feedback: format!("harness: git baseline failed: {e}"),
+                        feedback: "no rounds ran".to_string(),
                     };
-                    break;
+                    ran = 0;
+                    writes_made = 0;
+                    budget_hit = None;
                 }
-                let istate = CtxState {
+                // Round cap; the auto-poke below may extend it by exactly one
+                // which is why this is a `while` and not a range.
+                let mut rounds = rounds;
+                let mut round = 1u32;
+                let mut poked = false;
+                while round <= rounds {
+                    // Token guard: stop before spending another expensive round.
+                    // O(1) — the sink totals at the emit choke point (§4.3).
+                    if let Some(spent) = budget.exceeded() {
+                        self.trace.emit(TraceEvent::BudgetExceeded {
+                            task: task.clone(),
+                            tokens: spent,
+                            limit,
+                        });
+                        budget_hit = Some(spent);
+                        break;
+                    }
+                    ran = round;
+                    // The baseline this attempt starts from and rolls back to
+                    // (§4.2), committed before the implementer touches anything.
+                    if let Err(e) = tree.baseline() {
+                        self.trace.emit(TraceEvent::ModelError {
+                            agent: "tree".to_string(),
+                            error: e.to_string(),
+                        });
+                        verdict = Verdict {
+                            pass: false,
+                            feedback: format!("harness: git baseline failed: {e}"),
+                        };
+                        break;
+                    }
+                    let istate = CtxState {
                     long_term: impl_head.clone(),
                     // Stable-first ordering: goal and repo retrieval are
                     // byte-stable across runs, the plan is not, the task text
@@ -324,91 +357,92 @@ impl Orchestrator {
                         )
                     },
                 };
-                // Per-layer: summarize-before-truncate, one cached cheap-model
-                // call per layer that crossed its threshold. No `mut` state to
-                // carry between rounds — the builder's cache owns that.
-                let (iview, reports) = builder.plan_summarized(&istate, &self.context).await;
-                self.fold_layers(&reports, &mut acc);
-                let implementer = ImplementerAgent::new(&self.executor);
-                match implementer
-                    .run(AgentCtx {
-                        view: &iview,
-                        context: None,
-                        executor: Some(&self.executor),
-                        tools: Some(tools),
-                        workdir: Some(workdir),
-                        trace: &self.trace,
-                        volatile_budget: svc.volatile_budget(),
-                    })
-                    .await
-                {
-                    Ok(o) => artifact = o.data,
-                    Err(e) => {
-                        self.trace.emit(TraceEvent::ModelError {
-                            agent: "implementer".to_string(),
-                            error: e.to_string(),
-                        });
-                        artifact = serde_json::json!({"error": e.to_string()});
-                    }
-                };
-                self.trace.emit(TraceEvent::StateTransition {
-                    from: "implemented".to_string(),
-                    to: "reviewing".to_string(),
-                });
-
-                // Acceptance evidence: run the session's allowlisted checks BEFORE
-                // the verdict, so the reviewer judges execution, not prose.
-                let task_checks = svc.run_checks(session, workdir).await;
-                checks_log = render_checks(&task_checks);
-                // The last round's outcomes are the task's: `compare` matches by
-                // name, so accumulating earlier rounds would let a round-1
-                // failure outrank the round that fixed it.
-                check_results = task_checks;
-                let evidence = svc.reviewer_file_evidence(workdir, &artifact).await;
-                // A touched file the budget could not deliver even at the
-                // narrowest window: the reviewer is judging it blind, which is
-                // a harness condition, not a model verdict. Name it rather
-                // than letting a silent cut answer the wrong question.
-                if !evidence.excess.is_empty() {
-                    self.trace.emit(TraceEvent::ModelError {
-                        agent: "context".to_string(),
-                        error: format!(
-                            "evidence too large for the volatile budget: {}",
-                            evidence.excess.join(", ")
-                        ),
+                    // Per-layer: summarize-before-truncate, one cached cheap-model
+                    // call per layer that crossed its threshold. No `mut` state to
+                    // carry between rounds — the builder's cache owns that.
+                    let (iview, reports) = builder.plan_summarized(&istate, &self.context).await;
+                    self.fold_layers(&reports, &mut acc);
+                    let implementer = ImplementerAgent::new(&self.executor);
+                    match implementer
+                        .run(AgentCtx {
+                            view: &iview,
+                            context: None,
+                            executor: Some(&self.executor),
+                            tools: Some(tools),
+                            workdir: Some(workdir),
+                            trace: &self.trace,
+                            volatile_budget: svc.volatile_budget(),
+                        })
+                        .await
+                    {
+                        Ok(o) => artifact = o.data,
+                        Err(e) => {
+                            self.trace.emit(TraceEvent::ModelError {
+                                agent: "implementer".to_string(),
+                                error: e.to_string(),
+                            });
+                            artifact = serde_json::json!({"error": e.to_string()});
+                        }
+                    };
+                    self.trace.emit(TraceEvent::StateTransition {
+                        from: "implemented".to_string(),
+                        to: "reviewing".to_string(),
                     });
-                }
-                if evidence.eliminated > 0 {
-                    acc.eliminated_chars = acc.eliminated_chars.saturating_add(evidence.eliminated);
-                }
-                let verified_files = evidence.block;
-                // Write gate (§4.2): count what git saw change, not what the
-                // artifact claims. A new file the model wrote counts; prose-only
-                // work reads back as zero; a self-report that disagrees with the
-                // tree loses to the tree. The same names feed recall (§4.4).
-                let diff = match tree.diff() {
-                    Ok(diff) => diff,
-                    Err(e) => {
-                        self.trace.emit(TraceEvent::ModelError {
-                            agent: "tree".to_string(),
-                            error: e.to_string(),
-                        });
-                        verdict = Verdict {
-                            pass: false,
-                            feedback: format!("harness: git diff failed: {e}"),
-                        };
-                        break;
-                    }
-                };
-                writes_made = diff.changed();
-                diff_stat = diff.stat.clone();
-                for name in &diff.names {
-                    if !changed_files.iter().any(|seen: &String| seen == name) {
-                        changed_files.push(name.clone());
-                    }
-                }
 
-                let rstate = CtxState {
+                    // Acceptance evidence: run the session's allowlisted checks BEFORE
+                    // the verdict, so the reviewer judges execution, not prose.
+                    let task_checks = svc.run_checks(session, workdir).await;
+                    checks_log = render_checks(&task_checks);
+                    // The last round's outcomes are the task's: `compare` matches by
+                    // name, so accumulating earlier rounds would let a round-1
+                    // failure outrank the round that fixed it.
+                    check_results = task_checks;
+                    let evidence = svc.reviewer_file_evidence(workdir, &artifact).await;
+                    // A touched file the budget could not deliver even at the
+                    // narrowest window: the reviewer is judging it blind, which is
+                    // a harness condition, not a model verdict. Name it rather
+                    // than letting a silent cut answer the wrong question.
+                    if !evidence.excess.is_empty() {
+                        self.trace.emit(TraceEvent::ModelError {
+                            agent: "context".to_string(),
+                            error: format!(
+                                "evidence too large for the volatile budget: {}",
+                                evidence.excess.join(", ")
+                            ),
+                        });
+                    }
+                    if evidence.eliminated > 0 {
+                        acc.eliminated_chars =
+                            acc.eliminated_chars.saturating_add(evidence.eliminated);
+                    }
+                    let verified_files = evidence.block;
+                    // Write gate (§4.2): count what git saw change, not what the
+                    // artifact claims. A new file the model wrote counts; prose-only
+                    // work reads back as zero; a self-report that disagrees with the
+                    // tree loses to the tree. The same names feed recall (§4.4).
+                    let diff = match tree.diff() {
+                        Ok(diff) => diff,
+                        Err(e) => {
+                            self.trace.emit(TraceEvent::ModelError {
+                                agent: "tree".to_string(),
+                                error: e.to_string(),
+                            });
+                            verdict = Verdict {
+                                pass: false,
+                                feedback: format!("harness: git diff failed: {e}"),
+                            };
+                            break;
+                        }
+                    };
+                    writes_made = diff.changed();
+                    diff_stat = diff.stat.clone();
+                    for name in &diff.names {
+                        if !changed_files.iter().any(|seen: &String| seen == name) {
+                            changed_files.push(name.clone());
+                        }
+                    }
+
+                    let rstate = CtxState {
                     long_term: reviewer_head.clone(),
                     mid_term: format!("PLAN: {plan_json}\nCURRENT TASK: {task}{reviewer_reuse}"),
                     short_term: format!(
@@ -442,121 +476,129 @@ impl Orchestrator {
                         }
                     ),
                 };
-                // The reviewer is budgeted like everyone else, per layer. Its
-                // short layer holds the artifact and the check output — fresh
-                // evidence, unarmed for summarization by default (see
-                // `policy.rs`), so what it usually needs here is the cut.
-                let (rview, rreports) = builder.plan_summarized(&rstate, &self.context).await;
-                self.fold_layers(&rreports, &mut acc);
-                let reviewer = ReviewerAgent::new(&self.verify);
-                match reviewer
-                    .run(AgentCtx {
-                        view: &rview,
-                        context: None,
-                        executor: Some(&self.verify),
-                        tools: Some(tools),
-                        workdir: Some(workdir),
-                        trace: &self.trace,
-                        volatile_budget: 0,
-                    })
-                    .await
-                {
-                    Ok(o) => {
-                        if let Ok(v) = serde_json::from_value::<Verdict>(o.data.clone()) {
-                            verdict = v;
-                        } else {
+                    // The reviewer is budgeted like everyone else, per layer. Its
+                    // short layer holds the artifact and the check output — fresh
+                    // evidence, unarmed for summarization by default (see
+                    // `policy.rs`), so what it usually needs here is the cut.
+                    let (rview, rreports) = builder.plan_summarized(&rstate, &self.context).await;
+                    self.fold_layers(&rreports, &mut acc);
+                    let reviewer = ReviewerAgent::new(&self.verify);
+                    match reviewer
+                        .run(AgentCtx {
+                            view: &rview,
+                            context: None,
+                            executor: Some(&self.verify),
+                            tools: Some(tools),
+                            workdir: Some(workdir),
+                            trace: &self.trace,
+                            volatile_budget: 0,
+                        })
+                        .await
+                    {
+                        Ok(o) => {
+                            if let Ok(v) = serde_json::from_value::<Verdict>(o.data.clone()) {
+                                verdict = v;
+                            } else {
+                                verdict = Verdict {
+                                    pass: false,
+                                    feedback: "bad verdict shape".to_string(),
+                                };
+                            }
+                        }
+                        Err(e) => {
+                            self.trace.emit(TraceEvent::ModelError {
+                                agent: "reviewer".to_string(),
+                                error: e.to_string(),
+                            });
                             verdict = Verdict {
                                 pass: false,
-                                feedback: "bad verdict shape".to_string(),
+                                feedback: e.to_string(),
                             };
                         }
                     }
-                    Err(e) => {
-                        self.trace.emit(TraceEvent::ModelError {
-                            agent: "reviewer".to_string(),
-                            error: e.to_string(),
+                    // Harness-side write gate: defense in depth against a
+                    // pass-happy reviewer. The prompt asks for this, but the
+                    // harness refuses a pass on empty work regardless.
+                    if verdict.pass && session.expect_writes && writes_made == 0 {
+                        self.trace.emit(TraceEvent::StateTransition {
+                            from: "verdict_pass".to_string(),
+                            to: "rejected_no_writes".to_string(),
                         });
                         verdict = Verdict {
                             pass: false,
-                            feedback: e.to_string(),
+                            feedback:
+                                "harness: pass rejected — the task expected a file change but \
+                                   no writes were applied"
+                                    .to_string(),
                         };
                     }
-                }
-                // Harness-side write gate: defense in depth against a
-                // pass-happy reviewer. The prompt asks for this, but the
-                // harness refuses a pass on empty work regardless.
-                if verdict.pass && session.expect_writes && writes_made == 0 {
+                    if verdict.pass {
+                        break;
+                    }
+                    feedback = verdict.feedback.clone();
                     self.trace.emit(TraceEvent::StateTransition {
-                        from: "verdict_pass".to_string(),
-                        to: "rejected_no_writes".to_string(),
+                        from: "reviewing".to_string(),
+                        to: "implementing".to_string(),
                     });
-                    verdict = Verdict {
-                        pass: false,
-                        feedback: "harness: pass rejected — the task expected a file change but \
-                                   no writes were applied"
-                            .to_string(),
-                    };
+                    // Buy one more round instead of stopping when
+                    // the failure shape says "instruction problem" (no writes when
+                    // they were required) or a cap-exhausted retry. Bounded: a
+                    // task is poked at most once, whatever the cap.
+                    if !poked
+                        && self.cfg.auto_poke
+                        && round == rounds
+                        && crate::eval::goal_quality::should_auto_poke(
+                            verdict.pass,
+                            ran,
+                            writes_made,
+                            session.expect_writes,
+                            budget_hit.is_some(),
+                        )
+                    {
+                        poked = true;
+                        rounds += 1;
+                        let reason = crate::eval::goal_quality::poke_reason(
+                            ran,
+                            writes_made,
+                            session.expect_writes,
+                        );
+                        self.trace.emit(TraceEvent::AutoPoke {
+                            task: task.clone(),
+                            reason: reason.clone(),
+                        });
+                        feedback = format!("{feedback}\n{reason}");
+                    }
+                    // §4.2: a failed attempt is discarded when a retry follows, so
+                    // the retry starts from the baseline its snapshot shows. The
+                    // last round keeps its state in the copy for reading.
+                    if round < rounds {
+                        self.trace.emit(TraceEvent::StateTransition {
+                            from: "reviewing".to_string(),
+                            to: "rolled_back".to_string(),
+                        });
+                        if let Err(e) = tree.rollback() {
+                            // Best effort: a failed rollback leaves the tree as it
+                            // is, the next baseline re-commits it, and the run
+                            // continues — the substrate is a means, not a result.
+                            self.trace.emit(TraceEvent::ModelError {
+                                agent: "tree".to_string(),
+                                error: format!("rollback failed (continuing): {e}"),
+                            });
+                        }
+                    }
+                    // The retry's evidence, after the rollback: the tool verdicts,
+                    // minus any content the rollback reverted (see the function).
+                    refused = crate::engine::session::file_state_evidence(&artifact);
+                    round += 1;
                 }
+                total_rounds += ran;
+                // First pass wins: sequential attempts bill in order, so the
+                // first pass is the cheapest. A failed sequence falls through to
+                // the next attempt with a rolled-back tree.
                 if verdict.pass {
                     break;
                 }
-                feedback = verdict.feedback.clone();
-                self.trace.emit(TraceEvent::StateTransition {
-                    from: "reviewing".to_string(),
-                    to: "implementing".to_string(),
-                });
-                // Buy one more round instead of stopping when
-                // the failure shape says "instruction problem" (no writes when
-                // they were required) or a cap-exhausted retry. Bounded: a
-                // task is poked at most once, whatever the cap.
-                if !poked
-                    && self.cfg.auto_poke
-                    && round == rounds
-                    && crate::eval::goal_quality::should_auto_poke(
-                        verdict.pass,
-                        ran,
-                        writes_made,
-                        session.expect_writes,
-                        budget_hit.is_some(),
-                    )
-                {
-                    poked = true;
-                    rounds += 1;
-                    let reason = crate::eval::goal_quality::poke_reason(
-                        ran,
-                        writes_made,
-                        session.expect_writes,
-                    );
-                    self.trace.emit(TraceEvent::AutoPoke {
-                        task: task.clone(),
-                        reason: reason.clone(),
-                    });
-                    feedback = format!("{feedback}\n{reason}");
-                }
-                // §4.2: a failed attempt is discarded when a retry follows, so
-                // the retry starts from the baseline its snapshot shows. The
-                // last round keeps its state in the copy for reading.
-                if round < rounds {
-                    self.trace.emit(TraceEvent::StateTransition {
-                        from: "reviewing".to_string(),
-                        to: "rolled_back".to_string(),
-                    });
-                    if let Err(e) = tree.rollback() {
-                        // Best effort: a failed rollback leaves the tree as it
-                        // is, the next baseline re-commits it, and the run
-                        // continues — the substrate is a means, not a result.
-                        self.trace.emit(TraceEvent::ModelError {
-                            agent: "tree".to_string(),
-                            error: format!("rollback failed (continuing): {e}"),
-                        });
-                    }
-                }
-                // The retry's evidence, after the rollback: the tool verdicts,
-                // minus any content the rollback reverted (see the function).
-                refused = crate::engine::session::file_state_evidence(&artifact);
-                round += 1;
-            }
-            total_rounds += ran;
+            } // end attempts loop
             let aborted = budget_hit.is_some();
             if aborted {
                 verdict = Verdict {
