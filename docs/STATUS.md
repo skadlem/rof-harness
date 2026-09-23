@@ -2954,3 +2954,21 @@ vs the $60/mo deepseek-flash cap (4x promo ends Sep 27).
 skipped, 1 xfailed`, `oracle_is_repo: true`. The 1 broken test passes again;
 the fix is real, not vacuous. First generated-suite discrimination point:
 easy edge lands. Queued: bug05 (6 tests), bug07 (22), bug02 (35).
+
+## 2026-09-23 — skip-arm full-20: 18/20 (90%), gated 13/15, analysis 5/5
+
+`ROF_PLANNER=skip` + best-config bundle, deepseek-flash, jobs=4.
+Report: `~/rof-runs/report-full20-skip.json` (copy of report-0923-1031).
+Billed 555,671 — **2.5× cheaper than planner-on (1.40M) AND +4 tasks**.
+The Atria planner finding replicates and amplifies: skip dominates on both
+axes. Analysis goes 5/5 ( Atria skip managed 1-2/5); multi-metric-and-trace —
+failed under planner-on — passes. Only the stubborn pair still fails
+(add-retriever-test: transport/truncation across the chain; metrics: prose
+refusal), 12 rounds burned on each.
+
+## 2026-09-23 — click band: bug05 FIXED (middle, 6 tests)
+
+`pilot-go.py bug05 c1`: exit 0 in 880s, `612 passed`, oracle_is_repo true.
+Band so far: bug06 PASS (1 test), bug05 PASS (6 tests). Remaining: bug07
+(22 tests), bug02 (35 tests) — the hard edge that decides whether the suite
+discriminates or walls.
