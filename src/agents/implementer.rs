@@ -1,4 +1,4 @@
-use super::{Agent, AgentCtx, AgentOutput};
+use super::{max_tokens_from_env, thinking_start, Agent, AgentCtx, AgentOutput};
 use crate::context::retriever::window_on;
 use crate::context::{Assembly, ContextAssembler, ContextItem, Fidelity, ItemKey};
 use crate::llm::LlmReq;
@@ -521,36 +521,6 @@ fn string_list(data: &serde_json::Value, key: &str, max: usize) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `ROF_THINKING` starting posture for implementer calls, as
-/// `(thinking_off, reasoning_off, reasoning_low)`.
-///
-/// The retry ladder escalates after a truncation, which cannot help a model
-/// that never terminates reasoning (measured: 33k reasoning chars, 0 content).
-/// `off` starts thought-off so there is no budget to burn; `low` starts
-/// bounded. Anything else is current behavior. Read from the env at call time
-/// (like the provider clients) so arms need no config file.
-fn thinking_start() -> (bool, bool, bool) {
-    thinking_flags(
-        &std::env::var("ROF_THINKING")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase(),
-    )
-}
-
-fn thinking_flags(mode: &str) -> (bool, bool, bool) {
-    match mode {
-        "off" => (true, true, false),
-        "low" => (false, false, true),
-        _ => (false, false, false),
-    }
-}
-
-/// Test helper: the mode mapping without touching the env.
-pub fn thinking_flags_for_test(mode: &str) -> (bool, bool, bool) {
-    thinking_flags(mode)
-}
-
 impl ImplementerAgent<'_> {
     /// One Executor call, traced.
     async fn ask_with_system(
@@ -565,7 +535,7 @@ impl ImplementerAgent<'_> {
             .complete(LlmReq {
                 system: system.to_string(),
                 prompt: prompt.to_string(),
-                max_tokens: 8192,
+                max_tokens: max_tokens_from_env("ROF_IMPLEMENTER_MAX_TOKENS", 8192),
                 reasoning_off,
                 reasoning_low,
                 roomier: false,
