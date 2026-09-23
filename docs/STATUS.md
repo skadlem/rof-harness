@@ -3170,3 +3170,14 @@ delegation. Full suite + clippy + fmt green. Report:
 effort-medium base: 0 writes, 8 model errors, 3 retried calls, 35 failed /
 577 passed in 1149 s, oracle_is_repo true. Same silence class as c3/c5.
 Reps c7/c8 (identical config) running for the 3-rep verdict.
+
+## 2026-09-24 — bug02 caps arm verdict: 0/3, null result recorded
+
+Identical config (skip+explorer+attempts=3+250k+effort-medium), only
+`ROF_IMPLEMENTER_MAX_TOKENS=4096` (reviewer already 4096): c6/c7/c8 →
+0 writes every rep, 35 failed / 577 passed, ~1100 s each, oracle_is_repo
+true. Halving the per-call cap does not fix bug02 for rof — same silence
+class as c3/c5, and noisier than medium's one wrong-edit. The cheapest
+untested lever is spent; remaining hypotheses are loop-shape (leaner
+per-turn prompts, shrink-and-retry) or above this model's ceiling.
+Reports: `~/.local/share/rof-pilot/results/c{6,7,8}-bug02.json`.
