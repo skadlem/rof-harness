@@ -526,6 +526,25 @@ async fn main() -> anyhow::Result<()> {
             let cfg = load_config(cfg_path.as_deref())?;
             skills_cmd(&cfg, &args[2.min(args.len())..])
         }
+        Some("chat") => {
+            // Replay reads a recorded trace only; the live loop lands in
+            // Plan C. `--replay` parsing mirrors the `run` arm's tail
+            // convention: position in args[2..], value is the next arg.
+            let tail: &[String] = args.get(2..).unwrap_or(&[]);
+            let replay_path = tail
+                .iter()
+                .position(|a| a == "--replay")
+                .and_then(|i| tail.get(i + 1));
+            match replay_path {
+                Some(path) => rof::tui::run::replay(std::path::Path::new(path)),
+                None => {
+                    eprintln!(
+                        "rof chat: live loop lands in Plan C (replay with --replay <trace.jsonl>)"
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
         Some("run") => {
             // Flags are harness input, never goal text: strip them before the
             // join so they cannot pollute the recorded session goal.
