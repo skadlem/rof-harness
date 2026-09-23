@@ -3078,3 +3078,21 @@ timeout/silence/wrong-edit) — a harness-attributed gap on huge-deletion
 tasks with non-converging reasoning. Prime hypothesis: rivals bound reasoning
 effort in a way Go honors (hermes `--reasoning medium`); rof's vLLM-style
 controls are ignored there and its top-level effort only half-closes it.
+
+## 2026-09-23 — effort matrix on bug02: bounding doesn't fix it for rof
+
+Same config (skip+explorer+attempts=3+250k), only `ROF_REASONING_EFFORT` varies:
+
+| effort | outcome |
+|---|---|
+| low | 4× truncation, clean tree |
+| medium | acts unreliably (wrong-edit once, silent once) |
+| high | 6× truncation, clean tree |
+| none | converges every call, 0 writes, passive failure |
+
+hermes passes the same bug with `--reasoning medium` on the same model — so
+the wire-level bound works in their loop, not in rof's. Remaining hypotheses
+are loop-shape, not params: leaner per-turn prompts, or shrink-and-retry after
+truncation instead of same-size re-ask. A per-call output cap (`max_tokens`
+8192 today) forcing short reasoning is the cheapest untested lever. Not run
+tonight: diminishing returns after 4 runs, all committed below.
