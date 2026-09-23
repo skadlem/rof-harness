@@ -3150,3 +3150,23 @@ Coverage: `tests/v4_compact.rs` (prose-vs-bytes, env gate, fallback);
 full suite (21 targets) + clippy + fmt green; Atria reviewer OK (second shape —
 first timed out reading STATUS.md unasked; retry with docs forbidden passed
 all three checks). Live arm (compact on multi-round tasks) not yet run.
+
+## 2026-09-23 — TUI Plan A lands (renderer + --print-trace + lenient reader)
+
+`src/tui/render.rs`: pure `render_line`/`Counters::fold` over `TraceEvent`,
+`parse_lenient_line` (unknown JSONL kinds → dim marker, never an error);
+`rof run --print-trace` dumps the trace as JSONL (flag stripped from the
+recorded goal — a worker's demo caught the leak, fixed at the join).
+Subagent-driven per plan (3 Atria workers, main-thread review between tasks);
+one incident: a demo `rof run` executed with the repo as cwd committed the
+uncommitted work as `c469347 rof: attempt baseline` — unwound via soft reset,
+new hard rule (never execute rof with the repo as cwd) now rides every
+delegation. Full suite + clippy + fmt green. Report:
+`~/.local/share/rof-pilot/results/c6-bug02.json` pattern applies to TUI demo.
+
+## 2026-09-23 — bug02 caps arm rep 1 (c6): halving implementer cap doesn't move it
+
+`ROF_IMPLEMENTER_MAX_TOKENS=4096` (reviewer already 4096), planner-skip +
+effort-medium base: 0 writes, 8 model errors, 3 retried calls, 35 failed /
+577 passed in 1149 s, oracle_is_repo true. Same silence class as c3/c5.
+Reps c7/c8 (identical config) running for the 3-rep verdict.

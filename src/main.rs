@@ -527,12 +527,20 @@ async fn main() -> anyhow::Result<()> {
             skills_cmd(&cfg, &args[2.min(args.len())..])
         }
         Some("run") => {
+            // Flags are harness input, never goal text: strip them before the
+            // join so they cannot pollute the recorded session goal.
             let goal = args
                 .get(2..)
-                .map(|a| a.join(" "))
+                .map(|a| {
+                    a.iter()
+                        .filter(|w| *w != "--print-trace")
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
                 .filter(|g| !g.is_empty())
                 .unwrap_or("demo goal".to_string());
-            run_goal(&goal, cfg_path.as_deref()).await
+            run_goal(&goal, cfg_path.as_deref(), &args).await
         }
         _ => {
             let goal = args
@@ -540,12 +548,12 @@ async fn main() -> anyhow::Result<()> {
                 .map(|a| a.join(" "))
                 .filter(|g| !g.is_empty())
                 .unwrap_or("demo goal".to_string());
-            run_goal(&goal, cfg_path.as_deref()).await
+            run_goal(&goal, cfg_path.as_deref(), &args).await
         }
     }
 }
 
-async fn run_goal(goal: &str, config_path: Option<&str>) -> anyhow::Result<()> {
+async fn run_goal(goal: &str, config_path: Option<&str>, args: &[String]) -> anyhow::Result<()> {
     let s = setup(load_config(config_path)?)?;
     // Accept the same exact-allowlist check(s) in run mode.
     let checks: Vec<String> = std::env::var("ROF_CHECK")
@@ -571,6 +579,11 @@ async fn run_goal(goal: &str, config_path: Option<&str>) -> anyhow::Result<()> {
     println!("result: {}", serde_json::to_string_pretty(&out)?);
     let passed = out["passed"].as_bool().unwrap_or(false);
     print_report(&s.trace, passed);
+    if args.iter().any(|a| a == "--print-trace") {
+        for ev in s.trace.events() {
+            println!("{}", serde_json::to_string(&ev)?);
+        }
+    }
     // A harness that exits 0 on a failed task is invisible to every caller:
     // Harbor, CI, and a comparison script all read the exit code first. The
     // verdict is already computed; this only refuses to discard it.
