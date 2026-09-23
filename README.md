@@ -1,14 +1,60 @@
 # rof — a local agent harness with a meta-harness
 
 A self-contained Rust agent runtime. It owns its orchestration, context handling, tools and
-evaluation; only model inference goes to an external API. Two logical models are used:
+evaluation; only model inference goes to an external API. One model does everything by
+default (an explicit `ROF_CTX_MODEL` still buys a two-tier A/B) — the arms never showed
+a cheap planning tier earning its keep, so context assembly is fully deterministic:
+selection, budgeting, windowing and dedupe by rule, never summarization by model.
 
-- **Context LLM** — planning, context compaction (cheap tier)
-- **Executor LLM** — tool-using implementation and review (strong tier)
+Orchestration is `Planner -> (Implementer -> Reviewer)*` (or a single direct executor with
+`ROF_PLANNER=skip`), bounded by rounds, attempts and a per-task token ceiling, with every
+model call, tool call, verdict and budget abort written to a durable JSONL trace that the
+eval layer folds into metrics.
 
-Orchestration is `Planner -> (Implementer -> Reviewer)*`, bounded by rounds and a per-task token
-ceiling, with every model call, tool call, verdict and budget abort written to a durable JSONL
-trace that the eval layer folds into metrics.
+## Measured performance (DeepSeek V4.1 Flash via OpenCode Go, Sep 2026)
+
+`eval/suites/repo-tasks.json` (20 tasks: 15 gated on `cargo check`/`cargo test`, 5 oracle-less
+analysis judged by the reviewer), best config (`ROF_PLANNER=skip`, `ROF_EXPLORER=yes`,
+`ROF_ATTEMPTS=3`, `ROF_MAX_ROUNDS=4`, 250k task cap), three reps:
+
+| rep | total | gated (15) | analysis (5) | billed tokens |
+|---|---|---|---|---|
+| 1 | **18/20 (90%)** | 13 | 5 | 556k |
+| 2 | 16/20 (80%) | 12 | 4 | 713k |
+| 3 | 17/20 (85%) | 12 | 5 | 642k |
+| **mean** | **17/20 (85%)** | **12.3** | **4.7** | **~640k** |
+
+What moved it, in order (each measured against the row above on the same model):
+
+| lever | effect |
+|---|---|
+| `ROF_PLANNER=skip` | +4 tasks (14/20 → 18/20) at **2.5× fewer billed tokens** (1.40M → 556k); analysis went 2/5 → 5/5 |
+| `ROF_EXPLORER=yes` | retriever-class tasks 0/3 → **3/3** — evidence before action kills both recon-paralysis and wrong-guess patches |
+| `ROF_ATTEMPTS=3` + 250k cap | multi-hunk tasks start landing (0/2 → 1/2 on the hard pair); without headroom, 3 attempts die by budget, not capability |
+| `ROF_THINKING=off/low` | **no effect** — kept as an A/B lever, not a setting |
+| top-level `reasoning_effort` | moved the hardest bug from silence to action (see band below); vLLM-style thinking switches are ignored by this endpoint |
+
+Generated band (SWE-smith on `pallets__click`, kept iff the bug breaks a real test;
+counted by independent oracle that asserts it imports from the tree under test):
+
+| bug (tests broken) | rof | hermes | pi |
+|---|---|---|---|
+| `pass_context` arg order (1) | ✓ 14min | ✓ | ✓ |
+| inverted `startswith` (6) | ✓ 15min | ✓ | ✓ |
+| param-hint join (22) | ✓ 11min | ✓ | ✓ |
+| gutted `ProgressBar` (35) | ✗ (timeout/silence/wrong-edit over 3 tries) | ✓ | ✓ |
+
+The last row is reported the same way as the wins: on one fixed model everything ties
+except the hard edge, where rof is the lone failure — a harness-attributed gap on
+large-deletion tasks with non-converging reasoning, and the current top priority.
+Rival cells are single reps (their variance is unmeasured); rof cells are 1 rep each on
+the band, 3 reps on the suite. Wall-clock (~40min per full-20 rep) was the binding
+constraint throughout; total quota ≈ $2–3 of the model's $60/mo cap.
+
+Earlier era (Atria, quota-free endpoint): mf-suite 18/18 tied with hermes at 5.1× fewer
+billed tokens/task (7,906 vs 40,528, all 18 cells); Terminal-Bench 4.0 0/8 for all three
+harnesses on a correctness wall. The repo-tasks numbers above supersede the old headline
+(Atria best 12.7/20) on a stronger model with a better harness.
 
 ## Build and run
 
@@ -23,6 +69,7 @@ cargo build --release                 # single binary: target/release/rof
 ./target/release/rof skills approve <id>                    # apply an agent's proposed skill
 ./target/release/rof --config my.json eval suites/repo-tasks.json
 scripts/live-eval.sh eval/suites/repo-tasks.json --limit 6 --jobs 2        # same, wired to a live model
+scripts/live-go.sh eval/suites/repo-tasks.json --limit 6 --jobs 2          # same, via OpenCode Go (needs ROF_TOKEN, see below)
 scripts/measure-arm.sh before 3 eval/suites/repo-tasks.json --limit 6 --jobs 2   # an arm: 3 labelled runs
 ```
 
@@ -30,6 +77,19 @@ Live models need credentials in the environment (`OR_TOKEN` for OpenRouter, or
 `DEEPSEEK_API_KEY`/`ROF_TOKEN` with `ROF_CHAT_BASE` for a direct OpenAI-compatible endpoint).
 Without them the harness runs against a deterministic stub, which is how the tests exercise the
 full loop offline.
+
+OpenCode Go (DeepSeek V4.1 Flash) is the current live path: get the key via opencode
+`/connect` → OpenCode Go, then either `export ROF_TOKEN=<key>` or write it to
+`~/.rof/go.key` (chmod 600, outside the repo — never committed). `scripts/live-go.sh`
+reads one then the other and pins both model slots plus the reasoning-effort default:
+
+```bash
+export ROF_TOKEN="<your-go-key>"                 # or: echo "<key>" > ~/.rof/go.key
+scripts/live-go.sh eval/suites/repo-tasks.json --limit 6 --jobs 2
+```
+
+Go requires an `x-opencode-session` routing header, which rof sends (per-client UUID,
+OpenCode endpoints only) alongside a `rof/<version>` user agent.
 
 **Always point `ROF_WORKDIR` at a scratch copy** — the harness edits the working directory,
 and a run commits a baseline before each attempt (`git init` plus one commit if the tree is
@@ -70,6 +130,8 @@ A suite run never touches `ROF_WORKDIR`: every task runs in its own copy
 | `ROF_ATTEMPTS` | `1`-`5` — independent task attempts, cheapest-pass wins (default 1 = historical run) |
 | `ROF_VERIFY_GUARD` | `yes`/`true`/`1` — one post-hoc independent-judge pass; a veto fails the attempt (off by default) |
 | `ROF_ALLOW_PREFIXES` | comma-separated `proc.run` prefixes (`cargo test` covers `cargo test foo`, never `cargo test-evil`) |
+| `ROF_THINKING` | `off`/`low`/`on` — implementer reasoning starting posture (default `on`; measured no effect, kept for A/B) |
+| `ROF_REASONING_EFFORT` | `low`/`medium`/`high`/`none` — top-level effort field; the knob Go-style endpoints honor (vLLM switches are ignored there); unset = absent from the wire |
 
 Precedence: defaults < config file < environment < CLI flags. `rof eval <suite> --report out.json`
 writes the suite report (per-task verdicts + feedback, folded metrics) next to the trace, so a
