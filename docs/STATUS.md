@@ -2927,3 +2927,22 @@ way — high variance, above-ceiling follow-through (5 coordinated hunks stall
 at 3/5). attempts needs headroom: 3 sequences against a shared 50k cap die by
 budget, not capability. Wall-clock is now the binding constraint (~20min/rep
 at jobs=2); quota spend ≈ $0.50 total vs $60/mo deepseek-flash cap.
+
+## 2026-09-23 — full-20 best-config: 14/20 (70%), gated 12/15, analysis 2/5
+
+`ROF_EXPLORER=yes ROF_MAX_TASK_TOKENS=250000 ROF_ATTEMPTS=3 ROF_MAX_ROUNDS=4`,
+pipeline, deepseek-flash, jobs=4, ~40min wall. Report:
+`~/rof-runs/report-0923-0947.json`. Billed 1.40M (52% cache-hit), est $0.52.
+
+Against Atria's best skip-arm (gated 11-12/15, analysis 1-2/5, 12.7/20):
+deepseek-flash matches the top of Atria's gated range (12/15) and its analysis
+band (2/5). By the repo's own numbers that is frontier-class on this suite —
+with the single-rep caveat (methodology wants 3; wall-clock forbids it today).
+
+Failing gated: add-retriever-test, metrics-model-call-rate (the stubborn pair
+from the subset arms) plus multi-metric-and-trace, same multi-hunk family,
+failed 3/5-partial the same way. Retriever passed 3/3 on the subset but failed
+here — explorer moves probability, not certainty (jobs=4 vs 2, or variance).
+Failing analysis: the 3 prose-oracle tasks the reviewer alone judges, same as
+Atria. Cost note: est $0.52/run at Go prices; quota spend today ≈ $1.20 total
+vs the $60/mo deepseek-flash cap (4x promo ends Sep 27).
