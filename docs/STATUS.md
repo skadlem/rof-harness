@@ -3015,3 +3015,12 @@ was the fix, not credentials. bug06 on deepseek-flash: rof ✓ (822s), hermes �
 (self-verified red→green with pinned oracle discipline), pi ✓ — all confirmed
 by independent oracle (`612 passed`, import resolves to the work tree).
 (My first oracle pass said "no tests ran" — my own cwd mistake, corrected.)
+
+## 2026-09-23 — bug02c3 (skip+explorer): FAILED, pure non-terminating reasoning
+
+Best config + skip: 7 truncation errors at 32-34k reasoning / 0 content —
+implementer AND reviewer (reviewer has no thinking flags at all). Tree clean.
+Same signature as the Atria dotenv ceiling: reasoning never converges at any
+budget. Open question is wall-vs-gap: hermes + pi now running bug02 on the
+same model. If all three wall, the band is bug06/05/07 and bug02 is the
+documented ceiling, not a rof deficit.
