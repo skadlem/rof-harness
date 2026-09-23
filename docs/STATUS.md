@@ -3059,3 +3059,22 @@ planner decomposition, explorer evidence, bounded effort, venv suite signal,
 Standing result: rof 3/4 + hard-edge ceiling on this model. Rivals' bug02
 passes are single reps (their variance unmeasured); completing their band
 reps is now the comparison.
+
+## 2026-09-23 — three-way click band complete: hermes 4/4, pi 4/4, rof 3/4
+
+Oracle-verified (`612 passed`, repo-import forced via PYTHONPATH), single reps:
+
+| bug (tests broken) | rof | hermes | pi |
+|---|---|---|---|
+| bug06 (1) | ✓ 822s | ✓ | ✓ |
+| bug05 (6) | ✓ 880s | ✓ | ✓ |
+| bug07 (22) | ✓ 661s | ✓ | ✓ |
+| bug02 (35) | ✗✗✗ (c2 timeout, c3/c5 silent, c4 wrong-place) | ✓ | ✓ |
+
+This is the most valuable single datum of the session: on one fixed model,
+everything ties except the hard edge, where rof is the lone failure. Not a
+wall (two harnesses pass it), not variance (three rof tries, three shapes:
+timeout/silence/wrong-edit) — a harness-attributed gap on huge-deletion
+tasks with non-converging reasoning. Prime hypothesis: rivals bound reasoning
+effort in a way Go honors (hermes `--reasoning medium`); rof's vLLM-style
+controls are ignored there and its top-level effort only half-closes it.
