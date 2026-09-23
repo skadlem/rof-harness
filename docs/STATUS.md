@@ -3048,3 +3048,14 @@ never write into a working venv; check `ls -l` before linking over a binary.
 Side benefit: c5 (launched with venv-first PATH) now resolves `python3` to
 the venv interpreter mid-run, so its remaining rounds get a working suite
 signal — the trap fix landed by accident.
+
+## 2026-09-23 — bug02c5: pure truncation despite effort+explorer+venv signal
+
+8 implementer errors (truncations + 1 transport), 0 writes, clean tree. Same
+config as c4 (which acted-but-wrong) now yields silence — variance dominates,
+not the knobs. bug02 exceeds deepseek-flash-via-rof's reliable ceiling:
+planner decomposition, explorer evidence, bounded effort, venv suite signal,
+3 attempts — none of it gets a patch on the tree twice in three tries.
+Standing result: rof 3/4 + hard-edge ceiling on this model. Rivals' bug02
+passes are single reps (their variance unmeasured); completing their band
+reps is now the comparison.
