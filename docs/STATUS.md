@@ -3135,3 +3135,18 @@ was implemented main-thread instead (third shape, red-green owned). No hermes
 `responses` api_mode investigation (grind rule; the lever it would serve is
 already built). Heavy-judgment roles stay on Atria or main-thread until a
 responses-capable child path is proven.
+
+## 2026-09-23 — transcript-only compaction (/compact core, default off)
+
+`ROF_COMPACT=yes/true/1` arms a prose-only round digest (`src/engine/digest.rs`):
+verdict feedback, harness rejections, `answer_of`, skill lines, changed path
+NAMES, condensed checks. File bytes structurally excluded (no `file_state` /
+`refused` / `[VERIFIED FILES]` / retrieval reads — the Stage 2 8/12→2/12
+finding, by construction). Per-task digest, reset per attempt; prefix into
+implementer short-term; one cheap-model summarize at ≥1200 chars (bound
+clamped [64,2000]), head+tail fallback on failure, accounting through the
+existing `fold_layers` (trace + report). Unset → prompts byte-identical.
+Coverage: `tests/v4_compact.rs` (prose-vs-bytes, env gate, fallback);
+full suite (21 targets) + clippy + fmt green; Atria reviewer OK (second shape —
+first timed out reading STATUS.md unasked; retry with docs forbidden passed
+all three checks). Live arm (compact on multi-round tasks) not yet run.

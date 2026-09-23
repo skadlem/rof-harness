@@ -1,3 +1,4 @@
+pub mod digest;
 pub mod orchestrator;
 pub mod router;
 pub mod session;

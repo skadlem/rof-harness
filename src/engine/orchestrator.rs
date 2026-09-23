@@ -226,6 +226,11 @@ impl Orchestrator {
 
         for (ti, task) in tasks.iter().enumerate() {
             let mut feedback = String::new();
+            // Transcript-only compaction (/compact, default off): prose-only
+            // round notes. Reset per attempt like the rest of the round
+            // state, so attempts stay independent sequences.
+            let mut digest = crate::engine::digest::RoundDigest::new();
+            let compact_on = crate::engine::digest::compact_enabled();
             // Fresh-read evidence from a refused patch, for the next round.
             let mut refused = String::new();
             let mut artifact = serde_json::Value::Null;
@@ -282,6 +287,7 @@ impl Orchestrator {
                         });
                     }
                     feedback = String::new();
+                    digest = crate::engine::digest::RoundDigest::new();
                     refused = String::new();
                     artifact = serde_json::Value::Null;
                     changed_files = Vec::new();
@@ -326,6 +332,52 @@ impl Orchestrator {
                         };
                         break;
                     }
+                    // Digest prefix: raw below the floor, one cheap-model call
+                    // at/above it, head+tail cut when that call fails. File
+                    // bytes never enter the digest (Stage 2: 8/12 → 2/12),
+                    // and the accounting rides the existing fold so the call
+                    // is visible in the trace and the report like any layer
+                    // summary.
+                    let digest_prefix = if compact_on && !digest.is_empty() {
+                        let raw = digest.render_raw();
+                        if digest.needs_compaction() {
+                            let bound = (raw.chars().count() / 16).clamp(64, 2000);
+                            match self.context.summarize(&raw, bound).await {
+                                Ok(r) => {
+                                    self.fold_layers(
+                                        &[LayerReport {
+                                            layer: crate::context::LayerKind::Short,
+                                            strategy: crate::context::LayerStrategy::Raw,
+                                            chars: r.text.chars().count(),
+                                            est_tokens: r.text.chars().count() / 4,
+                                            truncated: false,
+                                            summarized: true,
+                                            summarize: crate::context::SummaryStat {
+                                                call: true,
+                                                cached: false,
+                                                input_tokens: r.input_tokens,
+                                                output_tokens: r.output_tokens,
+                                                cached_input_tokens: r.cached_input_tokens,
+                                                latency_ms: r.latency_ms,
+                                                cost_usd: r.cost_usd,
+                                                attempts: r.attempts,
+                                            },
+                                        }],
+                                        &mut acc,
+                                    );
+                                    format!("ROUND HISTORY (compacted):\n{}\n", r.text)
+                                }
+                                Err(_) => format!(
+                                    "ROUND HISTORY:\n{}\n",
+                                    crate::engine::digest::head_tail(&raw, 1600)
+                                ),
+                            }
+                        } else {
+                            format!("ROUND HISTORY:\n{raw}\n")
+                        }
+                    } else {
+                        String::new()
+                    };
                     let istate = CtxState {
                     long_term: impl_head.clone(),
                     // Stable-first ordering: goal and repo retrieval are
@@ -342,12 +394,12 @@ impl Orchestrator {
                     ),
                     short_term: if feedback.is_empty() {
                         format!(
-                            "WRITES REQUIRED: {}\nround {round}/{rounds}: first attempt",
+                            "{digest_prefix}WRITES REQUIRED: {}\nround {round}/{rounds}: first attempt",
                             if session.expect_writes { "yes" } else { "no" }
                         )
                     } else {
                         format!(
-                            "WRITES REQUIRED: {}\nround {round}/{rounds}: reviewer feedback: {feedback}\nPREVIOUS CHECKS:\n{}{refused}",
+                            "{digest_prefix}WRITES REQUIRED: {}\nround {round}/{rounds}: reviewer feedback: {feedback}\nPREVIOUS CHECKS:\n{}{refused}",
                             if session.expect_writes { "yes" } else { "no" },
                             if checks_log.is_empty() {
                                 "(none configured)"
@@ -536,6 +588,16 @@ impl Orchestrator {
                         break;
                     }
                     feedback = verdict.feedback.clone();
+                    if compact_on {
+                        digest.note_round(
+                            round,
+                            verdict.pass,
+                            &feedback,
+                            &artifact,
+                            &changed_files.join(","),
+                            &checks_log,
+                        );
+                    }
                     self.trace.emit(TraceEvent::StateTransition {
                         from: "reviewing".to_string(),
                         to: "implementing".to_string(),
