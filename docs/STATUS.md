@@ -3002,3 +3002,16 @@ land, hard-middle lands, hard edge inconclusive.
 
 Quota total today ≈ $1.50-2.00 (all runs + 4 click pilots) vs the $60/mo
 deepseek-flash cap. Wall-clock was the binding constraint throughout.
+
+## 2026-09-23 — three-way band opens: bug06 fixed by ALL of rof/hermes/pi
+
+Rival wiring (all env-only or additive, secrets never in files): pi via new
+`~/.local/share/go-pi-ext` (mirrors atria-pi-ext; `GO_BASE`/`GO_KEY` env,
+explicit session header; installed, settings backup at /tmp/pi-settings.bak);
+hermes via additive `custom:go` entry in `~/.hermes/config.yaml` (`key_env:
+GO_KEY`; backup at /tmp/hermes-config.bak) selected with `--provider
+custom:go`. hermes env-only failed twice (stale-key 401s) — provider selection
+was the fix, not credentials. bug06 on deepseek-flash: rof ✓ (822s), hermes ✓
+(self-verified red→green with pinned oracle discipline), pi ✓ — all confirmed
+by independent oracle (`612 passed`, import resolves to the work tree).
+(My first oracle pass said "no tests ran" — my own cwd mistake, corrected.)
