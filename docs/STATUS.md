@@ -3096,3 +3096,42 @@ are loop-shape, not params: leaner per-turn prompts, or shrink-and-retry after
 truncation instead of same-size re-ask. A per-call output cap (`max_tokens`
 8192 today) forcing short reasoning is the cheapest untested lever. Not run
 tonight: diminishing returns after 4 runs, all committed below.
+
+## 2026-09-23 — per-call caps + reviewer thinking shaping (bug02 #1 enabler, untested lever)
+
+`ROF_IMPLEMENTER_MAX_TOKENS` (default 8192) and `ROF_REVIEWER_MAX_TOKENS`
+(default 4096), both clamped to [1024, 32768]; `ROF_THINKING` shaping now also
+applies to reviewer calls (was implementer-only). Shared helpers in
+`src/agents/mod.rs` (`thinking_start`, `max_tokens_from_env`); zero behavior
+change when env unset. Coverage: `tests/v4_caps.rs` (caps + clamp + reviewer
+mapping); full suite + clippy + fmt green; Atria reviewer pass (OK with notes,
+2× P2 fixed: README env rows, test isolation comment). Uncommitted-live-arm
+status: caps are the instrument for the "per-call output cap below 8192"
+follow-up — no live rep run yet.
+
+## 2026-09-23 — unreal-agent research: audited, shortlisted, mostly adopt-nothing
+
+Researcher brief (M1–M19, repo-verified): async event loop + in-progress
+placeholder + batching + committed-prefix cache discipline; verification is
+structurally absent (no reviewer/checks/write gate — rof is ahead there);
+cost control is structural, no budget owner (rof has one). Main-thread
+verified the three decision-critical claims against source (footnote 2
+provider-rejection verbatim; "up to 40%/20%" = Terminal-Bench best case,
+Codex row has no token breakdown, no CIs anywhere; meta/body contradiction on
+"no negative performance impact" confirmed). Shortlist: (1) this commit's caps
+lever, (2) wide-not-long batching (untested), (3) shrink-and-retry on
+truncation (untested). Async placeholder port rejected for now (provider risk
+per footnote 2). Brief:
+`subagent-artifacts/outputs/089fe115-…-…/research.md` (session 01a0cece-…).
+
+## 2026-09-23 — subagent model path: Muse child confirmed dead, Atria for everything
+
+`opencode-go/muse-spark-1.3-contributor:xhigh` worker fails at launch (21 s,
+`Request timed out`, zero output) — the bootstrap's responses-endpoint blocker
+holds on the child path even though the main thread runs on the same model via
+opencode's native path. Atria worker stalls differently (30 min, 14 turns, zero
+edits — deliberation speed). Both shapes tried once each; the caps change above
+was implemented main-thread instead (third shape, red-green owned). No hermes
+`responses` api_mode investigation (grind rule; the lever it would serve is
+already built). Heavy-judgment roles stay on Atria or main-thread until a
+responses-capable child path is proven.

@@ -130,7 +130,9 @@ A suite run never touches `ROF_WORKDIR`: every task runs in its own copy
 | `ROF_ATTEMPTS` | `1`-`5` — independent task attempts, cheapest-pass wins (default 1 = historical run) |
 | `ROF_VERIFY_GUARD` | `yes`/`true`/`1` — one post-hoc independent-judge pass; a veto fails the attempt (off by default) |
 | `ROF_ALLOW_PREFIXES` | comma-separated `proc.run` prefixes (`cargo test` covers `cargo test foo`, never `cargo test-evil`) |
-| `ROF_THINKING` | `off`/`low`/`on` — implementer reasoning starting posture (default `on`; measured no effect, kept for A/B) |
+| `ROF_THINKING` | `off`/`low`/`on` — implementer + reviewer reasoning starting posture (default `on`; measured no effect, kept for A/B) |
+| `ROF_IMPLEMENTER_MAX_TOKENS` | per-call output cap for implementer calls (default 8192, clamped to [1024, 32768]) |
+| `ROF_REVIEWER_MAX_TOKENS` | per-call output cap for reviewer calls (default 4096, clamped to [1024, 32768]) |
 | `ROF_REASONING_EFFORT` | `low`/`medium`/`high`/`none` — top-level effort field; the knob Go-style endpoints honor (vLLM switches are ignored there); unset = absent from the wire |
 
 Precedence: defaults < config file < environment < CLI flags. `rof eval <suite> --report out.json`
