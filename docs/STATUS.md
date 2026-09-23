@@ -3181,3 +3181,22 @@ class as c3/c5, and noisier than medium's one wrong-edit. The cheapest
 untested lever is spent; remaining hypotheses are loop-shape (leaner
 per-turn prompts, shrink-and-retry) or above this model's ceiling.
 Reports: `~/.local/share/rof-pilot/results/c{6,7,8}-bug02.json`.
+
+## 2026-09-24 — TUI Plan B lands (console state + layout + replay)
+
+`src/tui/app.rs` (event-fed state, status line), `ui.rs` (transcript/status/
+composer layout), `run.rs` (`rof chat --replay <trace>` alternate-screen
+replay, `q`/Esc/Ctrl-C quit; live loop prints Plan-C notice, exit 2).
+Subagent-driven (2 Atria + 1 Muse — the Muse child path works now, see
+below); main-thread review between tasks; one clippy `single_match` fixed at
+landing. Full suite + clippy + fmt green (one parallel flake,
+`context_metrics_fold_retrieval…`, green solo and on re-run).
+
+## 2026-09-24 — Muse child path OPEN (blocker lifted)
+
+The `muse-spark-1.3-contributor:xhigh` worker that timed out at launch last
+night now completes fully (Plan B Task 3, PTY-verified demo) with
+`subagents.agentOverrides` routing in `~/.pi/agent/settings.json` — the
+earlier failure looks like a routing/override-shape issue, not the endpoint.
+Policy stands: researcher + evidence-auditor on Atria, everything else Muse
+xhigh. If a Muse child fails fast again, re-open this entry.
