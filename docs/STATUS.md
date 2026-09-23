@@ -3218,3 +3218,14 @@ reviewed per task. Full suite + clippy + fmt green.
 Fix: test-only static mutex serializing the fake-suite runners (+ the
 project's standard `await_holding_lock` allow). No production change.
 3/3 green after.
+
+## 2026-09-24 — compact arm verdict: null, mechanism fires, no movement
+
+hard-two on Go flash, 3 reps off + 3 reps `ROF_COMPACT=yes`: off 0/6 tasks,
+on 1/6 — the single pass (on-3, metrics-method) went in round 1 with
+`summarize_calls: 0`, i.e. the digest was empty and compact did nothing.
+Attributable effect: 0/3 vs 0/3. The digest fired exactly as designed in
+on-1/on-2 (1 cheap call each, visible in trace + report counters) on tasks
+that failed anyway. Side finding: hard-two on Go flash is ~0/6, far below
+historical deepseek-chat numbers — regime difference, not a regression
+(default-off tree is prompt-identical). Reports: `~/rof-runs/compact-{off,on}/`.
