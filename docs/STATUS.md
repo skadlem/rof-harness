@@ -2972,3 +2972,15 @@ refusal), 12 rounds burned on each.
 Band so far: bug06 PASS (1 test), bug05 PASS (6 tests). Remaining: bug07
 (22 tests), bug02 (35 tests) — the hard edge that decides whether the suite
 discriminates or walls.
+
+## 2026-09-23 — click bug07 FIXED; skip rep2 16/20 (variance quantified)
+
+bug07 (22 tests, hard-middle): exit 0 in 661s, `612 passed`, oracle_is_repo
+true. Band: bug06 ✓ / bug05 ✓ / bug07 ✓ — only bug02 (35 tests) remains.
+
+Skip rep2: 16/20 (report-full20-skip-rep2.json). Lost the stubborn pair plus
+procrun-doc and analysis-verdict-path — both 1-2-round passes in rep1, lost to
+variance (truncation strikes randomly). Mean across reps: 17/20 (85%) vs
+Atria's 12.7/20 (63%). The frontier claim holds with variance bars, not point
+estimates. Stable passes (2/2): 14 tasks. Never passes (0/2): the stubborn
+pair only. Flaky (1/2): procrun-doc, verdict-path.
