@@ -2946,3 +2946,11 @@ here — explorer moves probability, not certainty (jobs=4 vs 2, or variance).
 Failing analysis: the 3 prose-oracle tasks the reviewer alone judges, same as
 Atria. Cost note: est $0.52/run at Go prices; quota spend today ≈ $1.20 total
 vs the $60/mo deepseek-flash cap (4x promo ends Sep 27).
+
+## 2026-09-23 — click band probe opens: bug06 FIXED (easy edge, 1 test)
+
+`pilot-go.py bug06 c1` (best-config env: explorer, attempts=3, rounds=4,
+250k cap, deepseek-flash): rof exit 0 in 822s, oracle `612 passed, 21
+skipped, 1 xfailed`, `oracle_is_repo: true`. The 1 broken test passes again;
+the fix is real, not vacuous. First generated-suite discrimination point:
+easy edge lands. Queued: bug05 (6 tests), bug07 (22), bug02 (35).
