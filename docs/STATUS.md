@@ -3036,3 +3036,15 @@ blind to its own breakage (same class as the click-venv trap; pilot launches
 must put click-venv first on PATH for rof's own subprocess, not just the
 oracle); (b) effort bounding is strictly better than silence and worth the
 default. Next: c5 with venv-first PATH.
+
+## 2026-09-23 — self-inflicted venv breakage, recovered
+
+Tried to fix the pytest-9 trap with `ln -sf python click-venv/bin/python3`,
+which overwrote the venv's real python3 binary and looped python<->python3.
+Recovered by re-linking `bin/python3 -> /usr/bin/python3.14` per the venv's
+own pyvenv.cfg (base 3.14.4): `python -m pytest --version` = 7.4.4 again,
+click imports from repo via PYTHONPATH. Lesson in the standing-traps spirit:
+never write into a working venv; check `ls -l` before linking over a binary.
+Side benefit: c5 (launched with venv-first PATH) now resolves `python3` to
+the venv interpreter mid-run, so its remaining rounds get a working suite
+signal — the trap fix landed by accident.
