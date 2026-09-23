@@ -3024,3 +3024,15 @@ Same signature as the Atria dotenv ceiling: reasoning never converges at any
 budget. Open question is wall-vs-gap: hermes + pi now running bug02 on the
 same model. If all three wall, the band is bug06/05/07 and bug02 is the
 documented ceiling, not a rof deficit.
+
+## 2026-09-23 — bug02c4 (effort=medium): acts-but-wrong beats silence
+
+Top-level `reasoning_effort` (new `ROF_REASONING_EFFORT`, live-go defaults
+`medium`) moved bug02 from 7× pure truncation to a 1-line edit — wrong place
+(`_pipepager` reraise instead of `ProgressBar`) but real action, correctly
+rejected by the reviewer. Two harness-side findings: (a) the implementer's
+post-write suite ran under system pytest 9 → collection error → the model was
+blind to its own breakage (same class as the click-venv trap; pilot launches
+must put click-venv first on PATH for rof's own subprocess, not just the
+oracle); (b) effort bounding is strictly better than silence and worth the
+default. Next: c5 with venv-first PATH.
