@@ -108,6 +108,55 @@ pub struct OpenRouterClient {
     /// (OpenCode Go requires `x-opencode-session`; see `session_header`).
     /// Minted per client, so one rof process is one session.
     session: String,
+    /// OpenAI-style top-level `reasoning_effort` (`ROF_REASONING_EFFORT`).
+    /// `None` = absent from the wire (current shape, byte-identical).
+    /// This is the knob Go honours: vLLM's `chat_template_kwargs`,
+    /// `enable_thinking` and `reasoning: false` are all ignored there,
+    /// while hermes `--reasoning medium` (this field) converges.
+    effort: Option<String>,
+}
+
+/// `ROF_REASONING_EFFORT` allowlist; anything else (or unset) is `None`.
+fn effort_from_env() -> Option<String> {
+    match std::env::var("ROF_REASONING_EFFORT")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "low" | "medium" | "high" | "none" => Some(
+            std::env::var("ROF_REASONING_EFFORT")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase(),
+        ),
+        _ => None,
+    }
+}
+
+/// Test helper: a client with an explicit effort, no env involved.
+pub fn effort_client_for_test(effort: Option<String>) -> OpenRouterClient {
+    OpenRouterClient {
+        token: "test".to_string(),
+        base: DEFAULT_BASE.to_string(),
+        http: OpenRouterClient::http_client(),
+        session: "test-session".to_string(),
+        effort,
+    }
+}
+
+/// Test helper: the exact JSON `once()` would send.
+pub fn wire_body_for_test(client: &OpenRouterClient, model: &str) -> String {
+    let req = crate::llm::LlmReq {
+        system: "s".to_string(),
+        prompt: "p".to_string(),
+        max_tokens: 8,
+        reasoning_off: false,
+        reasoning_low: false,
+        roomier: false,
+        thinking_off: false,
+    };
+    serde_json::to_string(&client.payload(model, &req)).unwrap_or_default()
 }
 
 /// `Some((name, value))` when `base` is an OpenCode endpoint, else `None` —
@@ -150,7 +199,18 @@ impl OpenRouterClient {
             base: DEFAULT_BASE.to_string(),
             http: Self::http_client(),
             session: uuid::Uuid::new_v4().to_string(),
+            effort: effort_from_env(),
         }
+    }
+
+    /// The exact JSON `once()` POSTs: the static body plus the top-level
+    /// effort when set. One builder so the wire tests assert what ships.
+    fn payload(&self, model: &str, req: &LlmReq) -> serde_json::Value {
+        let mut v = serde_json::to_value(Self::body(model, req)).unwrap_or_default();
+        if let Some(e) = &self.effort {
+            v["reasoning_effort"] = serde_json::Value::String(e.clone());
+        }
+        v
     }
 
     pub fn from_env() -> Option<Self> {
@@ -175,6 +235,7 @@ impl OpenRouterClient {
             base,
             http: Self::http_client(),
             session: uuid::Uuid::new_v4().to_string(),
+            effort: effort_from_env(),
         })
     }
 
@@ -195,6 +256,7 @@ impl OpenRouterClient {
             base,
             http: Self::http_client(),
             session: uuid::Uuid::new_v4().to_string(),
+            effort: effort_from_env(),
         })
     }
 
@@ -415,7 +477,7 @@ impl OpenRouterClient {
             call = call.header(name, value);
         }
         let res = call
-            .json(&Self::body(model, req))
+            .json(&self.payload(model, req))
             .send()
             .await
             .map_err(|e| LlmError::Transport(e.to_string()))?;
