@@ -37,6 +37,8 @@ export ROF_TOKEN
 export ROF_CHAT_BASE="${ROF_CHAT_BASE:-https://opencode.ai/zen/go/v1}"
 export ROF_CTX_MODEL="${ROF_CTX_MODEL:-deepseek-flash}"
 export ROF_EXEC_MODEL="${ROF_EXEC_MODEL:-deepseek-flash}"
+# The knob Go honors (hermes parity); unset = absent from the wire.
+export ROF_REASONING_EFFORT="${ROF_REASONING_EFFORT:-medium}"
 export ROF_WORKDIR="${ROF_WORKDIR:-$PWD}"
 export ROF_TASK_ROOT="${ROF_TASK_ROOT:-$RUNS_DIR}"
 export ROF_ALLOW_CMDS="${ROF_ALLOW_CMDS:-cargo check,cargo test}"
