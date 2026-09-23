@@ -646,7 +646,15 @@ fn suite_of(name: &str, goals: &[(&str, &str)]) -> EvalSuite {
 
 /// A report that ran against a scratch tree: the `Fake` client writes
 /// `notes.md`, so a goal naming "eval target" retrieves exactly that file.
+/// Serializes the fake-suite runners: every caller names its task "work",
+/// so two parallel runners prepare/clean the same task dir mid-run and
+/// retrieval flakes (measured: ~50% solo-binary failure rate). The lock is
+/// test-only; production parallelism is unaffected.
+static FAKE_SUITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[allow(clippy::await_holding_lock)]
 async fn run_fake_suite(tag: &str) -> SuiteReport {
+    let _guard = FAKE_SUITE_LOCK.lock().unwrap();
     let root = std::env::temp_dir().join(format!("rof-eval-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();

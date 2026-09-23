@@ -3200,3 +3200,21 @@ night now completes fully (Plan B Task 3, PTY-verified demo) with
 earlier failure looks like a routing/override-shape issue, not the endpoint.
 Policy stands: researcher + evidence-auditor on Atria, everything else Muse
 xhigh. If a Muse child fails fast again, re-open this entry.
+
+## 2026-09-24 — TUI Plan C lands (commands + credentials + live session)
+
+`src/tui/cmd.rs` (closed Action parser, message-start-only, invalid shows
+help), `auth.rs` (0600 credentials store, offline-safe verify, env wins),
+`run.rs` (live poll loop, single-slot goal queue, between-goals application),
+per-goal config+client rebuild in main (else /effort /model /attempts /rounds
+would silently do nothing — caught at C3 review, fixed in C4 scope).
+Subagent-driven (Muse ×3 + 1 Atria... precisely: C1/C3/C4 Muse, C2 Atria),
+reviewed per task. Full suite + clippy + fmt green.
+
+## 2026-09-24 — pre-existing eval-suite race fixed (test-only)
+
+`context_metrics_fold_retrieval…` failed ~50% even solo: parallel
+`run_fake_suite` callers share task name "work" and race prepare/clean.
+Fix: test-only static mutex serializing the fake-suite runners (+ the
+project's standard `await_holding_lock` allow). No production change.
+3/3 green after.

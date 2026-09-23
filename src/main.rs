@@ -251,22 +251,17 @@ fn split_list(s: &str) -> Vec<String> {
         .collect()
 }
 
-fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
-    let mut cfg = cfg;
-    let root = match std::env::var("ROF_WORKDIR") {
-        Ok(w) if !w.trim().is_empty() => PathBuf::from(w.trim()),
-        _ => std::env::current_dir()?,
-    };
-    let root = root.canonicalize()?;
-    // Default policy denies everything; anchor the allowlist to the workdir.
-    cfg.permissions.allowed_dirs = vec![root.clone()];
+/// Build fresh LLM services from an effective config: router resolution
+/// (model ids) plus client construction (tokens, bases, effort snapshot).
+/// `setup()` calls this once; the chat loop calls it per goal, so
+/// `/model`, `/effort`, and `/login` between goals take effect on the next
+/// goal instead of silently riding the first goal's clients (which snapshot
+/// effort/tokens at construction). `announce` prints the `llm:` line.
+fn build_services(
+    cfg: &AppConfig,
+    announce: bool,
+) -> (ContextService, ExecutorService, ExecutorService) {
     let router = ModelRouter::from_config(&cfg.routing);
-    let trace = match std::env::var("ROF_TRACE") {
-        Ok(p) if !p.trim().is_empty() => TraceSink::with_file(std::path::Path::new(p.trim()))?,
-        _ => TraceSink::new(),
-    };
-    let trace = Arc::new(trace);
-
     // Direct provider endpoint first (your own keys), then OpenRouter,
     // then offline stub. Agents only see Context/Executor services.
     let real: Option<Arc<dyn LlmClient>> = OpenRouterClient::from_compat_env()
@@ -275,7 +270,7 @@ fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
     let (ctx_model, _) = router.resolve(Role::Context);
     let (exec_model, exec_fb) = router.resolve(Role::Executor);
     let (verify_model, verify_fb) = router.resolve(Role::Verify);
-    let (context, executor, verify) = match &real {
+    match &real {
         Some(c) => {
             let via = std::env::var("ROF_CHAT_BASE").unwrap_or("openrouter".to_string());
             // §4.5 arm #4: the judge may sit on a different provider than
@@ -284,10 +279,14 @@ fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
             let judge = OpenRouterClient::from_verify_env()
                 .map(|j| Arc::new(j) as Arc<dyn LlmClient>)
                 .unwrap_or_else(|| c.clone());
-            if verify_model == exec_model {
-                println!("llm: {via} (ctx={ctx_model}, exec={exec_model})");
-            } else {
-                println!("llm: {via} (ctx={ctx_model}, exec={exec_model}, verify={verify_model})");
+            if announce {
+                if verify_model == exec_model {
+                    println!("llm: {via} (ctx={ctx_model}, exec={exec_model})");
+                } else {
+                    println!(
+                        "llm: {via} (ctx={ctx_model}, exec={exec_model}, verify={verify_model})"
+                    );
+                }
             }
             (
                 ContextService::new(c.clone(), ctx_model.to_string()),
@@ -304,14 +303,34 @@ fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
             )
         }
         None => {
-            println!("llm: stub (set OR_TOKEN for live models)");
+            if announce {
+                println!("llm: stub (set OR_TOKEN for live models)");
+            }
             (
                 ContextService::new(Arc::new(StubClient), "context-stub".to_string()),
                 ExecutorService::new(Arc::new(StubClient), "executor-stub".to_string(), None),
                 ExecutorService::new(Arc::new(StubClient), "verify-stub".to_string(), None),
             )
         }
+    }
+}
+
+fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
+    let mut cfg = cfg;
+    let root = match std::env::var("ROF_WORKDIR") {
+        Ok(w) if !w.trim().is_empty() => PathBuf::from(w.trim()),
+        _ => std::env::current_dir()?,
     };
+    let root = root.canonicalize()?;
+    // Default policy denies everything; anchor the allowlist to the workdir.
+    cfg.permissions.allowed_dirs = vec![root.clone()];
+    let trace = match std::env::var("ROF_TRACE") {
+        Ok(p) if !p.trim().is_empty() => TraceSink::with_file(std::path::Path::new(p.trim()))?,
+        _ => TraceSink::new(),
+    };
+    let trace = Arc::new(trace);
+
+    let (context, executor, verify) = build_services(&cfg, true);
 
     let registry =
         ToolRegistry::with_defaults(root.clone(), cfg.permissions.clone(), cfg.skills.clone());
@@ -538,10 +557,14 @@ async fn main() -> anyhow::Result<()> {
             match replay_path {
                 Some(path) => rof::tui::run::replay(std::path::Path::new(path)),
                 None => {
-                    eprintln!(
-                        "rof chat: live loop lands in Plan C (replay with --replay <trace.jsonl>)"
-                    );
-                    std::process::exit(2);
+                    // Live console: idle prompt between goals. Main owns the
+                    // goal loop — each Goal runs to completion, then the
+                    // prompt re-enters on the same session.
+                    let s = setup(load_config(cfg_path.as_deref())?)?;
+                    while let rof::tui::run::LiveOut::Goal(g) = rof::tui::run::run_live(&s.trace)? {
+                        run_goal_text(&s, &g, false, false).await?;
+                    }
+                    Ok(())
                 }
             }
         }
@@ -574,6 +597,28 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_goal(goal: &str, config_path: Option<&str>, args: &[String]) -> anyhow::Result<()> {
     let s = setup(load_config(config_path)?)?;
+    run_goal_text(&s, goal, args.iter().any(|a| a == "--print-trace"), true).await
+}
+
+/// One goal on an existing session setup. The `run` path calls this once;
+/// the `chat` loop calls it per goal. Between-goals slash knobs land here:
+/// the same env names the loop reads are re-applied to this goal's config
+/// copy, stored logins fill blank env knobs (env wins), and the provider
+/// clients are rebuilt from that config — so `/attempts`, `/effort`,
+/// `/model`, and `/login` all take effect on the next goal. `run`
+/// (single setup, unchanged env) rebuilds identical services.
+async fn run_goal_text(
+    s: &Setup,
+    goal: &str,
+    print_trace: bool,
+    exit_on_fail: bool,
+) -> anyhow::Result<()> {
+    let mut cfg = s.cfg.clone();
+    apply_env(&mut cfg);
+    rof::tui::auth::store().export_missing_env();
+    // The `run` path already announced in setup(); the chat loop announces
+    // per goal so a model switch shows up where it takes effect.
+    let (context, executor, verify) = build_services(&cfg, !exit_on_fail);
     // Accept the same exact-allowlist check(s) in run mode.
     let checks: Vec<String> = std::env::var("ROF_CHECK")
         .map(|c| {
@@ -583,8 +628,8 @@ async fn run_goal(goal: &str, config_path: Option<&str>, args: &[String]) -> any
                 .collect()
         })
         .unwrap_or_default();
-    let expect_writes = s.cfg.expect_writes;
-    let orch = Orchestrator::new(s.cfg, s.trace.clone(), s.context, s.executor, s.verify);
+    let expect_writes = cfg.expect_writes;
+    let orch = Orchestrator::new(cfg, s.trace.clone(), context, executor, verify);
     let out = orch
         .run_loop(
             &Session::new(goal.to_string())
@@ -598,16 +643,21 @@ async fn run_goal(goal: &str, config_path: Option<&str>, args: &[String]) -> any
     println!("result: {}", serde_json::to_string_pretty(&out)?);
     let passed = out["passed"].as_bool().unwrap_or(false);
     print_report(&s.trace, passed);
-    if args.iter().any(|a| a == "--print-trace") {
+    if print_trace {
         for ev in s.trace.events() {
             println!("{}", serde_json::to_string(&ev)?);
         }
     }
     // A harness that exits 0 on a failed task is invisible to every caller:
     // Harbor, CI, and a comparison script all read the exit code first. The
-    // verdict is already computed; this only refuses to discard it.
+    // verdict is already computed; this only refuses to discard it. The chat
+    // loop passes false so one failed goal prints and continues the session
+    // instead of killing the console.
     if !passed {
-        std::process::exit(3);
+        if exit_on_fail {
+            std::process::exit(3);
+        }
+        println!("(goal failed — session continues)");
     }
     Ok(())
 }
