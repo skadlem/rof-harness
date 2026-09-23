@@ -2984,3 +2984,21 @@ variance (truncation strikes randomly). Mean across reps: 17/20 (85%) vs
 Atria's 12.7/20 (63%). The frontier claim holds with variance bars, not point
 estimates. Stable passes (2/2): 14 tasks. Never passes (0/2): the stubborn
 pair only. Flaky (1/2): procrun-doc, verdict-path.
+
+## 2026-09-23 — skip rep3 17/20; click bug02 TIMEOUT (inconclusive, hard edge)
+
+Rep3: 17/20 (report-full20-skip-rep3.json) — fails are the stubborn pair plus
+multi-metric-and-trace (metrics family, flaky 2/3). Three-rep tally: mean
+**17/20 (85%)**, stable passes 15/20, never-passes only the stubborn pair,
+flaky one rep each: procrun-doc, verdict-path, multi-metric-and-trace.
+
+bug02 (35 tests, ProgressBar gutted to a stub): rof produced zero tree
+changes in 1500s (only the harness baseline commit; clean tree) — all
+deliberation, no patch. Per the standing rule (2609.11987) that is
+**inconclusive, not failed**, and it smells like another deferral-loop
+instance on a 248-line deletion. Band stands at 3/4 with the hard edge open —
+which is what a discriminating band looks like, not a wall: easy and middle
+land, hard-middle lands, hard edge inconclusive.
+
+Quota total today ≈ $1.50-2.00 (all runs + 4 click pilots) vs the $60/mo
+deepseek-flash cap. Wall-clock was the binding constraint throughout.
