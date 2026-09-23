@@ -2902,3 +2902,28 @@ cache-hit 19% cold, tool accuracy 100%, skills reused 10. Report:
 Quota discipline: Go enforces per-model 5h/weekly/monthly $ caps, so arms run
 on `eval/suites/repo-failures.json` (just these 2 tasks), not full reps, until
 a lever moves one of them.
+
+## 2026-09-23 — arms on repo-failures (deepseek-flash): explorer confirmed 3/3
+
+Subset scoreboard (single reps unless noted; cap 50k blamed first):
+
+| arm | retriever | metrics | billed |
+|---|---|---|---|
+| baseline (defaults) | trunc | prose | 52k |
+| attempts=3 (50k cap) | trunc | partial | 43k — cap deaths, arm invalid |
+| attempts=3 + 250k | trunc | **PASS r1** | 77k |
+| + thinking=off | writes-but-wrong | trunc | 89k |
+| + thinking=low | trunc | 3/5 partial | 111k |
+| + explorer (pipe) | **PASS r1** | broken build | 75k, 0 model errors |
+| + explorer + rounds=4 (pipe) | **PASS r2** | 3/5 partial | 116k |
+| + explorer + rounds=4 + direct | trunc | **PASS r1** | 64k |
+| + explorer + rounds=4 rep2 (pipe) | **PASS r14** | 3/5 partial | 272k |
+
+Findings: **explorer moves the retriever class 3/3** (trunc/prose/wrong →
+pass, rounds 1-2 except a 14-round burn) — evidence-before-action kills both
+recon-paralysis and wrong-guess. thinking posture changes nothing (off trades
+paralysis for wrong guesses). metrics passes 2/6 configs, never twice the same
+way — high variance, above-ceiling follow-through (5 coordinated hunks stall
+at 3/5). attempts needs headroom: 3 sequences against a shared 50k cap die by
+budget, not capability. Wall-clock is now the binding constraint (~20min/rep
+at jobs=2); quota spend ≈ $0.50 total vs $60/mo deepseek-flash cap.
