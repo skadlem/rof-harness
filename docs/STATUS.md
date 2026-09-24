@@ -3242,3 +3242,25 @@ best-config env (planner-on/explorer-off/attempts-1 defaults); those reps are
 misconfigured, not data. `live-go.sh` still does not export the best config —
 export it at launch (this entry) until the script learns it.
 Reports: `~/rof-runs/final20b/report-0924-{0940,1004,1021}.json`.
+
+## 2026-09-24 — rival reps: hermes 3/3, pi 3/3 on bug02 (variance measured)
+
+bug02 ×2 more reps each, same model (deepseek-flash via Go), fresh copies,
+pinned oracle: hermes c2/c3 pass (240 s, 111 s), pi c2/c3 pass (63 s, 88 s),
+all `612 passed`, oracle_is_repo true. With last night's c1s: rivals 3/3
+each against rof 0/6 across three shapes (timeout/silence/wrong-edit/caps).
+The gap is real and reliably reproducible — and fast: rivals solve in 1-4
+min where rof burns ~19 min failing. Driver:
+`~/.local/share/rof-widening/rival-bug02.sh`; results:
+`~/.local/share/rof-pilot/results-rivals/c{2,3}-{hermes,pi}-bug02.json`.
+
+## 2026-09-24 — shrink-and-retry rung (second loop-shape attempt at bug02)
+
+New final ladder rung: a zero-content truncation with all reshapes spent
+halves `max_tokens` (floor 1024, reasoning stays off) instead of stopping —
+reasoning expands to fill any budget, so force a shorter pass. Uses roomier's
+vacated slot: loop still 0..5, terminal afterwards. `LlmReq.shrunk`
+(serde-default, control-only, wire effect via budget only). Coverage:
+`tests/v4_shrink.rs` + updated ladder spec test; full suite + clippy + fmt
+green; Muse reviewer OK with notes (3 doc P2s fixed at landing). Live probe
+pending.

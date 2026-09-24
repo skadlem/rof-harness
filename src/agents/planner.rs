@@ -42,6 +42,7 @@ impl Agent for PlannerAgent<'_> {
             reasoning_off: false,
             reasoning_low: false,
             roomier: false,
+            shrunk: false,
             thinking_off: false,
         };
         let resp = self

@@ -154,6 +154,7 @@ pub fn wire_body_for_test(client: &OpenRouterClient, model: &str) -> String {
         reasoning_off: false,
         reasoning_low: false,
         roomier: false,
+        shrunk: false,
         thinking_off: false,
     };
     serde_json::to_string(&client.payload(model, &req)).unwrap_or_default()
@@ -294,9 +295,9 @@ impl LlmClient for OpenRouterClient {
         // ponytail: retry lives here, not in every caller. Free tiers 429 often.
         let mut last = LlmError::Transport("no attempts".to_string());
         // Five shapes: the plain request, then four reshapes — low effort,
-        // the vLLM thinking switch, reasoning off, and a roomier re-ask. The
-        // loop bound and the rung order must stay in step: see
-        // `attempt_ge_max`.
+        // the vLLM thinking switch, reasoning off, and a roomier re-ask
+        // (or a shrink re-ask when zero content shipped). The loop bound
+        // and the rung order must stay in step: see `attempt_ge_max`.
         for attempt in 0..5 {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
@@ -387,7 +388,7 @@ fn retryable_error(text: &str, truncated: bool, attempt: usize) -> bool {
 }
 
 /// ponytail: the loop runs 0..5; the last slot is reserved for the roomier
-/// re-ask, so a reshape must not burn it on a plain re-roll.
+/// (or shrink) re-ask, so a reshape must not burn it on a plain re-roll.
 fn attempt_ge_max(attempt: usize) -> bool {
     attempt >= 4
 }
@@ -403,9 +404,9 @@ fn attempt_ge_max(attempt: usize) -> bool {
 /// was cut off (measured: 8,000-char prompt, 36,892 chars of content, still
 /// growing). When `content_chars` is 0 the budget went entirely to reasoning,
 /// and the doubled budget was measured to double the reasoning to 72,059
-/// chars while shipping nothing. So the rung stays off in that case and the
-/// ladder reports that no shape can help, which lets the retry loop stop
-/// instead of paying for a guaranteed-empty call.
+/// chars while shipping nothing. So roomier stays off in that case and the
+/// shrink rung fires instead; after it the ladder is spent, which lets the
+/// retry loop stop instead of paying for a guaranteed-empty call.
 ///
 /// Order is the point: the shapes least likely to cost quality come first, so
 /// a call that fails early keeps as much reasoning as the endpoint will
@@ -417,6 +418,11 @@ fn attempt_ge_max(attempt: usize) -> bool {
 /// 3. `reasoning: false` — honoured on small prompts, ignored on large ones.
 /// 4. roomier — reasoning back on with twice the budget, the last resort,
 ///    and only when the truncation actually shipped content.
+///    Shrink (takes roomier's slot when `content_chars` is 0): halve
+///    `max_tokens` with reasoning still off. Uses roomier's vacated slot,
+///    so the loop bound is unchanged; terminal afterwards because every
+///    lower rung checks `!reasoning_off` and the attempt gate (`attempt>3`)
+///    blocks any 6th call.
 ///
 /// Which knob the endpoint honours at a given prompt size is
 /// nondeterministic, which is why the ladder keeps climbing instead of
@@ -441,8 +447,42 @@ fn reshape_for_truncation(req: &mut LlmReq, content_chars: usize) -> bool {
         req.thinking_off = false;
         req.reasoning_off = false;
         true
+    } else if content_chars == 0 && !req.shrunk && req.max_tokens > 1024 {
+        // Shrink-and-retry: the budget went entirely to reasoning, and
+        // reasoning expands to fill any budget — so halve the budget to
+        // force a shorter pass. reasoning_off STAYS on (it is the rung that
+        // got us here): the small-budget call runs thought-off. The ladder
+        // is terminal for the all-zero-content sequence (lower rungs check
+        // !reasoning_off; roomier needs content>0), and the attempt gate
+        // (`truncated && attempt>3`) blocks any 6th call regardless — one
+        // extra call, never a new climb. Uses the attempt slot roomier
+        // vacated (refused at zero content), so the loop bound is unchanged.
+        req.shrunk = true;
+        req.max_tokens = (req.max_tokens / 2).max(1024);
+        req.reasoning_low = false;
+        req.thinking_off = false;
+        true
     } else {
         false
+    }
+}
+
+/// Test helper: the ladder without a model behind it.
+pub fn reshape_for_truncation_for_test(req: &mut crate::llm::LlmReq, content_chars: usize) -> bool {
+    reshape_for_truncation(req, content_chars)
+}
+
+/// Test helper: a blank request at a chosen cap.
+pub fn base_req_for_test(max_tokens: usize) -> crate::llm::LlmReq {
+    crate::llm::LlmReq {
+        system: String::new(),
+        prompt: String::new(),
+        max_tokens,
+        reasoning_off: false,
+        reasoning_low: false,
+        roomier: false,
+        thinking_off: false,
+        shrunk: false,
     }
 }
 
@@ -572,6 +612,7 @@ mod tests {
             reasoning_off: false,
             reasoning_low: false,
             roomier: false,
+            shrunk: false,
             thinking_off: false,
         };
         let b = OpenRouterClient::body("anthropic/claude-x", &req);
@@ -712,6 +753,7 @@ mod tests {
             reasoning_off: false,
             reasoning_low: false,
             roomier: false,
+            shrunk: false,
             thinking_off: false,
         };
         let wire = serde_json::to_string(&OpenRouterClient::body("m", &on)).unwrap();
@@ -764,6 +806,7 @@ mod tests {
             reasoning_low: false,
             thinking_off: false,
             roomier: false,
+            shrunk: false,
         };
         // A first attempt stays byte-identical to before this rung existed.
         let wire = serde_json::to_string(&OpenRouterClient::body("m", &base)).unwrap();
@@ -800,6 +843,7 @@ mod tests {
             reasoning_low: false,
             thinking_off: false,
             roomier: false,
+            shrunk: false,
         };
         // A real answer that ran out of room, so the roomier rung is
         // justified at the top of the climb.
@@ -847,6 +891,7 @@ mod tests {
             reasoning_low: false,
             thinking_off: false,
             roomier: false,
+            shrunk: false,
         };
         // The lower rungs are still worth trying: reasoning off may be the
         // shape that lets content through.
@@ -858,14 +903,18 @@ mod tests {
         assert!(req.reasoning_off);
         // But roomier is closed: no content was ever shipped.
         assert!(
-            !reshape_for_truncation(&mut req, 0),
-            "roomier must not fire on a contentless truncation"
+            reshape_for_truncation(&mut req, 0),
+            "shrink fires where roomier is refused"
         );
         assert!(!req.roomier);
+        assert!(req.shrunk);
         assert_eq!(
-            req.max_tokens, 8192,
-            "the budget must not double when no content was shipped"
+            req.max_tokens, 4096,
+            "the budget halves instead of doubling when no content shipped"
         );
+        // And the ladder is terminal afterwards: no new climb, no extra call.
+        assert!(!reshape_for_truncation(&mut req, 0));
+        assert_eq!(req.max_tokens, 4096);
     }
 
     /// The ladder decides from the numbers the error reports, so the extractor
