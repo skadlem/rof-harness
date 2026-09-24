@@ -9,6 +9,53 @@ pub struct Store {
     path: PathBuf,
 }
 
+/// User-defined providers: name -> base URL. Non-secret (keys stay in the
+/// credentials store); a test override wins so tests never touch home.
+/// Built-ins (openrouter/go/atria) are not stored here — they resolve first.
+pub fn providers_file() -> PathBuf {
+    std::env::var("ROF_PROVIDERS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join(".rof/providers.json"))
+                .unwrap_or_else(|_| PathBuf::from(".rof-providers.json"))
+        })
+}
+
+/// All user-defined providers, name -> base URL.
+pub fn registry() -> BTreeMap<String, String> {
+    read_all(&providers_file())
+}
+
+/// Add or replace a provider. The base must be http(s); trailing slashes
+/// are trimmed so URL joining stays stable.
+pub fn save_provider(name: &str, base: &str) -> anyhow::Result<()> {
+    let base = base.trim().trim_end_matches('/').to_string();
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        anyhow::bail!("provider base must be an http(s) URL, got {base}");
+    }
+    let path = providers_file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut map = read_all(&path);
+    map.insert(name.to_string(), base);
+    std::fs::write(&path, serde_json::to_string_pretty(&map)?)?;
+    Ok(())
+}
+
+/// Remove a user-defined provider. Returns false when it was not present.
+/// Built-ins are not in the registry, so they report false here.
+pub fn remove_provider(name: &str) -> anyhow::Result<bool> {
+    let path = providers_file();
+    let mut map = read_all(&path);
+    let hit = map.remove(name).is_some();
+    if hit {
+        std::fs::write(&path, serde_json::to_string_pretty(&map)?)?;
+    }
+    Ok(hit)
+}
+
 /// Resolve the store path. A test override wins so tests never touch home.
 pub fn store() -> Store {
     let path = std::env::var("ROF_CREDENTIALS")
@@ -74,6 +121,9 @@ impl Store {
     /// is empty, so a `/login` survives into the next goal's rebuilt
     /// clients. Env always wins per var (spec §6: env keys take precedence
     /// and skip login) — this only fills blanks, never overwrites.
+    /// Registry (user-defined) providers are deliberately NOT mapped here:
+    /// a blanket fill would reroute the default client, so a role uses a
+    /// registry key only when its model explicitly names that provider.
     pub fn export_missing_env(&self) {
         let map = read_all(&self.path);
         for (provider, key) in &map {
@@ -97,9 +147,10 @@ impl Store {
     }
 }
 
-/// Model-list base per known provider. `custom` resolves its base from
-/// `ROF_CHAT_BASE` (it has no fixed home). Unknown names error here,
-/// before any network, so the offline test stays offline.
+/// Model-list base per known provider. Built-ins first, then the persisted
+/// registry, then `custom` from `ROF_CHAT_BASE` (compat: it has no fixed
+/// home). Unknown names error here, before any network, so the offline
+/// test stays offline.
 fn base_for(provider: &str) -> Result<String, String> {
     match provider {
         "openrouter" => Ok("https://openrouter.ai/api/v1".to_string()),
@@ -110,10 +161,15 @@ fn base_for(provider: &str) -> Result<String, String> {
             .filter(|b| !b.trim().is_empty())
             .map(|b| b.trim().trim_end_matches('/').to_string())
             .ok_or_else(|| "custom provider needs ROF_CHAT_BASE set to its base URL".to_string()),
-        _ => Err(format!(
-            "unknown provider '{provider}' (openrouter/go/atria/custom)"
-        )),
+        _ => registry().remove(provider).ok_or_else(|| {
+            format!("unknown provider '{provider}' (/provider add <name> <base-url> to define it)")
+        }),
     }
+}
+
+/// Test helper: base resolution without a client.
+pub fn base_for_test(provider: &str) -> Result<String, String> {
+    base_for(provider)
 }
 
 static STATUS: std::sync::Mutex<BTreeMap<String, String>> = std::sync::Mutex::new(BTreeMap::new());
