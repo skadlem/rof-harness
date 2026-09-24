@@ -3371,3 +3371,21 @@ release-preset,tui-replay-vision}.md`. Full suite green 2× (27 binaries).
 - Release gate (`a560e49`): `rof eval --release` = reps floor 3 (explicit
   N>1 wins) + verify_guard on + hard error without a judge. Verified live
   on the binary both paths.
+
+## 2026-09-25 — D1/D2 via bunny subagent wave (supervisor-reviewed)
+
+Delegated wave on `openrouter/stealth/space-bunny-alpha` (max thinking):
+2 scouts (TUI survey + TB recon) then 2 workers (D1 replay, D2 vision).
+Parent review caught one real worker bug before landing: replay nav keys
+in the shared `pump` hijacked live-chat typing (`j/k/g/G//`, Up/Down).
+Fixed with replay-gated arms (guard fallthrough preserves live keys).
+Test gap noted: pump key routing has no unit test (interactive fn).
+
+- D1 seekable replay: cursor + case-insensitive filter in App (draw stays
+  pure), `replay i/N [filter]` status with help line, j/k/G/g// keys.
+- D2: `docs/superpowers/specs/2026-09-25-full-tui.md` + phased plan
+  (P1 event channel → P2 mid-run input → P3 panes → P4 polish), no code.
+- TB scout verdict: NOT READY for Slice A retry — container `tb-rof1` runs
+  (Up 10h), caches present, but the recipe demands one green hand-run
+  first and gives no literal command sequence (mounts/work-copy unverified).
+- Full suite green 2× (27 binaries), 0 warnings, fmt clean.
