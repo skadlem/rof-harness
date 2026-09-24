@@ -3304,3 +3304,18 @@ third try tonight). Wire verified alive afterwards (header-correct probe
 200s), so connection flakes, not outage. Slice B (adapter) waits on one
 green hand-run. Task dir: `~/.local/share/rof-tb/tasks/session-window-debug`;
 jobs: `~/.local/share/rof-tb/jobs/`; container `tb-rof1` left running.
+
+## 2026-09-25 — bug02 on Muse (responses transport): 0/3, line closed tonight
+
+New responses transport (`once()` routes `muse-*` to `{base}/responses`,
+ladder vocabulary preserved, reviewer P0 fixed) validated live: smoke write
+landed, then bug02 m1/m2/m3 — decoy-fix in 60 s (patched the stub's
+arithmetic, class still missing, reviewer wrongly passed on prose),
+m2 void (check command denied by exact-match allowlist: 12 silent rounds),
+m3 syntax-error patch (12 lines, broke line 38, 208k in/58k out).
+0/3 oracle. Muse acts in seconds where DeepSeek burns 19 min, but all three
+reps miss the same way: nobody restores the deleted 248-line class.
+Cost note: m3 billed 145k tokens on the metered Go key; contributor-tier
+Muse pricing is unverified — watch the cap. Transport stays (it works);
+bug02 needs a stronger plan, not more reps. Reports:
+`~/.local/share/rof-pilot/results/m{1,2,3}-bug02.json` (m2 void).
