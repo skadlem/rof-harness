@@ -15,6 +15,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use super::app::App;
 use super::cmd::Action;
 use super::render::parse_lenient_line;
+use super::splash;
 use super::ui::draw;
 use crate::obs::TraceEvent;
 
@@ -64,11 +65,22 @@ fn run_live_inner(trace: &crate::obs::TraceSink) -> anyhow::Result<LiveOut> {
             app.on_event(ev);
             shown += 1;
         }
-        terminal.draw(|f| draw(f, &app))?;
+        terminal.draw(|f| {
+            if app.fresh {
+                splash::draw(f);
+            } else {
+                draw(f, &app);
+            }
+        })?;
         if !event::poll(Duration::from_millis(33))? {
             continue;
         }
         if let Event::Key(key) = event::read()? {
+            // The splash consumes the first keypress outright.
+            if app.fresh {
+                app.fresh = false;
+                continue;
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             {
@@ -418,11 +430,22 @@ fn pump(
     app: &mut App,
 ) -> anyhow::Result<()> {
     loop {
-        terminal.draw(|f| draw(f, app))?;
+        terminal.draw(|f| {
+            if app.fresh {
+                splash::draw(f);
+            } else {
+                draw(f, app);
+            }
+        })?;
         if !event::poll(Duration::from_millis(33))? {
             continue;
         }
         if let Event::Key(key) = event::read()? {
+            // The splash consumes the first keypress outright.
+            if app.fresh {
+                app.fresh = false;
+                continue;
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             {

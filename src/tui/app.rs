@@ -5,12 +5,27 @@ use crate::obs::TraceEvent;
 /// the composer's input buffer, and scroll. Mutated only by `on_event` /
 /// `on_key`, so the whole state machine is testable without a terminal
 /// (`run.rs` owns the terminal; Plan C feeds this live).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct App {
     pub transcript: Vec<String>,
     pub counters: Counters,
     pub input: String,
     pub scroll: usize,
+    /// True until the first keypress; `run.rs` draws the splash overlay
+    /// while set and consumes that keypress.
+    pub fresh: bool,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            transcript: Vec::new(),
+            counters: Counters::default(),
+            input: String::new(),
+            scroll: 0,
+            fresh: true,
+        }
+    }
 }
 
 impl App {

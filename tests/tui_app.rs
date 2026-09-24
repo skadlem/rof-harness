@@ -23,7 +23,9 @@ fn scroll_offset_moves_the_transcript_window() {
     use ratatui::{backend::TestBackend, Terminal};
     use rof::tui::{app::App, ui::draw};
     fn screen(app: &App) -> String {
-        let backend = TestBackend::new(80, 10);
+        // 24 rows: the titled panes (transcript/status/composer) take 6
+        // chrome rows, leaving room for the scrolled window below.
+        let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, app)).unwrap();
         terminal
