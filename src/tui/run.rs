@@ -141,6 +141,7 @@ fn run_live_inner(trace: &crate::obs::TraceSink) -> anyhow::Result<LiveOut> {
                     // the next non-slash line is the key (never echoed,
                     // never queued as a goal). A slash line cancels it.
                     if let Some(prov) = awaiting_key.take() {
+                        app.mask_input = false;
                         if text.starts_with('/') {
                             app.transcript
                                 .push(format!("/login {prov} cancelled — key was not captured"));
@@ -308,7 +309,7 @@ fn apply_action(
             ));
         }
         Action::Model(_) => {
-            // Two-token `ctx` form rides the raw line: parse() keeps only
+            // Two-token role forms ride the raw line: parse() keeps only
             // the first token, so Model("ctx") alone never names a model.
             let toks: Vec<&str> = raw.split_whitespace().collect();
             match toks.as_slice() {
@@ -317,6 +318,25 @@ fn apply_action(
                     app.transcript.push(format!(
                         "context model={id} (ROF_CTX_MODEL, applies to the next goal — clients rebuild per goal)"
                     ));
+                }
+                [_, "verify", id] => {
+                    std::env::set_var("ROF_VERIFY_MODEL", id);
+                    app.transcript.push(format!(
+                        "verify model={id} (ROF_VERIFY_MODEL, applies to the next goal — clients rebuild per goal)"
+                    ));
+                }
+                [_, "fallback", id] => {
+                    if *id == "none" {
+                        std::env::remove_var("ROF_EXEC_FALLBACK");
+                        app.transcript.push(
+                            "executor fallback cleared (applies to the next goal)".to_string(),
+                        );
+                    } else {
+                        std::env::set_var("ROF_EXEC_FALLBACK", id);
+                        app.transcript.push(format!(
+                            "executor fallback={id} (ROF_EXEC_FALLBACK, applies to the next goal)"
+                        ));
+                    }
                 }
                 [_, spec] => {
                     if spec.contains('/') {
@@ -332,7 +352,7 @@ fn apply_action(
                 }
                 _ => {
                     app.transcript.push(
-                        "/model needs <provider>/<model-id> (or /model ctx <provider>/<model-id>)"
+                        "/model needs <provider>/<model-id> (or /model ctx|verify|fallback <provider>/<model-id>)"
                             .to_string(),
                     );
                 }
@@ -355,13 +375,61 @@ fn apply_action(
                 },
                 [_, prov] => {
                     *awaiting_key = Some((*prov).to_string());
+                    app.mask_input = true;
                     app.transcript.push(format!(
-                        "/login {prov}: type the key and press Enter (input will echo; private terminal assumed)"
+                        "/login {prov}: type the key and press Enter (input hidden)"
                     ));
                 }
-                _ => app
-                    .transcript
-                    .push("/login needs <provider> (openrouter/go/atria/custom)".to_string()),
+                _ => app.transcript.push(
+                    "/login needs <provider> (openrouter/go/atria/custom, or /provider add <name> <base> first)"
+                        .to_string(),
+                ),
+            }
+        }
+        Action::ProviderAdd(name) => {
+            // parse() validated three tokens; the base rides the raw line
+            // like /login's key does.
+            let base = raw.split_whitespace().nth(2).unwrap_or("");
+            match super::auth::save_provider(&name, base) {
+                Ok(()) => app.transcript.push(format!(
+                    "provider {name} → {base} (verify with /login {name})"
+                )),
+                Err(e) => app.transcript.push(format!("provider add failed: {e}")),
+            }
+        }
+        Action::ProviderList => {
+            let st = super::auth::statuses();
+            let status = |p: &str| {
+                st.get(p)
+                    .cloned()
+                    .unwrap_or_else(|| "unverified".to_string())
+            };
+            for p in ["openrouter", "go", "atria"] {
+                let base = super::auth::base_for_test(p).unwrap_or_default();
+                app.transcript
+                    .push(format!("provider {p} → {base} [built-in, {}]", status(p)));
+            }
+            for (name, base) in super::auth::registry() {
+                app.transcript.push(format!(
+                    "provider {name} → {base} [custom, {}]",
+                    status(&name)
+                ));
+            }
+            app.transcript.push(
+                "keys live in the credentials store or env; /login <provider> verifies + saves"
+                    .to_string(),
+            );
+        }
+        Action::ProviderRm(name) => {
+            if ["openrouter", "go", "atria", "custom"].contains(&name.as_str()) {
+                app.transcript
+                    .push(format!("{name} is built-in and cannot be removed"));
+            } else {
+                match super::auth::remove_provider(&name) {
+                    Ok(true) => app.transcript.push(format!("provider {name} removed")),
+                    Ok(false) => app.transcript.push(format!("no provider {name}")),
+                    Err(e) => app.transcript.push(format!("provider rm failed: {e}")),
+                }
             }
         }
         Action::Logout(p) => match super::auth::store().remove(&p) {

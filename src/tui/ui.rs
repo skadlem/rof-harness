@@ -36,8 +36,13 @@ pub fn draw(f: &mut Frame, app: &App) {
         Paragraph::new(app.status_line()).block(theme::pane("status")),
         rows[1],
     );
+    let shown = if app.mask_input {
+        "•".repeat(app.input.chars().count())
+    } else {
+        app.input.clone()
+    };
     f.render_widget(
-        Paragraph::new(app.input.as_str()).block(theme::composer_block(&app.thinking)),
+        Paragraph::new(shown.as_str()).block(theme::composer_block(&app.thinking)),
         rows[2],
     );
 }

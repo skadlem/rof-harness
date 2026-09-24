@@ -19,6 +19,9 @@ pub enum Action {
     Effort(String),
     Caps(usize, usize),
     Retry(Option<String>),
+    ProviderAdd(String),
+    ProviderList,
+    ProviderRm(String),
     Approve(String),
     Reject(String),
     Display(String),
@@ -86,6 +89,12 @@ pub fn parse(input: &str) -> Option<Action> {
             _ => Action::Unknown("/caps takes <implementer> <reviewer>".into()),
         },
         "retry" => Action::Retry(one(0)),
+        "provider" => match (one(0).as_deref(), one(1), one(2)) {
+            (Some("add"), Some(_), Some(_)) => Action::ProviderAdd(one(1).unwrap()),
+            (Some("list"), _, _) => Action::ProviderList,
+            (Some("rm"), Some(_), _) => Action::ProviderRm(one(1).unwrap()),
+            _ => Action::Unknown("/provider takes add <name> <base-url> | list | rm <name>".into()),
+        },
         "approve" => match one(0) {
             Some(id) => Action::Approve(id),
             None => Action::Unknown("/approve needs <id>".into()),
@@ -107,5 +116,5 @@ pub fn parse(input: &str) -> Option<Action> {
 }
 
 pub fn help_text() -> String {
-    "/quit /help /model <p/m> /models /login [provider] /logout <provider> /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /busy interrupt|queue|steer /hotkeys".to_string()
+    "/quit /help /model <p/m> /model ctx|verify|fallback <p/m> /models /login [provider] /logout <provider> /provider add|list|rm /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /busy interrupt|queue|steer /hotkeys".to_string()
 }

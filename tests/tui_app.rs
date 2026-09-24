@@ -92,6 +92,32 @@ fn composer_title_comes_from_app_not_the_environment() {
 }
 
 #[test]
+fn masked_composer_hides_key_entry() {
+    use ratatui::{backend::TestBackend, Terminal};
+    use rof::tui::{app::App, ui::draw};
+    fn screen(app: &App) -> String {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+    let mut app = App::new();
+    app.input = "sk-secret".to_string();
+    app.mask_input = true;
+    let out = screen(&app);
+    assert!(!out.contains("sk-secret"), "key must not render");
+    assert!(out.contains("••••••"), "bullets stand in: {out}");
+    app.mask_input = false;
+    assert!(screen(&app).contains("sk-secret"), "unmasked renders");
+}
+
+#[test]
 fn layout_shows_transcript_status_and_composer() {
     use ratatui::{backend::TestBackend, Terminal};
     use rof::tui::{app::App, ui::draw};

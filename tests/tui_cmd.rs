@@ -16,6 +16,27 @@ fn commands_parse_at_message_start_only() {
 }
 
 #[test]
+fn provider_forms_parse() {
+    assert!(matches!(
+        parse("/provider add acme https://llm.acme.test/v1"),
+        Some(Action::ProviderAdd(_))
+    ));
+    assert!(matches!(
+        parse("/provider list"),
+        Some(Action::ProviderList)
+    ));
+    assert!(matches!(
+        parse("/provider rm acme"),
+        Some(Action::ProviderRm(_))
+    ));
+    assert!(matches!(
+        parse("/provider add acme"),
+        Some(Action::Unknown(_))
+    ));
+    assert!(matches!(parse("/provider"), Some(Action::Unknown(_))));
+}
+
+#[test]
 fn help_lists_everything_with_current_values_placeholder() {
     let h = rof::tui::cmd::help_text();
     for cmd in [

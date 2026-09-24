@@ -18,6 +18,9 @@ pub struct App {
     /// `ROF_THINKING` at startup by `run.rs`, never at render time: `draw`
     /// is a pure function of `App`.
     pub thinking: String,
+    /// When true the composer renders bullets instead of input (key entry).
+    /// Set while a `/login` key capture is pending, cleared on submit.
+    pub mask_input: bool,
 }
 
 impl Default for App {
@@ -29,6 +32,7 @@ impl Default for App {
             scroll: 0,
             fresh: true,
             thinking: String::new(),
+            mask_input: false,
         }
     }
 }
