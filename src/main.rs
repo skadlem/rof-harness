@@ -280,9 +280,10 @@ fn role_client(
     let base = rof::tui::auth::base_for_test(prov);
     let key = rof::tui::auth::key_for(prov);
     match (base, key) {
-        (Ok(b), Some(k)) => Arc::new(
-            OpenRouterClient::from_parts(b, k).with_profile(profile.clone()),
-        ) as Arc<dyn LlmClient>,
+        (Ok(b), Some(k)) => {
+            Arc::new(OpenRouterClient::from_parts(b, k).with_profile(profile.clone()))
+                as Arc<dyn LlmClient>
+        }
         _ => shared.clone(),
     }
 }

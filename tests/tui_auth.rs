@@ -29,11 +29,11 @@ fn provider_prefix_splits_model_ids() {
         rof::tui::auth::split_provider_model("acme/model-x"),
         ("acme", "model-x")
     );
-    assert_eq!(rof::tui::auth::split_provider_model("model-x"), ("", "model-x"));
     assert_eq!(
-        rof::tui::auth::split_provider_model("a/b/c"),
-        ("a", "b/c")
+        rof::tui::auth::split_provider_model("model-x"),
+        ("", "model-x")
     );
+    assert_eq!(rof::tui::auth::split_provider_model("a/b/c"), ("a", "b/c"));
 }
 
 #[test]
@@ -54,7 +54,9 @@ fn provider_keys_resolve_store_then_env() {
         Some("env-key".to_string())
     );
     // The store wins over env.
-    rof::tui::auth::store().save("openrouter", "store-key").unwrap();
+    rof::tui::auth::store()
+        .save("openrouter", "store-key")
+        .unwrap();
     assert_eq!(
         rof::tui::auth::key_for("openrouter"),
         Some("store-key".to_string())
