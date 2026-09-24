@@ -141,7 +141,24 @@ impl Orchestrator {
         // The planner only gets bodies when it actually runs: with the planner
         // skipped there is no planner prompt to put them in, and a `reused`
         // count that includes a body nobody read would be a lie.
-        let planner_reuse = if self.cfg.planner == "skip" {
+        // Planner mode: "always" plans, "skip" never does, "auto" skips only
+        // task-shaped goals (names a file/symbol + opens with a code verb).
+        // The decision is computed once and shared, so the reuse gate and the
+        // plan branch cannot disagree about whether the planner ran.
+        let skip_planner = self.cfg.planner == "skip"
+            || (self.cfg.planner == "auto"
+                && crate::eval::goal_quality::goal_is_task_shaped(&session.goal));
+        if self.cfg.planner == "auto" {
+            self.trace.emit(TraceEvent::StateTransition {
+                from: "planner_auto".to_string(),
+                to: if skip_planner {
+                    "skip".to_string()
+                } else {
+                    "plan".to_string()
+                },
+            });
+        }
+        let planner_reuse = if skip_planner {
             String::new()
         } else {
             svc.skill_bodies("planner", &session.goal, &planner_skills)
@@ -168,10 +185,14 @@ impl Orchestrator {
         let (plan_view, _) = builder.plan(&plan_state);
         // Planner (Context LLM, no tools). Skippable: for goals that are
         // already task-shaped the call is pure overhead (see ROF_PLANNER).
-        let plan_out = if self.cfg.planner == "skip" {
+        let plan_out = if skip_planner {
+            let mut data = serde_json::json!({ "tasks": [], "acceptance": [], "skipped": true });
+            if self.cfg.planner == "auto" {
+                data["auto"] = serde_json::json!(true);
+            }
             crate::agents::AgentOutput {
                 summary: "planner skipped".to_string(),
-                data: serde_json::json!({ "tasks": [], "acceptance": [], "skipped": true }),
+                data,
             }
         } else {
             let planner = PlannerAgent::new(&self.context);

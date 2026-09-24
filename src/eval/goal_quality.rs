@@ -43,6 +43,41 @@ fn has_anchor(goal: &str) -> bool {
         })
 }
 
+/// Deterministic planner-skip heuristic ("auto" mode): skip planning when the
+/// goal is already task-shaped — it names a file/symbol anchor AND opens with
+/// an imperative code-action verb. Conservative by construction: no anchor or
+/// no verb means plan, so ambiguity always costs one planner call, never a
+/// missing plan.
+const TASK_VERBS: [&str; 19] = [
+    "fix",
+    "add",
+    "remove",
+    "refactor",
+    "implement",
+    "update",
+    "change",
+    "create",
+    "delete",
+    "move",
+    "rename",
+    "extract",
+    "replace",
+    "migrate",
+    "bump",
+    "wire",
+    "hoist",
+    "collapse",
+    "split",
+];
+
+pub fn goal_is_task_shaped(goal: &str) -> bool {
+    let first = goal.split_whitespace().next().unwrap_or("");
+    let verb = first
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_ascii_lowercase();
+    TASK_VERBS.contains(&verb.as_str()) && has_anchor(goal)
+}
+
 /// `Some(note)` when the goal looks too vague or too untethered from the tree
 /// to be worth a plan; `None` when it is at least actionable-looking.
 ///
@@ -134,6 +169,22 @@ mod tests {
         let note = check_goal_quality("Make the whole thing better and generally improve it")
             .expect("long vague goal flags");
         assert!(note.contains("anchor"), "{note}");
+    }
+
+    #[test]
+    fn task_shaped_goals_skip_the_planner() {
+        assert!(goal_is_task_shaped("Fix the login redirect in src/auth.rs"));
+        assert!(goal_is_task_shaped(
+            "Add retry with backoff to src/llm/openrouter.rs"
+        ));
+    }
+
+    #[test]
+    fn vague_or_anchorless_goals_still_plan() {
+        assert!(!goal_is_task_shaped("Review the architecture of rof"));
+        assert!(!goal_is_task_shaped("fix it"));
+        assert!(!goal_is_task_shaped("How does the retriever work?"));
+        assert!(!goal_is_task_shaped("Verify the build is green"));
     }
 
     #[test]

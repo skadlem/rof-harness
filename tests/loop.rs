@@ -392,6 +392,44 @@ async fn loop_passes_first_round() {
 }
 
 #[tokio::test]
+async fn planner_auto_skips_task_shaped_goals() {
+    let client = Arc::new(FakeClient::pass());
+    let (orch, reg, root) = harness_with(client.clone(), "auto-skip", 2, |cfg| {
+        cfg.planner = "auto".to_string();
+    });
+    let out = orch
+        .run_loop(
+            &Session::new("Fix the greeting in src/a.txt".into()).expecting_writes(false),
+            &reg,
+            &root,
+        )
+        .await;
+    assert_eq!(out["passed"], true);
+    assert_eq!(client.planner_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(out["plan"]["skipped"], true);
+    assert_eq!(out["plan"]["auto"], true);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn planner_auto_plans_vague_goals() {
+    let client = Arc::new(FakeClient::pass());
+    let (orch, reg, root) = harness_with(client.clone(), "auto-plan", 2, |cfg| {
+        cfg.planner = "auto".to_string();
+    });
+    let out = orch
+        .run_loop(
+            &Session::new("Review the greeting in src/a.txt".into()).expecting_writes(false),
+            &reg,
+            &root,
+        )
+        .await;
+    assert_eq!(out["passed"], true);
+    assert_eq!(client.planner_calls.load(Ordering::SeqCst), 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
 async fn direct_mode_uses_one_executor_and_requires_passing_checks() {
     let client = Arc::new(FakeClient::pass());
     let (orch, reg, root) = harness_with(client.clone(), "direct", 2, |cfg| {

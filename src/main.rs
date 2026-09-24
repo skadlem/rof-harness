@@ -140,9 +140,10 @@ fn apply_env(cfg: &mut AppConfig) {
             cfg.max_review_rounds = n;
         }
     }
-    // Planner A/B lever: "skip" treats every goal as a single task.
+    // Planner A/B lever: "skip" treats every goal as a single task,
+    // "auto" skips only task-shaped goals (see goal_is_task_shaped).
     if let Some(p) = get("ROF_PLANNER") {
-        if matches!(p.trim(), "skip" | "always") {
+        if matches!(p.trim(), "skip" | "always" | "auto") {
             cfg.planner = p.trim().to_string();
         }
     }
