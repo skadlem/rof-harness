@@ -503,8 +503,22 @@ fn truncated_content_chars(text: &str) -> usize {
     rest[..end].parse().unwrap_or(0)
 }
 
+/// Responses-transport routing: `muse-*` ids are responses-endpoint only
+/// (`.../responses`; chat/completions answers `Endpoint is unavailable`).
+fn uses_responses(model: &str) -> bool {
+    model.starts_with("muse-")
+}
+
+/// Test helper: the transport routing without a client.
+pub fn uses_responses_for_test(model: &str) -> bool {
+    uses_responses(model)
+}
+
 impl OpenRouterClient {
     async fn once(&self, model: &str, req: &LlmReq) -> Result<LlmResp, LlmError> {
+        if uses_responses(model) {
+            return self.once_responses(model, req).await;
+        }
         let mut call = self
             .http
             .post(format!("{}/chat/completions", self.base))
@@ -597,6 +611,159 @@ impl OpenRouterClient {
             attempts: 1, // overwritten by complete() with the real attempt count
         })
     }
+}
+
+impl OpenRouterClient {
+    /// Responses-API call (`POST {base}/responses`): the only dialect
+    /// `muse-*` models serve. Mirrors `once()` headers (bearer, referer,
+    /// title, Go session) and error vocabulary so the retry ladder above
+    /// classifies responses results without knowing the transport.
+    async fn once_responses(&self, model: &str, req: &LlmReq) -> Result<LlmResp, LlmError> {
+        // Reasoning consumes the cap alongside text (measured: 50-token cap
+        // bought 47 reasoning tokens and zero text), so width follows the
+        // summarize precedent (+headroom) instead of the raw budget.
+        let cap = req.max_tokens.saturating_add(3072);
+        let mut body = serde_json::json!({
+            "model": model,
+            "instructions": req.system,
+            "input": req.prompt,
+            "max_output_tokens": cap,
+        });
+        // `ROF_REASONING_EFFORT` rides as `reasoning.effort` here; the chat
+        // `reasoning_off/low` template switches are meaningless on this
+        // endpoint, so the ladder's reshapes arrive as budget changes only.
+        if let Some(e) = self.effort.as_deref() {
+            if matches!(e, "low" | "medium" | "high") {
+                body["reasoning"] = serde_json::json!({ "effort": e });
+            } else if e == "none" {
+                // Explicit opt-out must not become endpoint-default-high.
+                body["reasoning"] = serde_json::json!({ "effort": "minimal" });
+            }
+        }
+        if req.reasoning_off {
+            body["reasoning"] = serde_json::json!({ "effort": "minimal" });
+        } else if req.reasoning_low {
+            body["reasoning"] = serde_json::json!({ "effort": "low" });
+        }
+        let mut call = self
+            .http
+            .post(format!("{}/responses", self.base))
+            .bearer_auth(&self.token)
+            .header("HTTP-Referer", "rof-harness")
+            .header("X-Title", "rof-harness");
+        if let Some((name, value)) = self.session_header() {
+            call = call.header(name, value);
+        }
+        let res = call
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| LlmError::Transport(e.to_string()))?;
+        if !res.status().is_success() {
+            let code = res.status();
+            let text = res.text().await.unwrap_or_default();
+            let short: String = text.chars().take(300).collect();
+            return Err(LlmError::Transport(format!("{code}: {short}")));
+        }
+        let parsed: serde_json::Value = res
+            .json()
+            .await
+            .map_err(|e| LlmError::Transport(e.to_string()))?;
+        // The reasoning count is consumed inside `parse_responses` error
+        // strings (the ladder's budget signal); `LlmResp` carries no row.
+        let (text, inp, out, cached, _reasoning) =
+            parse_responses(&parsed, req.max_tokens).map_err(LlmError::Transport)?;
+        Ok(LlmResp {
+            text,
+            input_tokens: inp,
+            output_tokens: out,
+            latency_ms: 0,  // set by complete(), which owns the timer
+            cost_usd: None, // responses usage carries no cost row
+            cached_input_tokens: cached,
+            attempts: 1, // overwritten by complete() with the real attempt count
+        })
+    }
+}
+
+/// Parse a Responses-API body into `(text, in, out, cached, reasoning)`.
+/// Vocabulary contract with the ladder: `incomplete` + empty text reads as
+/// a length truncation with the reasoning signal attached; a model `error`
+/// object or non-completed status reads as a transport error carrying the
+/// server message.
+fn parse_responses(
+    body: &serde_json::Value,
+    max_tokens: usize,
+) -> Result<(String, u64, u64, u64, u64), String> {
+    let status = body
+        .pointer("/status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let server_error = body
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let mut text = String::new();
+    if let Some(items) = body.pointer("/output").and_then(|v| v.as_array()) {
+        for item in items {
+            if item.pointer("/type").and_then(|v| v.as_str()) != Some("message") {
+                continue;
+            }
+            if let Some(blocks) = item.pointer("/content").and_then(|v| v.as_array()) {
+                for b in blocks {
+                    if b.pointer("/type").and_then(|v| v.as_str()) == Some("output_text") {
+                        if let Some(t) = b.pointer("/text").and_then(|v| v.as_str()) {
+                            text.push_str(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let usage = body.pointer("/usage");
+    let inp = usage
+        .and_then(|u| u.pointer("/input_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let out = usage
+        .and_then(|u| u.pointer("/output_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cached = usage
+        .and_then(|u| u.pointer("/input_tokens_details/cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let reasoning = usage
+        .and_then(|u| u.pointer("/output_tokens_details/reasoning_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if let Some(msg) = server_error {
+        return Err(format!("responses error ({status}): {msg}"));
+    }
+    if status != "completed" {
+        // `incomplete` with reasoning-only output is the responses shape of
+        // a length truncation (measured live: empty `output`, 47 reasoning
+        // tokens against a 50 cap). Report it in the ladder's vocabulary —
+        // including the literal `finish_reason=length` token `complete()`
+        // classifies on — or the truncation reads as non-retryable.
+        return Err(format!(
+            "output truncated at {max_tokens} tokens (finish_reason=length; status={status}; content={} chars; reasoning_content={reasoning} chars); raise max_tokens",
+            text.trim().len()
+        ));
+    }
+    if text.trim().is_empty() {
+        return Err(format!(
+            "empty content from responses (status={status}; reasoning_content={reasoning} chars); the endpoint shipped no text"
+        ));
+    }
+    Ok((text, inp, out, cached, reasoning))
+}
+
+/// Test helper: the responses parser without a network round trip.
+pub fn responses_parse_for_test(
+    body: &serde_json::Value,
+    max_tokens: usize,
+) -> Result<(String, u64, u64, u64, u64), String> {
+    parse_responses(body, max_tokens)
 }
 
 #[cfg(test)]

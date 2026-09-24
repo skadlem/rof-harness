@@ -2,7 +2,8 @@ use async_trait::async_trait;
 pub mod openrouter;
 pub use openrouter::{
     base_req_for_test, client_session_for_test, effort_client_for_test,
-    reshape_for_truncation_for_test, session_header_for_test, wire_body_for_test, OpenRouterClient,
+    reshape_for_truncation_for_test, responses_parse_for_test, session_header_for_test,
+    uses_responses_for_test, wire_body_for_test, OpenRouterClient,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
