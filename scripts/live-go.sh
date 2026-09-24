@@ -39,6 +39,14 @@ export ROF_CTX_MODEL="${ROF_CTX_MODEL:-deepseek-flash}"
 export ROF_EXEC_MODEL="${ROF_EXEC_MODEL:-deepseek-flash}"
 # The knob Go honors (hermes parity); unset = absent from the wire.
 export ROF_REASONING_EFFORT="${ROF_REASONING_EFFORT:-medium}"
+# Best-known config (measured 18/20 mean, 2026-09-24). Explicit env wins:
+# a bare `scripts/live-go.sh` run without these silently measures defaults
+# (planner-on/explorer-off/attempts-1 ≈ 9-11/20), which is not data.
+export ROF_PLANNER="${ROF_PLANNER:-skip}"
+export ROF_EXPLORER="${ROF_EXPLORER:-yes}"
+export ROF_ATTEMPTS="${ROF_ATTEMPTS:-3}"
+export ROF_MAX_ROUNDS="${ROF_MAX_ROUNDS:-4}"
+export ROF_MAX_TASK_TOKENS="${ROF_MAX_TASK_TOKENS:-250000}"
 export ROF_WORKDIR="${ROF_WORKDIR:-$PWD}"
 export ROF_TASK_ROOT="${ROF_TASK_ROOT:-$RUNS_DIR}"
 export ROF_ALLOW_CMDS="${ROF_ALLOW_CMDS:-cargo check,cargo test}"
