@@ -1,8 +1,8 @@
 //! Mascot splash overlay for `rof chat`: baked ANSI art + title lines.
 //!
-//! The art is sprite 8 ("waving") from the canonical cheetahs3.png sheet,
-//! baked to `assets/mascot-splash.txt` (verified via `bake.py --check`).
-//! The file's first two lines are a label + blank header; the rest is art.
+//! The art is baked from the canonical cheetahs3.png sheet to
+//! `assets/mascot-N.txt` (verified via `bake.py --check`).
+//! Each file's first two lines are a blank + label header; the rest is art.
 
 use ansi_to_tui::IntoText;
 use ratatui::{
@@ -15,13 +15,48 @@ use ratatui::{
 
 use super::theme::{AMBER, DIM};
 
-const RAW: &str = include_str!("../../assets/mascot-splash.txt");
+/// Mascot expression per app state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mood {
+    Greet,
+    Working,
+    Idle,
+    Explore,
+    Happy,
+    Error,
+}
 
-/// Parse the baked art (skipping the 2 header lines) into styled text.
+const GREET_RAW: &str = include_str!("../../assets/mascot-8.txt");
+const WORKING_RAW: &str = include_str!("../../assets/mascot-5.txt");
+const IDLE_RAW: &str = include_str!("../../assets/mascot-7.txt");
+const EXPLORE_RAW: &str = include_str!("../../assets/mascot-10.txt");
+const HAPPY_RAW: &str = include_str!("../../assets/mascot-4.txt");
+const ERROR_RAW: &str = include_str!("../../assets/mascot-12.txt");
+
+/// Parse baked art (skipping the 2 header lines) into styled text.
 /// A parse failure falls back to unstyled lines — the overlay never panics.
-pub fn load() -> Text<'static> {
-    let body: String = RAW.lines().skip(2).collect::<Vec<_>>().join("\n");
+fn parse(raw: &str) -> Text<'static> {
+    let body: String = raw.lines().skip(2).collect::<Vec<_>>().join("\n");
     body.into_text().unwrap_or_else(|_| Text::from(body))
+}
+
+/// Art for the given mood: 8 waving (greet), 5 running (working),
+/// 7 sleeping (idle), 10 sniffing (explore), 4 laughing (happy),
+/// 12 chirping (error).
+pub fn art(mood: Mood) -> Text<'static> {
+    match mood {
+        Mood::Greet => parse(GREET_RAW),
+        Mood::Working => parse(WORKING_RAW),
+        Mood::Idle => parse(IDLE_RAW),
+        Mood::Explore => parse(EXPLORE_RAW),
+        Mood::Happy => parse(HAPPY_RAW),
+        Mood::Error => parse(ERROR_RAW),
+    }
+}
+
+/// Greet-alias kept for existing callers: the default splash art.
+pub fn load() -> Text<'static> {
+    art(Mood::Greet)
 }
 
 /// Title block under the art: "rof chat" in amber bold, the version, and a
@@ -86,11 +121,27 @@ mod tests {
 
     #[test]
     fn splash_loads_enough_art_lines() {
-        let text = load();
-        assert!(text.lines.len() >= 20, "lines={}", text.lines.len());
-        assert!(
-            text.lines[0].width() > 0,
-            "first art line must be non-empty"
-        );
+        let moods = [
+            Mood::Greet,
+            Mood::Working,
+            Mood::Idle,
+            Mood::Explore,
+            Mood::Happy,
+            Mood::Error,
+        ];
+        for mood in moods {
+            let text = art(mood);
+            assert!(
+                text.lines.len() >= 15,
+                "{mood:?}: lines={}",
+                text.lines.len()
+            );
+            assert!(
+                text.lines[0].width() > 0,
+                "{mood:?}: first art line must be non-empty"
+            );
+        }
+        // `load()` stays a greet-alias for existing callers.
+        assert_eq!(load().lines.len(), art(Mood::Greet).lines.len());
     }
 }
