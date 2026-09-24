@@ -3264,3 +3264,20 @@ vacated slot: loop still 0..5, terminal afterwards. `LlmReq.shrunk`
 `tests/v4_shrink.rs` + updated ladder spec test; full suite + clippy + fmt
 green; Muse reviewer OK with notes (3 doc P2s fixed at landing). Live probe
 pending.
+
+## 2026-09-24 — shrink arm verdict: 0/3 oracle, rung never fired, ceiling written
+
+c9/c10/c11 (default caps, shrink in-ladder): wrong-edit (477 s) / timeout
+(1500 s) / wrong-edit (341 s), oracle 35 failed throughout. Acting reps
+match the c4 variance shape, not a rung effect: no call in any rep reached
+5 shapes (`max 4 attempts` deepest), so shrink never fired — bug02 on this
+model resolves or dies within 4 ladder shapes or hangs past timeout.
+The rung is built + unit-pinned but live-unproven on this bug, not disproven.
+
+CEILING (grind rule, two loop-shape attempts spent: caps 0/3, shrink 0/3):
+bug02 on deepseek-flash-via-rof is above the reliable ceiling. The three
+shapes span silence/timeout/wrong-edit while hermes+pi pass 3/3 in 1-4 min
+on the same wire — the differentiator is loop-shape around non-converging
+reasoning, and the cheap rungs are exhausted. Next touches only with a
+stronger model or a full prompt-diet redesign, neither scheduled.
+Reports: `~/.local/share/rof-pilot/results/c{9,10,11}-bug02.json`.
