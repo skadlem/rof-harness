@@ -342,8 +342,9 @@ fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
         _ => std::env::current_dir()?,
     };
     let root = root.canonicalize()?;
-    // Default policy denies everything; anchor the allowlist to the workdir.
-    cfg.permissions.allowed_dirs = vec![root.clone()];
+    // Default policy denies everything; anchor the allowlist to the workdir
+    // (config-declared extra dirs are honoured, not dropped).
+    rof::tools::anchor_allowed_dirs(&mut cfg.permissions, &root);
     let trace = match std::env::var("ROF_TRACE") {
         Ok(p) if !p.trim().is_empty() => TraceSink::with_file(std::path::Path::new(p.trim()))?,
         _ => TraceSink::new(),
@@ -431,7 +432,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!(
                 "# effective config (defaults < file < env). Save with: rof config > cfg.json"
             );
-            eprintln!("# allowed_dirs is anchored to the workdir at run time.");
+            eprintln!("# allowed_dirs is anchored to the workdir at run time (plus config extras; eval restricts to the task copy).");
             println!("{}", cfg.to_json());
             Ok(())
         }

@@ -35,6 +35,16 @@ pub struct ToolRegistry {
     policy: PermissionPolicy,
 }
 
+/// Anchor the allowlist to the run root without dropping config-declared
+/// dirs: root first (the common case reads first), extras preserved in
+/// order, never duplicated. Eval task isolation still overwrites with the
+/// task copy (see `run_task_in`) — that is a security boundary, not config.
+pub fn anchor_allowed_dirs(policy: &mut PermissionPolicy, root: &PathBuf) {
+    if !policy.allowed_dirs.iter().any(|d| d == root) {
+        policy.allowed_dirs.insert(0, root.clone());
+    }
+}
+
 impl ToolRegistry {
     pub fn new(policy: PermissionPolicy) -> Self {
         Self {
@@ -66,7 +76,7 @@ impl ToolRegistry {
     /// (Propose by default). One tool, one door.
     pub fn with_defaults(root: PathBuf, policy: PermissionPolicy, skills: SkillsConfig) -> Self {
         let mut p = policy;
-        p.allowed_dirs = vec![root.clone()];
+        anchor_allowed_dirs(&mut p, &root);
         let mut r = Self::new(p.clone());
         r.register(FsListTool::new(root.clone()));
         r.register(FsReadTool::new(root.clone()));
@@ -574,6 +584,43 @@ pub fn prefix_allowed(prefixes: &[String], cmd: &str) -> bool {
 
 #[cfg(test)]
 fn _unused() {}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::anchor_allowed_dirs;
+    use crate::config::PermissionPolicy;
+    use std::path::PathBuf;
+
+    fn policy_with(dirs: &[&str]) -> PermissionPolicy {
+        PermissionPolicy {
+            allowed_dirs: dirs.iter().map(PathBuf::from).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn config_dirs_survive_with_root_first() {
+        let mut p = policy_with(&["/data"]);
+        anchor_allowed_dirs(&mut p, &PathBuf::from("/work"));
+        assert_eq!(
+            p.allowed_dirs,
+            vec![PathBuf::from("/work"), PathBuf::from("/data")]
+        );
+    }
+
+    #[test]
+    fn root_is_not_duplicated() {
+        let mut p = policy_with(&["/work"]);
+        anchor_allowed_dirs(&mut p, &PathBuf::from("/work"));
+        assert_eq!(p.allowed_dirs.len(), 1);
+        let mut p = policy_with(&["/data", "/work"]);
+        anchor_allowed_dirs(&mut p, &PathBuf::from("/work"));
+        assert_eq!(
+            p.allowed_dirs,
+            vec![PathBuf::from("/data"), PathBuf::from("/work")]
+        );
+    }
+}
 /// Test helper (stable path for integration tests).
 pub fn prefix_allowed_for_test(prefixes: &[String], cmd: &str) -> bool {
     prefix_allowed(prefixes, cmd)

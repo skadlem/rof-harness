@@ -51,6 +51,9 @@ fn run_live_inner(trace: &crate::obs::TraceSink) -> anyhow::Result<LiveOut> {
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut app = App::new();
+    // The posture accent is startup state, not render state: read once here
+    // so `draw` stays a pure function of `App`.
+    app.thinking = std::env::var("ROF_THINKING").unwrap_or_default();
     app.transcript
         .push("rof chat — type a goal, or /help for commands.".to_string());
     let mut shown: usize = 0;
@@ -396,6 +399,7 @@ fn apply_action(
 pub fn replay(path: &std::path::Path) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(path)?;
     let mut app = App::new();
+    app.thinking = std::env::var("ROF_THINKING").unwrap_or_default();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {

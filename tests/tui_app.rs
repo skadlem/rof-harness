@@ -62,6 +62,36 @@ fn scroll_offset_moves_the_transcript_window() {
 }
 
 #[test]
+fn composer_title_comes_from_app_not_the_environment() {
+    use ratatui::{backend::TestBackend, Terminal};
+    use rof::tui::{app::App, ui::draw};
+    fn screen(app: &App) -> String {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+    // The accent follows App state, never the process environment.
+    let mut app = App::new();
+    app.thinking = "low".to_string();
+    assert!(
+        screen(&app).contains("composer · low"),
+        "composer title carries App thinking"
+    );
+    let plain = App::new();
+    assert!(
+        !screen(&plain).contains("·"),
+        "no accent without App thinking"
+    );
+}
+
+#[test]
 fn layout_shows_transcript_status_and_composer() {
     use ratatui::{backend::TestBackend, Terminal};
     use rof::tui::{app::App, ui::draw};

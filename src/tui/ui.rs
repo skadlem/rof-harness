@@ -7,8 +7,7 @@ use ratatui::{
 use super::{app::App, theme};
 
 /// Transcript (top) · status (middle) · composer (bottom, 3 lines).
-/// Logic-free: every string comes from `App` (plus `ROF_THINKING` for the
-/// composer's title accent).
+/// Logic-free: every string comes from `App`.
 pub fn draw(f: &mut Frame, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -37,9 +36,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         Paragraph::new(app.status_line()).block(theme::pane("status")),
         rows[1],
     );
-    let thinking = std::env::var("ROF_THINKING").unwrap_or_default();
     f.render_widget(
-        Paragraph::new(app.input.as_str()).block(theme::composer_block(&thinking)),
+        Paragraph::new(app.input.as_str()).block(theme::composer_block(&app.thinking)),
         rows[2],
     );
 }

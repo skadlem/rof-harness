@@ -14,6 +14,10 @@ pub struct App {
     /// True until the first keypress; `run.rs` draws the splash overlay
     /// while set and consumes that keypress.
     pub fresh: bool,
+    /// Thinking posture for the composer's title accent. Read once from
+    /// `ROF_THINKING` at startup by `run.rs`, never at render time: `draw`
+    /// is a pure function of `App`.
+    pub thinking: String,
 }
 
 impl Default for App {
@@ -24,6 +28,7 @@ impl Default for App {
             input: String::new(),
             scroll: 0,
             fresh: true,
+            thinking: String::new(),
         }
     }
 }

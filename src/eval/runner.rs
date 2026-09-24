@@ -263,6 +263,9 @@ impl EvaluationRunner {
     pub async fn run_task_in(&self, task: &EvalTask, workdir: PathBuf) -> TaskResult {
         let sink = Arc::new(self.trace.fork());
         let mut cfg = self.cfg.clone();
+        // Task-copy isolation: the agent sees only its own copy, never the
+        // source tree and never config-declared extra dirs. Deliberate — a
+        // suite task that could reach outside its copy is unsound.
         cfg.permissions.allowed_dirs = vec![workdir.clone()];
         let reg = ToolRegistry::with_defaults(
             workdir.clone(),

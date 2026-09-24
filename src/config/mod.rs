@@ -47,7 +47,10 @@ impl Default for RoutingConfig {
 }
 
 /// Deny-by-default: a tool runs only if (agent, tool) is allowed AND the
-/// target path (if any) sits under an allowed dir.
+/// target path (if any) sits under an allowed dir. The run root is always
+/// anchored in (see `anchor_allowed_dirs`); extra dirs are honoured for live
+/// runs. Eval task runs restrict to the task copy regardless — that
+/// isolation is a security boundary, not configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PermissionPolicy {
