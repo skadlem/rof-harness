@@ -94,6 +94,8 @@ fn suite(goal: &str) -> EvalSuite {
             goal: goal.to_string(),
             expect_pass: true,
             checks: Vec::new(),
+            fail_to_pass: Vec::new(),
+            pass_to_pass: Vec::new(),
             expect_writes: true,
             max_tokens: None,
         }],
