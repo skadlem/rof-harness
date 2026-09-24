@@ -605,6 +605,23 @@ impl Orchestrator {
                                     .to_string(),
                         };
                     }
+                    // v4 verify guard in the pipeline: a reviewer pass is not
+                    // the final word when the outer judge is on. A veto fails
+                    // the round like any other verdict, so the retry sees the
+                    // veto note as feedback.
+                    if verdict.pass {
+                        if let Some(veto) = svc.verify_guard(task, &artifact, &check_results).await
+                        {
+                            self.trace.emit(TraceEvent::StateTransition {
+                                from: "verifying".to_string(),
+                                to: "implementing".to_string(),
+                            });
+                            verdict = Verdict {
+                                pass: false,
+                                feedback: veto,
+                            };
+                        }
+                    }
                     if verdict.pass {
                         break;
                     }

@@ -26,6 +26,8 @@ struct FakeClient {
     read_then_write: bool,
     /// Ask for a path outside the workdir, then answer.
     read_escape: bool,
+    /// When set, VERIFY-GUARD prompts fail (outer-judge veto path).
+    veto_guard: bool,
 }
 
 /// Set when a reviewer prompt carries the CHECKS section.
@@ -70,6 +72,7 @@ impl FakeClient {
             applied_retry: false,
             read_then_write: false,
             read_escape: false,
+            veto_guard: false,
         }
     }
     fn fail_then_pass() -> Self {
@@ -85,6 +88,7 @@ impl FakeClient {
             applied_retry: false,
             read_then_write: false,
             read_escape: false,
+            veto_guard: false,
         }
     }
     fn two_tasks() -> Self {
@@ -100,6 +104,7 @@ impl FakeClient {
             applied_retry: false,
             read_then_write: false,
             read_escape: false,
+            veto_guard: false,
         }
     }
     fn guess_then_fix() -> Self {
@@ -115,6 +120,7 @@ impl FakeClient {
             applied_retry: false,
             read_then_write: false,
             read_escape: false,
+            veto_guard: false,
         }
     }
     fn applied_retry() -> Self {
@@ -132,6 +138,7 @@ impl FakeClient {
             applied_retry: true,
             read_then_write: false,
             read_escape: false,
+            veto_guard: false,
         }
     }
     fn read_then_write() -> Self {
@@ -147,6 +154,7 @@ impl FakeClient {
             applied_retry: false,
             read_then_write: true,
             read_escape: false,
+            veto_guard: false,
         }
     }
     fn read_escape() -> Self {
@@ -162,6 +170,7 @@ impl FakeClient {
             applied_retry: false,
             read_then_write: false,
             read_escape: true,
+            veto_guard: false,
         }
     }
     fn resp(text: &str) -> Result<LlmResp, LlmError> {
@@ -235,6 +244,11 @@ impl LlmClient for FakeClient {
             // whatever the expectation is ("yes"/"no").
             if req.prompt.contains("EXPECT WRITES: ") && req.prompt.contains("WRITES MADE: ") {
                 SAW_WRITE_EXPECT.store(true, Ordering::SeqCst);
+            }
+            if self.veto_guard && req.prompt.contains("VERIFY-GUARD") {
+                return Self::resp(
+                    "{\"pass\": false, \"feedback\": \"guard: artifact insufficient\"}",
+                );
             }
             let n = self.review_calls.fetch_add(1, Ordering::SeqCst);
             if self.fail_first_review && n == 0 {
@@ -426,6 +440,35 @@ async fn planner_auto_plans_vague_goals() {
         .await;
     assert_eq!(out["passed"], true);
     assert_eq!(client.planner_calls.load(Ordering::SeqCst), 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn a_pipeline_veto_becomes_a_failed_task() {
+    // The inner reviewer passes; the outer guard vetoes. The pipeline must
+    // fail the task with the veto note, not ship the reviewer's pass.
+    let mut fake = FakeClient::pass();
+    fake.veto_guard = true;
+    let client = Arc::new(fake);
+    let (orch, reg, root) = harness_with(client, "pipeline-veto", 2, |cfg| {
+        cfg.verify_guard = true;
+    });
+    let out = orch
+        .run_loop(
+            &Session::new("g".into()).expecting_writes(false),
+            &reg,
+            &root,
+        )
+        .await;
+    assert_eq!(out["passed"], false);
+    assert!(
+        out["tasks"][0]["feedback"]
+            .as_str()
+            .unwrap_or("")
+            .contains("verify veto"),
+        "veto note must be the failure reason: {}",
+        out["tasks"][0]["feedback"]
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
