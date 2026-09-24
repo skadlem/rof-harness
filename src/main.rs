@@ -145,6 +145,14 @@ fn apply_env(cfg: &mut AppConfig) {
             cfg.max_review_rounds = n;
         }
     }
+    // Endpoint ceiling override (chars): the per-endpoint prompt size that
+    // still ships content. Clamped to the shrink floor — below it no call
+    // could complete a reasoning pass.
+    if let Some(n) = get("ROF_EMISSION_THRESHOLD") {
+        if let Ok(v) = n.trim().parse::<usize>() {
+            cfg.endpoint.emission_threshold_chars = v.max(1024);
+        }
+    }
     // Planner A/B lever: "skip" treats every goal as a single task,
     // "auto" skips only task-shaped goals (see goal_is_task_shaped).
     if let Some(p) = get("ROF_PLANNER") {
@@ -270,9 +278,15 @@ fn build_services(
     let router = ModelRouter::from_config(&cfg.routing);
     // Direct provider endpoint first (your own keys), then OpenRouter,
     // then offline stub. Agents only see Context/Executor services.
+    // The endpoint profile (prompt ceiling + ladder order) rides the
+    // clients, so a model move re-tunes config, not code. Defaults keep
+    // every existing run byte-identical.
     let real: Option<Arc<dyn LlmClient>> = OpenRouterClient::from_compat_env()
-        .map(|c| Arc::new(c) as Arc<dyn LlmClient>)
-        .or_else(|| OpenRouterClient::from_env().map(|c| Arc::new(c) as Arc<dyn LlmClient>));
+        .map(|c| Arc::new(c.with_profile(cfg.endpoint.clone())) as Arc<dyn LlmClient>)
+        .or_else(|| {
+            OpenRouterClient::from_env()
+                .map(|c| Arc::new(c.with_profile(cfg.endpoint.clone())) as Arc<dyn LlmClient>)
+        });
     let (ctx_model, _) = router.resolve(Role::Context);
     let (exec_model, exec_fb) = router.resolve(Role::Executor);
     let (verify_model, verify_fb) = router.resolve(Role::Verify);
@@ -283,7 +297,7 @@ fn build_services(
             // the executor. Its own client changes nothing when the env is
             // unset — same shared client, identical run.
             let judge = OpenRouterClient::from_verify_env()
-                .map(|j| Arc::new(j) as Arc<dyn LlmClient>)
+                .map(|j| Arc::new(j.with_profile(cfg.endpoint.clone())) as Arc<dyn LlmClient>)
                 .unwrap_or_else(|| c.clone());
             if announce {
                 if verify_model == exec_model {

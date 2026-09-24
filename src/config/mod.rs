@@ -259,6 +259,10 @@ pub struct AppConfig {
     /// v4: outer verify guard after inner pass (ROF_VERIFY_GUARD=yes). Off by default.
     #[serde(default)]
     pub verify_guard: bool,
+    /// Per-endpoint capability: the prompt ceiling and retry-ladder order.
+    /// Defaults reproduce the shipped DeepSeek/vLLM behavior bit for bit.
+    #[serde(default)]
+    pub endpoint: crate::llm::profile::EndpointProfile,
 }
 
 fn one_job() -> usize {
@@ -331,6 +335,7 @@ impl Default for AppConfig {
             explorer: false,
             attempts: 1,
             verify_guard: false,
+            endpoint: crate::llm::profile::EndpointProfile::default(),
         }
     }
 }

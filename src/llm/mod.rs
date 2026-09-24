@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 pub mod openrouter;
+pub mod profile;
 pub use openrouter::{
     base_req_for_test, client_session_for_test, effort_client_for_test,
     reshape_for_truncation_for_test, responses_parse_for_test, session_header_for_test,

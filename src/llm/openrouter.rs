@@ -114,6 +114,9 @@ pub struct OpenRouterClient {
     /// `enable_thinking` and `reasoning: false` are all ignored there,
     /// while hermes `--reasoning medium` (this field) converges.
     effort: Option<String>,
+    /// Per-endpoint capability: prompt ceiling + ladder order. Default =
+    /// the shipped behavior; `with_profile` overrides (wired from config).
+    profile: crate::llm::profile::EndpointProfile,
 }
 
 /// `ROF_REASONING_EFFORT` allowlist; anything else (or unset) is `None`.
@@ -142,6 +145,7 @@ pub fn effort_client_for_test(effort: Option<String>) -> OpenRouterClient {
         http: OpenRouterClient::http_client(),
         session: "test-session".to_string(),
         effort,
+        profile: crate::llm::profile::EndpointProfile::default(),
     }
 }
 
@@ -201,9 +205,15 @@ impl OpenRouterClient {
             http: Self::http_client(),
             session: uuid::Uuid::new_v4().to_string(),
             effort: effort_from_env(),
+            profile: crate::llm::profile::EndpointProfile::default(),
         }
     }
 
+    /// Override the endpoint capability (wired from config in `main`).
+    pub fn with_profile(mut self, profile: crate::llm::profile::EndpointProfile) -> Self {
+        self.profile = profile;
+        self
+    }
     /// The exact JSON `once()` POSTs: the static body plus the top-level
     /// effort when set. One builder so the wire tests assert what ships.
     fn payload(&self, model: &str, req: &LlmReq) -> serde_json::Value {
@@ -237,6 +247,7 @@ impl OpenRouterClient {
             http: Self::http_client(),
             session: uuid::Uuid::new_v4().to_string(),
             effort: effort_from_env(),
+            profile: crate::llm::profile::EndpointProfile::default(),
         })
     }
 
@@ -258,6 +269,7 @@ impl OpenRouterClient {
             http: Self::http_client(),
             session: uuid::Uuid::new_v4().to_string(),
             effort: effort_from_env(),
+            profile: crate::llm::profile::EndpointProfile::default(),
         })
     }
 
@@ -325,7 +337,7 @@ impl LlmClient for OpenRouterClient {
                         // it. The order matters and lives in one place:
                         // `reshape_for_truncation`.
                         let content = truncated_content_chars(&text);
-                        if !reshape_for_truncation(&mut req, content) {
+                        if !crate::llm::profile::apply_ladder(&mut req, content, &self.profile) {
                             break;
                         }
                     } else if reasoning_ate_budget(&text)
@@ -431,40 +443,11 @@ fn attempt_ge_max(attempt: usize) -> bool {
 /// Returns whether a reshape was applied. `false` means every rung is spent
 /// or the remaining one is known not to help, so the caller should stop.
 fn reshape_for_truncation(req: &mut LlmReq, content_chars: usize) -> bool {
-    if !req.reasoning_low && !req.thinking_off && !req.reasoning_off {
-        req.reasoning_low = true;
-        true
-    } else if !req.thinking_off && !req.reasoning_off {
-        req.thinking_off = true;
-        true
-    } else if !req.reasoning_off {
-        req.reasoning_off = true;
-        true
-    } else if !req.roomier && content_chars > 0 {
-        req.roomier = true;
-        req.max_tokens = req.max_tokens.saturating_mul(2);
-        req.reasoning_low = false;
-        req.thinking_off = false;
-        req.reasoning_off = false;
-        true
-    } else if content_chars == 0 && !req.shrunk && req.max_tokens > 1024 {
-        // Shrink-and-retry: the budget went entirely to reasoning, and
-        // reasoning expands to fill any budget — so halve the budget to
-        // force a shorter pass. reasoning_off STAYS on (it is the rung that
-        // got us here): the small-budget call runs thought-off. The ladder
-        // is terminal for the all-zero-content sequence (lower rungs check
-        // !reasoning_off; roomier needs content>0), and the attempt gate
-        // (`truncated && attempt>3`) blocks any 6th call regardless — one
-        // extra call, never a new climb. Uses the attempt slot roomier
-        // vacated (refused at zero content), so the loop bound is unchanged.
-        req.shrunk = true;
-        req.max_tokens = (req.max_tokens / 2).max(1024);
-        req.reasoning_low = false;
-        req.thinking_off = false;
-        true
-    } else {
-        false
-    }
+    crate::llm::profile::apply_ladder(
+        req,
+        content_chars,
+        &crate::llm::profile::EndpointProfile::default(),
+    )
 }
 
 /// Test helper: the ladder without a model behind it.

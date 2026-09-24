@@ -33,12 +33,24 @@ pub(crate) const EMISSION_THRESHOLD: usize = 12_000;
 
 /// The volatile budget for a short layer of `budget` tokens. The layer is
 /// counted in tokens and the assembler spends chars, hence the factor of four;
-/// the result is capped at [`EMISSION_THRESHOLD`] because that ceiling is an
-/// endpoint property the token derivation cannot see. One function so both
-/// consumers — the implementer's requested-file cap and the reviewer's
-/// evidence window — cannot drift apart.
+/// the result is capped at the endpoint profile's ceiling because that
+/// ceiling is an endpoint property the token derivation cannot see. One
+/// function so both consumers — the implementer's requested-file cap and the
+/// reviewer's evidence window — cannot drift apart.
 pub(crate) fn volatile_budget_for(budget_tokens: usize) -> usize {
-    (budget_tokens * 4).min(EMISSION_THRESHOLD)
+    volatile_budget_for_profile(
+        budget_tokens,
+        &crate::llm::profile::EndpointProfile::default(),
+    )
+}
+
+/// Profile-aware variant: the ceiling comes from the endpoint, so a model
+/// move re-tunes one number instead of invalidating the derivation.
+pub(crate) fn volatile_budget_for_profile(
+    budget_tokens: usize,
+    profile: &crate::llm::profile::EndpointProfile,
+) -> usize {
+    (budget_tokens * 4).min(profile.emission_threshold_chars)
 }
 
 /// One touched file's text as the implementer left it, plus the region the
@@ -371,7 +383,8 @@ impl<'a> RoundServices<'a> {
             }
         }
 
-        let cap = volatile_budget_for(self.cfg.context_policy().short.budget);
+        let cap =
+            volatile_budget_for_profile(self.cfg.context_policy().short.budget, &self.cfg.endpoint);
         let mut asm = ContextAssembler::new("", cap);
         for c in &carried {
             asm.add(ContextItem {
@@ -526,7 +539,7 @@ impl<'a> RoundServices<'a> {
     /// budget larger than the threshold buys nothing and silently breaks every
     /// call it governs. See the arm at `7cf52af`.
     pub fn volatile_budget(&self) -> usize {
-        volatile_budget_for(self.cfg.context_policy().short.budget)
+        volatile_budget_for_profile(self.cfg.context_policy().short.budget, &self.cfg.endpoint)
     }
 
     /// The stable head a prompt gets: the session's conventions, plus the
@@ -997,7 +1010,8 @@ mod evidence_tests {
 #[cfg(test)]
 mod budget_tests {
     use super::{
-        checks_pass, render_checks, volatile_budget_for, Budget, CheckResult, EMISSION_THRESHOLD,
+        checks_pass, render_checks, volatile_budget_for, volatile_budget_for_profile, Budget,
+        CheckResult, EMISSION_THRESHOLD,
     };
     use crate::config::AppConfig;
     use crate::obs::{TraceEvent, TraceSink};
@@ -1070,6 +1084,18 @@ mod budget_tests {
             EMISSION_THRESHOLD,
             "the cap must bind when the derivation exceeds it"
         );
+    }
+
+    /// A custom endpoint ceiling binds the same way: the profile's number,
+    /// not the shipped measurement, caps the derivation.
+    #[test]
+    fn a_custom_endpoint_ceiling_binds() {
+        let p = crate::llm::profile::EndpointProfile {
+            emission_threshold_chars: 4000,
+            ladder: Vec::new(),
+        };
+        assert_eq!(volatile_budget_for_profile(6000, &p), 4000);
+        assert_eq!(volatile_budget_for_profile(500, &p), 2000);
     }
 
     /// The cap is a ceiling, not a replacement: a small configured budget must
