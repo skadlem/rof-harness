@@ -1,15 +1,17 @@
 //! Shared TUI palette + pane frames.
 //!
-//! Single-accent scheme: amber leads (titles, composer), dim gray frames the
-//! panes, cyan is reserved for highlights, green/red only for pass/fail.
+//! Named ANSI colors only, so the UI respects the user's terminal theme.
+//! Single-accent scheme: amber (yellow) leads (titles, composer), dim gray
+//! frames the panes, cyan is reserved for highlights, green/red only for
+//! pass/fail.
 
 use ratatui::{
     style::{Color, Style},
     widgets::{Block, Borders},
 };
 
-pub const AMBER: Color = Color::Rgb(232, 160, 32);
-pub const CYAN: Color = Color::Rgb(53, 208, 224);
+pub const AMBER: Color = Color::Yellow;
+pub const CYAN: Color = Color::Cyan;
 pub const DIM: Color = Color::DarkGray;
 pub const PASS: Color = Color::Green;
 pub const FAIL: Color = Color::Red;
