@@ -22,6 +22,8 @@ fn partial_config_merges_over_defaults() {
         r#"{"budgets":{"long_term":1234},"planner":"skip","max_review_rounds":5}"#,
     )
     .unwrap();
+    // The removed "planner" key must not break old config files: serde
+    // ignores it and the rest loads.
     let cfg = AppConfig::load(&p).unwrap();
     assert_eq!(cfg.budgets.long_term, 1234, "stated field is taken");
     assert_eq!(
@@ -29,7 +31,6 @@ fn partial_config_merges_over_defaults() {
         AppConfig::default().budgets.mid_term,
         "unstated nested field falls back to default"
     );
-    assert_eq!(cfg.planner, "skip");
     assert_eq!(cfg.max_review_rounds, 5);
     // untouched top-level section keeps its default
     assert_eq!(

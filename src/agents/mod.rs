@@ -1,6 +1,5 @@
 pub mod explorer;
 pub mod implementer;
-pub mod planner;
 pub mod reviewer;
 use crate::context::CtxView;
 use crate::llm::{ContextService, ExecutorService};
@@ -11,13 +10,20 @@ pub use explorer::{
     explorer_block, explorer_report_for_test, ExplorerAgent, ExplorerReport, KeyFile, Quote,
 };
 pub use implementer::ImplementerAgent;
-pub use planner::{AgentOutput, Plan, PlannerAgent};
+/// Shared agent output envelope. (The planner that used to fill `data` with
+/// tasks/acceptance is gone — every goal runs as one task; this shape stays
+/// because implementer and reviewer both return it.)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentOutput {
+    pub summary: String,
+    pub data: serde_json::Value,
+}
 pub use reviewer::{ReviewerAgent, Verdict};
 use std::path::Path;
 
 /// Everything an agent may need. Agents only use what their role allows:
-/// Planner -> context LLM; Implementer -> executor LLM + tools;
-/// Reviewer -> executor LLM (read-only).
+/// Implementer -> executor LLM + tools; Reviewer -> executor LLM (read-only).
+/// The context LLM serves summarization (no planner remains).
 pub struct AgentCtx<'a> {
     pub view: &'a CtxView,
     pub context: Option<&'a ContextService>,

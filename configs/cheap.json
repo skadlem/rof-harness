@@ -18,6 +18,5 @@
   "max_review_rounds": 1,
   "max_tokens_per_task": 25000,
   "cost_lambda": 0.0,
-  "planner": "skip",
   "max_parallel_tasks": 4
 }

@@ -19,10 +19,6 @@
         "fs.patch",
         "http.get"
       ],
-      "planner": [
-        "fs.list",
-        "fs.read"
-      ],
       "reviewer": [
         "fs.read",
         "proc.run"
@@ -54,7 +50,6 @@
     "output_per_mtok": 0.6
   },
   "cost_lambda": 0.0,
-  "planner": "always",
   "expect_writes": true,
   "max_parallel_tasks": 1,
   "task_root": null,

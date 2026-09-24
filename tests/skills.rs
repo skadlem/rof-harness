@@ -103,19 +103,9 @@ fn suite(goal: &str) -> EvalSuite {
 }
 
 fn runner(e: &Env, client: Arc<dyn LlmClient>, policy: SkillPolicy) -> EvaluationRunner {
-    runner_with(e, client, policy, "always")
-}
-
-fn runner_with(
-    e: &Env,
-    client: Arc<dyn LlmClient>,
-    policy: SkillPolicy,
-    planner: &str,
-) -> EvaluationRunner {
     let mut cfg = AppConfig::default();
     cfg.skills.root = Some(e.skills.clone());
     cfg.skills.policy = policy;
-    cfg.planner = planner.to_string();
     // Per-task copies stay inside this test's own base dir. With the default
     // (the shared system temp dir) every test in this binary writes copies
     // named `rof-task-<pid>-task-<uuid>` and one test's teardown can delete a
@@ -206,8 +196,8 @@ async fn create_propose_approve_then_a_later_task_reuses_the_skill() {
         .await;
     assert!(rep2.tasks[0].matched, "{:?}", rep2.tasks[0]);
     assert_eq!(
-        rep2.aggregate.skills.reused, 3,
-        "planner, implementer and reviewer each got the body: {:?}",
+        rep2.aggregate.skills.reused, 2,
+        "implementer and reviewer each got the body (no planner): {:?}",
         rep2.aggregate.skills
     );
     assert!(
@@ -226,24 +216,6 @@ async fn create_propose_approve_then_a_later_task_reuses_the_skill() {
     );
     assert!(client2.wrote("[SKILLS]"), "the index rides the stable head");
 
-    // With the planner skipped there is no planner prompt to inject into, and
-    // the count says so: two agents ran, two bodies were delivered.
-    let client3 = Arc::new(SkillFake::new(vec![serde_json::json!({
-        "artifact": "x",
-        "notes": "y",
-        "writes": [{"path": "notes.md", "content": "third"}],
-    })]));
-    let rep3 = runner_with(&e, client3, SkillPolicy::Propose, "skip")
-        .run_suite(&suite(
-            "add tests the way the add-a-unit-test procedure says, to finish the eval target work",
-        ))
-        .await;
-    assert!(rep3.tasks[0].matched, "{:?}", rep3.tasks[0]);
-    assert_eq!(
-        rep3.aggregate.skills.reused, 2,
-        "implementer + reviewer, no phantom planner reuse: {:?}",
-        rep3.aggregate.skills
-    );
     std::fs::remove_dir_all(&e.base).ok();
 }
 
@@ -506,13 +478,19 @@ async fn the_gate_decides_who_reaches_the_skill_store() {
         r.unwrap().output.contains("proposed"),
         "implementer may propose"
     );
-    for agent in ["planner", "reviewer"] {
+    // No planner remains: the name is unknown to the gate, which denies it
+    // like any other unknown agent.
+    let (r, _) = reg
+        .call("planner", "skills.list", None, serde_json::json!({}))
+        .await;
+    assert!(r.is_err(), "planner is gone: unknown agent denied");
+    for agent in ["reviewer"] {
         let (r, _) = reg.call(agent, "skills.manage", None, create.clone()).await;
         assert!(r.is_err(), "{agent} must not manage skills");
     }
     // list grants, and a view that fails on a missing skill rather than on
     // policy (the grant is real).
-    for agent in ["planner", "reviewer", "implementer"] {
+    for agent in ["reviewer", "implementer"] {
         let (r, _) = reg
             .call(agent, "skills.list", None, serde_json::json!({}))
             .await;
@@ -541,15 +519,6 @@ async fn the_gate_decides_who_reaches_the_skill_store() {
         )
         .await;
     assert!(r.is_err(), "fs.write must not reach the skill store");
-    let (r, _) = reg
-        .call(
-            "planner",
-            "fs.read",
-            Some(&e.skills.join("anything.md")),
-            serde_json::json!({"path": "anything.md"}),
-        )
-        .await;
-    assert!(r.is_err(), "fs.read must not reach the skill store either");
     assert!(!e.skills.exists(), "nothing was written by any of this");
     std::fs::remove_dir_all(&e.base).ok();
 }

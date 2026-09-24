@@ -12,6 +12,5 @@
   },
   "max_review_rounds": 2,
   "max_tokens_per_task": 50000,
-  "planner": "always",
   "max_parallel_tasks": 1
 }

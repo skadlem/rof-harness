@@ -26,10 +26,10 @@ async fn read_only_tools_allow_and_deny() {
     reg.register(FsWriteTool::new(root.clone()));
     reg.register(ProcRunTool::new(root.clone(), vec!["echo hi".to_string()]));
 
-    // allowed: planner lists + reads inside root
+    // allowed: explorer lists + reads inside root
     let (r, _) = reg
         .call(
-            "planner",
+            "explorer",
             "fs.list",
             Some(&root),
             serde_json::json!({"path": "."}),
@@ -38,7 +38,7 @@ async fn read_only_tools_allow_and_deny() {
     assert!(r.unwrap().ok);
     let (r, _) = reg
         .call(
-            "planner",
+            "explorer",
             "fs.read",
             Some(&root.join("a.txt")),
             serde_json::json!({"path": "a.txt"}),
@@ -58,7 +58,7 @@ async fn read_only_tools_allow_and_deny() {
     assert!(r.is_err());
     let (r, _) = reg
         .call(
-            "planner",
+            "explorer",
             "fs.read",
             Some(&outside),
             serde_json::json!({"path": "x"}),
@@ -66,7 +66,7 @@ async fn read_only_tools_allow_and_deny() {
         .await;
     assert!(r.is_err());
     let (r, _) = reg
-        .call("planner", "shell.exec", Some(&root), serde_json::json!({}))
+        .call("explorer", "shell.exec", Some(&root), serde_json::json!({}))
         .await;
     assert!(r.is_err());
 
@@ -75,7 +75,7 @@ async fn read_only_tools_allow_and_deny() {
     std::fs::create_dir_all(&sibling).unwrap();
     let (r, _) = reg
         .call(
-            "planner",
+            "explorer",
             "fs.read",
             Some(&sibling),
             serde_json::json!({"path": "a.txt"}),
@@ -84,7 +84,7 @@ async fn read_only_tools_allow_and_deny() {
     assert!(r.is_err());
     let (r, _) = reg
         .call(
-            "planner",
+            "explorer",
             "fs.read",
             Some(&root.join("sub").join("..").join("..").join("etc")),
             serde_json::json!({"path": "sub/../../etc/passwd"}),
@@ -181,7 +181,7 @@ async fn git_substrate_is_unreachable_by_any_agent() {
     reg.register(ProcRunTool::new(root.clone(), vec!["echo hi".to_string()]));
 
     // No read of the substrate, at any depth, for any agent.
-    for agent in ["planner", "implementer", "reviewer"] {
+    for agent in ["explorer", "implementer", "reviewer"] {
         for path in [
             ".git/HEAD",
             ".git",
@@ -220,7 +220,7 @@ async fn git_substrate_is_unreachable_by_any_agent() {
     // A listing never offers the handle, so the model cannot probe it.
     let (r, _) = reg
         .call(
-            "planner",
+            "explorer",
             "fs.list",
             Some(&root),
             serde_json::json!({"path": "."}),
@@ -314,7 +314,7 @@ async fn symlinks_cannot_escape_the_tool_root() {
     // A link that resolves inside the root is not collateral damage.
     let (r, _) = reg
         .call(
-            "planner",
+            "explorer",
             "fs.read",
             Some(&root),
             serde_json::json!({"path": "sub/ok.md"}),

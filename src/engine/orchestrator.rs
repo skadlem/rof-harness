@@ -1,6 +1,6 @@
 use super::session::{checks_pass, render_checks, RoundServices};
 use super::Session;
-use crate::agents::{Agent, AgentCtx, ImplementerAgent, PlannerAgent, ReviewerAgent, Verdict};
+use crate::agents::{Agent, AgentCtx, ImplementerAgent, ReviewerAgent, Verdict};
 use crate::config::AppConfig;
 use crate::context::{render, ContextBuilder, CtxState, LayerReport, Retriever, Snippet};
 use crate::llm::{ContextService, ExecutorService};
@@ -78,16 +78,13 @@ impl Orchestrator {
             return self.run_direct_loop(session, &svc, workdir, &tree).await;
         }
         // Stage 2: the per-layer policy owns budgets, strategy and the
-        // summarize threshold. `plan_summarized` below is the first-class path;
-        // the planner's view stays on the pure `plan` because building a prompt
-        // must not cost a model call before the planner's own call.
+        // summarize threshold. `plan_summarized` below is the first-class path.
         let builder = ContextBuilder::with_policy(self.cfg.context_policy());
 
         // Keyword retrieval over the workdir feeds the mid-term layer,
-        // so planner + implementer see relevant files beyond top-level.
+        // so the implementer sees relevant files beyond top-level.
         let retriever = Retriever::new(workdir.to_path_buf(), self.cfg.retrieval.clone());
         let snips = retriever.retrieve(&session.goal, self.cfg.retrieval.max_total_chars);
-        let retrieved = render(&snips);
         // Files the goal names by path ride below the layers in the
         // implementer's volatile tail instead (see `named_file_contents`), so
         // they are neither cut nor summarized by the mid layer — and the
@@ -126,8 +123,7 @@ impl Orchestrator {
             .map(|s| serde_json::json!({ "path": s.path, "chars": s.content.chars().count() }))
             .collect();
         // Per-layer accounting (stage 2): every view the round loop builds
-        // folds its LayerReports here. The planner's one-shot view is outside
-        // the loop and is not counted.
+        // folds its LayerReports here.
         let mut acc = LayerAcc::default();
 
         // Skills, progressive disclosure: the index (names + one-line
@@ -138,7 +134,6 @@ impl Orchestrator {
         // decides who sees what. These are prompt-construction reads, not
         // agent tool calls: they emit `SkillOp` and never `ToolCall`, because
         // folding them into tool_accuracy would quietly inflate it.
-        let planner_skills = svc.skill_index("planner").await;
         let impl_skills = svc.skill_index("implementer").await;
         let reviewer_skills = svc.skill_index("reviewer").await;
         // v4 memory (pipeline mode): same stable-head prepend as direct mode.
@@ -149,91 +144,21 @@ impl Orchestrator {
         } else {
             format!("{mem_text}{}", session.ctx.long_term)
         };
-        let planner_head = RoundServices::head_with_index(&long_with_mem, &planner_skills.text);
         let impl_head = RoundServices::head_with_index(&long_with_mem, &impl_skills.text);
         let reviewer_head = RoundServices::head_with_index(&long_with_mem, &reviewer_skills.text);
-        // The planner only gets bodies when it actually runs: with the planner
-        // skipped there is no planner prompt to put them in, and a `reused`
-        // count that includes a body nobody read would be a lie.
-        // Planner mode: "always" plans, "skip" never does, "auto" skips only
-        // task-shaped goals (names a file/symbol + opens with a code verb).
-        // The decision is computed once and shared, so the reuse gate and the
-        // plan branch cannot disagree about whether the planner ran.
-        let skip_planner = self.cfg.planner == "skip"
-            || (self.cfg.planner == "auto"
-                && crate::eval::goal_quality::goal_is_task_shaped(&session.goal));
-        if self.cfg.planner == "auto" {
-            self.trace.emit(TraceEvent::StateTransition {
-                from: "planner_auto".to_string(),
-                to: if skip_planner {
-                    "skip".to_string()
-                } else {
-                    "plan".to_string()
-                },
-            });
-        }
-        let planner_reuse = if skip_planner {
-            String::new()
-        } else {
-            svc.skill_bodies("planner", &session.goal, &planner_skills)
-                .await
-        };
-
+        // No planner: every goal is one task. Decomposition lives outside the
+        // run (TUI goal queue, eval suite task lists) — the measured win was
+        // skipping, so the stage is gone, not defaulted off. The canned plan
+        // keeps the downstream shape (tasks/acceptance) stable.
         // A pre-check cheaper than the model that will consume the goal — the
         // one shared path, so direct mode cannot drift out of it again.
         let goal_note = svc.goal_note(&session.goal);
-
-        // Planner (Context LLM, no tools)
-        let plan_state = CtxState {
-            long_term: planner_head.clone(),
-            mid_term: format!(
-                "goal: {}\n{}{retrieved}{planner_reuse}",
-                session.goal,
-                goal_note
-                    .as_deref()
-                    .map(|n| format!("GOAL QUALITY NOTE: {n}\n"))
-                    .unwrap_or_default()
-            ),
-            short_term: session.ctx.short_term.clone(),
-        };
-        let (plan_view, _) = builder.plan(&plan_state);
-        // Planner (Context LLM, no tools). Skippable: for goals that are
-        // already task-shaped the call is pure overhead (see ROF_PLANNER).
-        let plan_out = if skip_planner {
-            let mut data = serde_json::json!({ "tasks": [], "acceptance": [], "skipped": true });
-            if self.cfg.planner == "auto" {
-                data["auto"] = serde_json::json!(true);
-            }
-            crate::agents::AgentOutput {
-                summary: "planner skipped".to_string(),
-                data,
-            }
-        } else {
-            let planner = PlannerAgent::new(&self.context);
-            match planner
-                .run(AgentCtx {
-                    view: &plan_view,
-                    context: Some(&self.context),
-                    executor: None,
-                    tools: None,
-                    workdir: None,
-                    trace: &self.trace,
-                    volatile_budget: 0,
-                })
-                .await
-            {
-                Ok(o) => o,
-                Err(e) => {
-                    self.trace.emit(TraceEvent::ModelError {
-                        agent: "planner".to_string(),
-                        error: e.to_string(),
-                    });
-                    return serde_json::json!({ "error": e.to_string() });
-                }
-            }
+        let plan_out = crate::agents::AgentOutput {
+            summary: "no planner".to_string(),
+            data: serde_json::json!({ "tasks": [], "acceptance": [], "skipped": true }),
         };
         self.trace.emit(TraceEvent::StateTransition {
-            from: "planned".to_string(),
+            from: "ready".to_string(),
             to: "implementing".to_string(),
         });
 
@@ -421,8 +346,12 @@ impl Orchestrator {
                     // cacheable prefix (this block) stays byte-identical, and
                     // an injected skill body goes last for the same reason.
                     mid_term: format!(
-                        "goal: {}\n{impl_retrieved}\nplan: {}\nCURRENT TASK ({}/{}) : {task}{impl_reuse}",
+                        "goal: {}\n{}{impl_retrieved}\nplan: {}\nCURRENT TASK ({}/{}) : {task}{impl_reuse}",
                         session.goal,
+                        goal_note
+                            .as_deref()
+                            .map(|n| format!("GOAL QUALITY NOTE: {n}\n"))
+                            .unwrap_or_default(),
                         plan_json,
                         ti + 1,
                         tasks.len()
@@ -761,7 +690,9 @@ impl Orchestrator {
             "layer_truncations": acc.layer_truncations,
             "eliminated_chars": acc.eliminated_chars,
             "checks": checks_log,
-            "ctx_tokens": plan_view.used_tokens,
+            // No planner view exists anymore; the planner's one-shot tokens
+            // were never folded into the layer accounts anyway.
+            "ctx_tokens": 0,
         })
     }
 

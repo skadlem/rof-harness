@@ -95,23 +95,6 @@ impl FakeClient {
             saw_explorer: AtomicBool::new(false),
         }
     }
-    fn two_tasks() -> Self {
-        Self {
-            direct_calls: AtomicUsize::new(0),
-            direct_saw_feedback: AtomicBool::new(false),
-            review_saw_verified_file: AtomicBool::new(false),
-            planner_calls: AtomicUsize::new(0),
-            review_calls: AtomicUsize::new(0),
-            fail_first_review: false,
-            plan_tasks: vec!["t1", "t2"],
-            guess_then_fix: false,
-            applied_retry: false,
-            read_then_write: false,
-            read_escape: false,
-            veto_guard: false,
-            saw_explorer: AtomicBool::new(false),
-        }
-    }
     fn guess_then_fix() -> Self {
         Self {
             direct_calls: AtomicUsize::new(0),
@@ -414,44 +397,6 @@ async fn loop_passes_first_round() {
         .await;
     assert_eq!(out["passed"], true);
     assert_eq!(out["rounds"], 1);
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[tokio::test]
-async fn planner_auto_skips_task_shaped_goals() {
-    let client = Arc::new(FakeClient::pass());
-    let (orch, reg, root) = harness_with(client.clone(), "auto-skip", 2, |cfg| {
-        cfg.planner = "auto".to_string();
-    });
-    let out = orch
-        .run_loop(
-            &Session::new("Fix the greeting in src/a.txt".into()).expecting_writes(false),
-            &reg,
-            &root,
-        )
-        .await;
-    assert_eq!(out["passed"], true);
-    assert_eq!(client.planner_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(out["plan"]["skipped"], true);
-    assert_eq!(out["plan"]["auto"], true);
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[tokio::test]
-async fn planner_auto_plans_vague_goals() {
-    let client = Arc::new(FakeClient::pass());
-    let (orch, reg, root) = harness_with(client.clone(), "auto-plan", 2, |cfg| {
-        cfg.planner = "auto".to_string();
-    });
-    let out = orch
-        .run_loop(
-            &Session::new("Review the greeting in src/a.txt".into()).expecting_writes(false),
-            &reg,
-            &root,
-        )
-        .await;
-    assert_eq!(out["passed"], true);
-    assert_eq!(client.planner_calls.load(Ordering::SeqCst), 1);
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -903,8 +848,27 @@ async fn reviewer_evidence_is_windowed_and_carried_once() {
 }
 
 #[tokio::test]
-async fn plan_tasks_each_get_their_own_cycle() {
-    let (orch, reg, root) = harness(Arc::new(FakeClient::two_tasks()), "tasks", 2);
+async fn no_planner_stage_runs() {
+    // No planner: the canned single-task plan is the contract. The planner
+    // model is never called, whatever the goal looks like.
+    let client = Arc::new(FakeClient::pass());
+    let (orch, reg, root) = harness(client.clone(), "no-planner", 2);
+    let out = orch
+        .run_loop(
+            &Session::new("Refactor main.rs in src".into()).expecting_writes(false),
+            &reg,
+            &root,
+        )
+        .await;
+    assert_eq!(out["passed"], true);
+    assert_eq!(client.planner_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(out["plan"]["skipped"], true);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn every_goal_runs_as_one_task() {
+    let (orch, reg, root) = harness(Arc::new(FakeClient::pass()), "onetask", 2);
     let out = orch
         .run_loop(
             &Session::new("g".into()).expecting_writes(false),
@@ -914,10 +878,8 @@ async fn plan_tasks_each_get_their_own_cycle() {
         .await;
     assert_eq!(out["passed"], true);
     let tasks = out["tasks"].as_array().unwrap();
-    assert_eq!(tasks.len(), 2, "both plan tasks must run: {tasks:?}");
-    assert_eq!(tasks[0]["task"], "t1");
-    assert_eq!(tasks[1]["task"], "t2");
-    assert_eq!(out["rounds"], 2, "one round each");
+    assert_eq!(tasks.len(), 1, "one goal is one task: {tasks:?}");
+    assert_eq!(tasks[0]["task"], "g");
     std::fs::remove_dir_all(&root).ok();
 }
 

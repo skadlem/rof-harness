@@ -43,11 +43,11 @@ fn has_anchor(goal: &str) -> bool {
         })
 }
 
-/// Deterministic planner-skip heuristic ("auto" mode): skip planning when the
-/// goal is already task-shaped — it names a file/symbol anchor AND opens with
-/// an imperative code-action verb. Conservative by construction: no anchor or
-/// no verb means plan, so ambiguity always costs one planner call, never a
-/// missing plan.
+/// Goal-shape classifier. It used to drive the planner's "auto" mode; the
+/// planner is gone, and this stays as the router primitive for any future
+/// auto-split: true when the goal is already task-shaped — it names a
+/// file/symbol anchor AND opens with an imperative code-action verb.
+/// Conservative by construction: no anchor or no verb means not task-shaped.
 const TASK_VERBS: [&str; 19] = [
     "fix",
     "add",

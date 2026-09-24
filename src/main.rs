@@ -153,13 +153,6 @@ fn apply_env(cfg: &mut AppConfig) {
             cfg.endpoint.emission_threshold_chars = v.max(1024);
         }
     }
-    // Planner A/B lever: "skip" treats every goal as a single task,
-    // "auto" skips only task-shaped goals (see goal_is_task_shaped).
-    if let Some(p) = get("ROF_PLANNER") {
-        if matches!(p.trim(), "skip" | "always" | "auto") {
-            cfg.planner = p.trim().to_string();
-        }
-    }
     if let Some(mode) = get("ROF_MODE") {
         if matches!(mode.trim(), "pipeline" | "direct") {
             cfg.execution = mode.trim().to_string();

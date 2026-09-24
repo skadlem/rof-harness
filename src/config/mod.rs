@@ -71,19 +71,6 @@ pub struct PermissionPolicy {
 impl Default for PermissionPolicy {
     fn default() -> Self {
         let mut agents_tools = BTreeMap::new();
-        agents_tools.insert(
-            "planner".to_string(),
-            vec![
-                "fs.list".to_string(),
-                "fs.read".to_string(),
-                "skills.list".to_string(),
-                // The plan is where a procedure shapes the task list, so the
-                // planner may read a body the task names (the plan's sketch
-                // granted `list` only; a grant the harness then depends on
-                // must exist, or the injection is dead code).
-                "skills.view".to_string(),
-            ],
-        );
         // reviewer verifies by running allowlisted checks; it never writes
         // v4 explorer: read-only context gathering in an isolated pass.
         agents_tools.insert(
@@ -219,8 +206,7 @@ pub struct AppConfig {
     pub pricing: PricingConfig,
     /// Weight on cost in the utility score. 0 = report-only (lexicographic).
     pub cost_lambda: f64,
-    /// "always" plans every goal; "skip" treats the goal as one task.
-    pub planner: String,
+
     /// "pipeline" runs Planner -> Implementer -> Reviewer; "direct" uses one executor.
     #[serde(default)]
     pub execution: String,
@@ -243,8 +229,8 @@ pub struct AppConfig {
     /// failing copy for inspection.
     #[serde(default = "yes")]
     pub clean_task_dirs: bool,
-    /// Run the goal-quality pre-check before planning. Emits a
-    /// `GoalQuality` trace event and, when set, a note in the planner prompt.
+    /// Run the goal-quality pre-check before the run. Emits a
+    /// `GoalQuality` trace event and, when set, a note in the implementer prompt.
     /// Off by default: it changes prompt content, which is an A/B'able change.
     #[serde(default)]
     pub goal_quality: bool,
@@ -325,7 +311,6 @@ impl Default for AppConfig {
             max_tokens_per_task: 50_000,
             pricing: PricingConfig::default(),
             cost_lambda: 0.0,
-            planner: "always".to_string(),
             execution: "pipeline".to_string(),
             expect_writes: true,
             max_parallel_tasks: 1,
