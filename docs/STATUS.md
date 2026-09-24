@@ -3319,3 +3319,33 @@ Cost note: m3 billed 145k tokens on the metered Go key; contributor-tier
 Muse pricing is unverified — watch the cap. Transport stays (it works);
 bug02 needs a stronger plan, not more reps. Reports:
 `~/.local/share/rof-pilot/results/m{1,2,3}-bug02.json` (m2 void).
+
+## 2026-09-25 — arch-review items 1–6 implemented (7 commits)
+
+Four-model review (DeepSeek/Muse/Bunny + 2 Atria briefs) converged; all six
+accepted items built with TDD, byte-identical defaults, full suite green
+(103 lib + 27 binaries, 2 consecutive full runs, 0 warnings, fmt clean).
+Plan: `docs/superpowers/plans/2026-09-24-rof-arch-review-1-6.md`.
+Reports: `~/.local/share/rof-arch-review/`.
+
+- Planner `auto` mode (`ROF_PLANNER=auto`): deterministic goal-shape
+  heuristic (imperative verb + file/symbol anchor), conservative, logged as
+  `planner_auto→skip|plan`. Default stays `always`.
+- Eval oracle split: `fail_to_pass`/`pass_to_pass` per task, baseline on the
+  pristine copy, compat scoring when undeclared. Plus `--reps N`/`ROF_REPS`
+  (default 1; aggregate is a rep rate; rows carry reps/passes).
+- Endpoint profile (`AppConfig.endpoint`, `ROF_EMISSION_THRESHOLD`): prompt
+  ceiling + ladder order per endpoint; shipped DeepSeek/vLLM values are the
+  default. Dead const/wrapper removed (single source).
+- `verify_guard` now runs in the pipeline loop (veto fails the round like
+  any verdict); direct mode unchanged.
+- Explorer takes the configured `RetrievalConfig` (was `default()`), runs in
+  both modes via shared `explorer_block` (names + snippets/chars stats).
+- Hygiene: config `allowed_dirs` honoured (root anchored first; eval still
+  restricts to the task copy — security boundary, documented); `ROF_THINKING`
+  moved from `draw()` env read into `App.thinking` set at startup.
+
+Test scar: new eval tests must NOT reuse task names `a/b/alpha/beta/noop/
+substrate/work` — `cleanup_task_dirs` sweeps those prefixes and deletes
+in-flight copies (measured flake). Unique names used. Also removed a stray
+`/tmp/.git` (2026-09-24, amplifies git fallback noise).
