@@ -28,6 +28,8 @@ struct FakeClient {
     read_escape: bool,
     /// When set, VERIFY-GUARD prompts fail (outer-judge veto path).
     veto_guard: bool,
+    /// Set when an implementer prompt carried the explorer line.
+    saw_explorer: AtomicBool,
 }
 
 /// Set when a reviewer prompt carries the CHECKS section.
@@ -73,6 +75,7 @@ impl FakeClient {
             read_then_write: false,
             read_escape: false,
             veto_guard: false,
+            saw_explorer: AtomicBool::new(false),
         }
     }
     fn fail_then_pass() -> Self {
@@ -89,6 +92,7 @@ impl FakeClient {
             read_then_write: false,
             read_escape: false,
             veto_guard: false,
+            saw_explorer: AtomicBool::new(false),
         }
     }
     fn two_tasks() -> Self {
@@ -105,6 +109,7 @@ impl FakeClient {
             read_then_write: false,
             read_escape: false,
             veto_guard: false,
+            saw_explorer: AtomicBool::new(false),
         }
     }
     fn guess_then_fix() -> Self {
@@ -121,6 +126,7 @@ impl FakeClient {
             read_then_write: false,
             read_escape: false,
             veto_guard: false,
+            saw_explorer: AtomicBool::new(false),
         }
     }
     fn applied_retry() -> Self {
@@ -139,6 +145,7 @@ impl FakeClient {
             read_then_write: false,
             read_escape: false,
             veto_guard: false,
+            saw_explorer: AtomicBool::new(false),
         }
     }
     fn read_then_write() -> Self {
@@ -155,6 +162,7 @@ impl FakeClient {
             read_then_write: true,
             read_escape: false,
             veto_guard: false,
+            saw_explorer: AtomicBool::new(false),
         }
     }
     fn read_escape() -> Self {
@@ -171,6 +179,7 @@ impl FakeClient {
             read_then_write: false,
             read_escape: true,
             veto_guard: false,
+            saw_explorer: AtomicBool::new(false),
         }
     }
     fn resp(text: &str) -> Result<LlmResp, LlmError> {
@@ -261,6 +270,9 @@ impl LlmClient for FakeClient {
             && req.prompt.contains("checked")
         {
             IMPL_SAW_CHECKS.store(true, Ordering::SeqCst);
+        }
+        if req.system.contains("implementer") && req.prompt.contains("explorer key files") {
+            self.saw_explorer.store(true, Ordering::SeqCst);
         }
         if req.system.contains("implementer") && self.guess_then_fix {
             if req.prompt.contains("round 2/2") {
@@ -468,6 +480,29 @@ async fn a_pipeline_veto_becomes_a_failed_task() {
             .contains("verify veto"),
         "veto note must be the failure reason: {}",
         out["tasks"][0]["feedback"]
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn pipeline_mode_runs_the_shared_explorer_stage() {
+    let client = Arc::new(FakeClient::pass());
+    let (orch, reg, root) = harness_with(client.clone(), "explorer-pipe", 2, |cfg| {
+        cfg.explorer = true;
+    });
+    // The goal names main.rs, which the harness root contains, so the
+    // explorer stage has a key file to report.
+    let out = orch
+        .run_loop(
+            &Session::new("Refactor main.rs".into()).expecting_writes(false),
+            &reg,
+            &root,
+        )
+        .await;
+    assert_eq!(out["passed"], true);
+    assert!(
+        client.saw_explorer.load(Ordering::SeqCst),
+        "the implementer prompt must carry the shared explorer line"
     );
     std::fs::remove_dir_all(&root).ok();
 }

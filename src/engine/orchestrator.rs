@@ -102,7 +102,21 @@ impl Orchestrator {
             .filter(|s| !named.contains(&s.path))
             .cloned()
             .collect();
-        let impl_retrieved = render(&unnamed);
+        let mut impl_retrieved = render(&unnamed);
+        // v4 explorer, pipeline mode: the same configured read-only pass the
+        // direct loop runs, so both modes explore identically. Key-file names
+        // join the implementer's volatile tail, never raw dumps.
+        if self.cfg.explorer {
+            let rep = crate::agents::ExplorerAgent::explore(
+                &session.goal,
+                workdir,
+                svc.tools,
+                &self.trace,
+                &self.cfg.retrieval,
+            )
+            .await;
+            impl_retrieved.push_str(&crate::agents::explorer_block(&rep));
+        }
         let retrieved_files = snips.len();
         // Context accounting (stage 0), folded per task by the eval layer. The
         // retriever's snippets are echoed with their sizes so a report can say
@@ -809,12 +823,10 @@ impl Orchestrator {
                 workdir,
                 svc.tools,
                 &self.trace,
+                &self.cfg.retrieval,
             )
             .await;
-            if !rep.key_files.is_empty() {
-                let names: Vec<String> = rep.key_files.iter().map(|k| k.path.clone()).collect();
-                retrieved.push_str(&format!("\nexplorer key files: {}", names.join(", ")));
-            }
+            retrieved.push_str(&crate::agents::explorer_block(&rep));
         }
         // v4 attempts: N independent round-sequences, cheapest-pass wins.
         // Default 1 = the historical single-sequence run, bit for bit.

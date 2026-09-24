@@ -17,12 +17,18 @@ pub struct Quote {
 
 /// What an isolated read-only exploration returns. Small by design: the caller
 /// appends key_files to the implementer's volatile tail through the assembler,
-/// never raw dumps.
+/// never raw dumps. The `*_seen` stats are the retrieval numbers behind the
+/// report, so a recall/token A/B reads off the prompt instead of needing a
+/// new trace schema.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ExplorerReport {
     pub summary: String,
     pub key_files: Vec<KeyFile>,
     pub quotes: Vec<Quote>,
+    #[serde(default)]
+    pub snippets_seen: usize,
+    #[serde(default)]
+    pub chars_seen: usize,
 }
 
 /// Read-only explorer. v1 is deterministic (no model call): it runs the same
@@ -31,18 +37,36 @@ pub struct ExplorerReport {
 /// prove itself against this baseline on recall before it ships.
 pub struct ExplorerAgent;
 
+/// The shared exploration line both loops append: key-file names plus the
+/// retrieval stats behind them. Empty when nothing was found, so callers
+/// append unconditionally.
+pub fn explorer_block(rep: &ExplorerReport) -> String {
+    if rep.key_files.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = rep.key_files.iter().map(|k| k.path.clone()).collect();
+    let line = format!(
+        "\nexplorer key files ({} seen, {} chars): {}",
+        rep.snippets_seen,
+        rep.chars_seen,
+        names.join(", ")
+    );
+    line
+}
+
 impl ExplorerAgent {
-    /// Explore `workdir` for `goal`. Read-only: lists and reads through the
-    /// passed registry as agent "explorer" (grant-gated like everyone else).
+    /// Explore `workdir` for `goal` with the configured retrieval caps.
+    /// Read-only: lists and reads through the passed registry as agent
+    /// "explorer" (grant-gated like everyone else).
     pub async fn explore(
         goal: &str,
         workdir: &Path,
         tools: &crate::tools::ToolRegistry,
         trace: &crate::obs::TraceSink,
+        retrieval: &crate::config::RetrievalConfig,
     ) -> ExplorerReport {
-        let cfg = crate::config::RetrievalConfig::default();
-        let r = crate::context::Retriever::new(workdir.to_path_buf(), cfg.clone());
-        let snips = r.retrieve(goal, cfg.max_total_chars);
+        let r = crate::context::Retriever::new(workdir.to_path_buf(), retrieval.clone());
+        let snips = r.retrieve(goal, retrieval.max_total_chars);
         let mut key_files: Vec<KeyFile> = Vec::new();
         let mut quotes: Vec<Quote> = Vec::new();
         for s in snips.iter().take(5) {
@@ -92,6 +116,8 @@ impl ExplorerAgent {
                 serde_json::json!({"path": "."}),
             )
             .await;
+        let snippets_seen = snips.len();
+        let chars_seen = snips.iter().map(|s| s.content.chars().count()).sum();
         ExplorerReport {
             summary: format!(
                 "explorer: {} key files for '{}'",
@@ -100,6 +126,8 @@ impl ExplorerAgent {
             ),
             key_files,
             quotes,
+            snippets_seen,
+            chars_seen,
         }
     }
 }
@@ -116,6 +144,8 @@ pub fn explorer_report_for_test(goal: &str, paths: &[&str]) -> String {
             })
             .collect(),
         quotes: Vec::new(),
+        snippets_seen: 0,
+        chars_seen: 0,
     };
     serde_json::to_string(&rep).unwrap_or_default()
 }
