@@ -264,6 +264,29 @@ fn split_list(s: &str) -> Vec<String> {
 /// `/model`, `/effort`, and `/login` between goals take effect on the next
 /// goal instead of silently riding the first goal's clients (which snapshot
 /// effort/tokens at construction). `announce` prints the `llm:` line.
+/// BYOK role binding: a `provider/model` id resolves its own base + key
+/// into a dedicated client; a bare id (or a provider with no base/key)
+/// rides the shared client. Never a startup error — an unresolvable binding
+/// falls back to shared, and the call fails at call time naming the model.
+fn role_client(
+    model_id: &str,
+    shared: &Arc<dyn LlmClient>,
+    profile: &rof::llm::profile::EndpointProfile,
+) -> Arc<dyn LlmClient> {
+    let (prov, _) = rof::tui::auth::split_provider_model(model_id);
+    if prov.is_empty() {
+        return shared.clone();
+    }
+    let base = rof::tui::auth::base_for_test(prov);
+    let key = rof::tui::auth::key_for(prov);
+    match (base, key) {
+        (Ok(b), Some(k)) => Arc::new(
+            OpenRouterClient::from_parts(b, k).with_profile(profile.clone()),
+        ) as Arc<dyn LlmClient>,
+        _ => shared.clone(),
+    }
+}
+
 fn build_services(
     cfg: &AppConfig,
     announce: bool,
@@ -286,12 +309,15 @@ fn build_services(
     match &real {
         Some(c) => {
             let via = std::env::var("ROF_CHAT_BASE").unwrap_or("openrouter".to_string());
+            // BYOK bindings ride per role; everything else shares `c`.
+            let ctx_client = role_client(ctx_model, c, &cfg.endpoint);
+            let exec_client = role_client(exec_model, c, &cfg.endpoint);
             // §4.5 arm #4: the judge may sit on a different provider than
             // the executor. Its own client changes nothing when the env is
             // unset — same shared client, identical run.
             let judge = OpenRouterClient::from_verify_env()
                 .map(|j| Arc::new(j.with_profile(cfg.endpoint.clone())) as Arc<dyn LlmClient>)
-                .unwrap_or_else(|| c.clone());
+                .unwrap_or_else(|| role_client(verify_model, c, &cfg.endpoint));
             if announce {
                 if verify_model == exec_model {
                     println!("llm: {via} (ctx={ctx_model}, exec={exec_model})");
@@ -302,9 +328,9 @@ fn build_services(
                 }
             }
             (
-                ContextService::new(c.clone(), ctx_model.to_string()),
+                ContextService::new(ctx_client, ctx_model.to_string()),
                 ExecutorService::new(
-                    c.clone(),
+                    exec_client,
                     exec_model.to_string(),
                     exec_fb.map(str::to_string),
                 ),

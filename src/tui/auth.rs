@@ -167,9 +167,41 @@ fn base_for(provider: &str) -> Result<String, String> {
     }
 }
 
-/// Test helper: base resolution without a client.
+/// Base resolution without a client (also the offline test hook).
 pub fn base_for_test(provider: &str) -> Result<String, String> {
     base_for(provider)
+}
+
+/// Split `provider/model` into (provider, model); a bare id has no provider
+/// prefix and keeps today's routing. Split at the FIRST slash so model paths
+/// like `a/b/c` keep their tail intact.
+pub fn split_provider_model(id: &str) -> (&str, &str) {
+    match id.find('/') {
+        Some(i) => (&id[..i], &id[i + 1..]),
+        None => ("", id),
+    }
+}
+
+fn nonblank_env(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// Resolve a provider's key: credentials store first, then the provider's
+/// env knob. Registry (user-defined) providers resolve from the store only —
+/// no blanket env fill (see `export_missing_env`). None when neither has
+/// it; callers fall back to the shared client rather than failing at startup.
+pub fn key_for(provider: &str) -> Option<String> {
+    if let Some(k) = read_all(&store().path)
+        .get(provider)
+        .filter(|k| !k.trim().is_empty())
+    {
+        return Some(k.clone());
+    }
+    match provider {
+        "openrouter" => nonblank_env("OR_TOKEN"),
+        "go" | "atria" | "custom" => nonblank_env("ROF_TOKEN"),
+        _ => None,
+    }
 }
 
 static STATUS: std::sync::Mutex<BTreeMap<String, String>> = std::sync::Mutex::new(BTreeMap::new());

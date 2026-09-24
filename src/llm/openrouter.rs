@@ -214,6 +214,19 @@ impl OpenRouterClient {
         self.profile = profile;
         self
     }
+
+    /// A client for an explicit base + key (BYOK provider bindings resolve
+    /// here instead of through the shared env-derived clients).
+    pub fn from_parts(base: String, token: String) -> Self {
+        Self {
+            token,
+            base,
+            http: Self::http_client(),
+            session: uuid::Uuid::new_v4().to_string(),
+            effort: effort_from_env(),
+            profile: crate::llm::profile::EndpointProfile::default(),
+        }
+    }
     /// The exact JSON `once()` POSTs: the static body plus the top-level
     /// effort when set. One builder so the wire tests assert what ships.
     fn payload(&self, model: &str, req: &LlmReq) -> serde_json::Value {
