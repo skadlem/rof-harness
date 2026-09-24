@@ -3292,3 +3292,15 @@ pure reasoning-side non-convergence, plus one transport error. Per the
 pre-registered kill criterion (no gap → no mechanism), the diet is not
 built. The remaining bug02 actions are all above this model's ceiling.
 Trace: `~/rof-runs/trace-bug02-c12.jsonl` (22 ModelCalls, 6 ModelErrors).
+
+## 2026-09-24 — Terminal-Bench Slice A: seam proven, attempts 0/2 on transport
+
+Task `session-window-debug` (Python, red 5/2, image cached, oracle 1.0 in
+25 s). Manual seam works end-to-end: host work copy, verifier-image
+container with /app + /tests mounts, rof checks via `docker exec` pytest,
+trace recorded. Both rof attempts died identically: `transport: error
+sending request` → fallback chain exhausted → 0 writes (grind rule: no
+third try tonight). Wire verified alive afterwards (header-correct probe
+200s), so connection flakes, not outage. Slice B (adapter) waits on one
+green hand-run. Task dir: `~/.local/share/rof-tb/tasks/session-window-debug`;
+jobs: `~/.local/share/rof-tb/jobs/`; container `tb-rof1` left running.
