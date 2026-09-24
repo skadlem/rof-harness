@@ -33,6 +33,23 @@ const EXPLORE_RAW: &str = include_str!("../../assets/mascot-10.txt");
 const HAPPY_RAW: &str = include_str!("../../assets/mascot-4.txt");
 const ERROR_RAW: &str = include_str!("../../assets/mascot-12.txt");
 
+/// The full baked set: sprite files are 1-indexed (`mascot-1.txt` …
+/// `mascot-12.txt`), all from the canonical cheetahs3.png sheet.
+const ALL_RAW: [&str; 12] = [
+    include_str!("../../assets/mascot-1.txt"),
+    include_str!("../../assets/mascot-2.txt"),
+    include_str!("../../assets/mascot-3.txt"),
+    include_str!("../../assets/mascot-4.txt"),
+    include_str!("../../assets/mascot-5.txt"),
+    include_str!("../../assets/mascot-6.txt"),
+    include_str!("../../assets/mascot-7.txt"),
+    include_str!("../../assets/mascot-8.txt"),
+    include_str!("../../assets/mascot-9.txt"),
+    include_str!("../../assets/mascot-10.txt"),
+    include_str!("../../assets/mascot-11.txt"),
+    include_str!("../../assets/mascot-12.txt"),
+];
+
 /// Parse baked art (skipping the 2 header lines) into styled text.
 /// A parse failure falls back to unstyled lines — the overlay never panics.
 fn parse(raw: &str) -> Text<'static> {
@@ -54,9 +71,16 @@ pub fn art(mood: Mood) -> Text<'static> {
     }
 }
 
-/// Greet-alias kept for existing callers: the default splash art.
+/// Splash art: a uniform-random sprite per launch, so every `rof chat`
+/// greets you with a different cheetah. No rand dependency — the clock's
+/// sub-second nanos pick the index; weighting or repetition across launches
+/// is explicitly not a goal.
 pub fn load() -> Text<'static> {
-    art(Mood::Greet)
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0);
+    parse(ALL_RAW[nanos % ALL_RAW.len()])
 }
 
 /// Title block under the art: "rof chat" in amber bold, the version, and a
@@ -141,7 +165,12 @@ mod tests {
                 "{mood:?}: first art line must be non-empty"
             );
         }
-        // `load()` stays a greet-alias for existing callers.
-        assert_eq!(load().lines.len(), art(Mood::Greet).lines.len());
+        // `load()` is a random sprite per launch: assert it is always one
+        // of the set (any sprite clears the floor, none is empty).
+        for _ in 0..12 {
+            let text = load();
+            assert!(text.lines.len() >= 15);
+            assert!(text.lines[0].width() > 0);
+        }
     }
 }
