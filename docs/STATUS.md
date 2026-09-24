@@ -3349,3 +3349,25 @@ Test scar: new eval tests must NOT reuse task names `a/b/alpha/beta/noop/
 substrate/work` — `cleanup_task_dirs` sweeps those prefixes and deletes
 in-flight copies (measured flake). Unique names used. Also removed a stray
 `/tmp/.git` (2026-09-24, amplifies git fallback noise).
+
+## 2026-09-25 — owner decisions implemented (BYOK, no-planner, release gate)
+
+Decisions: (1) BYOK with configurable providers in the TUI, (2) planner
+removed + rethink, (3) releases gate on reps-3, (4) seekable replay now +
+full-TUI vision doc, (5) self-review inner / judge on release arms.
+Plans: `docs/superpowers/plans/2026-09-25-{byok-providers,planner-removal,
+release-preset,tui-replay-vision}.md`. Full suite green 2× (27 binaries).
+
+- BYOK (`658dc32,b3e5657,ae7b4eb`): `~/.rof/providers.json` registry
+  (non-secret, ROF_PROVIDERS override) + existing 0600 credentials store;
+  per-role `provider/model` clients (bare ids ride the shared client,
+  byte-identical); `/provider add|list|rm`, `/model verify|fallback`,
+  masked key entry. Secrets never hit transcripts.
+- Planner gone (`2e78912`, breaking): stage + knob + env + grants + agent
+  deleted; every goal is one task; `goal_is_task_shaped` kept as the router
+  primitive. Old configs still load (serde ignores the key — tested).
+  Rethink (decided): decomposition lives outside the run (TUI queue, suite
+  task lists); goal-quality note preserved into the implementer prompt.
+- Release gate (`a560e49`): `rof eval --release` = reps floor 3 (explicit
+  N>1 wins) + verify_guard on + hard error without a judge. Verified live
+  on the binary both paths.
