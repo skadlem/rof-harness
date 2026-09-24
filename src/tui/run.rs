@@ -14,7 +14,6 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use super::app::App;
 use super::cmd::Action;
-use super::render::parse_lenient_line;
 use super::splash;
 use super::ui::draw;
 use crate::obs::TraceEvent;
@@ -468,16 +467,16 @@ pub fn replay(path: &std::path::Path) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(path)?;
     let mut app = App::new();
     app.thinking = std::env::var("ROF_THINKING").unwrap_or_default();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+    let mut events = Vec::new();
+    let mut unknown = Vec::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         match serde_json::from_str::<TraceEvent>(line) {
-            Ok(ev) => app.on_event(&ev),
-            Err(_) => app.transcript.push(parse_lenient_line(line)),
+            Ok(event) => events.push(event),
+            Err(_) => unknown.push(super::render::parse_lenient_line(line)),
         }
     }
+    app.set_replay_events(events);
+    app.set_replay_unknown(unknown);
     run_repl(app)
 }
 
@@ -501,6 +500,7 @@ fn pump(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
 ) -> anyhow::Result<()> {
+    let mut filtering = false;
     loop {
         terminal.draw(|f| {
             if app.fresh {
@@ -523,9 +523,54 @@ fn pump(
             {
                 break;
             }
+            if filtering {
+                match key.code {
+                    KeyCode::Esc => {
+                        filtering = false;
+                        app.input.clear();
+                    }
+                    KeyCode::Backspace => {
+                        app.input.pop();
+                    }
+                    KeyCode::Enter => {
+                        let query = app.input.clone();
+                        app.set_replay_filter(&query);
+                        app.input.clear();
+                        filtering = false;
+                    }
+                    KeyCode::Char(c)
+                        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                    {
+                        app.input.push(c);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match key.code {
                 KeyCode::Esc => break,
                 KeyCode::Char('q') if key.modifiers.is_empty() => break,
+                // Replay-only nav: a failed guard falls through to the live
+                // arms below, so live typing/scroll never loses keys.
+                KeyCode::Char('j') if key.modifiers.is_empty() && app.replay_mode => {
+                    app.replay_step(1)
+                }
+                KeyCode::Char('k') if key.modifiers.is_empty() && app.replay_mode => {
+                    app.replay_step(-1)
+                }
+                KeyCode::Char('g') if key.modifiers.is_empty() && app.replay_mode => {
+                    app.replay_start()
+                }
+                KeyCode::Char('G')
+                    if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                        && app.replay_mode =>
+                {
+                    app.replay_end()
+                }
+                KeyCode::Char('/') if key.modifiers.is_empty() && app.replay_mode => {
+                    app.input.clear();
+                    filtering = true;
+                }
                 KeyCode::Char(c)
                     if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
                 {
@@ -534,6 +579,8 @@ fn pump(
                 KeyCode::Backspace => {
                     app.input.pop();
                 }
+                KeyCode::Up if app.replay_mode => app.replay_step(-1),
+                KeyCode::Down if app.replay_mode => app.replay_step(1),
                 KeyCode::Up => app.scroll_lines(1),
                 KeyCode::Down => app.scroll_lines(-1),
                 KeyCode::PageUp => app.scroll_lines(10),

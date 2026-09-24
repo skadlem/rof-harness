@@ -1,5 +1,29 @@
 use crate::obs::TraceEvent;
 
+/// Select event indexes whose rendered text (or event name) contains `query`.
+///
+/// Replay search is deliberately pure: the caller owns the event list and
+/// App owns the cursor. Matching the serialized event as well as the human
+/// line makes event names such as `ReviewVerdict` searchable.
+pub fn replay_filter(events: &[TraceEvent], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return (0..events.len()).collect();
+    }
+    events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            let rendered = render_line(event).to_lowercase();
+            let serialized = serde_json::to_string(event)
+                .unwrap_or_default()
+                .to_lowercase();
+            rendered.contains(&query) || serialized.contains(&query)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 /// One event in, transcript lines out. Pure: no I/O, no terminal.
 pub fn render_line(ev: &TraceEvent) -> String {
     match ev {
