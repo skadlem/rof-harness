@@ -28,22 +28,9 @@ const EVIDENCE_WINDOW: usize = 24_000;
 /// Today the repo layer only ever holds goal-named files, so the cap is not
 /// reached — but the suite-widening plan points exactly at widening it.
 /// 12,000 is the largest measured size that still shipped content, so it is
-/// the value used rather than the 13,000 that already degraded.
-pub(crate) const EMISSION_THRESHOLD: usize = 12_000;
-
-/// The volatile budget for a short layer of `budget` tokens. The layer is
-/// counted in tokens and the assembler spends chars, hence the factor of four;
-/// the result is capped at the endpoint profile's ceiling because that
-/// ceiling is an endpoint property the token derivation cannot see. One
-/// function so both consumers — the implementer's requested-file cap and the
-/// reviewer's evidence window — cannot drift apart.
-pub(crate) fn volatile_budget_for(budget_tokens: usize) -> usize {
-    volatile_budget_for_profile(
-        budget_tokens,
-        &crate::llm::profile::EndpointProfile::default(),
-    )
-}
-
+/// the default in [`crate::llm::profile::EndpointProfile`] rather than the
+/// 13,000 that already degraded.
+///
 /// Profile-aware variant: the ceiling comes from the endpoint, so a model
 /// move re-tunes one number instead of invalidating the derivation.
 pub(crate) fn volatile_budget_for_profile(
@@ -1009,10 +996,11 @@ mod evidence_tests {
 
 #[cfg(test)]
 mod budget_tests {
-    use super::{
-        checks_pass, render_checks, volatile_budget_for, volatile_budget_for_profile, Budget,
-        CheckResult, EMISSION_THRESHOLD,
-    };
+    use super::{checks_pass, render_checks, volatile_budget_for_profile, Budget, CheckResult};
+
+    fn default_ceiling() -> usize {
+        crate::llm::profile::EndpointProfile::default().emission_threshold_chars
+    }
     use crate::config::AppConfig;
     use crate::obs::{TraceEvent, TraceSink};
     use std::sync::Arc;
@@ -1074,14 +1062,14 @@ mod budget_tests {
             "the shipped default still derives the oversized budget"
         );
         assert!(
-            tokens * 4 > EMISSION_THRESHOLD,
+            tokens * 4 > default_ceiling(),
             "this test is vacuous if the cap no longer binds"
         );
         // The real assertion: the function the two consumers call must return
         // the capped value, not the derivation.
         assert_eq!(
-            volatile_budget_for(tokens),
-            EMISSION_THRESHOLD,
+            volatile_budget_for_profile(tokens, &crate::llm::profile::EndpointProfile::default()),
+            default_ceiling(),
             "the cap must bind when the derivation exceeds it"
         );
     }
@@ -1102,12 +1090,13 @@ mod budget_tests {
     /// still pass through, so a lean task keeps the room it asked for.
     #[test]
     fn a_small_volatile_budget_passes_through_the_cap() {
-        assert_eq!(volatile_budget_for(500), 2_000);
-        assert_eq!(volatile_budget_for(0), 0);
+        let p = crate::llm::profile::EndpointProfile::default();
+        assert_eq!(volatile_budget_for_profile(500, &p), 2_000);
+        assert_eq!(volatile_budget_for_profile(0, &p), 0);
         // Exactly at the threshold: the boundary belongs to the capped side.
         assert_eq!(
-            volatile_budget_for(EMISSION_THRESHOLD / 4),
-            EMISSION_THRESHOLD
+            volatile_budget_for_profile(default_ceiling() / 4, &p),
+            default_ceiling()
         );
     }
 
