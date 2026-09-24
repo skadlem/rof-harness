@@ -70,6 +70,8 @@ async fn suite_tracks_per_task_match() {
                 goal: "eval target".to_string(),
                 expect_pass: true,
                 checks: Vec::new(),
+                fail_to_pass: Vec::new(),
+                pass_to_pass: Vec::new(),
                 expect_writes: true,
                 max_tokens: None,
             },
@@ -78,6 +80,8 @@ async fn suite_tracks_per_task_match() {
                 goal: "eval target".to_string(),
                 expect_pass: false,
                 checks: Vec::new(),
+                fail_to_pass: Vec::new(),
+                pass_to_pass: Vec::new(),
                 expect_writes: true,
                 max_tokens: None,
             },
@@ -157,6 +161,8 @@ async fn task_dirs_are_removed_by_default() {
             goal: "write out.md".to_string(),
             expect_pass: true,
             checks: Vec::new(),
+            fail_to_pass: Vec::new(),
+            pass_to_pass: Vec::new(),
             expect_writes: true,
             max_tokens: None,
         }],
@@ -237,6 +243,8 @@ async fn parallel_tasks_are_isolated_per_task_dir() {
         goal: goal.to_string(),
         expect_pass: true,
         checks: Vec::new(),
+        fail_to_pass: Vec::new(),
+        pass_to_pass: Vec::new(),
         expect_writes: true,
         max_tokens: None,
     };
@@ -353,6 +361,8 @@ async fn harness_rejects_pass_without_writes() {
             goal: "change a file".to_string(),
             expect_pass: false,
             checks: Vec::new(),
+            fail_to_pass: Vec::new(),
+            pass_to_pass: Vec::new(),
             expect_writes: true,
             max_tokens: None,
         }],
@@ -432,6 +442,8 @@ async fn write_gate_counts_the_tree_not_the_claim() {
             goal: "change a file".to_string(),
             expect_pass: true,
             checks: Vec::new(),
+            fail_to_pass: Vec::new(),
+            pass_to_pass: Vec::new(),
             expect_writes: true,
             max_tokens: None,
         }],
@@ -489,6 +501,8 @@ async fn a_non_repo_source_still_gets_the_substrate() {
             goal: "eval target".to_string(),
             expect_pass: true,
             checks: Vec::new(),
+            fail_to_pass: Vec::new(),
+            pass_to_pass: Vec::new(),
             expect_writes: true,
             max_tokens: None,
         }],
@@ -580,6 +594,8 @@ async fn task_root_is_honoured() {
             goal: "write out.md".to_string(),
             expect_pass: true,
             checks: Vec::new(),
+            fail_to_pass: Vec::new(),
+            pass_to_pass: Vec::new(),
             expect_writes: true,
             max_tokens: None,
         }],
@@ -637,6 +653,8 @@ fn suite_of(name: &str, goals: &[(&str, &str)]) -> EvalSuite {
                 goal: g.to_string(),
                 expect_pass: true,
                 checks: Vec::new(),
+                fail_to_pass: Vec::new(),
+                pass_to_pass: Vec::new(),
                 expect_writes: true,
                 max_tokens: None,
             })
@@ -761,6 +779,8 @@ async fn report_carries_a_label_and_its_inputs() {
         goal: "eval target".to_string(),
         expect_pass: true,
         checks: Vec::new(),
+        fail_to_pass: Vec::new(),
+        pass_to_pass: Vec::new(),
         expect_writes: true,
         max_tokens: None,
     });
@@ -836,7 +856,62 @@ fn labelled_task(name: &str, matched: bool, rounds: u32, feedback: &str) -> Task
             ..ContextMetrics::default()
         },
         checks: Vec::new(),
+        check_baseline: Vec::new(),
+        oracle_ok: None,
     }
+}
+
+#[tokio::test]
+async fn oracle_split_decides_the_task() {
+    let root = std::env::temp_dir().join(format!("rof-eval-oracle-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("notes.md"), "eval target content").unwrap();
+    let client = Arc::new(Fake);
+    let mut cfg = test_cfg();
+    cfg.permissions.allowed_commands = vec!["true".to_string(), "false".to_string()];
+    let runner = EvaluationRunner::new(
+        Arc::new(TraceSink::new()),
+        cfg,
+        ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
+        ExecutorService::new(client, "fake-exec".to_string(), None),
+        root.clone(),
+    );
+    let suite = EvalSuite {
+        name: "t".to_string(),
+        tasks: vec![
+            EvalTask {
+                name: "f2p-never-passes".to_string(),
+                goal: "eval target".to_string(),
+                expect_pass: false,
+                checks: vec!["false".to_string()],
+                fail_to_pass: vec!["false".to_string()],
+                pass_to_pass: Vec::new(),
+                expect_writes: true,
+                max_tokens: None,
+            },
+            EvalTask {
+                name: "p2p-always-passes".to_string(),
+                goal: "eval target".to_string(),
+                expect_pass: true,
+                checks: vec!["true".to_string()],
+                fail_to_pass: Vec::new(),
+                pass_to_pass: vec!["true".to_string()],
+                expect_writes: true,
+                max_tokens: None,
+            },
+        ],
+    };
+    let rep = runner.run_suite(&suite).await;
+    // The loop itself passes both (the fake reviewer always says pass and
+    // the fake implementer really writes): only the oracle fold separates them.
+    assert!(!rep.tasks[0].passed, "f2p on a failing check must fail");
+    assert_eq!(rep.tasks[0].oracle_ok, Some(false));
+    assert!(!rep.tasks[0].check_baseline.is_empty(), "baseline must run");
+    assert!(rep.tasks[1].passed, "p2p on a passing check must pass");
+    assert_eq!(rep.tasks[1].oracle_ok, Some(true));
+    assert!(rep.tasks[0].matched && rep.tasks[1].matched);
+    std::fs::remove_dir_all(&root).ok();
 }
 
 fn labelled_report(suite_hash: &str, tasks: Vec<TaskResult>) -> SuiteReport {

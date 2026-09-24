@@ -134,6 +134,15 @@ pub struct TaskResult {
     /// `compare` reads outcomes, not prose.
     #[serde(default)]
     pub checks: Vec<crate::engine::CheckResult>,
+    /// Baseline outcomes of the declared fail-to-pass / pass-to-pass checks,
+    /// run on the pristine task copy before the loop. Empty when the task
+    /// declares no oracle split (or the report predates it).
+    #[serde(default)]
+    pub check_baseline: Vec<crate::engine::CheckResult>,
+    /// Whether the oracle split held. None when the task declares no
+    /// fail-to-pass / pass-to-pass checks (compat: score exactly as before).
+    #[serde(default)]
+    pub oracle_ok: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -254,6 +263,29 @@ impl EvaluationRunner {
             cfg.permissions.clone(),
             cfg.skills.clone(),
         );
+        // Oracle baseline: run declared fail-to-pass / pass-to-pass checks on
+        // the pristine copy before the loop touches it, so the final fold can
+        // tell a fix from a suite that was already green.
+        let oracle_names: Vec<String> = task
+            .fail_to_pass
+            .iter()
+            .chain(task.pass_to_pass.iter())
+            .cloned()
+            .collect();
+        let baseline = if oracle_names.is_empty() {
+            Vec::new()
+        } else {
+            let probe = Session::new(task.goal.clone()).with_checks(oracle_names);
+            let svc0 = crate::engine::session::RoundServices {
+                cfg: &cfg,
+                trace: &sink,
+                context: &self.context,
+                executor: &self.executor,
+                verify: &self.verify,
+                tools: &reg,
+            };
+            svc0.run_checks(&probe, &workdir).await
+        };
         // v4 fix: the eval path wired the executor twice, silently dropping
         // the verify slot (§4.5) — ROF_VERIFY_MODEL never reached suite runs.
         let orch = Orchestrator::new(
@@ -274,12 +306,12 @@ impl EvaluationRunner {
             )
             .await;
         self.trace.extend(sink.events());
-        let passed = out["passed"].as_bool().unwrap_or(false);
+        let orch_passed = out["passed"].as_bool().unwrap_or(false);
         // The orchestrator records one entry per plan task, each with its own
         // feedback and checks. Surface the first failure's reason and its
         // checks (else the last entry's), so a MISMATCH line in the report is
         // never blank and the flipped-check row names the task that failed.
-        let (feedback, checks) = {
+        let (feedback, checks): (String, Vec<crate::engine::CheckResult>) = {
             let entries = out["tasks"].as_array().cloned().unwrap_or_default();
             let failed = entries.iter().find(|t| {
                 !t["passed"].as_bool().unwrap_or(false)
@@ -304,6 +336,20 @@ impl EvaluationRunner {
                     .unwrap_or_default(),
             )
         };
+        // Oracle fold over the same final outcomes the report surfaces: a
+        // declared split that did not hold fails the task even when the loop
+        // passed. No declared split scores exactly as before.
+        let oracle = if task.fail_to_pass.is_empty() && task.pass_to_pass.is_empty() {
+            None
+        } else {
+            Some(super::suite::oracle_ok(
+                &baseline,
+                &checks,
+                &task.fail_to_pass,
+                &task.pass_to_pass,
+            ))
+        };
+        let passed = orch_passed && oracle.unwrap_or(true);
         TaskResult {
             name: task.name.clone(),
             passed,
@@ -313,6 +359,8 @@ impl EvaluationRunner {
             feedback,
             context: ContextMetrics::from_run(&out),
             checks,
+            check_baseline: baseline,
+            oracle_ok: oracle,
         }
     }
 
@@ -334,6 +382,8 @@ impl EvaluationRunner {
                     feedback: format!("harness: task-dir copy failed: {e:#}"),
                     context: ContextMetrics::default(),
                     checks: Vec::new(),
+                    check_baseline: Vec::new(),
+                    oracle_ok: None,
                 };
             }
         };
@@ -395,6 +445,8 @@ impl EvaluationRunner {
                     feedback: format!("harness: task join failed (inconclusive, not failed): {e}"),
                     context: ContextMetrics::default(),
                     checks: Vec::new(),
+                    check_baseline: Vec::new(),
+                    oracle_ok: None,
                 }),
             }
         }
