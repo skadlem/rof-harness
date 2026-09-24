@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 pub mod openrouter;
 pub use openrouter::{
-    client_session_for_test, effort_client_for_test, session_header_for_test, wire_body_for_test,
-    OpenRouterClient,
+    base_req_for_test, client_session_for_test, effort_client_for_test,
+    reshape_for_truncation_for_test, session_header_for_test, wire_body_for_test, OpenRouterClient,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -39,6 +39,12 @@ pub struct LlmReq {
     /// attempt asks for more room with reasoning back on.
     #[serde(default)]
     pub roomier: bool,
+    /// Retry switch past the last rung: when a truncation shipped zero
+    /// content, reasoning expands to fill any budget, so the final attempt
+    /// halves `max_tokens` with reasoning still off to force a shorter pass.
+    /// Set only by the ladder, never by callers.
+    #[serde(default)]
+    pub shrunk: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +118,7 @@ impl ContextService {
             reasoning_off: false,
             reasoning_low: false,
             roomier: false,
+            shrunk: false,
             thinking_off: false,
         })
         .await

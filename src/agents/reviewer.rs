@@ -38,6 +38,7 @@ impl Agent for ReviewerAgent<'_> {
             reasoning_off,
             reasoning_low,
             roomier: false,
+            shrunk: false,
             thinking_off,
         };
         let resp = self
