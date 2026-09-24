@@ -446,7 +446,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let jobs = cfg.max_parallel_tasks.max(1);
             // Replication: --reps N wins, then ROF_REPS, then single runs.
-            let reps = reps_arg(&args[2.min(args.len())..])
+            let mut reps = reps_arg(&args[2.min(args.len())..])
                 .or_else(|| {
                     std::env::var("ROF_REPS")
                         .ok()
@@ -454,6 +454,15 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .unwrap_or(1)
                 .max(1);
+            // Release gate: reps floor, outer judge on, judge model required.
+            // Explicit --reps N>1 survives; the gate errors without a judge.
+            let release = args[2.min(args.len())..].iter().any(|a| a == "--release");
+            if release {
+                cfg.apply_release_preset(&mut reps)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let judge = cfg.routing.verify_model.clone().unwrap_or_default();
+                println!("release gate: reps={reps} verify_guard=on judge={judge}");
+            }
             let s = setup(cfg)?;
             let runner = EvaluationRunner::new(
                 s.trace.clone(),

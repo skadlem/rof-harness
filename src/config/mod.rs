@@ -286,6 +286,31 @@ impl AppConfig {
         serde_json::to_string_pretty(self).unwrap_or_default()
     }
 
+    /// Release gate preset: reps=3 (unless explicitly set otherwise),
+    /// outer judge on, and an independent judge model required. Errors when
+    /// no verify model is configured — a release gate without a judge is
+    /// self-review with extra steps. Call after env overrides so the
+    /// effective verify slot is what gets checked.
+    pub fn apply_release_preset(&mut self, reps: &mut usize) -> Result<(), String> {
+        let has_judge = self
+            .routing
+            .verify_model
+            .as_deref()
+            .map(|m| !m.trim().is_empty())
+            .unwrap_or(false);
+        if !has_judge {
+            return Err(
+                "release gate needs an independent judge: set verify_model or ROF_VERIFY_MODEL"
+                    .to_string(),
+            );
+        }
+        if *reps <= 1 {
+            *reps = 3;
+        }
+        self.verify_guard = true;
+        Ok(())
+    }
+
     /// The effective per-layer context policy: the config's `context` block
     /// when it has one, otherwise derived from `budgets` — so a file that only
     /// states budgets (every config written before stage 2) behaves exactly as
@@ -325,5 +350,31 @@ impl Default for AppConfig {
             verify_guard: false,
             endpoint: crate::llm::profile::EndpointProfile::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn release_preset_requires_a_judge() {
+        let mut cfg = AppConfig::default();
+        let mut reps = 1;
+        assert!(cfg.apply_release_preset(&mut reps).is_err());
+        cfg.routing.verify_model = Some("judge-model".to_string());
+        assert!(cfg.apply_release_preset(&mut reps).is_ok());
+        assert_eq!(reps, 3);
+        assert!(cfg.verify_guard);
+    }
+
+    #[test]
+    fn explicit_reps_survive_release() {
+        let mut cfg = AppConfig::default();
+        cfg.routing.verify_model = Some("j".to_string());
+        let mut reps = 5;
+        cfg.apply_release_preset(&mut reps).unwrap();
+        assert_eq!(reps, 5);
+        assert!(cfg.verify_guard);
     }
 }
