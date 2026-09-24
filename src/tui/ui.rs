@@ -17,12 +17,15 @@ pub fn draw(f: &mut Frame, app: &App) {
             Constraint::Length(3),
         ])
         .split(f.area());
+    let height = rows[0].height as usize;
+    let skip = app.scroll.min(app.transcript.len());
     let tail: Vec<String> = app
         .transcript
         .iter()
+        .take(app.transcript.len() - skip)
         .cloned()
         .rev()
-        .take(rows[0].height as usize)
+        .take(height)
         .collect();
     let shown: Vec<String> = tail.into_iter().rev().collect();
     f.render_widget(Paragraph::new(shown.join("\n")), rows[0]);

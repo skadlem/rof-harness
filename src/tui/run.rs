@@ -107,6 +107,12 @@ fn run_live_inner(trace: &crate::obs::TraceSink) -> anyhow::Result<LiveOut> {
                     quit_armed = false;
                     app.input.pop();
                 }
+                KeyCode::Up => app.scroll_lines(1),
+                KeyCode::Down => app.scroll_lines(-1),
+                KeyCode::PageUp => app.scroll_lines(10),
+                KeyCode::PageDown => app.scroll_lines(-10),
+                KeyCode::Home => app.scroll_lines(isize::MAX),
+                KeyCode::End => app.scroll_lines(isize::MIN),
                 KeyCode::Enter => {
                     quit_armed = false;
                     let text = std::mem::take(&mut app.input).trim().to_string();
@@ -433,6 +439,12 @@ fn pump(
                 KeyCode::Backspace => {
                     app.input.pop();
                 }
+                KeyCode::Up => app.scroll_lines(1),
+                KeyCode::Down => app.scroll_lines(-1),
+                KeyCode::PageUp => app.scroll_lines(10),
+                KeyCode::PageDown => app.scroll_lines(-10),
+                KeyCode::Home => app.scroll_lines(isize::MAX),
+                KeyCode::End => app.scroll_lines(isize::MIN),
                 KeyCode::Enter => {
                     app.input.clear();
                 }

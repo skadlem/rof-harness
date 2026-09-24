@@ -45,6 +45,15 @@ impl App {
         }
     }
 
+    /// Scroll the transcript window: positive moves toward older lines,
+    /// negative toward the tail. `scroll == 0` is tailed. Clamped to
+    /// `0..=transcript.len()` so it never panics, viewport math included —
+    /// `draw` clamps again against the visible height.
+    pub fn scroll_lines(&mut self, delta: isize) {
+        let max = self.transcript.len() as isize;
+        self.scroll = (self.scroll as isize).saturating_add(delta).clamp(0, max) as usize;
+    }
+
     pub fn status_line(&self) -> String {
         let c = &self.counters;
         format!(
