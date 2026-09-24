@@ -143,6 +143,12 @@ pub struct TaskResult {
     /// fail-to-pass / pass-to-pass checks (compat: score exactly as before).
     #[serde(default)]
     pub oracle_ok: Option<bool>,
+    /// Replication count this row aggregates (0 = report predates reps).
+    #[serde(default)]
+    pub reps: u32,
+    /// Reps that passed (0 = report predates reps).
+    #[serde(default)]
+    pub passes: u32,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -361,6 +367,10 @@ impl EvaluationRunner {
             checks,
             check_baseline: baseline,
             oracle_ok: oracle,
+            // Single execution here: reps aggregation in run_task_reps
+            // overwrites these with the replicated counts.
+            reps: 1,
+            passes: if passed { 1 } else { 0 },
         }
     }
 
@@ -384,6 +394,8 @@ impl EvaluationRunner {
                     checks: Vec::new(),
                     check_baseline: Vec::new(),
                     oracle_ok: None,
+                    reps: 1,
+                    passes: 0,
                 };
             }
         };
@@ -404,16 +416,58 @@ impl EvaluationRunner {
     /// Bounded fan-out over isolated task dirs. Results keep suite order
     /// regardless of finish order, so reports diff cleanly across runs.
     pub async fn run_suite_with_jobs(&self, suite: &EvalSuite, jobs: usize) -> SuiteReport {
+        self.run_suite_with_reps(suite, jobs, 1).await
+    }
+
+    /// One task, `reps` isolated times. The row keeps the first rep's detail
+    /// (feedback, checks, baseline, context); rounds sum across reps; passed
+    /// is pass^k and matched folds it against expectation. reps=1 is the
+    /// legacy rule exactly.
+    async fn run_task_reps(&self, task: EvalTask, reps: usize) -> TaskResult {
+        let reps = reps.max(1) as u32;
+        let mut row: Option<TaskResult> = None;
+        let mut passes = 0u32;
+        let mut rounds = 0u32;
+        for _ in 0..reps {
+            let r = self.run_task_isolated(task.clone()).await;
+            if r.passed {
+                passes += 1;
+            }
+            rounds += r.rounds;
+            if row.is_none() {
+                row = Some(r);
+            }
+        }
+        let mut row = row.expect("reps >= 1 runs at least once");
+        row.reps = reps;
+        row.passes = passes;
+        row.rounds = rounds;
+        row.passed = passes == reps;
+        row.matched = row.passed == row.expected;
+        row
+    }
+
+    /// Bounded fan-out over isolated task dirs, each task replicated `reps`
+    /// times (sequentially — every rep gets a fresh isolated copy, so reps
+    /// share nothing). Results keep suite order regardless of finish order.
+    /// Rep-level outcomes fold into the aggregate, so success_rate is a rep
+    /// rate; each row carries its first rep's detail plus reps/passes counts.
+    /// reps=1 is the historical single run, bit for bit.
+    pub async fn run_suite_with_reps(
+        &self,
+        suite: &EvalSuite,
+        jobs: usize,
+        reps: usize,
+    ) -> SuiteReport {
         let jobs = jobs.max(1);
+        let reps = reps.max(1);
         if jobs == 1 {
             let mut rep = SuiteReport::default();
             for t in &suite.tasks {
-                rep.tasks.push(self.run_task_isolated(t.clone()).await);
+                rep.tasks.push(self.run_task_reps(t.clone(), reps).await);
             }
             rep.aggregate = self.report();
-            for task in &rep.tasks {
-                rep.aggregate.record_task(task.passed);
-            }
+            Self::record_reps(&mut rep.aggregate, &rep.tasks);
             rep.label = self.label(suite);
             return rep;
         }
@@ -425,7 +479,7 @@ impl EvaluationRunner {
             let permit_slot = sem.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = permit_slot.acquire_owned().await;
-                runner.run_task_isolated(task).await
+                runner.run_task_reps(task, reps).await
             }));
         }
         let mut rep = SuiteReport::default();
@@ -447,15 +501,31 @@ impl EvaluationRunner {
                     checks: Vec::new(),
                     check_baseline: Vec::new(),
                     oracle_ok: None,
+                    reps: 1,
+                    passes: 0,
                 }),
             }
         }
         rep.aggregate = self.report();
-        for task in &rep.tasks {
-            rep.aggregate.record_task(task.passed);
-        }
+        Self::record_reps(&mut rep.aggregate, &rep.tasks);
         rep.label = self.label(suite);
         rep
+    }
+
+    /// Fold rep-level outcomes into the aggregate: every rep counts, so the
+    /// rate is a rep rate. A row from before reps existed (reps == 0) counts
+    /// once, exactly as it always did.
+    fn record_reps(agg: &mut super::metrics::EvalReport, tasks: &[TaskResult]) {
+        for task in tasks {
+            let r = task.reps.max(1);
+            let p = task.passes.min(r);
+            for _ in 0..p {
+                agg.record_task(true);
+            }
+            for _ in p..r {
+                agg.record_task(false);
+            }
+        }
     }
 
     /// Which harness revision / config / suite / model pair this report is

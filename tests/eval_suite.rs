@@ -858,6 +858,8 @@ fn labelled_task(name: &str, matched: bool, rounds: u32, feedback: &str) -> Task
         checks: Vec::new(),
         check_baseline: Vec::new(),
         oracle_ok: None,
+        reps: 1,
+        passes: 0,
     }
 }
 
@@ -911,6 +913,82 @@ async fn oracle_split_decides_the_task() {
     assert!(rep.tasks[1].passed, "p2p on a passing check must pass");
     assert_eq!(rep.tasks[1].oracle_ok, Some(true));
     assert!(rep.tasks[0].matched && rep.tasks[1].matched);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn reps_one_matches_single_run() {
+    let root = std::env::temp_dir().join(format!("rof-eval-reps1-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("notes.md"), "eval target content").unwrap();
+    let mk = || {
+        let client = Arc::new(Fake);
+        EvaluationRunner::new(
+            Arc::new(TraceSink::new()),
+            test_cfg(),
+            ContextService::new(client.clone(), "fake-ctx".to_string()),
+            ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
+            ExecutorService::new(client, "fake-exec".to_string(), None),
+            root.clone(),
+        )
+    };
+    let suite = EvalSuite {
+        name: "t".to_string(),
+        tasks: vec![EvalTask {
+            name: "reps-one".to_string(),
+            goal: "eval target".to_string(),
+            expect_pass: true,
+            checks: Vec::new(),
+            fail_to_pass: Vec::new(),
+            pass_to_pass: Vec::new(),
+            expect_writes: true,
+            max_tokens: None,
+        }],
+    };
+    let a = mk().run_suite_with_jobs(&suite, 1).await;
+    let b = mk().run_suite_with_reps(&suite, 1, 1).await;
+    assert_eq!(a.tasks.len(), b.tasks.len());
+    assert_eq!(a.tasks[0].matched, b.tasks[0].matched);
+    assert_eq!(b.tasks[0].reps, 1);
+    assert_eq!(b.tasks[0].passes, if b.tasks[0].passed { 1 } else { 0 });
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn reps_aggregate_pass_counts() {
+    let root = std::env::temp_dir().join(format!("rof-eval-reps2-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("notes.md"), "eval target content").unwrap();
+    let client = Arc::new(Fake);
+    let runner = EvaluationRunner::new(
+        Arc::new(TraceSink::new()),
+        test_cfg(),
+        ContextService::new(client.clone(), "fake-ctx".to_string()),
+        ExecutorService::new(client.clone(), "fake-exec".to_string(), None),
+        ExecutorService::new(client, "fake-exec".to_string(), None),
+        root.clone(),
+    );
+    let suite = EvalSuite {
+        name: "t".to_string(),
+        tasks: vec![EvalTask {
+            name: "reps-agg".to_string(),
+            goal: "eval target".to_string(),
+            expect_pass: true,
+            checks: Vec::new(),
+            fail_to_pass: Vec::new(),
+            pass_to_pass: Vec::new(),
+            expect_writes: true,
+            max_tokens: None,
+        }],
+    };
+    // The fake always passes: pass^k holds and matched follows it.
+    let rep = runner.run_suite_with_reps(&suite, 1, 3).await;
+    assert_eq!(rep.tasks[0].reps, 3);
+    assert_eq!(rep.tasks[0].passes, 3);
+    assert!(rep.tasks[0].passed && rep.tasks[0].matched);
+    // Rep-level aggregate: 3 reps recorded, not 1 row.
+    assert_eq!(rep.aggregate.tasks, 3);
+    assert_eq!(rep.aggregate.passed, 3);
     std::fs::remove_dir_all(&root).ok();
 }
 

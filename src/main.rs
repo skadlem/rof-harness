@@ -62,6 +62,11 @@ fn limit_arg(args: &[String]) -> Option<usize> {
     num_arg(args, "--limit")
 }
 
+/// Pull `--reps <n>` (eval repetitions per task) out of the argv tail.
+fn reps_arg(args: &[String]) -> Option<usize> {
+    num_arg(args, "--reps")
+}
+
 fn num_arg(args: &[String], flag: &str) -> Option<usize> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -432,6 +437,15 @@ async fn main() -> anyhow::Result<()> {
                 cfg.max_parallel_tasks = j.max(1);
             }
             let jobs = cfg.max_parallel_tasks.max(1);
+            // Replication: --reps N wins, then ROF_REPS, then single runs.
+            let reps = reps_arg(&args[2.min(args.len())..])
+                .or_else(|| {
+                    std::env::var("ROF_REPS")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(1)
+                .max(1);
             let s = setup(cfg)?;
             let runner = EvaluationRunner::new(
                 s.trace.clone(),
@@ -442,12 +456,13 @@ async fn main() -> anyhow::Result<()> {
                 s.root,
             );
             println!(
-                "suite: {} ({} tasks, jobs={})",
+                "suite: {} ({} tasks, jobs={}, reps={})",
                 suite.name,
                 suite.tasks.len(),
-                jobs
+                jobs,
+                reps
             );
-            let rep = runner.run_suite_with_jobs(&suite, jobs).await;
+            let rep = runner.run_suite_with_reps(&suite, jobs, reps).await;
             for t in &rep.tasks {
                 println!(
                     "  [{}] {} rounds={} recall={}/{} {}",
