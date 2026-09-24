@@ -7,11 +7,12 @@
 #   export ROF_TOKEN="your-go-key"          # session env (preferred), or
 #   echo "your-go-key" > ~/.rof/go.key      # chmod 600 file the script reads
 # Get the key via opencode `/connect` -> OpenCode Go -> opencode.ai/auth.
-# Model IDs: https://opencode.ai/docs/go/ (V4.1 Flash = deepseek-flash).
+# Model IDs: https://opencode.ai/docs/go/ (V4.1 Flash = deepseek-v4.1-flash;
+# the bare `deepseek-flash` id is deprecated, do not use it).
 #
-# Single-model default: ctx and exec both run deepseek-flash (see STATUS
+# Single-model default: ctx and exec both run deepseek-v4.1-flash (see STATUS
 # 2026-09-22 entry — the cheap tier never earned its keep in any arm).
-# Two-tier A/B: ROF_CTX_MODEL=deepseek-v4-flash scripts/live-go.sh ...
+# Two-tier A/B: ROF_CTX_MODEL=<other-id> scripts/live-go.sh ...
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -35,14 +36,14 @@ fi
 export ROF_TOKEN
 # rof appends /chat/completions itself — base stops at /v1.
 export ROF_CHAT_BASE="${ROF_CHAT_BASE:-https://opencode.ai/zen/go/v1}"
-export ROF_CTX_MODEL="${ROF_CTX_MODEL:-deepseek-flash}"
-export ROF_EXEC_MODEL="${ROF_EXEC_MODEL:-deepseek-flash}"
+export ROF_CTX_MODEL="${ROF_CTX_MODEL:-deepseek-v4.1-flash}"
+export ROF_EXEC_MODEL="${ROF_EXEC_MODEL:-deepseek-v4.1-flash}"
 # The knob Go honors (hermes parity); unset = absent from the wire.
 export ROF_REASONING_EFFORT="${ROF_REASONING_EFFORT:-medium}"
 # Best-known config (measured 18/20 mean, 2026-09-24). Explicit env wins:
 # a bare `scripts/live-go.sh` run without these silently measures defaults
-# (planner-on/explorer-off/attempts-1 ≈ 9-11/20), which is not data.
-export ROF_PLANNER="${ROF_PLANNER:-skip}"
+# (explorer-off/attempts-1 ≈ 9-11/20), which is not data. (The planner is
+# gone — every goal runs as one task.)
 export ROF_EXPLORER="${ROF_EXPLORER:-yes}"
 export ROF_ATTEMPTS="${ROF_ATTEMPTS:-3}"
 export ROF_MAX_ROUNDS="${ROF_MAX_ROUNDS:-4}"
