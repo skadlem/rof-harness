@@ -3229,3 +3229,16 @@ on-1/on-2 (1 cheap call each, visible in trace + report counters) on tasks
 that failed anyway. Side finding: hard-two on Go flash is ~0/6, far below
 historical deepseek-chat numbers — regime difference, not a regression
 (default-off tree is prompt-identical). Reports: `~/rof-runs/compact-{off,on}/`.
+
+## 2026-09-24 — full-20 on final config: 17/19/18, mean 18/20 (criterion b MET)
+
+Best config (skip+explorer+attempts=3+rounds=4+250k+effort-medium) on the
+final tree (caps + compact + TUI, all default-off → prompt-identical):
+17/20 (metrics-model-call-rate, procrun-doc, workspace-flag),
+19/20 (procrun-doc), 18/20 (add-retriever-test, metrics-model-call-rate).
+Mean 18/20 ≥ 17 sustained over 3 reps — above the 18/16/17 baseline.
+CAUTION: an earlier triple ran at 9-11/20 because the launcher forgot the
+best-config env (planner-on/explorer-off/attempts-1 defaults); those reps are
+misconfigured, not data. `live-go.sh` still does not export the best config —
+export it at launch (this entry) until the script learns it.
+Reports: `~/rof-runs/final20b/report-0924-{0940,1004,1021}.json`.
