@@ -3281,3 +3281,14 @@ on the same wire — the differentiator is loop-shape around non-converging
 reasoning, and the cheap rungs are exhausted. Next touches only with a
 stronger model or a full prompt-diet redesign, neither scheduled.
 Reports: `~/.local/share/rof-pilot/results/c{9,10,11}-bug02.json`.
+
+## 2026-09-24 — prompt-diet test KILLED before building (no measured gap)
+
+Instrumented bug02 rep (c12, trace saved) times out at 1500 s, but the
+trace kills the diet hypothesis: implementer input is only ~7k tokens/round
+— the prompt is already lean (goal + one 25KB file + plan, no bloat).
+Truncations hit at 4096 out with ~0 content against the small prompt, i.e.
+pure reasoning-side non-convergence, plus one transport error. Per the
+pre-registered kill criterion (no gap → no mechanism), the diet is not
+built. The remaining bug02 actions are all above this model's ceiling.
+Trace: `~/rof-runs/trace-bug02-c12.jsonl` (22 ModelCalls, 6 ModelErrors).
