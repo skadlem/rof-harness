@@ -3406,9 +3406,12 @@ configured check. Clean TB hand-runs through that endpoint were still
 model-limited: pipeline/low (`handrun-08`) wrote two files but left five
 verifier tests failing; pipeline/high (`handrun-10`) ended with no writes;
 direct/high (`handrun-11`) wrote one file but still left five tests
-failing. The other Zen free model ids rejected direct calls with
+failing. A continuation from that partial state (`handrun-12`) made one
+more GC edit and reduced the visible failures from five to four, but still
+did not pass. The other Zen free model ids rejected direct calls with
 `403 FreeTierError` because free-tier requests must originate inside
-OpenCode.
+OpenCode. A minimal Zen `deepseek-v4.1-flash` probe returned HTTP 402
+(`Insufficient account funds`), so no paid full run was attempted.
 
 The source fix from this investigation is independent of that model
 result: `ReasoningOff` now clears `reasoning_low` and `thinking_off`, so
