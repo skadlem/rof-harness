@@ -3389,3 +3389,50 @@ Test gap noted: pump key routing has no unit test (interactive fn).
   (Up 10h), caches present, but the recipe demands one green hand-run
   first and gives no literal command sequence (mounts/work-copy unverified).
 - Full suite green 2× (27 binaries), 0 warnings, fmt clean.
+
+## 2026-09-25 — TB Slice A continuation: no green hand-run yet
+
+Phase 1 resumed against the cached `session-window-debug` task and the
+`tb-rof1` verifier container. The Go hand-runs (`handrun-01` through
+`handrun-07`) did not produce a green task: early attempts hit the
+`low + thinking_off + reasoning_off` payload rejection (400/422), later
+attempts hit reasoning-only 4096-token truncations, and the final attempts
+were stopped by the Go weekly `429 GoUsageLimitError`. No green gate is
+claimed and Slice B remains blocked.
+
+A direct OpenCode Zen smoke probe (`space-bunny-free`) returned HTTP 200,
+and a clean `rof` harness smoke task made a real patch and passed its
+configured check. Clean TB hand-runs through that endpoint were still
+model-limited: pipeline/low (`handrun-08`) wrote two files but left five
+verifier tests failing; pipeline/high (`handrun-10`) ended with no writes;
+direct/high (`handrun-11`) wrote one file but still left five tests
+failing. The other Zen free model ids rejected direct calls with
+`403 FreeTierError` because free-tier requests must originate inside
+OpenCode.
+
+The source fix from this investigation is independent of that model
+result: `ReasoningOff` now clears `reasoning_low` and `thinking_off`, so
+the strongest rung travels as one non-contradictory wire shape. The
+temporary `ROF_DEBUG_BODY` instrumentation was removed after collecting
+the evidence; the profile unit test is the regression guard.
+
+For a Go-compatible retry, use a task copy rooted at
+`~/.local/share/rof-tb/work/<task>`, keep `/app` and `/tests` mounted in
+`tb-rof1`, and run:
+
+```sh
+export ROF_WORKDIR=~/.local/share/rof-tb/work/swd-rof1
+export ROF_CHAT_BASE=https://opencode.ai/zen/go/v1
+export ROF_CONFIG=/path/to/go-compatible-endpoint.json
+export ROF_CTX_MODEL=deepseek-v4.1-flash
+export ROF_EXEC_MODEL=deepseek-v4.1-flash
+export ROF_CHECK='docker exec tb-rof1 python3 -m pytest /tests/test_outputs.py -q'
+export ROF_ALLOW_CMDS="$ROF_CHECK"
+./target/debug/rof run '<task goal>'
+```
+
+The Go-compatible endpoint profile must omit `ReasoningOff` (use
+`ReasoningLow`, `ThinkingOff`, `Roomier`, `Shrink`); `reasoning:false` is
+rejected by that gateway. Re-open the Slice A gate only after a single
+recorded green `rof` run; do not infer success from the smoke task or
+from the verifier oracle.
