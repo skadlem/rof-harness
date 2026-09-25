@@ -69,7 +69,14 @@ pub fn apply_ladder(
             }
             LadderRung::ReasoningOff => {
                 if !req.reasoning_off {
+                    // Exclusive: gateways reject contradictory knob combos
+                    // (measured 400/422 for low+thinking_off+reasoning_off
+                    // together), so the strongest rung travels alone. Weaker
+                    // pairs (low / low+thinking_off) keep accumulating —
+                    // those shapes are validated, this one was not.
                     req.reasoning_off = true;
+                    req.reasoning_low = false;
+                    req.thinking_off = false;
                     return true;
                 }
             }
@@ -149,6 +156,20 @@ mod tests {
         };
         let mut req = blank_req(8000);
         assert!(!apply_ladder(&mut req, 100, &p));
+    }
+
+    #[test]
+    fn reasoning_off_clears_weaker_knobs() {
+        // Gateways reject contradictory knob combos (measured 400/422 on Go
+        // for low+thinking_off+reasoning_off together): the strongest rung
+        // is exclusive, so its wire shape carries exactly one knob.
+        let p = EndpointProfile::default();
+        let mut req = blank_req(8000);
+        req.reasoning_low = true;
+        req.thinking_off = true;
+        assert!(apply_ladder(&mut req, 0, &p));
+        assert!(req.reasoning_off);
+        assert!(!req.reasoning_low && !req.thinking_off);
     }
 
     #[test]
