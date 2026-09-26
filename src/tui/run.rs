@@ -16,7 +16,118 @@ use super::app::App;
 use super::cmd::Action;
 use super::splash;
 use super::ui::draw;
-use crate::obs::TraceEvent;
+use crate::obs::{GoalFinished, LiveEvent, TraceEvent};
+
+/// The goal worker task: one live run, resolving to its terminal outcome.
+/// The session never reads the `JoinHandle` result synchronously: the
+/// authoritative outcome is the `LiveEvent::Finished` the worker
+/// publishes, and a finished handle with no such event yields the generic
+/// fallback below rather than the handle's own error.
+pub type WorkerHandle = tokio::task::JoinHandle<anyhow::Result<GoalFinished>>;
+
+/// The live half of the terminal pump: owns the worker's event channel, the
+/// worker handle, and the stop latch. It is a pure reducer over
+/// `LiveEvent` -> `App`, with no terminal, clock, or file access, so the
+/// whole live state machine is testable headlessly.
+pub struct LiveSession {
+    receiver: tokio::sync::mpsc::UnboundedReceiver<LiveEvent>,
+    worker: Option<WorkerHandle>,
+    stop_requested: bool,
+}
+
+impl LiveSession {
+    /// Take ownership of the channel a goal worker publishes to. The
+    /// channel outlives any single run; `reset` prepares it for the next.
+    pub fn new(receiver: tokio::sync::mpsc::UnboundedReceiver<LiveEvent>) -> Self {
+        Self {
+            receiver,
+            worker: None,
+            stop_requested: false,
+        }
+    }
+
+    /// Admit one worker task. A previous handle is dropped (detached, never
+    /// aborted) and the stop latch clears for the new goal. The goal text is
+    /// display state and lives on `App::begin_run`; the session itself is
+    /// goal-agnostic.
+    pub fn begin(&mut self, _goal: &str, worker: WorkerHandle) {
+        self.worker = Some(worker);
+        self.stop_requested = false;
+    }
+
+    /// True while a worker is admitted and has not yet been resolved by a
+    /// terminal outcome.
+    pub fn is_running(&self) -> bool {
+        self.worker.is_some()
+    }
+
+    /// Ask the running goal to stop. This only sets the latch — the pump
+    /// decides what to do with it; the worker is never aborted, so a stop
+    /// cannot corrupt the trace the worker is still writing.
+    pub fn request_stop(&mut self) {
+        self.stop_requested = true;
+    }
+
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested
+    }
+
+    /// Return to the idle posture: forget the worker, clear the stop latch,
+    /// and discard events left over from the finished goal. The channel
+    /// stays open so the next goal can publish on it.
+    ///
+    /// Only valid after `drain` has reported the terminal outcome. While a
+    /// worker handle is still present this is a no-op, even if the task
+    /// happens to be finished: draining here could discard a queued
+    /// `LiveEvent::Finished` and strand the run before the outcome is
+    /// applied.
+    pub fn reset(&mut self) {
+        if self.worker.is_some() {
+            return;
+        }
+        self.worker = None;
+        self.stop_requested = false;
+        while self.receiver.try_recv().is_ok() {}
+    }
+
+    /// Apply every available live event to `app` and report a terminal
+    /// outcome at most once. Returns `None` while the run is live, and
+    /// `Some(GoalFinished)` on the single drain that carries the outcome.
+    ///
+    /// A worker that finished without publishing `LiveEvent::Finished` (a
+    /// panic, a cancelled task, a worker error) is still terminal: it is
+    /// reported as a failed outcome rather than leaving `App` running
+    /// forever.
+    pub fn drain(&mut self, app: &mut App) -> Option<GoalFinished> {
+        let mut outcome = None;
+        while let Ok(event) = self.receiver.try_recv() {
+            match event {
+                LiveEvent::Trace(event) => app.on_event(&event),
+                LiveEvent::Boundary(boundary) => app.on_live_boundary(boundary),
+                LiveEvent::Finished(finished) => outcome = Some(finished),
+            }
+        }
+        if outcome.is_none() {
+            if let Some(worker) = self.worker.as_ref() {
+                if worker.is_finished() {
+                    outcome = Some(GoalFinished {
+                        passed: false,
+                        error: Some("worker exited without a terminal outcome".to_string()),
+                    });
+                }
+            }
+        }
+        if let Some(finished) = &outcome {
+            app.on_live_finished(finished);
+            // The goal is over: forget the handle so a later drain cannot
+            // report a second outcome for the same run, and clear the stop
+            // latch so a resolved run cannot report a stale stop.
+            self.worker = None;
+            self.stop_requested = false;
+        }
+        outcome
+    }
+}
 
 /// What the idle console hands back to main: the next goal to run, or quit.
 /// Main owns the goal loop (`run_loop` blocks), so this enum is the whole
