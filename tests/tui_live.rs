@@ -3,7 +3,7 @@
 //! `TraceEvent` values and real tokio channels only.
 
 use crossterm::event::KeyCode;
-use rof::obs::{Boundary, GoalFinished, LiveEvent, TraceEvent};
+use rof::obs::{Boundary, GoalFinished, LiveEvent, TraceEvent, TraceSink};
 use rof::tui::app::{App, RunMode};
 use rof::tui::run::{handle_running_key, LiveSession, RunningKeyOutcome};
 use tokio::sync::mpsc::unbounded_channel;
@@ -468,6 +468,116 @@ fn a_repeated_stop_key_leaves_the_latch_for_the_pump() {
     );
     assert_eq!(app.run_mode, RunMode::Stopping);
     assert!(app.input.is_empty());
+}
+
+/// The live channel is worth subscribing to only if it carries exactly what
+/// the durable sink recorded: the same events, in the same order, through a
+/// real orchestrator worker instead of a hand-fed `emit` loop. The
+/// boundaries come from the runner around the worker, so they must bracket
+/// the trace it emitted. Stub client, temp work root: no network, no
+/// credentials, no wall-clock sleep.
+#[tokio::test]
+async fn stub_worker_delivers_the_same_trace_order_as_the_durable_sink() {
+    use rof::config::AppConfig;
+    use rof::engine::{Orchestrator, Session};
+    use rof::llm::{ContextService, ExecutorService, StubClient};
+    use rof::tools::ToolRegistry;
+    use std::sync::Arc;
+
+    let root =
+        std::env::temp_dir().join(format!("rof-p1a-live-{}-stub-worker", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    let trace = Arc::new(TraceSink::new());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    trace.attach_live(tx.clone());
+    // A GoalRunner announces the run before the worker starts, so every
+    // trace event the worker emits lands inside the boundary.
+    tx.send(LiveEvent::Boundary(Boundary::Started)).unwrap();
+
+    let worker_trace = trace.clone();
+    let worker_root = root.clone();
+    let handle = tokio::spawn(async move {
+        let cfg = AppConfig::default();
+        let context = ContextService::new(Arc::new(StubClient), "context-stub".into());
+        let executor = ExecutorService::new(Arc::new(StubClient), "executor-stub".into(), None);
+        let verify = ExecutorService::new(Arc::new(StubClient), "verify-stub".into(), None);
+        let registry = ToolRegistry::with_defaults(
+            worker_root.clone(),
+            cfg.permissions.clone(),
+            cfg.skills.clone(),
+        );
+        let orch = Orchestrator::new(cfg, worker_trace, context, executor, verify);
+        orch.run_loop(
+            &Session::new("stub integration goal".into()),
+            &registry,
+            &worker_root,
+        )
+        .await
+    });
+    handle.await.expect("the stub worker panicked");
+
+    // The notifications a GoalRunner sends around the worker, on the same
+    // channel: the sink is detached once the worker is done, then the run
+    // is bracketed and reported.
+    trace.detach_live();
+    tx.send(LiveEvent::Boundary(Boundary::Finished)).unwrap();
+    tx.send(LiveEvent::Finished(GoalFinished {
+        passed: true,
+        error: None,
+    }))
+    .unwrap();
+
+    // Every send happened above, so draining the closed-out channel is
+    // deterministic: no waiting, no sleep.
+    let live: Vec<LiveEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let stored = trace.events();
+    assert!(!stored.is_empty(), "the worker emitted no trace events");
+
+    // The runner's boundary notifications share this channel with the
+    // worker's trace events, so the traces are projected out and the
+    // notifications are asserted separately below.
+    let delivered: Vec<String> = live
+        .iter()
+        .filter_map(|event| match event {
+            LiveEvent::Trace(event) => Some(serde_json::to_string(event).unwrap()),
+            LiveEvent::Boundary(_) | LiveEvent::Finished(_) => None,
+        })
+        .collect();
+    let durable: Vec<String> = stored
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap())
+        .collect();
+    assert_eq!(delivered, durable);
+    // Started, then one trace notification per durable event, then the
+    // finished boundary and the outcome: nothing else travels this channel.
+    assert_eq!(live.len(), stored.len() + 3);
+    // The worker's own first event lands after the run was announced.
+    assert!(matches!(
+        live.get(1),
+        Some(LiveEvent::Trace(TraceEvent::SessionStart { .. }))
+    ));
+
+    assert!(matches!(
+        live.first(),
+        Some(LiveEvent::Boundary(Boundary::Started))
+    ));
+    assert!(matches!(
+        live.get(live.len() - 2),
+        Some(LiveEvent::Boundary(Boundary::Finished))
+    ));
+    assert!(matches!(live.last(), Some(LiveEvent::Finished(_))));
+    // Nothing but trace events between the two boundaries.
+    assert!(
+        live[1..live.len() - 2]
+            .iter()
+            .all(|event| matches!(event, LiveEvent::Trace(_))),
+        "unexpected notification between the boundaries: {live:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(!root.exists(), "the temp root was left behind: {root:?}");
 }
 
 #[test]
