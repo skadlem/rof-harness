@@ -39,8 +39,10 @@ impl GoalRunner {
     }
 
     /// Run one goal and return its raw result plus the derived verdict.
-    /// `announce` prints the `llm:` line; the printing `run`/`chat` path
-    /// passes it, the silent live worker does not.
+    /// `announce` prints the `llm:` line for a printing caller. The current
+    /// `run` path already announced during setup and the live worker is
+    /// silent, so both pass `false`; the parameter keeps the boundary
+    /// explicit for a future multi-goal printing caller.
     async fn execute(&self, goal: &str, announce: bool) -> anyhow::Result<GoalResult> {
         let mut cfg = self.cfg.clone();
         apply_env(&mut cfg);
@@ -87,9 +89,9 @@ impl GoalRunner {
     /// and report the terminal outcome. It writes nothing to stdout (the
     /// `llm:` announce is what `announce` gates); `apply_env` validation
     /// warnings still go to stderr. A closed channel is ignored because the
-    /// durable trace stays authoritative. Wired into the terminal pump by
-    /// the live-monitor task that follows.
-    #[allow(dead_code)]
+    /// durable trace stays authoritative. This is the closure the terminal
+    /// pump hands each goal to, so the pump owns the live session while
+    /// this task runs.
     async fn run_live(
         &self,
         goal: String,
@@ -110,7 +112,6 @@ impl GoalRunner {
 struct GoalResult {
     value: serde_json::Value,
     passed: bool,
-    #[allow(dead_code)]
     error: Option<String>,
 }
 
@@ -709,13 +710,15 @@ async fn main() -> anyhow::Result<()> {
             match replay_path {
                 Some(path) => rof::tui::run::replay(std::path::Path::new(path)),
                 None => {
-                    // Live console: idle prompt between goals. Main owns the
-                    // goal loop — each Goal runs to completion, then the
-                    // prompt re-enters on the same session.
+                    // Live console: the pump owns the whole session. It
+                    // calls back here for each goal, so a goal runs in a
+                    // worker task while the terminal keeps drawing and
+                    // reading keys beside it.
                     let s = setup(load_config(cfg_path.as_deref())?)?;
-                    while let rof::tui::run::LiveOut::Goal(g) = rof::tui::run::run_live(&s.trace)? {
-                        run_goal_text(&s, &g, false, false).await?;
-                    }
+                    rof::tui::run::run_live(&s.trace, |goal, tx| {
+                        let runner = GoalRunner::from_setup(&s);
+                        Ok(tokio::spawn(async move { runner.run_live(goal, tx).await }))
+                    })?;
                     Ok(())
                 }
             }
@@ -752,8 +755,11 @@ async fn run_goal(goal: &str, config_path: Option<&str>, args: &[String]) -> any
     run_goal_text(&s, goal, args.iter().any(|a| a == "--print-trace"), true).await
 }
 
-/// One goal on an existing session setup. The `run` path calls this once;
-/// the `chat` loop calls it per goal. Between-goals slash knobs land here:
+/// One goal on an existing session setup, with printing. The `run` path
+/// calls this; the live chat console runs the silent worker through the
+/// terminal pump instead. `exit_on_fail` is retained for a future
+/// non-quitting caller; the current CLI always passes `true`. Between-goals
+/// slash knobs land here:
 /// the same env names the loop reads are re-applied to this goal's config
 /// copy, stored logins fill blank env knobs (env wins), and the provider
 /// clients are rebuilt from that config — so `/attempts`, `/effort`,
@@ -765,8 +771,9 @@ async fn run_goal_text(
     print_trace: bool,
     exit_on_fail: bool,
 ) -> anyhow::Result<()> {
-    // The `run` path already announced in setup(); the chat loop announces
-    // per goal so a model switch shows up where it takes effect.
+    // The `run` path already announced in setup(), so it does not
+    // re-announce; a per-goal announce belongs to a multi-goal caller that
+    // moves the model between goals. The live worker never announces.
     let result = GoalRunner::from_setup(s)
         .execute(goal, !exit_on_fail)
         .await?;
@@ -781,9 +788,9 @@ async fn run_goal_text(
     }
     // A harness that exits 0 on a failed task is invisible to every caller:
     // Harbor, CI, and a comparison script all read the exit code first. The
-    // verdict is already computed; this only refuses to discard it. The chat
-    // loop passes false so one failed goal prints and continues the session
-    // instead of killing the console.
+    // verdict is already computed; this only refuses to discard it. A
+    // future non-quitting caller can pass false; the live console reports
+    // its verdict through the live session, not through this wrapper.
     if !passed {
         if exit_on_fail {
             std::process::exit(3);

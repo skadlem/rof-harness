@@ -1,7 +1,8 @@
-//! Terminal runner for `rof chat`: alternate-screen event pump plus a
+//! Terminal runner for `rof chat`: alternate-screen event pump that owns a
+//! whole live session (idle prompt plus one running goal) plus a
 //! `--replay <trace.jsonl>` mode that renders a recorded trace with no live
-//! loop. The live loop lands in Plan C; this file never touches the
-//! orchestrator.
+//! loop. This file never touches the orchestrator: the goal itself runs in
+//! a worker task supplied by the caller.
 
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 
 use super::app::App;
 use super::cmd::Action;
@@ -129,35 +130,93 @@ impl LiveSession {
     }
 }
 
-/// What the idle console hands back to main: the next goal to run, or quit.
-/// Main owns the goal loop (`run_loop` blocks), so this enum is the whole
-/// contract between the prompt UI and the goal runner.
-pub enum LiveOut {
-    Goal(String),
-    Quit,
+/// What one key means while a goal is live. The pump keeps ownership of
+/// ordinary character input and of the stop latch; this enum covers only
+/// the decisions that must not be reachable from a running session, which
+/// is what makes the read-only contract testable without a PTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunningKeyOutcome {
+    /// Enter while a goal is live: the composer is inert, so the key only
+    /// records the read-only posture in the transcript.
+    ReadOnlyNotice,
+    /// `q`/Esc on an empty composer: ask the running goal to stop. The
+    /// worker is asked, never aborted, so it still writes its trace, and
+    /// a second press detaches it instead of waiting for an
+    /// uninterruptible call. Modifiers are the pump's business, not
+    /// this reducer's: it sees a bare `KeyCode`, so it cannot tell
+    /// Ctrl-C from typing `c` or Ctrl-q from typing `q`, and the pump
+    /// matches both before calling it.
+    StopArmed,
+    /// Everything the pump handles itself: typing, Backspace, scrolling.
+    Ignored,
 }
 
-/// Live session: poll the shared trace, render at ~30fps, queue one goal.
-/// Goal N+1 starts when goal N's run_loop future resolves. Slash actions
-/// apply between goals via session-local env overrides (the loop reads the
-/// same vars at call time, so no orchestrator changes).
-pub fn run_live(trace: &crate::obs::TraceSink) -> anyhow::Result<LiveOut> {
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-    use crossterm::ExecutableCommand;
-    // NOTE: the plan sketch shows `Result<()>` here, but main matches on
-    // `LiveOut`, so this returns the outcome — otherwise nothing compiles.
+/// The running-mode key contract, as a pure `App` reducer. Nothing is
+/// parsed or dispatched here: a live goal owns the console, so a slash
+/// line stays composer text and is never applied.
+pub fn handle_running_key(app: &mut App, code: KeyCode) -> RunningKeyOutcome {
+    match code {
+        KeyCode::Enter => {
+            app.transcript
+                .push("run in progress — composer is read-only in P1a".to_string());
+            RunningKeyOutcome::ReadOnlyNotice
+        }
+        KeyCode::Esc => {
+            app.set_stopping();
+            RunningKeyOutcome::StopArmed
+        }
+        // `q` quits only on an empty composer, so goal text containing `q`
+        // stays typeable (the idle prompt keeps the same rule).
+        KeyCode::Char('q') if app.input.is_empty() => {
+            app.set_stopping();
+            RunningKeyOutcome::StopArmed
+        }
+        _ => RunningKeyOutcome::Ignored,
+    }
+}
+
+/// Live session: one alternate-screen pump owns the whole console. Idle
+/// Enter starts a goal in a worker task through the injected starter, and
+/// the pump keeps drawing and reading keys while it runs. `start_goal`
+/// is the only seam that knows how to build a worker, so this file never
+/// touches the orchestrator.
+///
+/// While a goal is live, `q`/Esc/Ctrl-C are stop keys with two
+/// presses: the first asks the worker to stop (the in-flight call
+/// cannot be interrupted), the second detaches it and ends the
+/// session. The worker is dropped, never aborted, so the trace it is
+/// still writing stays intact.
+///
+/// The live sender is attached to the durable sink for the whole session
+/// and detached on every return path, so `TraceSink` and the channel
+/// cannot drift out of the loop's reach on an error exit.
+pub fn run_live<F>(trace: &crate::obs::TraceSink, mut start_goal: F) -> anyhow::Result<()>
+where
+    F: FnMut(String, tokio::sync::mpsc::UnboundedSender<LiveEvent>) -> anyhow::Result<WorkerHandle>,
+{
     enable_raw_mode()?;
     std::io::stdout().execute(EnterAlternateScreen)?;
-    let out = run_live_inner(trace);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    trace.attach_live(tx.clone());
+    let out = run_live_inner(trace, rx, &tx, &mut start_goal);
+    trace.detach_live();
     disable_raw_mode()?;
     std::io::stdout().execute(LeaveAlternateScreen)?;
     out
 }
 
-/// Idle prompt between goals. Owns `App`, a `shown` cursor into
-/// `trace.events()`, and a single-slot `pending` goal buffer: Enter queues
-/// one goal, typing + Enter replaces it — never a list.
-fn run_live_inner(trace: &crate::obs::TraceSink) -> anyhow::Result<LiveOut> {
+/// The pump itself: owns `App`, the `LiveSession`, and the idle-only
+/// `/login` key capture. One goal at a time — P1a has no queue, so Enter
+/// starts a goal immediately and the run is watched in place.
+fn run_live_inner<F>(
+    trace: &crate::obs::TraceSink,
+    rx: tokio::sync::mpsc::UnboundedReceiver<LiveEvent>,
+    tx: &tokio::sync::mpsc::UnboundedSender<LiveEvent>,
+    start_goal: &mut F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(String, tokio::sync::mpsc::UnboundedSender<LiveEvent>) -> anyhow::Result<WorkerHandle>,
+{
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut app = App::new();
@@ -166,25 +225,32 @@ fn run_live_inner(trace: &crate::obs::TraceSink) -> anyhow::Result<LiveOut> {
     app.thinking = std::env::var("ROF_THINKING").unwrap_or_default();
     app.transcript
         .push("rof chat — type a goal, or /help for commands.".to_string());
-    let mut shown: usize = 0;
-    let mut pending: Option<String> = None;
+    let mut session = LiveSession::new(rx);
     let mut awaiting_key: Option<String> = None;
-    // Double-press quit: the goal call blocks and is not interruptible, so
-    // the first press only arms (with an indicator line naming that fact)
-    // and the second press exits. Any other key disarms.
+    // Double-press quit while idle: a goal is never preempted from the
+    // idle prompt either, so the first press only arms (with an
+    // indicator line naming that fact) and the second press exits. Any
+    // other key disarms.
     let mut quit_armed = false;
+    // A stopped run that reached its outcome ends the session, but the
+    // outcome line is the whole point of the stop, so the return waits
+    // for the draw that shows it instead of pre-empting that frame.
+    let mut exit_after_draw = false;
     loop {
-        for ev in trace.events().iter().skip(shown) {
-            app.on_event(ev);
-            shown += 1;
+        // Drain before every draw, with or without a key: the worker
+        // publishes on its own schedule, not ours.
+        let stop_armed = session.stop_requested();
+        if session.drain(&mut app).is_some() {
+            // Terminal: back to the idle posture, keeping the activity
+            // pane. A stop requested before the outcome ends the session
+            // now that the run is over.
+            session.reset();
+            exit_after_draw = stop_armed;
         }
-        terminal.draw(|f| {
-            if app.fresh {
-                splash::draw(f);
-            } else {
-                draw(f, &app);
-            }
-        })?;
+        terminal.draw(|f| draw_frame(f, &app))?;
+        if exit_after_draw {
+            return Ok(());
+        }
         if !event::poll(Duration::from_millis(33))? {
             continue;
         }
@@ -194,11 +260,70 @@ fn run_live_inner(trace: &crate::obs::TraceSink) -> anyhow::Result<LiveOut> {
                 app.fresh = false;
                 continue;
             }
+            if session.is_running() {
+                // Running posture: the composer is a scratch pad and the
+                // run is read-only. No slash action, no config mutation, no
+                // second goal is reachable from this branch.
+                //
+                // Ctrl-C is matched on the modifier first, because a bare
+                // `KeyCode` cannot tell it from typing `c`; the remaining
+                // stop keys (`q`/Esc) go through the pure helper, guarded
+                // by an empty modifier set so Shift/Alt/Ctrl+q stays draft
+                // text.
+                let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
+                let stop_key = ctrl_c
+                    || (key.modifiers.is_empty()
+                        && handle_running_key(&mut app, key.code) == RunningKeyOutcome::StopArmed);
+                // A stop key ends the key here: it must not also be typed
+                // into the draft.
+                if stop_key {
+                    // Once a stop is requested, do not clear the latch on
+                    // later typing: the user asked to stop, and a stray
+                    // draft keystroke must not silently cancel that request.
+                    if session.stop_requested() {
+                        // Second press: the call cannot be interrupted, so
+                        // the worker is detached rather than waited for.
+                        // Dropping the handle never aborts the task, and
+                        // whatever it has already written stays in the
+                        // JSONL trace.
+                        app.transcript.push(detach_hint());
+                        terminal.draw(|f| draw_frame(f, &app))?;
+                        return Ok(());
+                    }
+                    session.request_stop();
+                    app.set_stopping();
+                    app.transcript.push(stop_hint());
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char(c)
+                        if key.modifiers.is_empty()
+                            || key.modifiers == KeyModifiers::SHIFT
+                            // A modified `q` is ordinary text, not a stop
+                            // key, so it must still reach the draft.
+                            || c == 'q' =>
+                    {
+                        app.input.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        app.input.pop();
+                    }
+                    KeyCode::Up => app.scroll_lines(1),
+                    KeyCode::Down => app.scroll_lines(-1),
+                    KeyCode::PageUp => app.scroll_lines(10),
+                    KeyCode::PageDown => app.scroll_lines(-10),
+                    KeyCode::Home => app.scroll_lines(isize::MAX),
+                    KeyCode::End => app.scroll_lines(isize::MIN),
+                    _ => {}
+                }
+                continue;
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             {
                 if quit_armed {
-                    return Ok(LiveOut::Quit);
+                    return Ok(());
                 }
                 quit_armed = true;
                 app.transcript.push(quit_hint());
@@ -207,7 +332,7 @@ fn run_live_inner(trace: &crate::obs::TraceSink) -> anyhow::Result<LiveOut> {
             match key.code {
                 KeyCode::Esc => {
                     if quit_armed {
-                        return Ok(LiveOut::Quit);
+                        return Ok(());
                     }
                     quit_armed = true;
                     app.transcript.push(quit_hint());
@@ -217,7 +342,7 @@ fn run_live_inner(trace: &crate::obs::TraceSink) -> anyhow::Result<LiveOut> {
                 // cannot afford that).
                 KeyCode::Char('q') if key.modifiers.is_empty() && app.input.is_empty() => {
                     if quit_armed {
-                        return Ok(LiveOut::Quit);
+                        return Ok(());
                     }
                     quit_armed = true;
                     app.transcript.push(quit_hint());
@@ -242,14 +367,11 @@ fn run_live_inner(trace: &crate::obs::TraceSink) -> anyhow::Result<LiveOut> {
                     quit_armed = false;
                     let text = std::mem::take(&mut app.input).trim().to_string();
                     if text.is_empty() {
-                        if let Some(goal) = pending.take() {
-                            return Ok(LiveOut::Goal(goal));
-                        }
                         continue;
                     }
-                    // A pending /login key capture wins over goal queueing:
-                    // the next non-slash line is the key (never echoed,
-                    // never queued as a goal). A slash line cancels it.
+                    // A pending /login key capture wins over starting a goal:
+                    // the next non-slash line is the key (never echoed, never
+                    // run as a goal). A slash line cancels it.
                     if let Some(prov) = awaiting_key.take() {
                         app.mask_input = false;
                         if text.starts_with('/') {
@@ -275,14 +397,31 @@ fn run_live_inner(trace: &crate::obs::TraceSink) -> anyhow::Result<LiveOut> {
                     }
                     match super::cmd::parse(&text) {
                         None => {
-                            pending = Some(text.clone());
-                            app.transcript.push(format!(
-                                "queued (single slot): {text} — Enter runs it, typing + Enter replaces it"
-                            ));
+                            // P1a has no goal queue: a non-slash line starts
+                            // immediately and is watched in place. The run
+                            // state opens first so the worker's first event
+                            // is already a `Running` activity line.
+                            if session.is_running() {
+                                continue;
+                            }
+                            app.begin_run(&text);
+                            match start_goal(text.clone(), tx.clone()) {
+                                Ok(handle) => session.begin(&text, handle),
+                                // A starter that cannot spawn must not take
+                                // the terminal with it: record the failure and
+                                // stay idle.
+                                Err(error) => {
+                                    app.on_live_finished(&GoalFinished {
+                                        passed: false,
+                                        error: Some(format!("could not start the run: {error}")),
+                                    });
+                                    session.reset();
+                                }
+                            }
                         }
                         Some(action) => {
                             if apply_action(&mut app, trace, action, &text, &mut awaiting_key) {
-                                return Ok(LiveOut::Quit);
+                                return Ok(());
                             }
                         }
                     }
@@ -293,8 +432,30 @@ fn run_live_inner(trace: &crate::obs::TraceSink) -> anyhow::Result<LiveOut> {
     }
 }
 
+/// One console frame: the startup splash until the first keypress, then
+/// the live view. The pump and its force-exit share this, so the last
+/// frame a user sees is drawn exactly like every other one.
+fn draw_frame(f: &mut Frame, app: &App) {
+    if app.fresh {
+        splash::draw(f);
+    } else {
+        draw(f, app);
+    }
+}
+
 fn quit_hint() -> String {
-    "quit armed — press q/Esc/Ctrl-C again to exit (a running goal is a blocking call and cannot be interrupted mid-goal)".to_string()
+    "quit armed — press q/Esc/Ctrl-C again to exit".to_string()
+}
+
+/// First stop press on a live run: the worker is asked, not interrupted.
+fn stop_hint() -> String {
+    "stop requested — the current call cannot be interrupted; press q/Esc/Ctrl-C again to detach and exit"
+        .to_string()
+}
+
+/// Second stop press: the run is abandoned, not aborted.
+fn detach_hint() -> String {
+    "detaching the worker — completed events remain in the JSONL trace; an in-flight tool may finish on its own timeout".to_string()
 }
 
 fn env_present(k: &str) -> bool {
@@ -566,7 +727,7 @@ fn apply_action(
             "display={m}: single fullscreen view in this console"
         )),
         Action::Busy(m) => app.transcript.push(format!(
-            "busy={m}: one goal at a time; Enter queues a single pending goal"
+            "busy={m}: one goal at a time; Enter during a run is read-only (P1a has no queue)"
         )),
     }
     false

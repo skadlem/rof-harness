@@ -2,9 +2,10 @@
 //! `LiveSession` channel reducer. No terminal, no network, no model: real
 //! `TraceEvent` values and real tokio channels only.
 
+use crossterm::event::KeyCode;
 use rof::obs::{Boundary, GoalFinished, LiveEvent, TraceEvent};
 use rof::tui::app::{App, RunMode};
-use rof::tui::run::LiveSession;
+use rof::tui::run::{handle_running_key, LiveSession, RunningKeyOutcome};
 use tokio::sync::mpsc::unbounded_channel;
 
 fn transition(from: &str, to: &str) -> TraceEvent {
@@ -365,6 +366,108 @@ fn a_scrolled_transcript_holds_its_anchor_until_end() {
 
     app.scroll_lines(isize::MIN);
     assert_eq!(app.scroll, 0);
+}
+
+/// P1a is a read-only monitor: a running goal owns the console's attention,
+/// so Enter may only record the read-only posture. Nothing is parsed,
+/// dispatched, or cleared — the draft the user typed survives untouched.
+#[test]
+fn running_mode_does_not_dispatch_composer_text() {
+    let mut app = App::new();
+    app.begin_run("busy");
+    app.input.push_str("/model provider/model");
+
+    assert_eq!(
+        handle_running_key(&mut app, KeyCode::Enter),
+        RunningKeyOutcome::ReadOnlyNotice
+    );
+    assert_eq!(app.input, "/model provider/model");
+    assert!(app.transcript.iter().any(|line| line.contains("read-only")));
+    assert_eq!(
+        app.transcript.last().map(String::as_str),
+        Some("run in progress — composer is read-only in P1a")
+    );
+    // The notice is the only thing the key produced: no run state change.
+    assert_eq!(app.run_mode, RunMode::Running);
+    assert!(app.activity.is_empty());
+}
+
+#[test]
+fn running_quit_keys_arm_a_stop_and_never_edit_the_draft() {
+    let mut app = App::new();
+    app.begin_run("busy");
+
+    // An empty composer is the only place `q` is a quit key: goal text
+    // containing `q` must stay typeable while a run is live.
+    assert_eq!(
+        handle_running_key(&mut app, KeyCode::Esc),
+        RunningKeyOutcome::StopArmed
+    );
+    assert_eq!(
+        handle_running_key(&mut app, KeyCode::Char('q')),
+        RunningKeyOutcome::StopArmed
+    );
+    assert_eq!(app.run_mode, RunMode::Stopping);
+    assert!(app.input.is_empty(), "the quit keys edited the draft");
+
+    // A non-empty draft keeps `q` as ordinary composer text; the pump, not
+    // this helper, appends it.
+    let mut app = App::new();
+    app.begin_run("busy");
+    app.input.push_str("qq");
+    assert_eq!(
+        handle_running_key(&mut app, KeyCode::Char('q')),
+        RunningKeyOutcome::Ignored
+    );
+    assert_eq!(app.input, "qq");
+    assert_eq!(app.run_mode, RunMode::Running);
+}
+
+/// A modified `q` is text, not a stop: the pump reads the modifier
+/// before the helper, and a shifted `q` is exactly what a user typing
+/// Shift+q into the draft produces. Nothing about the run may change.
+#[test]
+fn a_shifted_q_is_ordinary_text_while_running() {
+    let mut app = App::new();
+    app.begin_run("busy");
+
+    assert_eq!(
+        handle_running_key(&mut app, KeyCode::Char('Q')),
+        RunningKeyOutcome::Ignored
+    );
+    assert_eq!(app.run_mode, RunMode::Running);
+    assert!(
+        app.transcript.is_empty(),
+        "a typed key wrote to the transcript"
+    );
+}
+
+/// The second stop key is the pump's to act on: the helper is a pure
+/// reducer, so a repeated `q`/Esc re-reports the same posture and
+/// leaves the stop latch standing. The pump reads that latch to tell
+/// "ask the worker to stop" from "detach it and exit".
+#[test]
+fn a_repeated_stop_key_leaves_the_latch_for_the_pump() {
+    let (_tx, rx) = unbounded_channel::<LiveEvent>();
+    let mut app = App::new();
+    app.begin_run("busy");
+    let mut session = LiveSession::new(rx);
+
+    assert_eq!(
+        handle_running_key(&mut app, KeyCode::Esc),
+        RunningKeyOutcome::StopArmed
+    );
+    session.request_stop();
+    assert_eq!(
+        handle_running_key(&mut app, KeyCode::Char('q')),
+        RunningKeyOutcome::StopArmed
+    );
+    assert!(
+        session.stop_requested(),
+        "the second stop key cleared the latch the pump detaches on"
+    );
+    assert_eq!(app.run_mode, RunMode::Stopping);
+    assert!(app.input.is_empty());
 }
 
 #[test]
