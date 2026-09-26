@@ -585,42 +585,6 @@ pub fn prefix_allowed(prefixes: &[String], cmd: &str) -> bool {
 #[cfg(test)]
 fn _unused() {}
 
-#[cfg(test)]
-mod anchor_tests {
-    use super::anchor_allowed_dirs;
-    use crate::config::PermissionPolicy;
-    use std::path::PathBuf;
-
-    fn policy_with(dirs: &[&str]) -> PermissionPolicy {
-        PermissionPolicy {
-            allowed_dirs: dirs.iter().map(PathBuf::from).collect(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn config_dirs_survive_with_root_first() {
-        let mut p = policy_with(&["/data"]);
-        anchor_allowed_dirs(&mut p, &PathBuf::from("/work"));
-        assert_eq!(
-            p.allowed_dirs,
-            vec![PathBuf::from("/work"), PathBuf::from("/data")]
-        );
-    }
-
-    #[test]
-    fn root_is_not_duplicated() {
-        let mut p = policy_with(&["/work"]);
-        anchor_allowed_dirs(&mut p, &PathBuf::from("/work"));
-        assert_eq!(p.allowed_dirs.len(), 1);
-        let mut p = policy_with(&["/data", "/work"]);
-        anchor_allowed_dirs(&mut p, &PathBuf::from("/work"));
-        assert_eq!(
-            p.allowed_dirs,
-            vec![PathBuf::from("/data"), PathBuf::from("/work")]
-        );
-    }
-}
 /// Test helper (stable path for integration tests).
 pub fn prefix_allowed_for_test(prefixes: &[String], cmd: &str) -> bool {
     prefix_allowed(prefixes, cmd)
@@ -715,5 +679,42 @@ impl Tool for FsWriteTool {
             output: format!("wrote {} bytes to {}", content.len(), rel),
             error: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::anchor_allowed_dirs;
+    use crate::config::PermissionPolicy;
+    use std::path::PathBuf;
+
+    fn policy_with(dirs: &[&str]) -> PermissionPolicy {
+        PermissionPolicy {
+            allowed_dirs: dirs.iter().map(PathBuf::from).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn config_dirs_survive_with_root_first() {
+        let mut p = policy_with(&["/data"]);
+        anchor_allowed_dirs(&mut p, &PathBuf::from("/work"));
+        assert_eq!(
+            p.allowed_dirs,
+            vec![PathBuf::from("/work"), PathBuf::from("/data")]
+        );
+    }
+
+    #[test]
+    fn root_is_not_duplicated() {
+        let mut p = policy_with(&["/work"]);
+        anchor_allowed_dirs(&mut p, &PathBuf::from("/work"));
+        assert_eq!(p.allowed_dirs.len(), 1);
+        let mut p = policy_with(&["/data", "/work"]);
+        anchor_allowed_dirs(&mut p, &PathBuf::from("/work"));
+        assert_eq!(
+            p.allowed_dirs,
+            vec![PathBuf::from("/data"), PathBuf::from("/work")]
+        );
     }
 }

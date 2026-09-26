@@ -100,7 +100,7 @@ mod tests {
         assert!(oracle_ok(&base, &fin, &[], &["cargo test bar".to_string()]));
         assert!(!oracle_ok(
             &base,
-            &vec![cr("cargo test bar", false)],
+            &[cr("cargo test bar", false)],
             &[],
             &["cargo test bar".to_string()]
         ));
