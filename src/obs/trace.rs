@@ -1,3 +1,4 @@
+use super::live::LiveEvent;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -97,6 +98,14 @@ pub struct TraceSink {
     /// here. §4.3: the per-task budget reads this instead of rescanning the
     /// event stream, so spend accounting is O(1) per round, not O(rounds²).
     total: AtomicU64,
+    /// Optional live subscriber. The durable trace stays authoritative, so a
+    /// closed or absent sender is simply ignored, never an error.
+    live: Mutex<Option<tokio::sync::mpsc::UnboundedSender<LiveEvent>>>,
+    /// Serializes emission so a live subscriber can never observe `emit`ed
+    /// events out of `events()` order. It spans the live send and the
+    /// in-memory push; `extend` is durable-only by design and is not
+    /// live-forwarded, so it needs no place in this order.
+    emit_order: Mutex<()>,
 }
 
 impl TraceSink {
@@ -105,6 +114,8 @@ impl TraceSink {
             inner: Mutex::new(Vec::new()),
             file: None,
             total: AtomicU64::new(0),
+            live: Mutex::new(None),
+            emit_order: Mutex::new(()),
         }
     }
 
@@ -115,6 +126,8 @@ impl TraceSink {
             inner: Mutex::new(Vec::new()),
             file: Some((Arc::new(Mutex::new(file)), path.to_path_buf())),
             total: AtomicU64::new(0),
+            live: Mutex::new(None),
+            emit_order: Mutex::new(()),
         })
     }
 
@@ -123,6 +136,27 @@ impl TraceSink {
             std::fs::create_dir_all(dir)?;
         }
         OpenOptions::new().create(true).append(true).open(path)
+    }
+
+    /// Start mirroring emitted events to `tx`. A second attach replaces the
+    /// first.
+    pub fn attach_live(&self, tx: tokio::sync::mpsc::UnboundedSender<LiveEvent>) {
+        // `emit_order` first, then `live` (never the reverse): an in-flight
+        // `emit` finishes its live send and memory push before the swap, so
+        // the subscriber is attached to a consistent view of both.
+        let _order = self.emit_order.lock().ok();
+        if let Ok(mut guard) = self.live.lock() {
+            *guard = Some(tx);
+        }
+    }
+
+    /// Stop live notification; the durable trace is unaffected.
+    pub fn detach_live(&self) {
+        // Same lock order as `attach_live`; see the note there.
+        let _order = self.emit_order.lock().ok();
+        if let Ok(mut guard) = self.live.lock() {
+            *guard = None;
+        }
     }
 
     /// Fresh in-memory sink writing to the same file (per-task isolation
@@ -136,12 +170,19 @@ impl TraceSink {
                 // A fork counts only what it emits itself; the parent's total
                 // already holds the events being handed over.
                 total: AtomicU64::new(0),
+                // A fork never inherits the parent's live subscriber: one
+                // channel, one subscriber.
+                live: Mutex::new(None),
+                emit_order: Mutex::new(()),
             },
             None => Self::new(),
         }
     }
 
     pub fn emit(&self, ev: TraceEvent) {
+        // One lock for the whole method: the live forward and the in-memory
+        // push must appear in the same order to every observer.
+        let _order = self.emit_order.lock().ok();
         if let TraceEvent::ModelCall {
             input_tokens,
             output_tokens,
@@ -160,6 +201,10 @@ impl TraceSink {
                     let _ = f.write_all(&buf);
                 }
             }
+        }
+        let live = self.live.lock().ok().and_then(|guard| guard.clone());
+        if let Some(tx) = live {
+            let _ = tx.send(LiveEvent::Trace(ev.clone()));
         }
         if let Ok(mut guard) = self.inner.lock() {
             guard.push(ev);
@@ -212,6 +257,146 @@ impl Default for TraceSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::obs::LiveEvent;
+
+    /// The live channel is an optimization of the durable trace, never a
+    /// replacement: whatever a subscriber sees must equal `events()`. The
+    /// invariant covers events delivered through `emit`; `extend` is
+    /// durable-only by design and is not live-forwarded.
+    #[test]
+    fn live_sender_receives_the_same_event_order_as_the_sink() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = TraceSink::new();
+        sink.attach_live(tx);
+
+        sink.emit(TraceEvent::StateTransition {
+            from: "ready".into(),
+            to: "implementing".into(),
+        });
+        sink.emit(TraceEvent::StateTransition {
+            from: "implementing".into(),
+            to: "reviewing".into(),
+        });
+
+        let delivered: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| match event {
+                LiveEvent::Trace(event) => serde_json::to_string(&event).unwrap(),
+                other => panic!("unexpected non-trace notification: {other:?}"),
+            })
+            .collect();
+        let stored: Vec<String> = sink
+            .events()
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect();
+        assert_eq!(delivered, stored);
+    }
+
+    /// Detaching only stops notification; the durable sink keeps recording.
+    #[test]
+    fn detaching_live_notifications_keeps_the_durable_sink() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = TraceSink::new();
+        sink.attach_live(tx);
+        sink.detach_live();
+        sink.emit(TraceEvent::StateTransition {
+            from: "ready".into(),
+            to: "implementing".into(),
+        });
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sink.len(), 1);
+    }
+
+    /// Threads sharing one sink, not just separate forks: `emit` holds
+    /// `emit_order` across the live send and the memory push, so a single
+    /// subscriber still sees exactly the durable order.
+    #[test]
+    fn concurrent_emitters_on_one_sink_keep_live_and_durable_order_equal() {
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 50;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = Arc::new(TraceSink::new());
+        sink.attach_live(tx);
+
+        let start = Arc::new(std::sync::Barrier::new(THREADS));
+        let mut threads = Vec::new();
+        for t in 0..THREADS {
+            let sink = Arc::clone(&sink);
+            let start = Arc::clone(&start);
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                for i in 0..PER_THREAD {
+                    sink.emit(TraceEvent::ToolCall {
+                        agent: format!("agent-{t}"),
+                        tool: format!("tool-{i}"),
+                        ok: true,
+                        latency_ms: (t * PER_THREAD + i) as u64,
+                    });
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        let delivered: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| match event {
+                LiveEvent::Trace(event) => serde_json::to_string(&event).unwrap(),
+                other => panic!("unexpected non-trace notification: {other:?}"),
+            })
+            .collect();
+        let stored: Vec<String> = sink
+            .events()
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect();
+
+        assert_eq!(stored.len(), THREADS * PER_THREAD);
+        assert_eq!(delivered, stored);
+    }
+
+    /// A subscriber that went away (aborted run, dropped monitor) must not
+    /// break emission: the live send fails, the durable trace still records.
+    #[test]
+    fn emitting_after_the_receiver_is_dropped_keeps_the_durable_sink() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = TraceSink::new();
+        sink.attach_live(tx);
+        drop(rx);
+
+        sink.emit(TraceEvent::StateTransition {
+            from: "ready".into(),
+            to: "implementing".into(),
+        });
+
+        assert_eq!(sink.len(), 1);
+    }
+
+    /// A fork is a separate subscriber scope: the parent's channel must not
+    /// see the child's events.
+    #[test]
+    fn fork_does_not_inherit_the_parent_live_subscriber() {
+        let path =
+            std::env::temp_dir().join(format!("rof-trace-fork-live-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Exercise the file-backed fork arm used by the evaluation runner.
+        let parent = TraceSink::with_file(&path).unwrap();
+        parent.attach_live(tx);
+        let child = parent.fork();
+
+        child.emit(TraceEvent::ToolCall {
+            agent: "implementer".into(),
+            tool: "apply".into(),
+            ok: true,
+            latency_ms: 1,
+        });
+
+        assert!(rx.try_recv().is_err(), "parent saw a child event");
+        assert_eq!(child.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn writes_jsonl_lines_and_keeps_memory() {
