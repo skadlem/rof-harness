@@ -189,6 +189,117 @@ fn masked_composer_hides_key_entry() {
     assert!(screen(&app).contains("sk-secret"), "unmasked renders");
 }
 
+/// Row text of a rendered screen: one `String` per terminal row.
+fn rendered_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+    use ratatui::{backend::TestBackend, Terminal};
+    use rof::tui::ui::draw;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, app)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    buf.content()
+        .chunks(width as usize)
+        .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+        .collect()
+}
+
+#[test]
+fn live_activity_and_read_only_composer_render() {
+    let mut app = App::new();
+    app.begin_run("watch the run");
+    // More events than the activity pane has interior rows, so the newest
+    // line can only be visible if the renderer honors the border.
+    for (from, to) in [
+        ("ready", "implementing"),
+        ("implementing", "reviewing"),
+        ("reviewing", "verifying"),
+        ("verifying", "summarizing"),
+        ("summarizing", "reporting"),
+        ("reporting", "finalizing"),
+    ] {
+        app.on_event(&TraceEvent::StateTransition {
+            from: from.into(),
+            to: to.into(),
+        });
+    }
+    let rows = rendered_rows(&app, 100, 24);
+    let out: String = rows.concat();
+    assert!(out.contains("run activity"), "{out}");
+    assert!(out.contains("composer · read-only (P1a)"), "{out}");
+    let at = |needle: &str| rows.iter().position(|row| row.contains(needle)).unwrap();
+    // The pane is 6 rows on a 24-row terminal, so 4 interior rows hold the
+    // tail; inside the pane the oldest line is the one that gets clipped.
+    let top = at("run activity");
+    let pane: String = rows[top..top + 6].concat();
+    assert!(
+        pane.contains("finalizing"),
+        "newest line inside pane: {pane}"
+    );
+    assert!(
+        !pane.contains("implementing"),
+        "oldest line clipped: {pane}"
+    );
+    let bottom = at("composer · read-only (P1a)");
+    assert!(top < bottom, "activity pane sits above the composer: {out}");
+}
+
+#[test]
+fn replay_activity_region_does_not_claim_a_live_wait() {
+    let mut app = App::new();
+    app.set_replay_events(vec![TraceEvent::SessionStart {
+        session_id: "s".into(),
+        goal: "recorded".into(),
+    }]);
+    let out: String = rendered_rows(&app, 100, 24).concat();
+    assert!(!out.contains("waiting for run"), "{out}");
+    assert!(out.contains("replay: no live activity"), "{out}");
+}
+
+#[test]
+fn small_terminal_keeps_transcript_status_and_composer() {
+    let mut app = App::new();
+    app.transcript.push("tail line".into());
+    app.begin_run("small");
+    let rows = rendered_rows(&app, 60, 9);
+    let out: String = rows.concat();
+    // 9 rows is exactly status + composer + a 3-row transcript, so the
+    // activity pane yields its rows to the transcript rather than squeezing
+    // it down to a bare border.
+    assert_eq!(rows.len(), 9);
+    assert!(out.contains("transcript"), "{out}");
+    assert!(out.contains("tail line"), "transcript keeps content: {out}");
+    assert!(out.contains("status"), "{out}");
+    assert!(out.contains("composer"), "{out}");
+    assert!(
+        !out.contains("run activity"),
+        "pane hidden at 9 rows: {out}"
+    );
+    let at = |title: &str| rows.iter().position(|row| row.contains(title)).unwrap();
+    assert!(at("transcript") < at("status") && at("status") < at("composer"));
+}
+
+#[test]
+fn medium_terminal_shows_all_four_panes() {
+    let mut app = App::new();
+    app.transcript.push("tail line".into());
+    app.begin_run("medium");
+    let rows = rendered_rows(&app, 60, 12);
+    let out: String = rows.concat();
+    assert_eq!(rows.len(), 12);
+    for title in ["transcript", "run activity", "status", "composer"] {
+        assert!(out.contains(title), "{title} missing: {out}");
+    }
+    // Transcript content survives alongside the restored activity pane.
+    assert!(out.contains("tail line"), "transcript keeps content: {out}");
+    let at = |title: &str| rows.iter().position(|row| row.contains(title)).unwrap();
+    assert!(
+        at("transcript") < at("run activity")
+            && at("run activity") < at("status")
+            && at("status") < at("composer"),
+        "panes stack in order: {out}"
+    );
+}
+
 #[test]
 fn layout_shows_transcript_status_and_composer() {
     use ratatui::{backend::TestBackend, Terminal};
