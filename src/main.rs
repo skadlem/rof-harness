@@ -3,7 +3,7 @@ use rof::context::LayerKind;
 use rof::engine::{ModelRouter, Orchestrator, Role, Session};
 use rof::eval::{EvalSuite, EvaluationRunner, SuiteReport};
 use rof::llm::{ContextService, ExecutorService, LlmClient, OpenRouterClient, StubClient};
-use rof::obs::TraceSink;
+use rof::obs::{Boundary, GoalFinished, LiveEvent, TraceSink};
 use rof::skills::{SkillManager, SkillOp, SkillPolicy};
 use rof::tools::ToolRegistry;
 use std::path::PathBuf;
@@ -15,8 +15,103 @@ struct Setup {
     context: ContextService,
     executor: ExecutorService,
     verify: ExecutorService,
-    registry: ToolRegistry,
     root: PathBuf,
+}
+
+/// The execution half of a setup, owned so it can be moved into a worker
+/// task. Only the config, the trace sink, and the work root are cloned:
+/// services and the tool registry are deliberately NOT snapshotted, because
+/// each goal must rebuild them from the current env and stored logins.
+#[derive(Clone)]
+struct GoalRunner {
+    cfg: AppConfig,
+    trace: Arc<TraceSink>,
+    root: PathBuf,
+}
+
+impl GoalRunner {
+    fn from_setup(s: &Setup) -> Self {
+        Self {
+            cfg: s.cfg.clone(),
+            trace: s.trace.clone(),
+            root: s.root.clone(),
+        }
+    }
+
+    /// Run one goal and return its raw result plus the derived verdict.
+    /// `announce` prints the `llm:` line; the printing `run`/`chat` path
+    /// passes it, the silent live worker does not.
+    async fn execute(&self, goal: &str, announce: bool) -> anyhow::Result<GoalResult> {
+        let mut cfg = self.cfg.clone();
+        apply_env(&mut cfg);
+        rof::tui::auth::store().export_missing_env();
+        let (context, executor, verify) = build_services(&cfg, announce);
+        // Accept the same exact-allowlist check(s) in run mode.
+        let checks: Vec<String> = std::env::var("ROF_CHECK")
+            .map(|c| {
+                c.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let expect_writes = cfg.expect_writes;
+        let registry = ToolRegistry::with_defaults(
+            self.root.clone(),
+            cfg.permissions.clone(),
+            cfg.skills.clone(),
+        );
+        let orch = Orchestrator::new(cfg, self.trace.clone(), context, executor, verify);
+        let value = orch
+            .run_loop(
+                &Session::new(goal.to_string())
+                    .with_checks(checks)
+                    .expecting_writes(expect_writes),
+                &registry,
+                &self.root,
+            )
+            .await;
+        let passed = value["passed"].as_bool().unwrap_or(false);
+        let error = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        Ok(GoalResult {
+            value,
+            passed,
+            error,
+        })
+    }
+
+    /// The silent worker entry point: bracket the run on the live channel
+    /// and report the terminal outcome. It writes nothing to stdout (the
+    /// `llm:` announce is what `announce` gates); `apply_env` validation
+    /// warnings still go to stderr. A closed channel is ignored because the
+    /// durable trace stays authoritative. Wired into the terminal pump by
+    /// the live-monitor task that follows.
+    #[allow(dead_code)]
+    async fn run_live(
+        &self,
+        goal: String,
+        tx: tokio::sync::mpsc::UnboundedSender<LiveEvent>,
+    ) -> anyhow::Result<GoalFinished> {
+        let _ = tx.send(LiveEvent::Boundary(Boundary::Started));
+        let result = self.execute(&goal, false).await?;
+        let finished = GoalFinished {
+            passed: result.passed,
+            error: result.error,
+        };
+        let _ = tx.send(LiveEvent::Boundary(Boundary::Finished));
+        let _ = tx.send(LiveEvent::Finished(finished.clone()));
+        Ok(finished)
+    }
+}
+
+struct GoalResult {
+    value: serde_json::Value,
+    passed: bool,
+    #[allow(dead_code)]
+    error: Option<String>,
 }
 
 /// Precedence: defaults < config file (--config or ROF_CONFIG) < env vars.
@@ -373,15 +468,12 @@ fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
 
     let (context, executor, verify) = build_services(&cfg, true);
 
-    let registry =
-        ToolRegistry::with_defaults(root.clone(), cfg.permissions.clone(), cfg.skills.clone());
     Ok(Setup {
         cfg,
         trace,
         context,
         executor,
         verify,
-        registry,
         root,
     })
 }
@@ -673,35 +765,14 @@ async fn run_goal_text(
     print_trace: bool,
     exit_on_fail: bool,
 ) -> anyhow::Result<()> {
-    let mut cfg = s.cfg.clone();
-    apply_env(&mut cfg);
-    rof::tui::auth::store().export_missing_env();
     // The `run` path already announced in setup(); the chat loop announces
     // per goal so a model switch shows up where it takes effect.
-    let (context, executor, verify) = build_services(&cfg, !exit_on_fail);
-    // Accept the same exact-allowlist check(s) in run mode.
-    let checks: Vec<String> = std::env::var("ROF_CHECK")
-        .map(|c| {
-            c.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let expect_writes = cfg.expect_writes;
-    let orch = Orchestrator::new(cfg, s.trace.clone(), context, executor, verify);
-    let out = orch
-        .run_loop(
-            &Session::new(goal.to_string())
-                .with_checks(checks)
-                .expecting_writes(expect_writes),
-            &s.registry,
-            &s.root,
-        )
-        .await;
+    let result = GoalRunner::from_setup(s)
+        .execute(goal, !exit_on_fail)
+        .await?;
     println!("goal: {goal}");
-    println!("result: {}", serde_json::to_string_pretty(&out)?);
-    let passed = out["passed"].as_bool().unwrap_or(false);
+    println!("result: {}", serde_json::to_string_pretty(&result.value)?);
+    let passed = result.passed;
     print_report(&s.trace, passed);
     if print_trace {
         for ev in s.trace.events() {
@@ -844,5 +915,78 @@ fn skills_cmd(cfg: &AppConfig, args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         Some(other) => anyhow::bail!("unknown skills subcommand {other}: list|show|approve|reject"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rof::obs::{Boundary, LiveEvent};
+
+    /// The live worker is silent: it brackets the run on the channel and
+    /// reports the same terminal outcome it returns. Provider env is
+    /// removed so `build_services` deterministically picks the stub client,
+    /// and `ROF_CREDENTIALS` is pointed at an empty scratch store so
+    /// `export_missing_env` cannot refill the removed keys from the
+    /// developer's ~/.rof logins. The mutex keeps the provider-env reads of
+    /// other main unit tests from racing this one.
+    #[tokio::test]
+    async fn goal_runner_reports_a_terminal_live_outcome() {
+        // Tokio's mutex so the guard is async-aware: the run below awaits
+        // while the provider env is scrubbed.
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _env = ENV_LOCK.lock().await;
+        // Capture the developer's env so the scrub is invisible to the rest
+        // of the suite and to the process that ran the test.
+        let prior: Vec<(&str, Option<String>)> =
+            ["ROF_TOKEN", "OR_TOKEN", "ROF_CHAT_BASE", "ROF_CREDENTIALS"]
+                .into_iter()
+                .map(|k| (k, std::env::var(k).ok()))
+                .collect();
+        for key in ["ROF_TOKEN", "OR_TOKEN", "ROF_CHAT_BASE"] {
+            std::env::remove_var(key);
+        }
+        let root = std::env::temp_dir().join(format!("rof-p1a-runner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // The scratch store is empty/nonexistent: `export_missing_env`
+        // resolves no keys, so no provider can be selected by a login that
+        // happened to exist on this machine.
+        let credentials = root.join("scratch").join("credentials");
+        std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&credentials);
+        std::env::set_var("ROF_CREDENTIALS", &credentials);
+        let runner = GoalRunner {
+            cfg: AppConfig::default(),
+            trace: Arc::new(TraceSink::new()),
+            root: root.clone(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = runner.run_live("stub smoke goal".into(), tx).await.unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(LiveEvent::Boundary(Boundary::Started))
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(LiveEvent::Boundary(Boundary::Finished))
+        ));
+        let delivered = match rx.try_recv().unwrap() {
+            LiveEvent::Finished(finished) => finished,
+            other => panic!("expected Finished, got {other:?}"),
+        };
+        assert_eq!(result, delivered);
+        // Exactly three notifications: Started, Finished, Finished(outcome).
+        assert!(
+            rx.try_recv().is_err(),
+            "expected no notification after the terminal outcome"
+        );
+        for (key, value) in prior {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }
