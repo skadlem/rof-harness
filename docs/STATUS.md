@@ -3439,3 +3439,44 @@ The Go-compatible endpoint profile must omit `ReasoningOff` (use
 rejected by that gateway. Re-open the Slice A gate only after a single
 recorded green `rof` run; do not infer success from the smoke task or
 from the verifier oracle.
+
+## 2026-09-25 — P1a live read-only monitor shipped
+
+The first full-TUI slice is implemented and reviewed through subagent
+writer/reviewer cycles. Commits: `b02d7fc` (Clippy baseline),
+`efb8320` (ordered live notifications), `3c8ce50` (App/LiveSession state),
+`ea1f5b6` (silent GoalRunner), `f4227bc` (activity pane), `743008e` (worker
+beside the terminal pump), `56f9467` (stub-worker order integration).
+
+- `TraceSink` forwards `LiveEvent::Trace` under the same emission order as
+  its durable in-memory/JSONL write; attach/detach is optional and forks do
+  not inherit a subscriber.
+- `GoalRunner` rebuilds services from the current env and stored logins for
+  every goal; the live path is silent, while `run` keeps its printing and
+  exit behavior.
+- `run_live` owns the whole idle/running session, drains worker events
+  before each draw, starts exactly one goal, and keeps the existing idle
+  slash/login/scroll/quit behavior. Running-mode Enter is read-only; the
+  first stop key requests a non-preemptive stop and a second unmodified
+  q/Esc/Ctrl-C force-detaches after a final frame.
+- `App` holds a bounded 200-line/32,000-character activity deque; `ui::draw`
+  stays pure and renders transcript, activity, status, and composer. The
+  activity pane hides below 10 rows, preserves transcript content at 9
+  rows, and all four panes fit at 12 rows.
+- Verification: `cargo test` full suite green (264 tests, 0 failures),
+  focused TUI/live/render/command suites green, `cargo fmt -- --check`
+  clean, and `cargo clippy --all-targets --all-features -- -D warnings`
+  clean.
+
+Offline PTY smoke (`stty rows 24 cols 100; ./target/debug/rof chat`) with
+`StubClient`, an empty scratch credentials path, and one submitted goal
+exited 0, produced a 12-event trace, rendered the run-activity and
+read-only composer panes, showed the terminal outcome, and restored the
+terminal. No network model was used.
+
+Known limits carried forward: invalid `ROF_*` values can still emit
+`apply_env` warnings to stderr while the alternate screen is active; a
+force-exit detaches the worker, so an in-flight tool process may continue
+until its own timeout; and P1b–P4 (steering/queue, diff/provider panes,
+themes/persistence) remain unstarted. The TB Slice A gate remains blocked
+until a funded/available Go endpoint produces one green run.
