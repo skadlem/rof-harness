@@ -76,9 +76,13 @@ one and therefore remain byte-for-byte unchanged on the wire and in the sink.
 ### Goal worker ownership
 
 `main.rs` gets a clonable `GoalRunner` built from the existing setup data:
-config, trace, context service, executor service, verifier service, and work
-root. It builds a fresh `ToolRegistry` inside each worker invocation, so no new
-`Clone` implementation is required for the tool registry.
+config, trace, and work root. Each invocation applies the current environment
+knobs and stored logins, then rebuilds the context/executor/verifier
+services exactly as the existing between-goals path does; it must not
+snapshot the setup services, because `/model`, `/login`, and other
+configuration are intentionally applied on the next goal. The worker also
+builds a fresh `ToolRegistry` inside each invocation, so no new `Clone`
+implementation is required for the tool registry.
 
 The worker:
 
