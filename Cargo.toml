@@ -2,6 +2,9 @@
 name = "rof"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/skadlem/rof-harness"
+description = "A general coding-agent harness: a bounded implementer/reviewer loop with a live terminal console, replayable evidence, and a measured judge-free oracle."
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
