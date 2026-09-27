@@ -3565,3 +3565,84 @@ capture can still be started from the idle prompt. Not started, and not
 claimed: diff and provider panes, token deltas, session persistence,
 multi-session state (P3), and the TB Slice A gate, which still needs a
 funded/available Go endpoint to produce one green run.
+
+## 2026-09-27 — P3/P4 batch shipped: replay parity, providers, diff pane, focus, metrics, themes, completion, preferences
+
+The six unblocked items from the P1b handoff are implemented, each through a
+fresh writer plus review. Commits: `dfcfe00` (design note), `4fdee7d` (durable
+control acks), `5a20af0` (`/providers`), `0b249bf` (bounded diff evidence),
+`1af3d2c` (diff pane), `6b092e8` (focus + per-pane scroll), `61a552e` (status
+metrics), `6ed6cdc` (themes), `03b314f` (completion), `437ecdf` (preferences),
+`fdbc32a` (trace-in-work-root warning), `207c67f` (mask an inline login key).
+
+- **Replay parity (the P1b gap).** `LiveEvent::Control` is REMOVED. An
+  acknowledgement is `TraceEvent::Control`, emitted by the orchestrator — the
+  only emitter — so the live console and a recorded replay read the same
+  ordered events, and a run nobody watched still leaves its control history.
+  `RunHooks` now carries no channel at all: `apply_boundary` RETURNS the
+  acknowledgements and is `#[must_use]`, because dropping them is how a command
+  goes unanswered. `control_ack_line` is the single spelling for both the live
+  line and the replayed one. A recorded P1b session now replays its control
+  history through the same `on_control_ack` reducer.
+- **Bounded diff evidence.** `TreeService::patch` cuts to 8 KiB AND 200 lines
+  on whole lines only, so a multi-byte codepoint can never be split, and the
+  text carries its own truncation marker. `TraceEvent::DiffSnapshot` is emitted
+  at the two `tree.diff()` boundaries and as an EMPTY snapshot after every
+  successful rollback — a pane showing reverted changes is the disagreement the
+  spec forbids. A failed rollback keeps the last known evidence.
+- **The diff pane** renders from `App::diff_snapshot()` only: never git, never
+  the filesystem, never env. It separates "no diff evidence yet" from "tree is
+  clean", and labels a cut patch `diff (partial)` from the boolean, not by
+  parsing the marker. A short WIDE terminal once gave the transcript zero rows;
+  it now keeps its 3-row floor, which the narrow stack always had.
+- **Focus and per-pane scroll.** Tab/Shift-Tab cycle transcript → run → diff →
+  composer, skipping a pane that is not rendered. The diff got its own scroll
+  offset (it previously shared the transcript's, so scrolling one moved the
+  other), and a pane cannot be scrolled into blank space.
+- **Status metrics.** Cost comes from the `Counters` fold that already existed
+  but was never displayed, with a `cost_recorded` flag so a recorded `$0.00`
+  is distinguishable from `cost=unrecorded` — a sum of zero means two different
+  things. Model identity comes from the recorded `ModelCall { agent, model }`.
+  No price or per-token estimate is ever computed.
+- **Providers, themes, completion, preferences.** `/providers` lists built-ins
+  and registry providers with key PRESENCE only — `key_for` is consumed by
+  `is_some()` and its value is never bound to a name. `/theme` switches
+  immediately (display-only, view bucket) and every frame constructor takes a
+  required `Theme`, so a missed call site is a compile error. `Ctrl-N` completes
+  from the `Action` registry with a drift guard that reads the parser's own
+  arms. `~/.rof/tui.json` is a four-field typed struct — the allowlist is a
+  type, not a filter — written by rename, and malformed input never blocks
+  startup. `/display` says "not available" rather than faking a switch.
+- **Verification.** `cargo fmt -- --check` clean; `cargo test` green (427
+  tests, 0 failures, 32 binaries); `cargo clippy --all-targets --all-features
+  -- -D warnings` clean; `git diff --check` clean.
+
+Offline PTY smoke (160×40, `StubClient`, empty scratch credentials, trace
+outside the work root, `ROF_TUI_PREFS` sandboxed): a goal was submitted, a
+steer while it ran, `/busy queue`, a queued goal, `/theme light`, two Tab
+presses, `/providers`, `Ctrl-N` completion, and `/theme default`; the session
+exited 0. All 18 assertions passed. Behavioural claims are asserted on the
+DURABLE trace, because a short pane scrolls a line out of view without the
+behaviour being absent: `SessionStart: 2` in submission order, 14
+`StateTransition`s, `DiffSnapshot: 4`, `Control: 2`, `ReviewVerdict: 3`, and no
+credential text anywhere in the terminal stream. The two-press quit path was
+verified separately at 100×24 (`quit armed — press q/Esc/Ctrl-C again to exit`,
+exit 0).
+
+Found and fixed while verifying: with `ROF_TRACE` inside the work root, the
+harness diffed its OWN telemetry — the trace file appeared in the diff pane and
+counted toward `writes_made`. That is now a startup warning (`fdbc32a`) rather
+than a silent self-measurement. A batch review also caught that the
+goal-boundary drain discarded its acknowledgements — a real P0, since that
+drain is the only thing answering a command arriving after the orchestrator's
+terminal drain — which is why `apply_boundary` is now `#[must_use]`.
+
+Known limits carried forward: the mask for an inline `/login <provider> <key>`
+is recomputed at the pump's key arms rather than inside `App`, so a future
+draft mutation added without a `refresh_mask` call could drift; pane sizes are
+NOT persisted because `App` has no pane-size state to persist, so the spec's
+allowlist is satisfied for the three fields that exist; `/display` remains
+unavailable; a `Stop` that lands after a goal's final drain is still seen at the
+next goal's first boundary. The TB Slice A gate still needs a funded/available
+Go endpoint for one green verifier run, and no claim is made about a live model:
+everything above is stub-verified.
