@@ -1,8 +1,12 @@
 //! Mascot splash overlay for `rof chat`: baked ANSI art + title lines.
 //!
-//! The art is baked from the canonical cheetahs3.png sheet to
-//! `assets/mascot-N.txt` (verified via `bake.py --check`).
-//! Each file's first two lines are a blank + label header; the rest is art.
+//! The twelve sprites in `assets/mascot-N.txt` are baked to ANSI with
+//! truecolor escapes. Each file's first two lines are a blank + label header
+//! (e.g. `[4] laughing`); the rest is the art.
+//!
+//! If art from an external source is ever vendored in, name the source in
+//! this comment and add its licence terms here — do not reference a
+//! provenance nobody can point at.
 
 use ansi_to_tui::IntoText;
 use ratatui::{
