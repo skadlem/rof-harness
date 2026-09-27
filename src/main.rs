@@ -581,7 +581,23 @@ fn setup(cfg: AppConfig) -> anyhow::Result<Setup> {
     // (config-declared extra dirs are honoured, not dropped).
     rof::tools::anchor_allowed_dirs(&mut cfg.permissions, &root);
     let trace = match std::env::var("ROF_TRACE") {
-        Ok(p) if !p.trim().is_empty() => TraceSink::with_file(std::path::Path::new(p.trim()))?,
+        Ok(p) if !p.trim().is_empty() => {
+            let path = std::path::Path::new(p.trim());
+            // The work root is what the write gate and the diff pane read, so
+            // a trace file INSIDE it is harness telemetry that the harness
+            // then counts as the agent's work: it shows up in the diff pane
+            // and lands in `writes_made`. Say so once, at startup, rather
+            // than let a run measure itself.
+            if let Some(trace_root) = path.parent().and_then(|p| p.canonicalize().ok()) {
+                if trace_root == root {
+                    eprintln!(
+                        "warning: ROF_TRACE is inside the work root ({}) — the trace will appear in the diff pane and count as an agent write; point it outside the root instead",
+                        root.display()
+                    );
+                }
+            }
+            TraceSink::with_file(path)?
+        }
         _ => TraceSink::new(),
     };
     let trace = Arc::new(trace);
