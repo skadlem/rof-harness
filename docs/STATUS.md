@@ -3649,3 +3649,89 @@ unavailable; a `Stop` that lands after a goal's final drain is still seen at the
 next goal's first boundary. The TB Slice A gate still needs a funded/available
 Go endpoint for one green verifier run, and no claim is made about a live model:
 everything above is stub-verified.
+
+## 2026-09-27 — harness quality batch and Learn mode (slices A–C1)
+
+Seven measured changes, each with a commit and a test that fails without it.
+Design: `docs/superpowers/specs/2026-09-27-rof-harness-design-report.md` (with
+its cited research brief) and `2026-09-27-learn-mode-design.md`.
+
+**Verification for the whole batch:** `cargo fmt -- --check` clean; `cargo test`
+green (531 tests, 0 failures, 39 binaries); `cargo clippy --all-targets
+--all-features -- -D warnings` clean; `git diff --check` clean.
+
+- **Protected oracle** (`5e72bff`, `746281b`) — a run that modifies a BASELINE
+  test file or a runner config cannot pass. This exists because Claude Code
+  issue #319 documents an agent told to get tests green that "simply updated
+  the make file to only run tests that were passing. It called these
+  'safe-tests'" — closed by an inactivity bot, never fixed. New test files are
+  still allowed (a new file cannot rewrite an existing failing assertion);
+  a tamper is refused and, when a retry follows, the pre-retry rollback
+  restores the oracle. Proven end to end: tamper → refuse → rollback →
+  honest fix → run passes.
+- **Context per turn** (`b6980ff`) — `TraceEvent::ContextMeasured` measures
+  what each agent call ACTUALLY receives, at the assembler's `parts.full()`
+  for the implementer's first ask AND its `reads` re-ask, and the `CtxView`
+  prompt for the reviewer. Two findings outweigh the metric: a `reads` re-ask
+  costs a SECOND FULL CONTEXT (`implementer.rs:271` rebuilds `parts.full()`),
+  and no lever exists for a cap over the whole prompt — the three layers are
+  cut independently, so a total cap would need a new reduction algorithm and
+  was not built.
+- **Cache prefix** (`711d04a`) — before, only 239 of 4,351 chars were
+  cacheable across rounds (5.5%): a 20-character round counter sat above 4 KB
+  of byte-identical file map. After: 4,333 (99.6%). Totals unchanged; nothing
+  trimmed. The reviewer was already correctly ordered and was not touched.
+- **Meta layer v1** (`61075ec`) — sequential decomposition, gate measured at
+  20/30 over the shipped suite goals (an upper bound on a deliberately hard
+  corpus, not a typical rate) and 0 of 20 test goals. A task-shaped goal makes
+  zero extra calls and is outcome byte-identical. The plan is a durable file
+  named in the trace, unique per run; decomposition degrades to `[goal]`
+  rather than failing a run. No fan-out: Anthropic's own post says multi-agent
+  suits research, not coding, and token spend alone explains 80% of variance.
+- **Learn mode A** (`d9269f6`) — `~/.rof/PROFILE.md`, one entry list and two
+  DERIVED sets, evidence mandatory, `global` vs `repo:<name>` scopes, a
+  separately capped head section so a huge profile cannot evict `AGENTS.md`.
+  `State::Understood` is constructed in exactly one place in the crate, inside
+  the one `&mut` write path, reachable only from a user command.
+- **Learn mode B** (`e67bb9c`) — the agent NAMES a concept (`introduces`); the
+  gate is set membership and nothing else; the lesson is the model's own
+  words; one concept per goal, hoisted across rounds into the result (without
+  the hoist the default 2-round config teaches nothing at all); the state
+  write is tied to actually emitting, so a suppressed concept stays
+  `not_explained` instead of being claimed and hidden forever.
+- **Learn mode C1** (`2c5ab82`) — the lesson is on screen (`★ lesson: …` with
+  a static `(answer: /got it or /still lost)`), and those two words are the
+  user's routes to `understood` and back. `/got it` is the only new production
+  path to `understood`.
+- **Research folder** (`019aa30`) — `.rof/research/index.md` plus one note per
+  topic, addressed by path (not embeddings: retrieval must be decidable without
+  a judgement, and a wrong nearest-neighbour serves the wrong note believing
+  it). Freshness is COMPUTED: fresh iff the note's pinned commit equals HEAD
+  and the note still carries that pin. That is the conservative rule, and
+  re-verifying too often is correct while serving stale research is not.
+
+**Two defects found while verifying, both fixed:**
+
+1. A P0 I introduced with the durable-control refactor: the goal-boundary
+   drain discarded its acknowledgements, so a command arriving after the
+   orchestrator's terminal drain was never answered. `apply_boundary` is now
+   `#[must_use]`, which makes the whole class a compile error.
+2. `protected_oracle` read learn-mode's own bookkeeping as tampering: a
+   research note about a suite lives at `.rof/research/tests/<suite>.md`, which
+   is test-SHAPED, so re-verifying a committed note would refuse an
+   otherwise-clean run's pass. `.rof/` is now excluded — harness bookkeeping is
+   not the suite, and the suite lives outside it.
+
+**Known limits, stated rather than buried.** The manifest files
+(`Cargo.toml`/`package.json`) stay unprotected so adding a dependency is never
+blocked — a dependency edit can also change what the suite runs. A task whose
+deliverable is editing an existing baseline test is currently unpassable, and
+the escape (a declared allowance) is deliberately not built. A `git` call in
+the research folder has no timeout; it hung once under heavy parallel load and
+is not yet wired into a run. A brand-new `.rof/` folder appears in
+`git status` as one untracked name, so once the run path is wired a note could
+satisfy `expect_writes` on its own. `/got it` and `/still lost` are not offered
+by Ctrl-N completion. The research folder is NOT yet read by any run: it is
+store, staleness and commands only, and its help says so in the product's own
+words. Nothing here is measured against a live model: TB Slice A and the
+crossbench still need a funded endpoint for one green run.
