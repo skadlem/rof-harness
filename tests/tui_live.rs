@@ -8,7 +8,7 @@ use rof::obs::{
     Boundary, ControlAck, ControlKind, ControlStatus, GoalFinished, LiveEvent, TraceEvent,
     TraceSink,
 };
-use rof::tui::app::{control_ack_line, App, BusyMode, DeferredConfig, RunMode};
+use rof::tui::app::{control_ack_line, App, BusyMode, DeferredConfig, Focus, RunMode};
 use rof::tui::cmd::{parse, Action};
 use rof::tui::render::render_line;
 use rof::tui::run::{
@@ -2487,4 +2487,79 @@ fn provider_mutations_stay_refused_while_providers_is_allowed() {
         "a refused mutation still changed the registry"
     );
     assert!(rx.try_recv().is_err(), "a refused mutation sent a command");
+}
+
+// ---- pane focus keys (P3 D): decided without a terminal ----
+
+/// Tab and Shift-Tab are pane keys, not draft text. The mapping is decided
+/// in one place so the pump cannot read a Tab as a character on one
+/// terminal and as a focus key on another.
+#[test]
+fn tab_is_a_focus_key_and_shift_tab_reverses_the_cycle() {
+    use crossterm::event::KeyModifiers;
+    use rof::tui::run::{focus_step, FocusStep};
+
+    assert_eq!(
+        focus_step(KeyCode::Tab, KeyModifiers::NONE),
+        Some(FocusStep::Next)
+    );
+    // crossterm reports Shift-Tab as BackTab; a terminal that sends a tab
+    // character with SHIFT is the same press and must not become a glyph.
+    assert_eq!(
+        focus_step(KeyCode::BackTab, KeyModifiers::SHIFT),
+        Some(FocusStep::Prev)
+    );
+    assert_eq!(
+        focus_step(KeyCode::Char('\t'), KeyModifiers::SHIFT),
+        Some(FocusStep::Prev)
+    );
+    // An ordinary character is never a focus key, and neither is a bare tab
+    // character with no modifier.
+    assert_eq!(focus_step(KeyCode::Char('\t'), KeyModifiers::NONE), None);
+    assert_eq!(focus_step(KeyCode::Char('a'), KeyModifiers::NONE), None);
+}
+
+/// While a goal is live the focus keys reach the composer branch first, so
+/// they can never be typed into the draft — and the cycle still runs.
+#[test]
+fn focus_keys_are_never_draft_text_while_a_run_is_live() {
+    use rof::tui::run::{focus_step, FocusStep};
+
+    let mut app = App::new();
+    app.begin_run("busy");
+    for (code, modifiers, expected) in [
+        (
+            KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+            FocusStep::Next,
+        ),
+        (
+            KeyCode::BackTab,
+            crossterm::event::KeyModifiers::SHIFT,
+            FocusStep::Prev,
+        ),
+    ] {
+        // The running reducer leaves both keys to the pump: a focus key
+        // moves no run lifecycle and edits no draft.
+        assert_eq!(
+            handle_running_key(&mut app, code),
+            RunningKeyOutcome::Ignored
+        );
+        assert_eq!(app.input, "", "{code:?} typed into the draft");
+        assert_eq!(app.run_mode, RunMode::Running, "{code:?} moved the run");
+        assert_eq!(focus_step(code, modifiers), Some(expected));
+    }
+    // The idle branch is unchanged: focus begins on the composer and its
+    // character arm is untouched, so a Tab there is still dropped by the
+    // idle pump exactly as it was before focus existed, and typing still
+    // edits the draft with no focus key pressed.
+    let mut idle = App::new();
+    assert_eq!(idle.focus, Focus::Composer);
+    assert_eq!(
+        handle_running_key(&mut idle, KeyCode::Char('a')),
+        RunningKeyOutcome::Ignored
+    );
+    idle.input.push('a');
+    assert_eq!(idle.input, "a", "the composer path changed");
+    assert_eq!(idle.focus, Focus::Composer, "typing moved the focus");
 }

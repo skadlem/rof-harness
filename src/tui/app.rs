@@ -117,6 +117,29 @@ impl DeferredConfig {
     }
 }
 
+/// Which pane the keys act on. This is `App` state, never render state, so
+/// the frame stays a pure function of `App` and a whole focus cycle is
+/// testable without a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Transcript,
+    Run,
+    Diff,
+    Composer,
+}
+
+/// The cycle order, and the only place it is written down: the ring is read
+/// from the top for a forward Tab and from the bottom for a reverse one.
+pub const FOCUS_ORDER: [Focus; 4] = [Focus::Transcript, Focus::Run, Focus::Diff, Focus::Composer];
+
+/// The composer is where the console starts. Typing must keep working with
+/// no focus key pressed, so focus never begins anywhere else.
+impl Default for Focus {
+    fn default() -> Self {
+        Self::Composer
+    }
+}
+
 /// Caps for the live activity deque: past either limit the oldest lines
 /// are evicted. These bound `activity` only — `transcript` keeps every
 /// line for the whole session, so `App` memory is not capped here.
@@ -146,6 +169,13 @@ pub struct App {
     pub counters: Counters,
     pub input: String,
     pub scroll: usize,
+    /// The pane the keys act on. The composer by default, so typing behaves
+    /// exactly as it did before focus existed.
+    pub focus: Focus,
+    /// The diff pane's own window offset, in body lines hidden from its
+    /// bottom. The diff NEVER shares the transcript's `scroll`: one pane's
+    /// window is not the other's business, and a shared offset moved both.
+    pub diff_scroll: usize,
     /// True until the first keypress; `run.rs` draws the splash overlay
     /// while set and consumes that keypress.
     pub fresh: bool,
@@ -211,6 +241,8 @@ impl Default for App {
             counters: Counters::default(),
             input: String::new(),
             scroll: 0,
+            focus: Focus::Composer,
+            diff_scroll: 0,
             fresh: true,
             thinking: String::new(),
             mask_input: false,
@@ -566,6 +598,88 @@ impl App {
         self.scroll = (self.scroll as isize).saturating_add(delta).clamp(0, max) as usize;
     }
 
+    /// Move the focus one pane forward, around [`FOCUS_ORDER`].
+    ///
+    /// `visible` is the panes the current frame actually rendered, which the
+    /// cycle reads so a pane that was dropped (a diff pane on a short
+    /// terminal) is stepped OVER instead of swallowing the key press. An
+    /// empty list means "no frame has been drawn yet", and the whole ring is
+    /// used, so a Tab is never lost.
+    pub fn focus_next(&mut self, visible: &[Focus]) {
+        self.step_focus(visible, 1);
+    }
+
+    /// The same cycle in reverse, for Shift-Tab.
+    pub fn focus_prev(&mut self, visible: &[Focus]) {
+        self.step_focus(visible, -1);
+    }
+
+    /// One step around the rendered part of the ring. Focus can only ever
+    /// come to rest on a pane the frame drew: a focus that is not itself
+    /// rendered starts the walk at the neighbouring end of the list.
+    fn step_focus(&mut self, visible: &[Focus], step: isize) {
+        let ring: Vec<Focus> = if visible.is_empty() {
+            FOCUS_ORDER.to_vec()
+        } else {
+            FOCUS_ORDER
+                .iter()
+                .copied()
+                .filter(|pane| visible.contains(pane))
+                .collect()
+        };
+        if ring.is_empty() {
+            return;
+        }
+        let len = ring.len() as isize;
+        // `-step` puts a focus that is not on the ring immediately before
+        // (or after) the first rendered pane, so the step lands there.
+        let from = ring
+            .iter()
+            .position(|pane| *pane == self.focus)
+            .map_or(-step, |index| index as isize);
+        self.focus = ring[(from + step).rem_euclid(len) as usize];
+    }
+
+    /// The scrollable body of the diff pane: its evidence-bound marker, its
+    /// stat summary, and its patch — counted exactly as the pane builds
+    /// them. Zero when there is no patch to scroll (no snapshot, or a
+    /// snapshot that changed no files), which pins the offset at 0.
+    pub fn diff_body_len(&self) -> usize {
+        let Some(snapshot) = &self.diff_snapshot else {
+            return 0;
+        };
+        if snapshot.names.is_empty() {
+            return 0;
+        }
+        let mut body = usize::from(snapshot.truncated);
+        if !snapshot.stat.trim().is_empty() {
+            body += 1;
+        }
+        body + snapshot.patch.lines().count()
+    }
+
+    /// Scroll the diff pane's own window. Clamped so the first body line
+    /// can never scroll out of reach: a pane with less content than its
+    /// window is therefore not scrollable at all, and one with more can
+    /// always be walked back to its head.
+    pub fn scroll_diff(&mut self, delta: isize) {
+        let max = self.diff_body_len().saturating_sub(1) as isize;
+        self.diff_scroll = (self.diff_scroll as isize)
+            .saturating_add(delta)
+            .clamp(0, max) as usize;
+    }
+
+    /// Apply a scroll key to the focused pane. Only the diff owns a second
+    /// offset; the run pane is a live tail with nothing to scroll and the
+    /// composer is a text line, so for both — and for the transcript itself
+    /// — the keys keep the transcript meaning they always had.
+    pub fn scroll_focused(&mut self, delta: isize) {
+        match self.focus {
+            Focus::Diff => self.scroll_diff(delta),
+            Focus::Transcript | Focus::Run | Focus::Composer => self.scroll_lines(delta),
+        }
+    }
+
     /// Load the complete trace and display through its final event.
     pub fn set_replay_events(&mut self, events: Vec<TraceEvent>) {
         self.replay_events = events;
@@ -624,6 +738,9 @@ impl App {
         // held, and a recorded rollback's empty snapshot clears it. They stay
         // out of the transcript, exactly as `on_event` keeps them out.
         self.diff_snapshot = None;
+        // The diff offset goes with the pane it describes: a rebuilt pane
+        // has a body this offset never scrolled.
+        self.diff_scroll = 0;
         let horizon = self.replay_idx;
         let matching = replay_filter(&self.replay_events, &self.replay_filter);
         for index in matching.into_iter().filter(|index| *index <= horizon) {

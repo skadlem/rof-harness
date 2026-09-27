@@ -5,7 +5,7 @@ use ratatui::{
 };
 
 use super::{
-    app::{App, DiffSnapshot, RunMode},
+    app::{App, DiffSnapshot, Focus, RunMode},
     theme,
 };
 
@@ -94,7 +94,13 @@ fn workspace(area: Rect) -> Workspace {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(detail - diff_rows),
+                // The transcript keeps its 3-row floor, exactly as the
+                // narrow stack does. Sizing the upper area as
+                // `detail - diff_rows` handed it zero rows on a short WIDE
+                // terminal (6 rows at 160 cols), which is the one pane a
+                // user cannot afford to lose: the run and diff panes give
+                // way instead.
+                Constraint::Min(3),
                 Constraint::Length(diff_rows),
                 Constraint::Length(3),
                 Constraint::Length(3),
@@ -145,6 +151,24 @@ fn workspace(area: Rect) -> Workspace {
     }
 }
 
+/// The panes this terminal size actually renders, in [`FOCUS_ORDER`]
+/// (super::app::FOCUS_ORDER) order. The geometry alone decides it, so the
+/// reducer that walks the focus cycle is told the same thing the frame drew:
+/// a pane that was dropped whole is stepped over, never landed on.
+pub fn visible_panes(area: Rect) -> Vec<Focus> {
+    let panes = workspace(area);
+    [
+        (Focus::Transcript, panes.transcript),
+        (Focus::Run, panes.activity),
+        (Focus::Diff, panes.diff),
+        (Focus::Composer, panes.composer),
+    ]
+    .into_iter()
+    .filter(|(_, rect)| rect.width > 0 && rect.height > 0)
+    .map(|(focus, _)| focus)
+    .collect()
+}
+
 /// The lines the diff pane shows: the snapshot's own evidence, or the
 /// plain name of what is missing. No git, no filesystem, no environment —
 /// the snapshot is the only input, so a replayed session renders the same
@@ -180,11 +204,12 @@ fn diff_lines(snapshot: Option<&DiffSnapshot>, height: usize, scroll: usize) -> 
     }
     body.extend(snapshot.patch.lines().map(str::to_string));
     // The harness bounds the patch, not the pane, so the body is tail
-    // anchored and the frame never grows with the patch. `App` owns one
-    // scroll position and this renderer may not add another, so the same
-    // `scroll_lines` the transcript uses moves this window too: each step
+    // anchored and the frame never grows with the patch. The window moves
+    // through the diff's OWN offset (`App::diff_scroll`); it is never the
+    // transcript's `scroll`, which moved both panes at once. Each step
     // hides one more line from the bottom, clamped so the first line can
-    // never scroll out of reach.
+    // never scroll out of reach, which is what keeps a short patch from
+    // being scrolled into blank space.
     let hidden = scroll.min(body.len().saturating_sub(1));
     let visible = body.len() - hidden;
     let window = height.saturating_sub(1);
@@ -218,7 +243,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         .collect();
     let shown: Vec<String> = tail.into_iter().rev().collect();
     f.render_widget(
-        Paragraph::new(shown.join("\n")).block(theme::pane("transcript")),
+        Paragraph::new(shown.join("\n")).block(theme::pane_or_focused(
+            "transcript",
+            app.focus == Focus::Transcript,
+        )),
         panes.transcript,
     );
     // `theme::pane` draws `Borders::ALL`, so the text area is two rows
@@ -242,7 +270,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         activity
     };
     f.render_widget(
-        Paragraph::new(activity.join("\n")).block(theme::pane("run activity")),
+        Paragraph::new(activity.join("\n")).block(theme::pane_or_focused(
+            "run activity",
+            app.focus == Focus::Run,
+        )),
         panes.activity,
     );
     // The diff pane renders the engine's own bounded read, so it can never
@@ -251,11 +282,12 @@ pub fn draw(f: &mut Frame, app: &App) {
     let diff = diff_lines(
         snapshot,
         panes.diff.height.saturating_sub(2) as usize,
-        app.scroll,
+        app.diff_scroll,
     );
     f.render_widget(
         Paragraph::new(diff.join("\n")).block(theme::diff_block(
             snapshot.is_some_and(|recorded| recorded.truncated),
+            app.focus == Focus::Diff,
         )),
         panes.diff,
     );
@@ -271,9 +303,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     // A live run is not read-only: the composer submits steers and queues
     // the next goal, so its title names the busy mode and what is pending.
     let block = if matches!(app.run_mode, RunMode::Running | RunMode::Stopping) {
-        theme::composer_block_live(&app.thinking, &app.control_summary())
+        theme::composer_block_live(
+            &app.thinking,
+            &app.control_summary(),
+            app.focus == Focus::Composer,
+        )
     } else {
-        theme::composer_block(&app.thinking)
+        theme::composer_block(&app.thinking, app.focus == Focus::Composer)
     };
     f.render_widget(Paragraph::new(shown.as_str()).block(block), panes.composer);
 }

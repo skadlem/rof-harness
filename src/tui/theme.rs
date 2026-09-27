@@ -24,6 +24,33 @@ pub fn pane(title: &str) -> Block<'_> {
         .border_style(Style::default().fg(DIM))
 }
 
+/// Appended to the title of the pane the keys act on. It is APPENDED, never
+/// prefixed, so the frame's own title is still the first thing read, and it
+/// carries no word that could read as a pane the user is barred from — the
+/// composer is focused by default, so a "read-only" mark there would be a
+/// lie the console cannot act on.
+pub const FOCUS_MARK: &str = " ▸";
+
+/// Titled bordered pane holding the focus: the same frame, the mark on its
+/// title, and the highlight accent cyan already reserves. No new color is
+/// introduced for focus — the scheme says cyan is for highlights, and a
+/// focused pane is one.
+pub fn focused_pane(title: &str) -> Block<'_> {
+    Block::default()
+        .title(format!("{title}{FOCUS_MARK}"))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN))
+}
+
+/// The dim pane, or its focused frame, according to where the keys go.
+pub fn pane_or_focused(title: &str, focused: bool) -> Block<'_> {
+    if focused {
+        focused_pane(title)
+    } else {
+        pane(title)
+    }
+}
+
 /// Composer frame: amber border. The title carries the thinking state so the
 /// state-color intent stays a single accent for now. A live run uses
 /// [`composer_block_live`] instead, which names the busy mode and whatever
@@ -31,12 +58,24 @@ pub fn pane(title: &str) -> Block<'_> {
 ///
 /// The P1a `read_only` variant of this title is GONE, not merely unused: a
 /// live composer submits steers and queued goals, so nothing can render that
-/// claim truthfully any more.
-pub fn composer_block(thinking: &str) -> Block<'static> {
+/// claim truthfully any more. `focused` only ADDS the focus mark: the
+/// composer keeps its amber border whether or not it holds the focus, so
+/// being focused never changes what the composer looks like it can do.
+pub fn composer_block(thinking: &str, focused: bool) -> Block<'static> {
     let title = if thinking.trim().is_empty() {
         "composer".to_string()
     } else {
         format!("composer · {}", thinking.trim())
+    };
+    composer_title(title, focused)
+}
+
+/// The composer's own title, with the focus mark when it holds the focus.
+fn composer_title(title: String, focused: bool) -> Block<'static> {
+    let title = if focused {
+        format!("{title}{FOCUS_MARK}")
+    } else {
+        title
     };
     Block::default()
         .title(title)
@@ -47,10 +86,11 @@ pub fn composer_block(thinking: &str) -> Block<'static> {
 /// Diff frame. A snapshot the harness cut at its evidence bound gets a
 /// `partial` title, so a short patch can never read as the whole change;
 /// the body carries the same claim in words. Every other posture uses
-/// [`pane`], which this defers to.
-pub fn diff_block(truncated: bool) -> Block<'static> {
+/// [`pane`], which this defers to, or [`focused_pane`] when the diff holds
+/// the focus.
+pub fn diff_block(truncated: bool, focused: bool) -> Block<'static> {
     let title = if truncated { "diff (partial)" } else { "diff" };
-    pane(title)
+    pane_or_focused(title, focused)
 }
 
 /// Longest control summary a live composer title may carry. The title
@@ -83,7 +123,7 @@ fn clip(text: &str, max: usize) -> String {
 /// control segment is what survives a long thinking label.
 ///
 /// Every other posture uses [`composer_block`].
-pub fn composer_block_live(thinking: &str, control: &str) -> Block<'static> {
+pub fn composer_block_live(thinking: &str, control: &str, focused: bool) -> Block<'static> {
     let mut title = String::from("composer");
     let thinking = thinking.trim();
     if !thinking.is_empty() {
@@ -95,8 +135,7 @@ pub fn composer_block_live(thinking: &str, control: &str) -> Block<'static> {
         title.push_str(" · ");
         title.push_str(&clip(control, LIVE_TITLE_SUMMARY_MAX_CHARS));
     }
-    Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(AMBER))
+    // The focus mark is the last segment, so the control state keeps its
+    // place in the budget and only the mark is what a narrow title can lose.
+    composer_title(title, focused)
 }

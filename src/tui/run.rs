@@ -11,7 +11,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
-use ratatui::{backend::CrosstermBackend, Frame, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::Rect, Frame, Terminal};
 
 use super::app::{App, BusyMode, DeferredConfig};
 use super::cmd::Action;
@@ -226,6 +226,30 @@ pub fn handle_running_key(app: &mut App, code: KeyCode) -> RunningKeyOutcome {
             RunningKeyOutcome::StopArmed
         }
         _ => RunningKeyOutcome::Ignored,
+    }
+}
+
+/// Which way a focus key turns the cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusStep {
+    /// Tab.
+    Next,
+    /// Shift-Tab.
+    Prev,
+}
+
+/// The focus key for one key press, or `None` when it is not one.
+///
+/// Decided here, modifiers included, so the pump reads the same answer on
+/// every terminal: crossterm reports Shift-Tab as `BackTab`, but a terminal
+/// that sends a tab character with SHIFT held is the same press, and neither
+/// may ever reach the composer's character arm and become draft text.
+pub fn focus_step(code: KeyCode, modifiers: KeyModifiers) -> Option<FocusStep> {
+    match code {
+        KeyCode::BackTab => Some(FocusStep::Prev),
+        KeyCode::Char('\t') if modifiers.contains(KeyModifiers::SHIFT) => Some(FocusStep::Prev),
+        KeyCode::Tab => Some(FocusStep::Next),
+        _ => None,
     }
 }
 
@@ -821,6 +845,19 @@ where
                     // scrollback below.
                     RunningKeyOutcome::Ignored => {}
                 }
+                // The focus keys are answered before the composer arm, so
+                // neither Tab nor Shift-Tab can be typed into the draft, and
+                // the cycle skips any pane this terminal size did not draw.
+                if let Some(step) = focus_step(key.code, key.modifiers) {
+                    let size = terminal.size()?;
+                    let visible =
+                        super::ui::visible_panes(Rect::new(0, 0, size.width, size.height));
+                    match step {
+                        FocusStep::Next => app.focus_next(&visible),
+                        FocusStep::Prev => app.focus_prev(&visible),
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::Char(c)
                         if key.modifiers.is_empty()
@@ -834,12 +871,15 @@ where
                     KeyCode::Backspace => {
                         app.input.pop();
                     }
-                    KeyCode::Up => app.scroll_lines(1),
-                    KeyCode::Down => app.scroll_lines(-1),
-                    KeyCode::PageUp => app.scroll_lines(10),
-                    KeyCode::PageDown => app.scroll_lines(-10),
-                    KeyCode::Home => app.scroll_lines(isize::MAX),
-                    KeyCode::End => app.scroll_lines(isize::MIN),
+                    // The scroll keys act on the focused pane. The composer
+                    // is the default focus, so these keep scrolling the
+                    // transcript exactly as they did before focus existed.
+                    KeyCode::Up => app.scroll_focused(1),
+                    KeyCode::Down => app.scroll_focused(-1),
+                    KeyCode::PageUp => app.scroll_focused(10),
+                    KeyCode::PageDown => app.scroll_focused(-10),
+                    KeyCode::Home => app.scroll_focused(isize::MAX),
+                    KeyCode::End => app.scroll_focused(isize::MIN),
                     _ => {}
                 }
                 continue;
