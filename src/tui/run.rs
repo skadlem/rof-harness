@@ -475,6 +475,13 @@ pub enum RunningActionOutcome {
 ///   [`apply_action`] exactly as they do between goals, and return
 ///   [`RunningActionOutcome::View`]. They read state and write transcript
 ///   lines, and a live goal is no reason to refuse a read.
+/// - **`Profile`** is also routed to [`apply_action`] as a `View`, and it
+///   is the one action here that can WRITE a file. That is safe against a
+///   live goal for the same reason a knob is: the running goal built its
+///   stable head once, at the top of the loop, from
+///   `context::memory::load` — so a store edit reaches the NEXT goal and
+///   cannot change the head the running one is already using. It is still
+///   a user command and never a write the harness makes on its own.
 /// - **`Busy("steer" | "queue")`** sets the composer's busy mode, sends
 ///   nothing, and returns the new mode. **`Busy("interrupt")`** sets
 ///   `BusyMode::Interrupt` and returns [`RunningActionOutcome::Stop`]: it
@@ -506,8 +513,9 @@ pub fn handle_running_action(
     trace: &crate::obs::TraceSink,
     awaiting_key: &mut Option<String>,
 ) -> RunningActionOutcome {
-    // Every action routed here is display-only, a setting, a posture, or
-    // a refusal: none of them sends on the command channel. The parameter
+    // Every action routed here is display-only, a setting, a posture, a
+    // user-driven store edit, or a refusal: none of them sends on the
+    // command channel. The parameter
     // is part of the caller's one shape for a composer line, and the one
     // send a live session does make — the stop — belongs to the pump, so
     // `/busy interrupt` and the stop keys cannot drift into two
@@ -523,6 +531,7 @@ pub fn handle_running_action(
         | Action::Diff
         | Action::ProviderList
         | Action::Providers
+        | Action::Profile(_)
         | Action::Display(_)
         | Action::Theme(_)
         | Action::Retry(_)
@@ -657,6 +666,112 @@ fn model_change(raw: &str) -> Result<DeferredConfig, ModelRefusal> {
 /// abandon a running worker.
 const QUIT_REFUSED: &str =
     "/quit is available between goals — press q/Esc/Ctrl-C twice to stop the run and exit";
+
+/// Run one `/profile` subcommand against `~/.rof/PROFILE.md` and say what
+/// happened, in the transcript.
+///
+/// This arm is the ONLY caller of [`profile::load`] and [`profile::save`]
+/// outside the context path, and `Profile::apply` is the store's only
+/// mutating entry point — so every entry in the file was created here, by a
+/// user command, and nothing in an agent turn can add one. The `understood`
+/// state has exactly one route, `assume-understood`, which is a person
+/// saying so.
+///
+/// A write is only attempted when `apply` accepted the edit: a refusal (no
+/// evidence, no such concept) leaves the file untouched, so a typo cannot
+/// damage a store the user also edits by hand.
+fn profile_command(app: &mut App, cmd: super::cmd::ProfileCmd) {
+    use super::cmd::ProfileCmd as C;
+    let mut p = crate::context::profile::load();
+    // A file that exists but could not be read is reported before anything
+    // is shown, because an empty store and a broken store look identical
+    // and the user must be able to tell them apart.
+    if let Some(warning) = &p.warning {
+        app.transcript.push(format!("profile: {warning}"));
+    }
+    let mut edited = None;
+    match cmd {
+        C::List => {
+            if p.entries.is_empty() {
+                app.transcript.push("profile: no entries yet".to_string());
+            }
+            for e in &p.entries {
+                // State, scope and evidence are all shown: a row that hid
+                // the evidence would hide the thing a wrong assumption is
+                // corrected with.
+                app.transcript.push(format!(
+                    "profile: {} [{}] ({}) — {}",
+                    e.concept,
+                    e.state.name(),
+                    e.scope.as_str(),
+                    e.evidence
+                ));
+            }
+            if !p.notes.trim().is_empty() {
+                app.transcript
+                    .push(format!("profile notes: {}", p.notes.trim()));
+            }
+            if let Some(repo) = std::env::current_dir()
+                .ok()
+                .map(|d| crate::context::profile::repo_name(&d))
+                .filter(|n| !n.is_empty())
+            {
+                app.transcript.push(format!(
+                    "profile: this workdir is repo:{repo} — a repo: entry loads only here"
+                ));
+            }
+        }
+        C::Known => render_set(app, "assumed_known", &p.assumed_known()),
+        C::Unknown => render_set(app, "assumed_unknown", &p.assumed_unknown()),
+        C::Add {
+            concept,
+            scope,
+            evidence,
+        } => {
+            edited = Some(crate::context::profile::Edit::Add {
+                concept,
+                scope,
+                evidence,
+            })
+        }
+        C::AssumeKnown(concept) => {
+            edited = Some(crate::context::profile::Edit::AssumeKnown(concept))
+        }
+        C::AssumeUnknown(concept) => {
+            edited = Some(crate::context::profile::Edit::AssumeUnknown(concept))
+        }
+        C::AssumeUnderstood(concept) => {
+            edited = Some(crate::context::profile::Edit::AssumeUnderstood(concept))
+        }
+        C::Forget(concept) => edited = Some(crate::context::profile::Edit::Forget(concept)),
+    }
+    if let Some(edit) = edited {
+        match p.apply(edit) {
+            Ok(line) => match crate::context::profile::save(&p) {
+                Ok(()) => app.transcript.push(line),
+                Err(e) => app.transcript.push(format!(
+                    "profile: edit applied in memory but save failed: {e}"
+                )),
+            },
+            Err(refusal) => app.transcript.push(refusal),
+        }
+    }
+}
+
+/// Print one derived set, naming the set so the two are never confused.
+fn render_set(app: &mut App, name: &str, entries: &[&crate::context::profile::Entry]) {
+    if entries.is_empty() {
+        app.transcript.push(format!("profile: {name}: empty"));
+        return;
+    }
+    for e in entries {
+        app.transcript.push(format!(
+            "profile: {name}: {} [{}]",
+            e.concept,
+            e.state.name()
+        ));
+    }
+}
 
 /// Why a credential action cannot run against a live goal. The action is
 /// named, never its arguments: a refused `/login` line can carry a key.
@@ -1499,6 +1614,7 @@ pub fn apply_action(
         Action::Reject(id) => app
             .transcript
             .push(format!("no pending proposal {id} in this console yet")),
+        Action::Profile(cmd) => profile_command(app, cmd),
         Action::Display(m) => app.transcript.push(format!(
             "display={m}: not available in this console — it renders one fullscreen view"
         )),

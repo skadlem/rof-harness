@@ -261,14 +261,14 @@ fn several_matches_complete_to_the_common_prefix_and_list_the_rest() {
     let candidates = first.candidates();
     assert_eq!(
         candidates,
-        vec!["/provider".to_string(), "/providers".to_string()],
+        vec![
+            "/profile".to_string(),
+            "/provider".to_string(),
+            "/providers".to_string()
+        ],
         "the ambiguous set is not what the registry says"
     );
-    assert_eq!(
-        first.text(),
-        "/provider",
-        "the common prefix was not inserted"
-    );
+    assert_eq!(first.text(), "/pro", "the common prefix was not inserted");
     // Deterministic: the second press is the same answer, not a pick.
     assert_eq!(
         complete(first.text()),

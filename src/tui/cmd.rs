@@ -1,5 +1,7 @@
 //! Slash-command registry: one parser driving help, completion, and dispatch.
 
+use crate::context::profile::Scope;
+
 #[derive(Debug, PartialEq)]
 pub enum Action {
     Quit,
@@ -26,6 +28,12 @@ pub enum Action {
     /// the `Providers` arm in `run.rs`.
     Providers,
     ProviderRm(String),
+    /// Inspect and correct the user-knowledge store (`~/.rof/PROFILE.md`).
+    /// Display and manual edit, both explicit: the subcommands below are
+    /// the ONLY way an entry is ever created or moved, and
+    /// `assume-understood` is the only route to `understood` anywhere in
+    /// the harness. See the `Action::Profile` arm in `run.rs`.
+    Profile(ProfileCmd),
     Approve(String),
     Reject(String),
     Display(String),
@@ -36,6 +44,42 @@ pub enum Action {
     Theme(Option<String>),
     Busy(String),
     Unknown(String),
+}
+
+/// What one `/profile` line asked for.
+///
+/// A parse shape, not the store's own vocabulary: it is what the closed
+/// parser can validate (a scope spelled correctly, a concept present), and
+/// the `run.rs` arm turns it into one `context::profile::Edit`. Free text
+/// that may contain spaces — the concept and the evidence — is joined here
+/// so the whole request is one value the arm can hand straight to the
+/// store.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProfileCmd {
+    /// Every entry, with its state, scope and evidence.
+    List,
+    /// The `explained | understood` set, derived from the states.
+    Known,
+    /// The `not_explained` set, derived from the states.
+    Unknown,
+    /// `add <concept…> <scope> <evidence…>`: create an entry as
+    /// `not_explained`. The evidence is mandatory and is refused by the
+    /// store if it is blank, not by the parser, because a blank is not a
+    /// malformed LINE.
+    Add {
+        concept: String,
+        scope: Scope,
+        evidence: String,
+    },
+    /// Move an entry to `explained` — an assumption about what we said.
+    AssumeKnown(String),
+    /// Move an entry back to `not_explained`; a first-class answer.
+    AssumeUnknown(String),
+    /// Move an entry to `understood`. The user, and only the user, may say
+    /// this; the harness has no other route to the state.
+    AssumeUnderstood(String),
+    /// Drop an entry.
+    Forget(String),
 }
 
 /// Every command name the closed parser above accepts, in the order
@@ -53,6 +97,7 @@ pub const COMMANDS: &[&str] = &[
     "login",
     "logout",
     "provider",
+    "profile",
     "attempts",
     "rounds",
     "thinking",
@@ -327,6 +372,37 @@ pub fn parse(input: &str) -> Option<Action> {
             (Some("rm"), Some(_), _) => Action::ProviderRm(one(1).unwrap()),
             _ => Action::Unknown("/provider takes add <name> <base-url> | list | rm <name>".into()),
         },
+        // The scope is the FIRST token that spells one, so a concept of
+        // several words ("retry backoff") and evidence of several words
+        // both survive; everything before it is the concept, everything
+        // after it is the evidence. A scope that is not spelled correctly
+        // is refused HERE, so a scope that could never match is never
+        // stored.
+        "profile" => match one(0).as_deref() {
+            Some("list") => Action::Profile(ProfileCmd::List),
+            Some("known") => Action::Profile(ProfileCmd::Known),
+            Some("unknown") => Action::Profile(ProfileCmd::Unknown),
+            Some("assume-known") => concept_arg(rest.get(1..), "assume-known"),
+            Some("assume-unknown") => concept_arg(rest.get(1..), "assume-unknown"),
+            Some("assume-understood") => concept_arg(rest.get(1..), "assume-understood"),
+            Some("forget") => concept_arg(rest.get(1..), "forget"),
+            Some("add") => {
+                // `args` is the line AFTER the subcommand, so the concept
+                // can never absorb the word `add` itself.
+                let args = &rest[1..];
+                match args.iter().position(|tok| Scope::parse(tok).is_some()) {
+                    Some(at) if at > 0 => Action::Profile(ProfileCmd::Add {
+                        concept: args[..at].join(" "),
+                        scope: Scope::parse(args[at]).expect("checked just above"),
+                        evidence: args[at + 1..].join(" "),
+                    }),
+                    // No scope anywhere, or the line IS a scope: there is no
+                    // concept to attach it to, so nothing is guessed.
+                    _ => Action::Unknown(PROFILE_HELP.into()),
+                }
+            }
+            _ => Action::Unknown(PROFILE_HELP.into()),
+        },
         "approve" => match one(0) {
             Some(id) => Action::Approve(id),
             None => Action::Unknown("/approve needs <id>".into()),
@@ -365,7 +441,33 @@ pub fn parse(input: &str) -> Option<Action> {
 }
 
 pub fn help_text() -> String {
-    "/quit /help /model <p/m> /model ctx|verify|fallback <p/m> /models /providers /login [provider] /logout <provider> /provider add|list|rm /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /theme [name] /busy interrupt|queue|steer /hotkeys\n/busy: steer is the default — Enter during a run steers the live goal · queue stores exactly one next goal · interrupt arms the stop path (q/Esc/Ctrl-C)".to_string()
+    "/quit /help /model <p/m> /model ctx|verify|fallback <p/m> /models /providers /login [provider] /logout <provider> /provider add|list|rm /profile list|known|unknown|add|assume-known|assume-unknown|assume-understood|forget /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /theme [name] /busy interrupt|queue|steer /hotkeys\n/busy: steer is the default — Enter during a run steers the live goal · queue stores exactly one next goal · interrupt arms the stop path (q/Esc/Ctrl-C)".to_string()
+}
+
+/// The `/profile` grammar, reused by the two refusals that name it. Lives
+/// below `help_text` on purpose: the drift guard in `tests/tui_cmd.rs`
+/// reads the text between `parse` and `help_text` as `parse`'s own arms,
+/// and a subcommand name is not a top-level command.
+const PROFILE_HELP: &str = "/profile takes list | known | unknown | add <concept> <global|repo:<name>> <evidence> | assume-known|assume-unknown|assume-understood|forget <concept>";
+
+/// A concept-argument subcommand: the concept is the WHOLE rest of the
+/// line, because a concept is free text and "retry backoff" is one
+/// concept, not two words to split on. With nothing left, it is refused
+/// rather than applied to an empty label.
+fn concept_arg(concept: Option<&[&str]>, sub: &str) -> Action {
+    let Some(words) = concept else {
+        return Action::Unknown(format!("/profile {sub} needs <concept>"));
+    };
+    let concept = words.join(" ");
+    if concept.trim().is_empty() {
+        return Action::Unknown(format!("/profile {sub} needs <concept>"));
+    }
+    match sub {
+        "assume-known" => Action::Profile(ProfileCmd::AssumeKnown(concept)),
+        "assume-unknown" => Action::Profile(ProfileCmd::AssumeUnknown(concept)),
+        "assume-understood" => Action::Profile(ProfileCmd::AssumeUnderstood(concept)),
+        _ => Action::Profile(ProfileCmd::Forget(concept)),
+    }
 }
 
 /// What `/busy <mode>` reports, per mode. The modes are postures, not
