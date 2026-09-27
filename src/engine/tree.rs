@@ -78,6 +78,15 @@ impl TreeDiff {
                 (crate::engine::session::is_test_shaped(name)
                     || crate::engine::session::is_runner_config(name))
                     && !self.untracked.contains(name)
+                    // `.rof/` is the HARNESS's own bookkeeping, not the
+                    // suite: `.rof/research/tests/<suite>.md` is a note
+                    // ABOUT a suite (learn-mode principle 9), so a
+                    // re-verified note would otherwise read as a tracked
+                    // modification of a test-shaped path and refuse an
+                    // otherwise-clean run's pass as oracle tampering. The
+                    // suite itself lives outside `.rof/`, so excluding the
+                    // folder cannot hide a real test edit.
+                    && !name.starts_with(".rof/")
             })
             .cloned()
             .collect()

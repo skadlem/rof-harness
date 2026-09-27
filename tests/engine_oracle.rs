@@ -634,3 +634,42 @@ async fn direct_mode_refuses_a_tamper_even_when_no_writes_are_expected() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// Learn mode writes research notes about a suite to
+/// `.rof/research/tests/<suite>.md`, which is a test-SHAPED path. Without
+/// the `.rof/` exclusion, re-verifying such a note once it is committed is a
+/// tracked modification of a test-shaped path, so a run that touched nothing
+/// in the suite has its reviewer pass refused as oracle tampering. The suite
+/// itself lives outside `.rof/`, so excluding the folder cannot hide a real
+/// test edit.
+#[test]
+fn a_research_note_about_a_suite_is_not_oracle_tampering() {
+    use rof::engine::TreeDiff;
+    let note = TreeDiff {
+        names: vec![
+            ".rof/research/tests/core.md".to_string(),
+            ".rof/research/index.md".to_string(),
+        ],
+        stat: String::new(),
+        untracked: vec![],
+    };
+    assert!(
+        note.protected_oracle().is_empty(),
+        "harness bookkeeping under .rof/ must not be read as suite tampering: {:?}",
+        note.protected_oracle()
+    );
+    // The suite itself is still protected — the exclusion is scoped to .rof/.
+    let suite = TreeDiff {
+        names: vec![
+            "tests/core.rs".to_string(),
+            ".rof/research/tests/core.md".to_string(),
+        ],
+        stat: String::new(),
+        untracked: vec![],
+    };
+    assert_eq!(
+        suite.protected_oracle(),
+        vec!["tests/core.rs".to_string()],
+        "excluding .rof/ must not unprotect the real suite"
+    );
+}

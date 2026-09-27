@@ -539,6 +539,7 @@ pub fn handle_running_action(
         | Action::ProviderList
         | Action::Providers
         | Action::Profile(_)
+        | Action::Research(_)
         | Action::GotIt
         | Action::StillLost
         | Action::Display(_)
@@ -760,6 +761,112 @@ fn profile_command(app: &mut App, cmd: super::cmd::ProfileCmd) {
                 Ok(()) => app.transcript.push(line),
                 Err(e) => app.transcript.push(format!(
                     "profile: edit applied in memory but save failed: {e}"
+                )),
+            },
+            Err(refusal) => app.transcript.push(refusal),
+        }
+    }
+}
+
+/// Run one `/research` subcommand against `<work root>/.rof/research` and
+/// say what happened, in the transcript.
+///
+/// This arm is the ONLY caller of the research store outside its own tests,
+/// and `Research::apply` is the store's one mutating entry point — so every
+/// note in the folder was created by a user typing `/research write` with
+/// the body they wanted recorded. The harness writes no research content of
+/// its own, and a write with no body is refused at the parser.
+///
+/// Freshness is not a judgement made here. One `git rev-parse` reads HEAD
+/// into a [`TreeState`](crate::context::research::TreeState), and
+/// `Research::needs_research` compares it against each note's pinned commit:
+/// equal is fresh, anything else — including a HEAD that could not be read —
+/// is stale, and a stale note is reported rather than served.
+///
+/// NOTHING in a run reaches this arm. It is a user command, and until the
+/// orchestrator is wired to consult the folder, a run buys no research from
+/// it and reads none of it (design report §9 item 5, second half).
+fn research_command(app: &mut App, cmd: super::cmd::ResearchCmd) {
+    use super::cmd::ResearchCmd as C;
+    use crate::context::research::{self, Edit, Research, TreeState, Verdict};
+    let Some(root) = research::work_root() else {
+        app.transcript
+            .push("research: no work root — /research needs a repository".to_string());
+        return;
+    };
+    // The one git read this slice makes, and it is here because a USER typed
+    // a command: no render path spawns anything.
+    let tree = TreeState::read(&root);
+    if tree.head().is_none() {
+        app.transcript.push(format!(
+            "research: {} has no readable commit, so nothing in it can be pinned or checked",
+            root.display()
+        ));
+    }
+    let mut store = Research::load(&root);
+    // A store that could not be read is reported before anything is shown,
+    // because an empty store and a broken one look identical — and that
+    // difference is what decides whether new research gets bought.
+    if let Some(warning) = &store.warning {
+        app.transcript.push(format!("research: {warning}"));
+    }
+    let mut edited = None;
+    match cmd {
+        C::List => {
+            if store.notes.is_empty() {
+                app.transcript
+                    .push(format!("research: no notes in {}", research::DIR));
+            }
+            for note in &store.notes {
+                let freshness = store.freshness(&note.topic, &tree);
+                let state = if freshness.is_fresh() {
+                    "fresh"
+                } else {
+                    "stale"
+                };
+                app.transcript.push(format!(
+                    "research: {} ({}) {} — {state}: {}",
+                    note.topic,
+                    note.kind.name(),
+                    note.path,
+                    freshness.reason_line()
+                ));
+            }
+            if !store.notes_text.trim().is_empty() {
+                app.transcript
+                    .push(format!("research index notes: {}", store.notes_text.trim()));
+            }
+        }
+        C::Read(topic) => match store.needs_research(&topic, &tree) {
+            Verdict::Answered(answer) => {
+                app.transcript.push(format!(
+                    "research: {} ({}) at {} — pinned {}",
+                    answer.topic,
+                    answer.kind.name(),
+                    answer.path,
+                    answer.pinned
+                ));
+                for line in answer.body.trim().lines() {
+                    app.transcript.push(format!("research: {line}"));
+                }
+            }
+            Verdict::NotAnswered { reason, .. } => {
+                app.transcript.push(format!("research: {reason}"))
+            }
+        },
+        C::Write { topic, body } => edited = Some(Edit::Write { topic, body }),
+        C::Verify(topic) => edited = Some(Edit::Verify { topic }),
+        C::Forget(topic) => edited = Some(Edit::Forget { topic }),
+    }
+    if let Some(edit) = edited {
+        // A write is attempted only after `apply` accepted the edit, so a
+        // refusal (an escaping topic, a blank body, a note that cannot be
+        // read) leaves the folder exactly as the user left it.
+        match store.apply(edit, &tree) {
+            Ok(line) => match store.save() {
+                Ok(()) => app.transcript.push(line),
+                Err(e) => app.transcript.push(format!(
+                    "research: edit accepted in memory but the folder could not be written: {e}"
                 )),
             },
             Err(refusal) => app.transcript.push(refusal),
@@ -1685,6 +1792,11 @@ pub fn apply_action(
             .transcript
             .push(format!("no pending proposal {id} in this console yet")),
         Action::Profile(cmd) => profile_command(app, cmd),
+        // The per-repo research folder. Display-only in the sense that
+        // nothing here sends on the command channel or reaches a model — the
+        // arm is a read of a folder, and the only writes are the two the
+        // user typed, through the store's one mutating entry point.
+        Action::Research(cmd) => research_command(app, cmd),
         // The two answers to the last lesson, the same write path
         // `/profile assume-understood | assume-unknown` takes and for the
         // same reason: both are one `Edit` through the store's only

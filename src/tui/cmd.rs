@@ -44,6 +44,13 @@ pub enum Action {
     /// to `not_explained` so the anti-nag gate teaches it again. A
     /// first-class answer, not a failure.
     StillLost,
+    /// The per-repo research folder (`<work root>/.rof/research`).
+    ///
+    /// Explicit user actions only: nothing in a run reads this folder yet,
+    /// and nothing writes a note except the `write`/`verify` arms below,
+    /// which need the body the user typed. See the `Action::Research` arm
+    /// in `run.rs`.
+    Research(ResearchCmd),
     Approve(String),
     Reject(String),
     Display(String),
@@ -92,6 +99,32 @@ pub enum ProfileCmd {
     Forget(String),
 }
 
+/// What one `/research` line asked for.
+///
+/// A parse shape, not the store's vocabulary, for the reason
+/// [`ProfileCmd`] has: it is what the closed parser can validate (a body
+/// delimited, a topic present), and the `run.rs` arm turns it into one
+/// `context::research::Edit`. The body of a `write` is free text that may
+/// contain spaces, so it is joined here and the topic is everything before
+/// the `--` delimiter.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResearchCmd {
+    /// Every note: topic, path, pinned commit, and fresh or stale with the
+    /// computed reason.
+    List,
+    /// The note at a topic, IF it is fresh — a stale note is reported as
+    /// stale, not served as an answer.
+    Read(String),
+    /// `write <topic…> -- <body…>`: a new note, pinned to the current
+    /// commit. The body is required and is the user's, verbatim.
+    Write { topic: String, body: String },
+    /// `verify <topic…>`: re-pin what is already there at the current
+    /// commit. A re-verification, not a new claim.
+    Verify(String),
+    /// Drop a note and its body file.
+    Forget(String),
+}
+
 /// Every command name the closed parser above accepts, in the order
 /// `/help` lists them. This is the registry completion reads: there is no
 /// second list, so a command cannot be added to `parse` and left out of
@@ -108,6 +141,7 @@ pub const COMMANDS: &[&str] = &[
     "logout",
     "provider",
     "profile",
+    "research",
     "attempts",
     "rounds",
     "thinking",
@@ -428,6 +462,33 @@ pub fn parse(input: &str) -> Option<Action> {
             }
             _ => Action::Unknown(PROFILE_HELP.into()),
         },
+        "research" => match one(0).as_deref() {
+            // A bare `/research` lists, the way `/profile` alone does not
+            // list but `/theme` does: nothing was asked, so nothing is an
+            // error.
+            None | Some("list") => Action::Research(ResearchCmd::List),
+            Some("read") => topic_arg(rest.get(1..), "read"),
+            Some("verify") => topic_arg(rest.get(1..), "verify"),
+            Some("forget") => topic_arg(rest.get(1..), "forget"),
+            Some("write") => {
+                // The topic is everything before a `--` and the body is
+                // everything after it, so neither absorbs the other's
+                // spaces. A line with no `--`, or an empty side of one, is
+                // refused HERE: it is a malformed LINE, and the harness
+                // will not invent the body that is missing.
+                let Some(at) = rest[1..].iter().position(|tok| *tok == "--") else {
+                    return Some(Action::Unknown(RESEARCH_HELP.into()));
+                };
+                let words = &rest[1..];
+                let topic = words[..at].join(" ");
+                let body = words[at + 1..].join(" ");
+                if topic.trim().is_empty() || body.trim().is_empty() {
+                    return Some(Action::Unknown(RESEARCH_HELP.into()));
+                }
+                Action::Research(ResearchCmd::Write { topic, body })
+            }
+            _ => Action::Unknown(RESEARCH_HELP.into()),
+        },
         "approve" => match one(0) {
             Some(id) => Action::Approve(id),
             None => Action::Unknown("/approve needs <id>".into()),
@@ -466,7 +527,7 @@ pub fn parse(input: &str) -> Option<Action> {
 }
 
 pub fn help_text() -> String {
-    "/quit /help /model <p/m> /model ctx|verify|fallback <p/m> /models /providers /login [provider] /logout <provider> /provider add|list|rm /profile list|known|unknown|add|assume-known|assume-unknown|assume-understood|forget /got it /still lost /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /theme [name] /busy interrupt|queue|steer /hotkeys\n/busy: steer is the default — Enter during a run steers the live goal · queue stores exactly one next goal · interrupt arms the stop path (q/Esc/Ctrl-C)\n/got it /still lost answer the last lesson — only what YOU typed can mark a concept understood; still lost is a first-class answer that has it explained again".to_string()
+    "/quit /help /model <p/m> /model ctx|verify|fallback <p/m> /models /providers /login [provider] /logout <provider> /provider add|list|rm /profile list|known|unknown|add|assume-known|assume-unknown|assume-understood|forget /research list|read <topic>|write <topic> -- <body>|verify <topic>|forget <topic> /got it /still lost /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /theme [name] /busy interrupt|queue|steer /hotkeys\n/busy: steer is the default — Enter during a run steers the live goal · queue stores exactly one next goal · interrupt arms the stop path (q/Esc/Ctrl-C)\n/got it /still lost answer the last lesson — only what YOU typed can mark a concept understood; still lost is a first-class answer that has it explained again\n/research is your per-repo research folder under .rof/research — every note pins the commit it was verified against, and a note whose pin is behind HEAD is stale and is NOT served as an answer. A run does not read this folder yet: /research is yours alone".to_string()
 }
 
 /// The `/profile` grammar, reused by the two refusals that name it. Lives
@@ -474,6 +535,28 @@ pub fn help_text() -> String {
 /// reads the text between `parse` and `help_text` as `parse`'s own arms,
 /// and a subcommand name is not a top-level command.
 const PROFILE_HELP: &str = "/profile takes list | known | unknown | add <concept> <global|repo:<name>> <evidence> | assume-known|assume-unknown|assume-understood|forget <concept>";
+
+/// The `/research` grammar, reused by the three refusals that name it.
+const RESEARCH_HELP: &str = "/research takes list | read <topic> | write <topic> -- <body> | verify <topic> | forget <topic>";
+
+/// A topic-argument subcommand: the topic is the WHOLE rest of the line,
+/// because a topic is free text ("retry backoff" is one topic). `tests/<name>`
+/// addresses the note about a test suite. With nothing left, it is refused
+/// rather than applied to an empty topic.
+fn topic_arg(topic: Option<&[&str]>, sub: &str) -> Action {
+    let Some(words) = topic else {
+        return Action::Unknown(format!("/research {sub} needs <topic>"));
+    };
+    let topic = words.join(" ");
+    if topic.trim().is_empty() {
+        return Action::Unknown(format!("/research {sub} needs <topic>"));
+    }
+    match sub {
+        "read" => Action::Research(ResearchCmd::Read(topic)),
+        "verify" => Action::Research(ResearchCmd::Verify(topic)),
+        _ => Action::Research(ResearchCmd::Forget(topic)),
+    }
+}
 
 /// A concept-argument subcommand: the concept is the WHOLE rest of the
 /// line, because a concept is free text and "retry backoff" is one
