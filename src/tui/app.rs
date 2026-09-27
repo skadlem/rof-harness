@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use super::render::{render_line, replay_filter, Counters};
+use super::render::{format_cost, format_models, render_line, replay_filter, Counters};
 use crate::obs::{Boundary, ControlAck, ControlKind, ControlStatus, GoalFinished, TraceEvent};
 
 /// One acknowledgement, one line — for BOTH the live view and a replayed
@@ -305,27 +305,10 @@ impl App {
         // line are the same string, so the caps are measured on real text.
         let line = render_line(ev);
         self.transcript.push(line.clone());
-        match ev {
-            TraceEvent::ModelCall {
-                input_tokens,
-                output_tokens,
-                cost_usd,
-                ..
-            } => {
-                self.counters.model_calls += 1;
-                self.counters.in_tokens += input_tokens;
-                self.counters.out_tokens += output_tokens;
-                self.counters.cost_usd += cost_usd.unwrap_or(0.0);
-            }
-            TraceEvent::ReviewVerdict { pass, .. } => {
-                if *pass {
-                    self.counters.pass += 1;
-                } else {
-                    self.counters.fail += 1;
-                }
-            }
-            _ => {}
-        }
+        // The counters go through the same fold the replay path uses, so a
+        // live run and a replay of the same events cannot report different
+        // totals — the status row below reads only what this wrote.
+        self.counters.apply(ev);
         if matches!(self.run_mode, RunMode::Running | RunMode::Stopping) {
             self.push_activity_line(line);
         }
@@ -764,6 +747,17 @@ impl App {
             "calls={} in={} out={} pass={} fail={}",
             c.model_calls, c.in_tokens, c.out_tokens, c.pass, c.fail
         );
+        // The status metrics the spec asks for: the recorded spend and the
+        // model identity, both read off the reduced counters — nothing is
+        // fetched or priced at draw time. They come LAST so the run
+        // posture, the pinned tokens, and the control/replay text a user
+        // acts on all stay readable at the widths they were proven at; a
+        // narrow row clips the trailing metrics, never the accounting.
+        let metrics = format!(
+            " · cost={} · model={}",
+            format_cost(c.cost_usd, c.cost_recorded),
+            format_models(c.executor_model.as_deref(), c.reviewer_model.as_deref())
+        );
         // The run posture is shown only outside `Idle`, which keeps the
         // replay status line byte-identical to before.
         let run = if self.run_mode == RunMode::Idle {
@@ -785,7 +779,7 @@ impl App {
         };
         if self.replay_mode {
             format!(
-                "{run}{counters} · replay {}/{} [{}] · help: j/k move · g/G ends · / filter · q quit",
+                "{run}{counters} · replay {}/{} [{}] · help: j/k move · g/G ends · / filter · q quit{metrics}",
                 if self.replay_events.is_empty() {
                     0
                 } else {
@@ -795,7 +789,7 @@ impl App {
                 self.replay_filter
             )
         } else {
-            format!("{run}{counters}{control}")
+            format!("{run}{counters}{control}{metrics}")
         }
     }
 }

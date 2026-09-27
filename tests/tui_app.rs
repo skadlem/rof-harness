@@ -2,7 +2,7 @@ use ratatui::layout::Rect;
 use rof::obs::{TraceEvent, TraceSink};
 use rof::tui::app::{App, BusyMode, DeferredConfig, Focus, RunMode};
 use rof::tui::cmd::Action;
-use rof::tui::render::replay_filter;
+use rof::tui::render::{replay_filter, Counters};
 use rof::tui::run::{handle_running_action, RunningActionOutcome};
 use rof::tui::ui::visible_panes;
 
@@ -161,10 +161,14 @@ fn composer_title_comes_from_app_not_the_environment() {
         "composer title carries App thinking"
     );
     let plain = App::new();
-    assert!(
-        !screen(&plain).contains("·"),
-        "no accent without App thinking"
-    );
+    // Scoped to the composer's own pane: the check is that the title carries
+    // no accent, and the status row has separators of its own.
+    let plain_screen = screen(&plain);
+    let composer = plain_screen
+        .split('┌')
+        .find(|pane| pane.starts_with("composer"))
+        .expect("a composer pane is rendered at 80x24");
+    assert!(!composer.contains('·'), "no accent without App thinking");
 }
 
 #[test]
@@ -405,24 +409,40 @@ fn refused_login_renders_without_the_key() {
 }
 
 #[test]
-fn idle_and_replay_status_lines_are_unchanged() {
-    // Pinned byte-for-byte: the live control summary is appended only while
-    // a run is live, so these two postures must not shift by a character.
-    assert_eq!(App::new().status_line(), "calls=0 in=0 out=0 pass=0 fail=0");
+fn idle_replay_and_settled_status_lines_keep_their_pinned_prefix() {
+    // Pinned byte-for-byte as a PREFIX, and the name says what the assertion
+    // actually is: the live control summary is appended only while a run is
+    // live, and the metrics the status row gained (cost, model identity) are
+    // appended AFTER the counters, so these postures must not shift the
+    // pinned text by a character. What follows the prefix is the metrics
+    // suffix, pinned separately by the metrics tests.
+    assert!(
+        App::new()
+            .status_line()
+            .starts_with("calls=0 in=0 out=0 pass=0 fail=0"),
+        "{}",
+        App::new().status_line()
+    );
     let mut app = App::new();
     app.set_replay_events(replay_events());
-    assert_eq!(
-        app.status_line(),
-        "calls=0 in=0 out=0 pass=1 fail=0 · replay 3/3 [] · help: j/k move · g/G ends · / filter · q quit"
+    assert!(
+        app.status_line().starts_with(
+            "calls=0 in=0 out=0 pass=1 fail=0 · replay 3/3 [] · help: j/k move · g/G ends · / filter · q quit"
+        ),
+        "{}",
+        app.status_line()
     );
     // A finished run is not live either: the control summary is not
     // appended to a terminal status line.
     let mut settled = live_control_app();
     settled.defer_config(DeferredConfig::Rounds(2));
     settled.run_mode = RunMode::Finished;
-    assert_eq!(
-        settled.status_line(),
-        "finished · calls=0 in=0 out=0 pass=0 fail=0"
+    assert!(
+        settled
+            .status_line()
+            .starts_with("finished · calls=0 in=0 out=0 pass=0 fail=0"),
+        "{}",
+        settled.status_line()
     );
 }
 
@@ -1079,6 +1099,275 @@ fn the_transcript_survives_a_short_wide_terminal() {
             rows.matches("transcript").count(),
             1,
             "the transcript was displaced at {width}x{height}"
+        );
+    }
+}
+
+/// The status pane's own text row, borders trimmed: the metrics row a user
+/// reads, not a string the reducer happens to build.
+fn status_row(app: &App, width: u16, height: u16) -> String {
+    let rows = rendered_rows(app, width, height);
+    let top = rows
+        .iter()
+        .position(|row| row.contains("┌status"))
+        .unwrap_or_else(|| panic!("no status pane at {width}x{height}: {rows:?}"));
+    // The pane's interior row, with the frame's own border characters and
+    // padding stripped so the text a user reads is what is asserted on.
+    rows[top + 1]
+        .trim_matches(|c: char| c == '│' || c.is_whitespace())
+        .to_string()
+}
+
+/// One segment of the status row, e.g. its `cost=…` or `model=…` part. Read
+/// segment-wise because a prefix overlaps: `$0.0042` starts with `$0.00`.
+fn metric(row: &str, name: &str) -> String {
+    row.split(" · ")
+        .find(|part| part.starts_with(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("no {name} segment in: {row}"))
+        .to_string()
+}
+
+/// One recorded model call, so a test states the identity and the cost it
+/// is about and nothing else.
+fn model_call(agent: &str, model: &str, input: u64, output: u64, cost: Option<f64>) -> TraceEvent {
+    TraceEvent::ModelCall {
+        agent: agent.into(),
+        model: model.into(),
+        input_tokens: input,
+        output_tokens: output,
+        latency_ms: 10,
+        cost_usd: cost,
+        cached_input_tokens: 0,
+        attempts: 1,
+    }
+}
+
+#[test]
+fn status_row_names_the_executor_and_reviewer_models() {
+    let mut app = App::new();
+    app.begin_run("ship the feature");
+    app.on_event(&model_call("executor", "exec-model", 100, 40, Some(0.25)));
+    app.on_event(&model_call("reviewer", "rev-model", 20, 10, Some(0.25)));
+    // Both identities on one compact row is a wide-terminal read: a narrow
+    // row clips its trailing metrics rather than splitting them.
+    let row = status_row(&app, 140, 24);
+    // Both identities come from what the trace recorded, one per path, so a
+    // run that reviewed with a different model cannot read as if it used one.
+    assert!(
+        row.contains("model=exec=exec-model rev=rev-model"),
+        "model identity missing: {row}"
+    );
+}
+
+#[test]
+fn a_run_with_no_model_calls_says_none_yet() {
+    let row = status_row(&App::new(), 100, 24);
+    assert!(
+        row.contains("model=none yet"),
+        "no honest empty state: {row}"
+    );
+    assert!(
+        !row.contains("model=exec=") && !row.contains("model=rev="),
+        "a model was invented: {row}"
+    );
+    // A recorded but blank model id is no identity at all, so it reads the
+    // same way: an empty string must never print as if it named a model.
+    let mut blank = App::new();
+    blank.on_event(&model_call("executor", "   ", 10, 5, None));
+    let row = status_row(&blank, 100, 24);
+    assert!(row.contains("model=none yet"), "blank model printed: {row}");
+}
+
+#[test]
+fn a_cost_bearing_run_shows_the_recorded_cost() {
+    let mut app = App::new();
+    app.on_event(&model_call("executor", "exec-model", 100, 40, Some(0.25)));
+    app.on_event(&model_call("reviewer", "rev-model", 20, 10, Some(0.25)));
+    let row = status_row(&app, 100, 24);
+    assert_eq!(metric(&row, "cost"), "cost=$0.50", "recorded cost: {row}");
+    // Sub-cent money is real money: rounding it to a `$0.00` would read as a
+    // free run, so the amount keeps the digits it actually has.
+    let mut sub = App::new();
+    sub.on_event(&model_call("executor", "exec-model", 100, 40, Some(0.0042)));
+    let row = status_row(&sub, 100, 24);
+    assert_eq!(
+        metric(&row, "cost"),
+        "cost=$0.0042",
+        "sub-cent cost lost: {row}"
+    );
+}
+
+#[test]
+fn an_unrecorded_cost_is_not_a_free_run() {
+    // `cost_usd: None` means the provider reported no cost at all, which is
+    // not the same claim as "this run cost nothing".
+    let mut none = App::new();
+    none.on_event(&model_call("executor", "exec-model", 10, 5, None));
+    let none_row = status_row(&none, 100, 24);
+    assert_eq!(metric(&none_row, "cost"), "cost=unrecorded", "{none_row}");
+    assert!(
+        !none_row.contains('$'),
+        "an amount was invented: {none_row}"
+    );
+
+    // A recorded zero is the opposite claim, and must read differently.
+    let mut free = App::new();
+    free.on_event(&model_call("executor", "exec-model", 10, 5, Some(0.0)));
+    let free_row = status_row(&free, 100, 24);
+    assert_eq!(metric(&free_row, "cost"), "cost=$0.00", "{free_row}");
+    assert_ne!(
+        metric(&none_row, "cost"),
+        metric(&free_row, "cost"),
+        "unknown and free read the same"
+    );
+}
+
+#[test]
+fn the_pinned_status_strings_are_still_byte_identical() {
+    // The P1a tokens and the run prefix are pinned: the metrics the row
+    // gained are appended after them, never folded into them.
+    let idle = App::new().status_line();
+    assert!(
+        idle.starts_with("calls=0 in=0 out=0 pass=0 fail=0"),
+        "the idle counters shifted: {idle}"
+    );
+    let row = status_row(&App::new(), 100, 24);
+    assert!(
+        row.starts_with("calls=0 in=0 out=0 pass=0 fail=0"),
+        "the rendered idle row shifted: {row}"
+    );
+    let mut settled = App::new();
+    settled.run_mode = RunMode::Finished;
+    settled.on_event(&TraceEvent::ReviewVerdict {
+        pass: true,
+        feedback: "ok".into(),
+    });
+    let line = settled.status_line();
+    assert!(
+        line.starts_with("finished · calls=0 in=0 out=0 pass=1 fail=0"),
+        "the run prefix or the tokens shifted: {line}"
+    );
+}
+
+#[test]
+fn the_status_metrics_come_from_the_reduced_trace() {
+    let events = vec![
+        model_call("executor", "exec-model", 100, 40, Some(0.25)),
+        TraceEvent::ReviewVerdict {
+            pass: true,
+            feedback: "ok".into(),
+        },
+        model_call("executor", "exec-model", 250, 60, Some(0.25)),
+        TraceEvent::ReviewVerdict {
+            pass: false,
+            feedback: "not yet".into(),
+        },
+        model_call("reviewer", "rev-model", 30, 5, None),
+    ];
+    let mut app = App::new();
+    for event in &events {
+        app.on_event(event);
+    }
+    // The live reducer and the replay fold are the only two writers of these
+    // numbers, so feeding the same events through both must agree: a row
+    // built from anywhere else would be a number no trace reducer produced.
+    assert_eq!(
+        app.counters,
+        Counters::fold(&events),
+        "the live reducer drifted from the fold"
+    );
+    // The expected row is derived from those same events, here in the test.
+    let mut expected = String::new();
+    let mut in_tokens = 0;
+    let mut out_tokens = 0;
+    let mut cost = 0.0;
+    let mut pass = 0;
+    let mut fail = 0;
+    for event in &events {
+        match event {
+            TraceEvent::ModelCall {
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                ..
+            } => {
+                in_tokens += input_tokens;
+                out_tokens += output_tokens;
+                cost += cost_usd.unwrap_or(0.0);
+            }
+            TraceEvent::ReviewVerdict { pass: ok, .. } => {
+                if *ok {
+                    pass += 1;
+                } else {
+                    fail += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    expected.push_str(&format!(
+        "calls={} in={in_tokens} out={out_tokens} pass={pass} fail={fail}",
+        events
+            .iter()
+            .filter(|event| matches!(event, TraceEvent::ModelCall { .. }))
+            .count()
+    ));
+    let row = status_row(&app, 100, 24);
+    assert!(
+        row.contains(&expected),
+        "row disagrees with the events: {row}"
+    );
+    // 0.25 + 0.25 is the whole recorded spend; the call that carried no cost
+    // adds nothing and does not make the sum look unknown.
+    assert_eq!(metric(&row, "cost"), "cost=$0.50", "cost: {row}");
+    assert!(
+        row.contains("model=exec=exec-model rev=rev-model"),
+        "identity is not the reduced last call per path: {row}"
+    );
+    assert_eq!(cost, 0.5, "the test's own sum drifted");
+}
+
+#[test]
+fn the_status_row_fits_the_short_terminals() {
+    let mut app = App::new();
+    app.transcript.push("tail line".into());
+    app.begin_run("short");
+    app.on_event(&model_call("executor", "exec-model", 100, 40, Some(0.25)));
+    app.on_event(&model_call("reviewer", "rev-model", 20, 10, Some(0.25)));
+    for (width, height) in [(60u16, 9u16), (60, 12)] {
+        let rows = rendered_rows(&app, width, height);
+        assert_eq!(rows.len(), height as usize, "{width}x{height}");
+        let out: String = rows.concat();
+        for title in ["transcript", "status", "composer"] {
+            assert!(
+                out.contains(title),
+                "{title} lost at {width}x{height}: {out}"
+            );
+        }
+        let at = |title: &str| rows.iter().position(|row| row.contains(title)).unwrap();
+        // The transcript keeps its 3-row floor, so it still has an interior
+        // row to read: the metrics row never took the space instead.
+        let transcript_top = at("transcript");
+        assert!(
+            !rows[transcript_top + 1]
+                .trim_matches(|c: char| c == '│' || c.is_whitespace())
+                .is_empty(),
+            "the transcript lost its interior row at {width}x{height}: {out}"
+        );
+        // The metrics row is still ONE row, so it cannot push the transcript
+        // or the composer out of a 9-row terminal.
+        assert_eq!(
+            at("composer") - at("status"),
+            3,
+            "the status row changed height at {width}x{height}: {out}"
+        );
+        // The pinned counters stay inside a 60-column row: the metrics are
+        // appended, never spliced into the tokens, so what the narrow row
+        // clips is the trailing metrics, not the run's own accounting.
+        let row = status_row(&app, width, height);
+        assert!(
+            row.contains("calls=2 in=120 out=50 pass=0 fail=0"),
+            "the pinned counters are not readable at {width}x{height}: {row}"
         );
     }
 }
