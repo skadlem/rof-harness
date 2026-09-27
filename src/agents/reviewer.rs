@@ -30,6 +30,16 @@ impl Agent for ReviewerAgent<'_> {
     }
     async fn run(&self, ctx: AgentCtx<'_>) -> anyhow::Result<AgentOutput> {
         let (thinking_off, reasoning_off, reasoning_low) = thinking_start();
+        // §6: the reviewer's turn is exactly `ctx.view.prompt` — nothing is
+        // appended below it — so the view is the whole context and measuring
+        // it here is measuring the request, not a proxy for it. The reviewer
+        // reports its own turn, so the orchestrator needs no knowledge of this.
+        crate::context::measure_turn(
+            ctx.trace,
+            self.name(),
+            crate::context::TURN_CALL,
+            &ctx.view.prompt,
+        );
         let req = LlmReq {
             system: "You are a reviewer. Given PLAN and ARTIFACT, output JSON {pass: bool, feedback: string}. Rules: (1) if EXPECT WRITES is yes and WRITES MADE is 0, fail — prose is not a deliverable; (2) if CHECKS shows real command output, a failure there means fail; (3) if CHECKS says (none configured), judge the artifact itself and never fail merely for missing evidence. When the round taught a rule that generalizes beyond this task (a mistake to avoid, a procedure that worked), name it in feedback as `SKILL: <when to use it> — <the one rule>`; the implementer records those as skills a human approves."
                 .to_string(),

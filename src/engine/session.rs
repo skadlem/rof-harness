@@ -33,11 +33,36 @@ const EVIDENCE_WINDOW: usize = 24_000;
 ///
 /// Profile-aware variant: the ceiling comes from the endpoint, so a model
 /// move re-tunes one number instead of invalidating the derivation.
-pub(crate) fn volatile_budget_for_profile(
+///
+/// §6 adds the third term, `per_turn_cap`: a cap on the volatile budget, in
+/// tokens, expressed in chars like every other budget here. It is applied
+/// through the one lever that already reduces this part of a prompt — the
+/// §4.1 assembler's budget, whose `Windowed` fidelity narrows a file that
+/// does not fit and whose optional items are left out. Nothing new decides
+/// what to cut, and nothing above the layers (the goal, the task statement,
+/// the evidence block) is reachable from here.
+///
+/// **0 = off**, and that is the shipped default: the derived budget is
+/// returned unchanged, so a run is byte-identical to one from before the knob
+/// existed. A cap is a lever to pull once a run has recorded what it feeds the
+/// model (§6 measures first, cuts second).
+///
+/// A cap is also floored at [`crate::context::assembler::MIN_WINDOW`]: below
+/// that width the assembler cannot narrow an item any further, so a smaller
+/// budget would not deliver a thinner window, it would stop delivering the
+/// item. A knob that silently drops evidence is not a cheaper context, it is a
+/// wrong one.
+pub fn volatile_budget_for_profile(
     budget_tokens: usize,
     profile: &crate::llm::profile::EndpointProfile,
+    per_turn_cap: usize,
 ) -> usize {
-    (budget_tokens * 4).min(profile.emission_threshold_chars)
+    let derived = (budget_tokens * 4).min(profile.emission_threshold_chars);
+    if per_turn_cap == 0 {
+        derived
+    } else {
+        derived.min((per_turn_cap * 4).max(crate::context::assembler::MIN_WINDOW))
+    }
 }
 
 /// One touched file's text as the implementer left it, plus the region the
@@ -370,8 +395,11 @@ impl<'a> RoundServices<'a> {
             }
         }
 
-        let cap =
-            volatile_budget_for_profile(self.cfg.context_policy().short.budget, &self.cfg.endpoint);
+        let cap = volatile_budget_for_profile(
+            self.cfg.context_policy().short.budget,
+            &self.cfg.endpoint,
+            self.cfg.per_turn_context_cap,
+        );
         let mut asm = ContextAssembler::new("", cap);
         for c in &carried {
             asm.add(ContextItem {
@@ -525,8 +553,16 @@ impl<'a> RoundServices<'a> {
     /// this endpoint stops emitting content above a measured prompt size, so a
     /// budget larger than the threshold buys nothing and silently breaks every
     /// call it governs. See the arm at `7cf52af`.
+    ///
+    /// And at §6's `per_turn_context_cap` when one is set: the cap reaches
+    /// this part of a prompt through the same budget, so it is the assembler's
+    /// windowing that does the cutting. Off by default.
     pub fn volatile_budget(&self) -> usize {
-        volatile_budget_for_profile(self.cfg.context_policy().short.budget, &self.cfg.endpoint)
+        volatile_budget_for_profile(
+            self.cfg.context_policy().short.budget,
+            &self.cfg.endpoint,
+            self.cfg.per_turn_context_cap,
+        )
     }
 
     /// The stable head a prompt gets: the session's conventions, plus the
@@ -1226,7 +1262,11 @@ mod budget_tests {
         // The real assertion: the function the two consumers call must return
         // the capped value, not the derivation.
         assert_eq!(
-            volatile_budget_for_profile(tokens, &crate::llm::profile::EndpointProfile::default()),
+            volatile_budget_for_profile(
+                tokens,
+                &crate::llm::profile::EndpointProfile::default(),
+                0
+            ),
             default_ceiling(),
             "the cap must bind when the derivation exceeds it"
         );
@@ -1240,8 +1280,8 @@ mod budget_tests {
             emission_threshold_chars: 4000,
             ladder: Vec::new(),
         };
-        assert_eq!(volatile_budget_for_profile(6000, &p), 4000);
-        assert_eq!(volatile_budget_for_profile(500, &p), 2000);
+        assert_eq!(volatile_budget_for_profile(6000, &p, 0), 4000);
+        assert_eq!(volatile_budget_for_profile(500, &p, 0), 2000);
     }
 
     /// The cap is a ceiling, not a replacement: a small configured budget must
@@ -1249,12 +1289,33 @@ mod budget_tests {
     #[test]
     fn a_small_volatile_budget_passes_through_the_cap() {
         let p = crate::llm::profile::EndpointProfile::default();
-        assert_eq!(volatile_budget_for_profile(500, &p), 2_000);
-        assert_eq!(volatile_budget_for_profile(0, &p), 0);
+        assert_eq!(volatile_budget_for_profile(500, &p, 0), 2_000);
+        assert_eq!(volatile_budget_for_profile(0, &p, 0), 0);
         // Exactly at the threshold: the boundary belongs to the capped side.
         assert_eq!(
-            volatile_budget_for_profile(default_ceiling() / 4, &p),
+            volatile_budget_for_profile(default_ceiling() / 4, &p, 0),
             default_ceiling()
+        );
+    }
+
+    /// §6: `per_turn_context_cap` defaults to 0 and 0 means off — the
+    /// derived budget is returned untouched, so the knob cannot change a run
+    /// unless a config asks it to. A cap that does not bind is also inert, so
+    /// the lever is the number a config sets, not its mere presence.
+    #[test]
+    fn the_per_turn_cap_is_off_by_default_and_inert_above_the_ceiling() {
+        let p = crate::llm::profile::EndpointProfile::default();
+        let shipped = volatile_budget_for_profile(6000, &p, 0);
+        assert_eq!(shipped, default_ceiling());
+        assert_eq!(volatile_budget_for_profile(6000, &p, 1_000_000), shipped);
+        // Bound, it caps: 2_000 tokens = 8_000 chars under a 12_000 ceiling.
+        assert_eq!(volatile_budget_for_profile(6000, &p, 2_000), 8_000);
+        // Floored: a cap under MIN_WINDOW/4 would configure the assembler below
+        // the width at which it can still narrow a window, which stops
+        // delivering an item rather than delivering a thinner one.
+        assert_eq!(
+            volatile_budget_for_profile(6000, &p, 1),
+            crate::context::assembler::MIN_WINDOW
         );
     }
 

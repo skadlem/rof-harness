@@ -28,7 +28,11 @@ use std::collections::HashSet;
 
 /// Below this many chars a window is too narrow to judge, so a `must_include`
 /// item that still does not fit after [`SHRINK_PASSES`] halvings is excess.
-const MIN_WINDOW: usize = 2_000;
+///
+/// Also the floor for §6's `per_turn_context_cap`: a budget under this is one
+/// the assembler can only refuse to narrow, so a cap below it would not make
+/// the context smaller, it would make an item vanish.
+pub const MIN_WINDOW: usize = 2_000;
 
 /// How much of an item's text may be delivered, and how the elision happens
 /// when it does not fit.

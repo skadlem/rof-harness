@@ -37,6 +37,13 @@ pub fn render_line(ev: &TraceEvent) -> String {
             format!("● {agent} (in {input_tokens}, out {output_tokens})")
         }
         TraceEvent::ModelError { agent, error } => format!("! {agent}: {error}"),
+        // §6: the context-per-turn measurement. A line like every other: the
+        // number only matters if a transcript can be read for it, and a new
+        // event kind that renders as nothing would be a measurement no run
+        // could report.
+        TraceEvent::ContextMeasured {
+            agent, turn, chars, ..
+        } => format!("≡ {agent} {turn}: {chars} chars of context"),
         TraceEvent::ToolCall {
             agent, tool, ok, ..
         } => {

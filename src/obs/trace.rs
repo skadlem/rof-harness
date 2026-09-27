@@ -34,6 +34,33 @@ pub enum TraceEvent {
         agent: String,
         error: String,
     },
+    /// §6: what ONE agent turn was actually given. The competitive axis is
+    /// context-per-turn — two harnesses ran the same model at the same
+    /// thinking effort, tied on quality, and one spent over twice the cost
+    /// per task because it fed the model roughly three times as much context
+    /// per turn. This is the number that has to exist before any of it is cut.
+    ///
+    /// It is the rendered context of that call, measured at the last point
+    /// before the request is built: the assembler's `parts.full()` for the
+    /// implementer (which is the layered head PLUS the volatile tail below
+    /// it, and is a different string for the `reads` re-ask), the `CtxView`
+    /// prompt for the reviewer. Never the sum of its parts and never an
+    /// estimate — an estimate of a context cost is the thing being measured.
+    ContextMeasured {
+        /// The agent the call was for: `implementer` / `executor` (direct
+        /// mode) or `reviewer`. Per agent, never summed away: a run shows both
+        /// sides, and the two are not the same size.
+        agent: String,
+        /// Which call of that agent's turn this was: `ask` (the first),
+        /// `re-ask` (the follow-up that re-sends the context plus the files
+        /// the model asked for), or `call` for a single-call agent.
+        turn: String,
+        /// Chars of rendered context handed to this call. The exact count,
+        /// not tokens and not a rounded figure.
+        chars: u64,
+        /// `chars / 4`, the same estimate the token budgets are expressed in.
+        est_tokens: u64,
+    },
     ToolCall {
         agent: String,
         tool: String,

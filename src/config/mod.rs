@@ -252,6 +252,26 @@ pub struct AppConfig {
     /// Defaults reproduce the shipped DeepSeek/vLLM behavior bit for bit.
     #[serde(default)]
     pub endpoint: crate::llm::profile::EndpointProfile,
+    /// §6: a per-turn cap, in tokens, on the part of one agent turn that no
+    /// layer budget sees — the file map, the goal-named files, the files a
+    /// model asked for, and the skill bodies, all placed below the layers by
+    /// the §4.1 assembler. The assembler's budget becomes
+    /// `min(cap * 4, the endpoint's emission ceiling)`, so a cap is enforced
+    /// by the windowing that already exists and a file that does not fit is
+    /// narrowed rather than dropped.
+    ///
+    /// NOT a cap on the whole prompt: the three layers keep their own per-layer
+    /// caps (`context`, or `budgets` when that block is absent), and the goal,
+    /// the task statement and the evidence block live there. This number only
+    /// governs the tail below them.
+    ///
+    /// **0 = off, which is the default, and that is deliberate.** Context
+    /// discipline was measured before it was cut: an arm that lowers this
+    /// before a run has recorded what it feeds the model has no baseline to
+    /// compare against. The default leaves the assembler budget exactly where
+    /// it was, so a run is byte-identical to one from before the knob existed.
+    #[serde(default)]
+    pub per_turn_context_cap: usize,
 }
 
 fn one_job() -> usize {
@@ -349,6 +369,8 @@ impl Default for AppConfig {
             attempts: 1,
             verify_guard: false,
             endpoint: crate::llm::profile::EndpointProfile::default(),
+            // §6: measured, not cut. See the field's doc comment.
+            per_turn_context_cap: 0,
         }
     }
 }

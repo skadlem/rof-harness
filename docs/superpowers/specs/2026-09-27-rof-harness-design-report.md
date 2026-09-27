@@ -161,6 +161,33 @@ Honest accounting, because a control that overstates itself is worse than none:
 
 ## 6. Context discipline — the measured competitive axis
 
+**Shipped** (build item 2): `TraceEvent::ContextMeasured { agent, turn, chars,
+est_tokens }`, emitted at the last point each agent's rendered prompt is still
+the string that goes out — the assembler's `parts.full()` for the implementer's
+first ask AND its `reads` re-ask, and the `CtxView` prompt for the reviewer —
+and folded into the eval metrics next to tokens-per-task.
+
+**Two findings, both more useful than the metric itself:**
+
+- **The `reads` re-ask costs a SECOND FULL CONTEXT.** `implementer.rs:271`
+  rebuilds `parts.full()` — the whole layered head plus every item already
+  delivered — and adds the requested files. A `reads` turn is not an
+  increment; it re-sends everything. This is the cheapest item on the cut list
+  regardless of what the average says.
+- **A total-prompt cap has no lever to route through.** The three layers are cut
+  independently at `budget*4` and the volatile tail is cut by the assembler;
+  nothing ranks content across that boundary, and the assembler retains in
+  insertion order rather than by priority. A true total cap needs a
+  cross-boundary priority order plus a cut spanning layers — i.e. a new
+  reduction algorithm, which was explicitly out of scope. `per_turn_context_cap`
+  therefore governs the unlayered tail only, and says so in its own doc comment.
+
+**Known imprecision, stated rather than hidden:** the measurement is EXACT in
+chars; the cap is expressed in TOKENS and bridged by a `chars/4` heuristic
+(the existing budget machinery is char-based and a real tokenizer would be a new
+dependency). Read the cap as approximate until that changes. The knob defaults
+to `0` = off, and a test proves the default leaves a run byte-identical.
+
 - **Make context-per-turn a first-class metric with a budget**, alongside
   tokens-per-task. We are optimising the wrong thing until this is measured.
 - **Stable prefix, dynamic tail.** Naive full-context caching can *increase*

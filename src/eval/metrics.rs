@@ -48,6 +48,42 @@ pub struct EvalReport {
     /// Goals the quality pre-check flagged.
     #[serde(default)]
     pub goal_quality_flags: u64,
+    /// §6: the context each agent turn actually received, folded from
+    /// `ContextMeasured`. It sits next to `est_input_tokens` on purpose: the
+    /// competitive axis is context-per-turn, and a future arm can only be
+    /// judged cost-adjusted if the run recorded what it fed the model as well
+    /// as what it paid.
+    #[serde(default)]
+    pub context: ContextPerTurn,
+}
+
+/// Context-per-turn for one run: what the model was given, per turn and per
+/// agent. Chars, not tokens — the measurement is the rendered prompt, and a
+/// token figure derived from it is an estimate of the estimate.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextPerTurn {
+    /// Agent calls that reported a rendered context (one per turn, per agent).
+    pub turns: u64,
+    /// Sum of the rendered context over those calls, in chars.
+    pub total_chars: u64,
+    /// Chars per agent, so the implementer and the reviewer are never averaged
+    /// into one number: they are not the same size and only the split says
+    /// which side the bytes are on.
+    pub chars_by_agent: std::collections::BTreeMap<String, u64>,
+    /// Calls per agent — the denominator the mean is read against.
+    pub turns_by_agent: std::collections::BTreeMap<String, u64>,
+}
+
+impl ContextPerTurn {
+    /// Mean rendered context per measured turn, 0.0 when nothing was measured
+    /// (undefined, not zero).
+    pub fn mean_chars(&self) -> f64 {
+        if self.turns == 0 {
+            0.0
+        } else {
+            self.total_chars as f64 / self.turns as f64
+        }
+    }
 }
 
 /// Skill-store traffic for one run. Only successful ops count: a refused
@@ -94,6 +130,7 @@ impl Default for EvalReport {
             skills: SkillMetrics::default(),
             auto_pokes: 0,
             goal_quality_flags: 0,
+            context: ContextPerTurn::default(),
         }
     }
 }
@@ -225,6 +262,24 @@ impl EvalReport {
             // so a report can say whether either feature did anything at all.
             TraceEvent::GoalQuality { .. } => self.goal_quality_flags += 1,
             TraceEvent::AutoPoke { .. } => self.auto_pokes += 1,
+            // §6: one measured turn of context. Folded per agent, so the
+            // implementer (which also pays for a re-ask turn and a volatile
+            // tail) never hides inside the reviewer's number or the other way
+            // round.
+            TraceEvent::ContextMeasured { agent, chars, .. } => {
+                self.context.turns += 1;
+                self.context.total_chars += chars;
+                *self
+                    .context
+                    .chars_by_agent
+                    .entry(agent.clone())
+                    .or_insert(0) += chars;
+                *self
+                    .context
+                    .turns_by_agent
+                    .entry(agent.clone())
+                    .or_insert(0) += 1;
+            }
             _ => {}
         }
     }

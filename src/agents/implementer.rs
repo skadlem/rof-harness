@@ -40,6 +40,20 @@ impl<'a> ImplementerAgent<'a> {
         r.file_map()
     }
 
+    /// The name this agent's calls are attributed to, the same rule
+    /// `ask_with_system` uses for `ModelCall`: direct mode runs on the
+    /// executor slot, so its context is attributed to `executor`. §6's
+    /// per-turn number has to land on the same agent as the token number it
+    /// is meant to be compared against, or the comparison is between two
+    /// different populations.
+    fn turn_agent(&self, system: &str) -> &'static str {
+        if system == DIRECT_SYSTEM {
+            "executor"
+        } else {
+            self.name()
+        }
+    }
+
     pub async fn run_direct(&self, ctx: AgentCtx<'_>) -> anyhow::Result<AgentOutput> {
         self.run_with_system(ctx, DIRECT_SYSTEM).await
     }
@@ -129,6 +143,16 @@ impl ImplementerAgent<'_> {
             // The map is optional, so either arm delivers the parts that fit.
             Assembly::Ok(parts) | Assembly::SelectionFailure { parts, .. } => parts.full(),
         };
+        // §6: the context this call actually gets is `prompt` — the layered
+        // head plus everything the assembler placed below it. Measured here,
+        // after the assembly and before the request, because that is the last
+        // moment at which the string is the one the model receives.
+        crate::context::measure_turn(
+            ctx.trace,
+            self.turn_agent(system),
+            crate::context::TURN_ASK,
+            &prompt,
+        );
         let mut data = self.ask_with_system(&ctx, &prompt, system).await?;
         // Paths the model asked for that did not fit the volatile budget even
         // at the narrowest window. Carried to the re-ask so the marker never
@@ -244,13 +268,18 @@ impl ImplementerAgent<'_> {
                         parts
                     }
                 };
-                data = self
-                    .ask_with_system(
-                        &ctx,
-                        &reask_with_delivery(&parts.full(), &already, &cuts),
-                        system,
-                    )
-                    .await?;
+                let reask = reask_with_delivery(&parts.full(), &already, &cuts);
+                // §6: the re-ask is its own turn, and its own measurement. It
+                // re-sends the whole assembled context plus the requested
+                // files, so averaging it into the first ask would hide exactly
+                // the cost this metric exists to make visible.
+                crate::context::measure_turn(
+                    ctx.trace,
+                    self.turn_agent(system),
+                    crate::context::TURN_REASK,
+                    &reask,
+                );
+                data = self.ask_with_system(&ctx, &reask, system).await?;
             }
         }
         // Patches first, then whole-file writes (a write to the same path wins).
