@@ -21,6 +21,10 @@ pub enum Action {
     Retry(Option<String>),
     ProviderAdd(String),
     ProviderList,
+    /// Display-only listing of every known provider: base, whether a key
+    /// is present, and the cached verify status. Never a key value — see
+    /// the `Providers` arm in `run.rs`.
+    Providers,
     ProviderRm(String),
     Approve(String),
     Reject(String),
@@ -45,6 +49,7 @@ pub fn parse(input: &str) -> Option<Action> {
         "quit" => Action::Quit,
         "help" => Action::Help,
         "models" => Action::Models,
+        "providers" => Action::Providers,
         "context" => Action::Context,
         "undo" => Action::Undo,
         "diff" => Action::Diff,
@@ -116,7 +121,7 @@ pub fn parse(input: &str) -> Option<Action> {
 }
 
 pub fn help_text() -> String {
-    "/quit /help /model <p/m> /model ctx|verify|fallback <p/m> /models /login [provider] /logout <provider> /provider add|list|rm /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /busy interrupt|queue|steer /hotkeys\n/busy: steer is the default — Enter during a run steers the live goal · queue stores exactly one next goal · interrupt arms the stop path (q/Esc/Ctrl-C)".to_string()
+    "/quit /help /model <p/m> /model ctx|verify|fallback <p/m> /models /providers /login [provider] /logout <provider> /provider add|list|rm /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /busy interrupt|queue|steer /hotkeys\n/busy: steer is the default — Enter during a run steers the live goal · queue stores exactly one next goal · interrupt arms the stop path (q/Esc/Ctrl-C)".to_string()
 }
 
 /// What `/busy <mode>` reports, per mode. The modes are postures, not

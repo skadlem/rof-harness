@@ -2175,3 +2175,316 @@ async fn one_emitted_ack_reaches_the_live_console_exactly_once() {
     );
     drop(hold_tx);
 }
+
+// ---------------------------------------------------------------------------
+// P3 Task B: `/providers` as a display command over the BYOK substrate.
+// ---------------------------------------------------------------------------
+
+/// A scratch credentials + providers pair for one `/providers` test, both
+/// pointed at the override paths the auth substrate already honours, and
+/// removed afterwards. No home directory, no network, no real store.
+///
+/// The env lock and the saved values are held for the WHOLE test, not just
+/// the setup: env is process-global, so a helper that released the lock on
+/// return would let another test's override race this one's assertions.
+struct ProvidersEnv {
+    dir: std::path::PathBuf,
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl ProvidersEnv {
+    const VARS: [&'static str; 6] = [
+        "ROF_CREDENTIALS",
+        "ROF_PROVIDERS",
+        "OR_TOKEN",
+        "ROF_TOKEN",
+        "ROF_CHAT_BASE",
+        "ROF_ATTEMPTS",
+    ];
+
+    fn new(tag: &str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(&'static str, Option<String>)> = Self::VARS
+            .iter()
+            .map(|var| (*var, std::env::var(var).ok()))
+            .collect();
+        for var in Self::VARS {
+            std::env::remove_var(var);
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rof-providers-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ROF_CREDENTIALS", dir.join("credentials.json"));
+        std::env::set_var("ROF_PROVIDERS", dir.join("providers.json"));
+        Self {
+            dir,
+            _lock: lock,
+            saved,
+        }
+    }
+}
+
+impl Drop for ProvidersEnv {
+    fn drop(&mut self) {
+        for (var, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Run `/providers` between goals and hand back the rendered transcript.
+fn render_providers() -> Vec<String> {
+    let trace = TraceSink::new();
+    let mut app = App::new();
+    let mut awaiting_key: Option<String> = None;
+    let quit = apply_action(
+        &mut app,
+        &trace,
+        Action::Providers,
+        "/providers",
+        &mut awaiting_key,
+    );
+    assert!(!quit, "/providers ended the console");
+    app.transcript
+}
+
+/// No key material, by construction: the fixture key is a value that
+/// cannot be spelled by accident, and the assertions below scan every
+/// rendered line for it and for each part of it.
+const FIXTURE_KEY: &str = "sk-rofdanger-0f1e2d3c-THIS-MUST-NEVER-BE-PRINTED";
+
+/// Assert that nothing in the transcript is the key or any part of it. A
+/// row that reported presence by formatting `key_for`'s value would fail
+/// here, and so would one that leaked a fragment (prefix, suffix, or the
+/// distinctive middle).
+fn assert_no_key_material(lines: &[String], key: &str) {
+    for line in lines {
+        assert!(
+            !line.contains(key),
+            "the key reached the transcript: {line}"
+        );
+        for part in [
+            "rofdanger",
+            "0f1e2d3c",
+            "THIS-MUST-NEVER-BE-PRINTED",
+            "sk-rof",
+        ] {
+            assert!(
+                !line.contains(part),
+                "key material ({part}) reached the transcript: {line}"
+            );
+        }
+    }
+}
+
+/// An empty store still lists the three built-ins as key-absent, adds the
+/// plain store-is-empty line, and emits no registry rows. A regression that
+/// hid the built-ins fails here, because the names are asserted, not a
+/// line count.
+#[test]
+fn providers_with_an_empty_store_lists_the_built_ins_and_says_the_store_is_empty() {
+    let _env = ProvidersEnv::new("empty");
+
+    let lines = render_providers();
+
+    for builtin in ["openrouter", "go", "atria"] {
+        let row = lines
+            .iter()
+            .find(|l| l.starts_with(&format!("provider {builtin} ")))
+            .unwrap_or_else(|| panic!("the built-in {builtin} was not listed: {lines:?}"));
+        assert!(
+            row.contains("key absent"),
+            "{builtin} has no key but the row does not say so: {row}"
+        );
+        assert!(
+            !row.contains("key present"),
+            "{builtin} has no key but the row claims one: {row}"
+        );
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("no provider logins in the credentials store")),
+        "an empty store was not reported: {lines:?}"
+    );
+    // Nothing is defined, so there is no registry row to name a custom
+    // base: this line proves the empty case is stated, not merely reached.
+    assert!(
+        !lines.iter().any(|l| l.contains("[custom,")),
+        "a provider was invented from an empty registry: {lines:?}"
+    );
+    assert_no_key_material(&lines, FIXTURE_KEY);
+}
+
+/// A defined provider with no key is named, and its row says the key is
+/// absent. The base comes from the registry; nothing here is a secret.
+#[test]
+fn providers_names_a_registry_provider_whose_key_is_absent() {
+    let _env = ProvidersEnv::new("nokey");
+    rof::tui::auth::save_provider("acme", "https://llm.acme.test/v1").unwrap();
+    assert!(
+        rof::tui::auth::key_for("acme").is_none(),
+        "the fixture must have no key for this test to mean anything"
+    );
+
+    let lines = render_providers();
+
+    let row = lines
+        .iter()
+        .find(|l| l.starts_with("provider acme "))
+        .unwrap_or_else(|| panic!("a defined provider was not listed: {lines:?}"));
+    assert!(row.contains("acme"), "{row}");
+    assert!(row.contains("https://llm.acme.test/v1"), "{row}");
+    assert!(row.contains("key absent"), "{row}");
+    // Defining a provider is not logging in: the store can still be empty
+    // here, and saying so is the `Models` arm's behaviour, not a bug.
+    assert_no_key_material(&lines, FIXTURE_KEY);
+}
+
+/// The safety boundary, stated as a test: a provider with a real key in
+/// the real store renders as PRESENT, and the literal key value appears
+/// nowhere in the transcript.
+#[test]
+fn providers_reports_a_present_key_without_ever_printing_it() {
+    let _env = ProvidersEnv::new("present");
+    rof::tui::auth::save_provider("acme", "https://llm.acme.test/v1").unwrap();
+    rof::tui::auth::store().save("acme", FIXTURE_KEY).unwrap();
+    assert_eq!(
+        rof::tui::auth::key_for("acme").as_deref(),
+        Some(FIXTURE_KEY),
+        "the fixture key did not reach the store"
+    );
+
+    let lines = render_providers();
+
+    let row = lines
+        .iter()
+        .find(|l| l.starts_with("provider acme "))
+        .unwrap_or_else(|| panic!("a logged-in provider was not listed: {lines:?}"));
+    assert!(row.contains("key present"), "{row}");
+    assert!(
+        !row.contains("no provider logins"),
+        "a store with a login claimed to be empty: {lines:?}"
+    );
+    // Every rendered line, not just the one row: the leak this forbids
+    // could be in a summary or a note line.
+    for line in &lines {
+        assert!(!line.contains(FIXTURE_KEY), "leaked: {line}");
+    }
+    assert_no_key_material(&lines, FIXTURE_KEY);
+}
+
+/// The negative form of the same boundary: this test fails the moment a
+/// row is built by formatting `key_for`'s value, which is the only way the
+/// substrate hands key text to a caller.
+#[test]
+fn providers_never_uses_the_key_value_to_report_presence() {
+    let _env = ProvidersEnv::new("nokeyvalue");
+    rof::tui::auth::save_provider("acme", "https://llm.acme.test/v1").unwrap();
+    rof::tui::auth::store().save("acme", FIXTURE_KEY).unwrap();
+
+    let lines = render_providers();
+    let row = lines
+        .iter()
+        .find(|l| l.starts_with("provider acme "))
+        .expect("no row");
+
+    // Presence is a word, and it is chosen from the same two states the
+    // store can be in — the value itself is never a substring of the row
+    // in any form, including a prefix of four characters.
+    assert!(row.contains("key present"), "{row}");
+    for n in 4..FIXTURE_KEY.len() {
+        assert!(
+            !row.contains(&FIXTURE_KEY[..n]),
+            "the row carries the first {n} characters of the key: {row}"
+        );
+    }
+}
+
+/// A read-only listing while a goal is live is a view action: it renders,
+/// sends nothing, and touches neither the env nor a pending slot.
+#[test]
+fn providers_is_a_view_action_while_a_goal_is_live() {
+    let _env = ProvidersEnv::new("live");
+    rof::tui::auth::save_provider("acme", "https://llm.acme.test/v1").unwrap();
+    rof::tui::auth::store().save("acme", FIXTURE_KEY).unwrap();
+    let (mut app, tx, mut rx) = live_goal();
+    app.input.push_str("/providers");
+
+    let draft = app.input.clone();
+    assert_eq!(
+        running_action(&mut app, Action::Providers, &tx, &draft),
+        RunningActionOutcome::View
+    );
+
+    assert!(
+        app.transcript
+            .iter()
+            .any(|l| l.starts_with("provider acme ")),
+        "/providers rendered nothing while live: {:?}",
+        app.transcript
+    );
+    assert!(rx.try_recv().is_err(), "/providers sent a command");
+    assert!(app.pending_goal.is_none() && app.pending_steer.is_none());
+    assert!(app.deferred_config.is_empty());
+    assert_eq!(
+        app.run_mode,
+        RunMode::Running,
+        "/providers moved the run state"
+    );
+    assert!(app.input.is_empty());
+    assert!(
+        std::env::var("ROF_TOKEN").is_err(),
+        "/providers wrote the env"
+    );
+    assert!(
+        std::env::var("OR_TOKEN").is_err(),
+        "/providers wrote the env"
+    );
+    assert_no_key_material(&app.transcript, FIXTURE_KEY);
+}
+
+/// Adding a provider is a mutation, so it stays refused while a goal is
+/// live even though its read-only sibling is allowed. The boundary is the
+/// pair: `/providers` views, `/provider add` does not.
+#[test]
+fn provider_mutations_stay_refused_while_providers_is_allowed() {
+    let _env = ProvidersEnv::new("refused");
+    let (mut app, tx, mut rx) = live_goal();
+
+    for (action, raw) in [
+        (
+            Action::ProviderAdd("acme".into()),
+            "/provider add acme https://llm.acme.test/v1",
+        ),
+        (Action::ProviderRm("acme".into()), "/provider rm acme"),
+        (Action::Login(None), "/login acme"),
+        (Action::Logout("acme".into()), "/logout acme"),
+    ] {
+        app.input.clear();
+        app.input.push_str(raw);
+        let draft = app.input.clone();
+        assert!(
+            matches!(
+                running_action(&mut app, action, &tx, &draft),
+                RunningActionOutcome::Rejected(_)
+            ),
+            "{raw} was not refused while live"
+        );
+        assert_eq!(app.input, raw, "{raw} cleared the draft");
+    }
+    assert!(
+        !rof::tui::auth::registry().contains_key("acme"),
+        "a refused mutation still changed the registry"
+    );
+    assert!(rx.try_recv().is_err(), "a refused mutation sent a command");
+}

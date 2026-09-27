@@ -377,7 +377,8 @@ pub enum RunningActionOutcome {
 /// exhaustive over [`Action`]:
 ///
 /// - **Display-only** — `Help`, `Unknown`, `Models`, `Context`, `Trace`,
-///   `Hotkeys`, `Diff`, `ProviderList`, `Display`, and the already
+///   `Hotkeys`, `Diff`, `ProviderList`, `Providers`, `Display`, and the
+///   already
 ///   unavailable `Retry`/`Approve`/`Reject`/`Undo` answers — go through
 ///   [`apply_action`] exactly as they do between goals, and return
 ///   [`RunningActionOutcome::View`]. They read state and write transcript
@@ -429,6 +430,7 @@ pub fn handle_running_action(
         | Action::Hotkeys
         | Action::Diff
         | Action::ProviderList
+        | Action::Providers
         | Action::Display(_)
         | Action::Retry(_)
         | Action::Approve(_)
@@ -1214,6 +1216,56 @@ pub fn apply_action(
             }
             app.transcript.push(
                 "keys live in the credentials store or env; /login <provider> verifies + saves"
+                    .to_string(),
+            );
+        }
+        // Read-only provider listing: base, key PRESENCE, and the cached
+        // verify status for every built-in and every registry provider.
+        //
+        // The safety boundary is the whole point of this arm. Presence is
+        // `key_for(p).is_some()` and nothing more: the value that call
+        // returns is never bound, formatted, or lengthened, so a key
+        // cannot reach the transcript. The store is read only through
+        // those two existing accessors — no file read, no new accessor.
+        Action::Providers => {
+            let st = super::auth::statuses();
+            let status = |p: &str| {
+                st.get(p)
+                    .cloned()
+                    .unwrap_or_else(|| "unverified".to_string())
+            };
+            // `.is_some()` and nothing else: the presence flag is the
+            // whole of what a row learns from the key.
+            let presence = |p: &str| {
+                if super::auth::key_for(p).is_some() {
+                    "key present"
+                } else {
+                    "key absent"
+                }
+            };
+            for p in ["openrouter", "go", "atria"] {
+                let base = super::auth::base_for_test(p).unwrap_or_default();
+                app.transcript.push(format!(
+                    "provider {p} → {base} [built-in, {}, {}]",
+                    presence(p),
+                    status(p)
+                ));
+            }
+            for (name, base) in super::auth::registry() {
+                app.transcript.push(format!(
+                    "provider {name} → {base} [custom, {}, {}]",
+                    presence(&name),
+                    status(&name)
+                ));
+            }
+            if super::auth::store().providers().is_empty() {
+                app.transcript.push(
+                    "providers: no provider logins in the credentials store (env keys still apply at call time)"
+                        .to_string(),
+                );
+            }
+            app.transcript.push(
+                "providers: presence only — key values are never printed; /login <provider> verifies + saves"
                     .to_string(),
             );
         }

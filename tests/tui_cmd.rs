@@ -36,6 +36,25 @@ fn provider_forms_parse() {
     assert!(matches!(parse("/provider"), Some(Action::Unknown(_))));
 }
 
+/// `/providers` is its own display command and `/provider list` keeps the
+/// mutation-grammar arm it always was: the two are not synonyms, and a
+/// near-miss on either is still `Unknown` rather than a guess.
+#[test]
+fn providers_parses_to_its_own_action_and_neighbours_still_parse() {
+    assert!(matches!(parse("/providers"), Some(Action::Providers)));
+    assert!(
+        matches!(parse("/provider list"), Some(Action::ProviderList)),
+        "/provider list must keep parsing to the existing arm"
+    );
+    assert!(matches!(parse("/providers all"), Some(Action::Providers)));
+    for unknown in ["/providersx", "/providerx list", "/provider lists"] {
+        assert!(
+            matches!(parse(unknown), Some(Action::Unknown(_))),
+            "{unknown} should be Unknown"
+        );
+    }
+}
+
 #[test]
 fn help_lists_everything_with_current_values_placeholder() {
     let h = rof::tui::cmd::help_text();
@@ -47,6 +66,7 @@ fn help_lists_everything_with_current_values_placeholder() {
         "/retry",
         "/undo",
         "/diff",
+        "/providers",
     ] {
         assert!(h.contains(cmd), "help mentions {cmd}");
     }
