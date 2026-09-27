@@ -9,10 +9,14 @@ use rof::obs::{
     TraceSink,
 };
 use rof::tui::app::{App, BusyMode, DeferredConfig, RunMode};
+use rof::tui::cmd::{parse, Action};
 use rof::tui::run::{
-    handle_running_key, submit_running_input, LiveSession, RunningKeyOutcome, RunningSubmit,
+    apply_action, apply_deferred_config, handle_running_action, handle_running_key, request_stop,
+    running_key_outcome, submit_running_input, LiveSession, RunningActionOutcome,
+    RunningKeyOutcome, RunningSubmit,
 };
-use tokio::sync::mpsc::unbounded_channel;
+use std::sync::Mutex;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 /// A live session, which owns both halves of the command channel until a
 /// worker claims the receiver half.
@@ -1469,4 +1473,589 @@ fn replay_mode_records_no_live_activity() {
     let status = app.status_line();
     assert!(status.contains("replay"), "{status}");
     assert!(!status.contains("running"), "{status}");
+}
+
+// ---------------------------------------------------------------------------
+// P1b Task 4b: routing a console action while a goal is live.
+// ---------------------------------------------------------------------------
+
+/// Env-touching tests in this file share one process, so they take this
+/// lock: two of them setting the same knob concurrently would make each
+/// other's env assertion a race.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Save the named env vars, clear them for the test, and put them back
+/// when it ends — a knob set here must not leak into the next test.
+struct EnvRestore(Vec<(&'static str, Option<String>)>);
+
+impl EnvRestore {
+    fn new(keys: &[&'static str]) -> Self {
+        let saved: Vec<(&'static str, Option<String>)> = keys
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect();
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        for (key, value) in &self.0 {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+/// The running-path dispatch exactly as the pump's Enter branch calls it:
+/// one real command channel, one real sink, no terminal.
+fn running_action(
+    app: &mut App,
+    action: Action,
+    commands: &UnboundedSender<RunCommand>,
+    raw: &str,
+) -> RunningActionOutcome {
+    let trace = TraceSink::new();
+    let mut awaiting_key: Option<String> = None;
+    handle_running_action(app, action, commands, raw, &trace, &mut awaiting_key)
+}
+
+/// A live goal and an empty command channel: the state every routing test
+/// starts from, so "nothing was sent" is a claim about the action alone.
+fn live_goal() -> (
+    App,
+    UnboundedSender<RunCommand>,
+    tokio::sync::mpsc::UnboundedReceiver<RunCommand>,
+) {
+    let (tx, rx) = unbounded_channel::<RunCommand>();
+    let mut app = App::new();
+    app.begin_run("busy");
+    (app, tx, rx)
+}
+
+/// A knob typed while a goal is live is not applied to the running goal
+/// and is not a command: it is held for the next one, written to the env
+/// at submission time, and reported as deferred. The env write is the
+/// point — a queued goal is started by the worker, so the pump can never
+/// run just before it and the write cannot wait for one.
+#[test]
+fn a_knob_while_running_is_deferred_and_written_to_the_env_now() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvRestore::new(&["ROF_ATTEMPTS"]);
+    let (mut app, tx, mut rx) = live_goal();
+    app.input.push_str("/attempts 2");
+
+    let draft = app.input.clone();
+    assert_eq!(
+        running_action(&mut app, Action::Attempts(2), &tx, &draft),
+        RunningActionOutcome::Deferred
+    );
+
+    assert_eq!(app.deferred_config, vec![DeferredConfig::Attempts(2)]);
+    assert_eq!(
+        std::env::var("ROF_ATTEMPTS").as_deref(),
+        Ok("2"),
+        "a deferred knob was not written to the env at submission time"
+    );
+    assert_eq!(
+        app.transcript.last().map(String::as_str),
+        Some("attempts=2 (ROF_ATTEMPTS, applies to the next goal)")
+    );
+    // A setting is not a command and occupies no control slot: the run in
+    // flight is untouched and the worker sees nothing new.
+    assert!(
+        rx.try_recv().is_err(),
+        "a knob reached the worker as a command"
+    );
+    assert!(app.pending_goal.is_none());
+    assert!(app.pending_steer.is_none());
+    assert_eq!(app.run_mode, RunMode::Running);
+    assert!(app.input.is_empty(), "a handled line kept the draft");
+}
+
+/// Deferring is a record, not a slot: two different settings both stay, in
+/// submission order, so a later knob can never displace an earlier one.
+#[test]
+fn a_second_deferred_setting_keeps_the_first_in_submission_order() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvRestore::new(&["ROF_ATTEMPTS", "ROF_MAX_ROUNDS"]);
+    let (mut app, tx, _rx) = live_goal();
+
+    for (action, raw) in [
+        (Action::Attempts(2), "/attempts 2"),
+        (Action::Rounds(4), "/rounds 4"),
+    ] {
+        assert_eq!(
+            running_action(&mut app, action, &tx, raw),
+            RunningActionOutcome::Deferred
+        );
+    }
+
+    assert_eq!(
+        app.deferred_config,
+        vec![DeferredConfig::Attempts(2), DeferredConfig::Rounds(4)]
+    );
+    assert_eq!(std::env::var("ROF_ATTEMPTS").as_deref(), Ok("2"));
+    assert_eq!(std::env::var("ROF_MAX_ROUNDS").as_deref(), Ok("4"));
+}
+
+/// Credential actions are the one thing a live goal must not absorb:
+/// they are refused outright, with no credential read, no env write, and
+/// no store call. Nothing in the refusal may echo a secret either.
+#[test]
+fn credential_actions_are_refused_while_a_goal_is_live() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvRestore::new(&["OR_TOKEN", "ROF_ATTEMPTS", "ROF_CREDENTIALS"]);
+    std::env::set_var("OR_TOKEN", "env-token-must-survive");
+    let creds = std::env::temp_dir().join(format!("rof-p1b-refused-creds-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&creds);
+    std::fs::create_dir_all(&creds).unwrap();
+    std::env::set_var("ROF_CREDENTIALS", creds.join("credentials.json"));
+    let (mut app, tx, mut rx) = live_goal();
+
+    for (action, raw) in [
+        (
+            Action::Login(Some("acme".into())),
+            "/login acme super-secret",
+        ),
+        (Action::ProviderRm("acme".into()), "/provider rm acme"),
+    ] {
+        app.input.push_str(raw);
+        let draft = app.input.clone();
+        match running_action(&mut app, action, &tx, &draft) {
+            RunningActionOutcome::Rejected(reason) => assert!(
+                reason.contains("available between goals"),
+                "the refusal does not say when it is available: {reason}"
+            ),
+            other => panic!("a credential action was routed as {other:?}"),
+        }
+        assert_eq!(app.input, raw, "a refused line cleared the draft");
+        app.input.clear();
+    }
+
+    assert_eq!(
+        std::env::var("OR_TOKEN").as_deref(),
+        Ok("env-token-must-survive"),
+        "a refused credential action wrote the env"
+    );
+    assert!(
+        std::env::var("ROF_ATTEMPTS").is_err(),
+        "a refused credential action deferred a setting"
+    );
+    assert!(app.deferred_config.is_empty());
+    assert!(rx.try_recv().is_err(), "a credential action sent a command");
+    assert!(
+        !creds.join("credentials.json").exists(),
+        "a refused credential action touched the credentials store"
+    );
+    let _ = std::fs::remove_dir_all(&creds);
+}
+
+/// `/busy queue` is a posture change and nothing more: the mode is set so
+/// the next submission stores a goal, but no command is sent now and the
+/// draft is consumed.
+#[test]
+fn queue_mode_while_running_sends_nothing() {
+    let (mut app, tx, mut rx) = live_goal();
+    app.input.push_str("/busy queue");
+
+    let draft = app.input.clone();
+    assert_eq!(
+        running_action(&mut app, Action::Busy("queue".into()), &tx, &draft),
+        RunningActionOutcome::BusyMode(BusyMode::Queue)
+    );
+
+    assert_eq!(app.busy_mode, BusyMode::Queue);
+    assert!(rx.try_recv().is_err(), "a busy mode sent a command");
+    assert_eq!(app.run_mode, RunMode::Running);
+    assert!(app.input.is_empty());
+}
+
+/// `/busy interrupt` asks for the stop path, so it is routed as a stop
+/// request and not as anything this function sends: the pump's shared
+/// stop path owns that send, and two sends would not agree.
+#[test]
+fn interrupt_mode_while_running_arms_the_stop_and_sends_nothing() {
+    let (mut app, tx, mut rx) = live_goal();
+    app.input.push_str("/busy interrupt");
+
+    let draft = app.input.clone();
+    assert_eq!(
+        running_action(&mut app, Action::Busy("interrupt".into()), &tx, &draft),
+        RunningActionOutcome::Stop
+    );
+
+    assert_eq!(app.busy_mode, BusyMode::Interrupt);
+    assert!(
+        rx.try_recv().is_err(),
+        "interrupt mode sent a command of its own"
+    );
+    assert!(app.input.is_empty());
+}
+
+/// A read-only action still works while a goal is live: it renders into
+/// the transcript, changes no run state, and sends nothing.
+#[test]
+fn a_view_action_while_running_still_renders_its_own_line() {
+    let (mut app, tx, mut rx) = live_goal();
+    app.input.push_str("/context");
+
+    let draft = app.input.clone();
+    assert_eq!(
+        running_action(&mut app, Action::Context, &tx, &draft),
+        RunningActionOutcome::View
+    );
+
+    assert!(
+        app.transcript
+            .iter()
+            .any(|line| line.starts_with("context: ")),
+        "a view action rendered no line: {:?}",
+        app.transcript
+    );
+    assert!(rx.try_recv().is_err(), "a view action sent a command");
+    assert_eq!(app.run_mode, RunMode::Running);
+    assert!(app.input.is_empty());
+    assert!(app.deferred_config.is_empty());
+}
+
+/// The env write happens when the setting is submitted, so a setting typed
+/// while a goal is ALREADY QUEUED is picked up by that very goal — the
+/// worker rebuilds config when it starts it. Claiming the setting would land
+/// "after queued goal" would be a lie, and would hide a live knob change.
+#[test]
+fn a_setting_typed_while_a_goal_is_queued_applies_to_that_goal() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvRestore::new(&["ROF_ATTEMPTS"]);
+    let (mut app, tx, _rx) = live_goal();
+    app.submit_pending_goal("then fix the lexer");
+
+    let draft = "/attempts 2".to_string();
+    assert_eq!(
+        running_action(&mut app, Action::Attempts(2), &tx, &draft),
+        RunningActionOutcome::Deferred
+    );
+
+    // The value is already in the env, which is what the queued goal reads
+    // when the worker starts it.
+    assert_eq!(std::env::var("ROF_ATTEMPTS").as_deref(), Ok("2"));
+    assert_eq!(
+        app.transcript.last().map(String::as_str),
+        Some("attempts=2 (ROF_ATTEMPTS, applies to the next goal)"),
+        "the wording must not promise to wait past a queued goal"
+    );
+    assert_eq!(app.deferred_config, vec![DeferredConfig::Attempts(2)]);
+}
+
+/// The draft is the user's: a handled line is spent, a refused one stays
+/// so it can be corrected. This is what makes a refusal recoverable
+/// without retyping the line.
+#[test]
+fn a_refused_line_keeps_its_draft_while_a_handled_one_is_cleared() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvRestore::new(&["ROF_ATTEMPTS", "OR_TOKEN"]);
+    let (mut app, tx, _rx) = live_goal();
+
+    app.input.push_str("/logout openrouter");
+    let refused = app.input.clone();
+    assert!(matches!(
+        running_action(&mut app, Action::Logout("openrouter".into()), &tx, &refused),
+        RunningActionOutcome::Rejected(_)
+    ));
+    assert_eq!(app.input, "/logout openrouter");
+
+    app.input.clear();
+    app.input.push_str("/attempts 2");
+    let deferred = app.input.clone();
+    assert_eq!(
+        running_action(&mut app, Action::Attempts(2), &tx, &deferred),
+        RunningActionOutcome::Deferred
+    );
+    assert!(app.input.is_empty());
+
+    app.input.push_str("/context");
+    let viewed = app.input.clone();
+    assert_eq!(
+        running_action(&mut app, Action::Context, &tx, &viewed),
+        RunningActionOutcome::View
+    );
+    assert!(app.input.is_empty());
+}
+
+/// The deferred list is a record of what is waiting, so it ends with the
+/// goal it was waiting for: a fresh run must not inherit settings that
+/// were already consumed.
+#[test]
+fn begin_run_clears_the_deferred_settings() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvRestore::new(&["ROF_ATTEMPTS"]);
+    let (mut app, tx, _rx) = live_goal();
+
+    let draft = "/attempts 2".to_string();
+    running_action(&mut app, Action::Attempts(2), &tx, &draft);
+    assert_eq!(app.deferred_config.len(), 1);
+    assert!(app.control_summary().contains("deferred"));
+
+    app.begin_run("the next goal");
+    assert!(
+        app.deferred_config.is_empty(),
+        "deferred settings outlived the goal they were waiting for"
+    );
+    assert!(!app.control_summary().contains("deferred"));
+    // The env write is not undone: the goal that starts now reads it.
+    assert_eq!(std::env::var("ROF_ATTEMPTS").as_deref(), Ok("2"));
+}
+
+/// One env mapping, two callers: a setting applied between goals and the
+/// same setting applied while one is live must leave the same env behind
+/// and say the same thing, or the two paths have drifted.
+#[test]
+fn the_shared_env_helper_agrees_from_both_paths() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvRestore::new(&["ROF_ATTEMPTS", "ROF_MAX_ROUNDS", "OR_TOKEN"]);
+
+    // Between goals: the between-goals dispatcher, which must reach the
+    // same env mapping through the same helper the running path uses.
+    let trace = TraceSink::new();
+    let mut idle = App::new();
+    let mut awaiting_key: Option<String> = None;
+    let raw = "/attempts 2".to_string();
+    let quit = apply_action(
+        &mut idle,
+        &trace,
+        Action::Attempts(2),
+        &raw,
+        &mut awaiting_key,
+    );
+    assert!(!quit, "a knob ended the console");
+    let idle_wording = idle.transcript.last().cloned().expect("no wording");
+
+    // While live: the same setting through the running path.
+    let (mut app, tx, _rx) = live_goal();
+    let draft = raw.clone();
+    assert_eq!(
+        running_action(&mut app, Action::Attempts(2), &tx, &draft),
+        RunningActionOutcome::Deferred
+    );
+    let running_wording = app.transcript.last().cloned().expect("no wording");
+
+    assert_eq!(std::env::var("ROF_ATTEMPTS").as_deref(), Ok("2"));
+    assert_eq!(
+        running_wording, idle_wording,
+        "the two paths worded the same setting differently"
+    );
+
+    // And the helper itself, called directly, is the single env mapping.
+    let direct = apply_deferred_config(&DeferredConfig::Rounds(4));
+    assert_eq!(std::env::var("ROF_MAX_ROUNDS").as_deref(), Ok("4"));
+    assert!(direct.contains("ROF_MAX_ROUNDS"), "{direct}");
+}
+
+/// `/display` only draws a line, so it is a view action while live.
+/// `/quit` is the one that is refused: a single keystroke must not end the
+/// console and abandon a worker that is still writing its trace, and the
+/// draft stays so the line can be corrected.
+#[test]
+fn display_is_a_view_action_and_quit_is_refused_while_running() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvRestore::new(&["OR_TOKEN", "ROF_ATTEMPTS"]);
+    std::env::set_var("OR_TOKEN", "env-token-must-survive");
+    let (mut app, tx, mut rx) = live_goal();
+
+    app.input.push_str("/display fullscreen");
+    let viewed = app.input.clone();
+    assert_eq!(
+        running_action(&mut app, Action::Display("fullscreen".into()), &tx, &viewed),
+        RunningActionOutcome::View
+    );
+    assert!(
+        app.transcript.iter().any(|l| l.contains("fullscreen")),
+        "a display action rendered no line: {:?}",
+        app.transcript
+    );
+    assert_eq!(
+        std::env::var("OR_TOKEN").as_deref(),
+        Ok("env-token-must-survive")
+    );
+
+    app.input.clear();
+    app.input.push_str("/quit");
+    let refused = app.input.clone();
+    match running_action(&mut app, Action::Quit, &tx, &refused) {
+        RunningActionOutcome::Rejected(reason) => {
+            assert!(reason.contains("between goals"), "{reason}");
+            for key in ["q", "Esc", "Ctrl-C"] {
+                assert!(
+                    reason.contains(key),
+                    "the refusal does not name {key}: {reason}"
+                );
+            }
+        }
+        other => panic!("/quit was routed as {other:?}"),
+    }
+    assert_eq!(app.input, "/quit", "a refused /quit cleared the draft");
+    assert!(rx.try_recv().is_err(), "/quit sent a command");
+    assert!(app.pending_goal.is_none() && app.pending_steer.is_none());
+    assert_eq!(app.run_mode, RunMode::Running, "/quit moved the run state");
+    assert_eq!(
+        std::env::var("OR_TOKEN").as_deref(),
+        Ok("env-token-must-survive")
+    );
+    assert!(app.deferred_config.is_empty());
+}
+
+/// The pump's Enter branch decides between an action and a submission by
+/// parsing the draft, and the two go to different reducers: a slash line
+/// never rides the command channel as steer text, and goal text never
+/// becomes a slash action.
+#[test]
+fn the_enter_route_splits_on_the_parse_of_the_draft() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvRestore::new(&["ROF_ATTEMPTS"]);
+    let (mut app, tx, mut rx) = live_goal();
+
+    app.input.push_str("/attempts 2");
+    let slash = app.input.clone();
+    let action = parse(&slash).expect("a slash line did not parse");
+    assert_eq!(
+        running_action(&mut app, action, &tx, &slash),
+        RunningActionOutcome::Deferred
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "an action route put something on the command channel"
+    );
+
+    app.input.push_str("focus on the parser");
+    let goal = app.input.clone();
+    assert!(parse(&goal).is_none(), "goal text parsed as a command");
+    assert_eq!(
+        submit_running_input(&mut app, &tx, &goal),
+        RunningSubmit::Sent(ControlKind::Steer)
+    );
+    assert!(matches!(rx.try_recv(), Ok(RunCommand::Steer { .. })));
+}
+
+/// The modifier decision belongs to the same helper that reads the key, so
+/// a MODIFIED key can never reach the reducer's stop arms. Those arms set
+/// the stopping posture as a side effect, and a stopping run refuses to
+/// start a queued goal — so Shift+q silently dropping a queued goal is the
+/// exact regression this pins.
+#[test]
+fn only_an_unmodified_stop_key_reaches_the_stop_arms() {
+    use crossterm::event::KeyModifiers;
+
+    let mut app = App::new();
+    app.begin_run("busy");
+    app.submit_pending_goal("then fix the lexer");
+
+    // Ctrl-C is the one modified key that IS a stop key.
+    assert_eq!(
+        running_key_outcome(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+        RunningKeyOutcome::StopArmed
+    );
+
+    // Every other modified key is ordinary input and must not move the
+    // posture, or the queued goal above would be dropped by the guard that
+    // refuses to reopen a stopping run.
+    for (code, modifiers) in [
+        (KeyCode::Char('q'), KeyModifiers::SHIFT),
+        (KeyCode::Char('q'), KeyModifiers::ALT),
+        (KeyCode::Char('Q'), KeyModifiers::SHIFT),
+        (KeyCode::Esc, KeyModifiers::CONTROL),
+        (KeyCode::Esc, KeyModifiers::ALT),
+    ] {
+        assert_eq!(
+            running_key_outcome(&mut app, code, modifiers),
+            RunningKeyOutcome::Ignored,
+            "{code:?} with {modifiers:?} must not be a stop key"
+        );
+    }
+    assert_eq!(
+        app.run_mode,
+        RunMode::Running,
+        "a modified key moved the posture"
+    );
+    assert!(app.pending_goal.is_some(), "the queued goal survived");
+
+    // The unmodified stop keys still work, and `q` only when the draft is
+    // empty so goal text containing `q` stays typeable.
+    assert_eq!(
+        running_key_outcome(&mut app, KeyCode::Char('q'), KeyModifiers::NONE),
+        RunningKeyOutcome::StopArmed
+    );
+    let mut typed = App::new();
+    typed.begin_run("busy");
+    typed.input.push('q');
+    assert_eq!(
+        running_key_outcome(&mut typed, KeyCode::Char('q'), KeyModifiers::NONE),
+        RunningKeyOutcome::Ignored
+    );
+    assert_eq!(
+        running_key_outcome(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+        RunningKeyOutcome::Submit
+    );
+}
+
+/// A stop is requested once. `/busy interrupt` after a stop key must not
+/// send a second command, repeat the hint, or be read as the second press
+/// that detaches and exits — only a key press does that.
+#[test]
+fn a_stop_is_requested_once_however_many_times_it_is_asked_for() {
+    let (command_tx, mut command_rx) = unbounded_channel::<RunCommand>();
+    // The sender is held (not dropped) for the session's lifetime, exactly
+    // as the pump does, so the receiver is never spuriously closed.
+    let (_event_tx, event_rx) = unbounded_channel::<LiveEvent>();
+    let mut session = live_session(event_rx);
+    let mut app = App::new();
+    app.begin_run("busy");
+
+    request_stop(&mut app, &mut session, &command_tx);
+    assert!(matches!(command_rx.try_recv(), Ok(RunCommand::Stop { .. })));
+    assert!(session.stop_requested());
+    assert_eq!(app.run_mode, RunMode::Stopping);
+    let hints = app
+        .transcript
+        .iter()
+        .filter(|l| l.contains("stop requested"))
+        .count();
+    assert_eq!(hints, 1);
+
+    // A second request from the command path changes no state and sends
+    // nothing; it only says the stop already stands.
+    request_stop(&mut app, &mut session, &command_tx);
+    assert!(command_rx.try_recv().is_err(), "a second Stop was sent");
+    let hints = app
+        .transcript
+        .iter()
+        .filter(|l| l.contains("stop requested"))
+        .count();
+    assert_eq!(hints, 1, "the stop hint was repeated");
+    assert!(session.stop_requested());
+}
+
+/// A mode change is narrated on the live path too. Silently switching to
+/// `queue` would turn the user's next Enter into a queued goal they never
+/// asked for.
+#[test]
+fn a_busy_mode_change_is_narrated_while_a_goal_runs() {
+    let (mut app, tx, _rx) = live_goal();
+
+    assert_eq!(
+        running_action(&mut app, parse("/busy queue").unwrap(), &tx, "/busy queue"),
+        RunningActionOutcome::BusyMode(BusyMode::Queue)
+    );
+    assert_eq!(app.busy_mode, BusyMode::Queue);
+    assert!(
+        app.transcript
+            .iter()
+            .any(|line| line.contains("busy=queue")),
+        "the mode change was silent: {:?}",
+        app.transcript
+    );
 }

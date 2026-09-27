@@ -116,5 +116,23 @@ pub fn parse(input: &str) -> Option<Action> {
 }
 
 pub fn help_text() -> String {
-    "/quit /help /model <p/m> /model ctx|verify|fallback <p/m> /models /login [provider] /logout <provider> /provider add|list|rm /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /busy interrupt|queue|steer /hotkeys".to_string()
+    "/quit /help /model <p/m> /model ctx|verify|fallback <p/m> /models /login [provider] /logout <provider> /provider add|list|rm /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /busy interrupt|queue|steer /hotkeys\n/busy: steer is the default — Enter during a run steers the live goal · queue stores exactly one next goal · interrupt arms the stop path (q/Esc/Ctrl-C)".to_string()
+}
+
+/// What `/busy <mode>` reports, per mode. The modes are postures, not
+/// commands, so the copy says what Enter will do under each one. No
+/// credential is ever named here: a `/busy` line is not a place for one.
+pub fn busy_line(mode: &str) -> String {
+    match mode {
+        "steer" => {
+            "busy=steer: the default — Enter during a run steers the live goal (nothing is interrupted)".to_string()
+        }
+        "queue" => {
+            "busy=queue: Enter during a run stores exactly one next goal, started when the live one finishes".to_string()
+        }
+        "interrupt" => {
+            "busy=interrupt: Enter during a run arms the stop path — press q/Esc/Ctrl-C to stop and exit".to_string()
+        }
+        other => format!("/busy takes steer|queue|interrupt (got {other})"),
+    }
 }

@@ -159,8 +159,10 @@ pub struct App {
     /// Configuration held for the next goal, never for the running one,
     /// in submission order, so the future applying path consumes every
     /// entry and an earlier setting is never dropped by a later one.
-    /// `App` itself never clears them: [`Self::begin_run`] starts a run
-    /// and leaves the entries for that path to consume.
+    /// The env is written when the setting is submitted; this list is the
+    /// user-visible record of what is waiting, so [`Self::begin_run`]
+    /// clears it — otherwise the record would outlive the goal the
+    /// settings were waiting for.
     pub deferred_config: Vec<DeferredConfig>,
     /// The next command id. Monotonic, so an acknowledgement always
     /// matches exactly one submission.
@@ -274,13 +276,17 @@ impl App {
     }
 
     /// Start a live run: a new goal clears the previous run's activity and
-    /// outcome, but never the transcript.
+    /// outcome, but never the transcript. It also clears the deferred
+    /// configuration: the env write for those settings already happened,
+    /// and the goal starting now is the one they were waiting for, so
+    /// keeping the record would show settings that are already in force.
     pub fn begin_run(&mut self, goal: &str) {
         self.activity.clear();
         self.activity_chars = 0;
         self.run_outcome = None;
         self.run_goal = goal.to_string();
         self.run_mode = RunMode::Running;
+        self.deferred_config.clear();
     }
 
     /// Arm a stop request. Only a running run can become `Stopping`; any

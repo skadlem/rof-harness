@@ -13,7 +13,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 
-use super::app::{App, BusyMode};
+use super::app::{App, BusyMode, DeferredConfig};
 use super::cmd::Action;
 use super::splash;
 use super::ui::draw;
@@ -226,6 +226,35 @@ pub fn handle_running_key(app: &mut App, code: KeyCode) -> RunningKeyOutcome {
     }
 }
 
+/// One key's meaning while a goal is live, WITH the modifier decision made
+/// here rather than in the pump.
+///
+/// This exists because [`handle_running_key`] cannot see modifiers: a bare
+/// `KeyCode` cannot tell Ctrl-C from typing `c`, and the reducer's `Esc`/`q`
+/// arms have the side effect of setting the stopping posture. If the pump
+/// asked the reducer first and filtered afterwards, a MODIFIED key would move
+/// the posture before anyone decided it was a stop key — and a stopping run
+/// refuses to start a queued goal, so Shift+q would silently drop one.
+/// Deciding here also means the reducer is consulted exactly once per key.
+pub fn running_key_outcome(
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> RunningKeyOutcome {
+    // Ctrl-C is matched on the modifier first, for the reason above.
+    if modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        return RunningKeyOutcome::StopArmed;
+    }
+    // Any other modified key is ordinary input: Shift+q is draft text,
+    // Alt+Esc is not a request to end the run.
+    if !modifiers.is_empty() {
+        return RunningKeyOutcome::Ignored;
+    }
+    handle_running_key(app, code)
+}
+
 /// What one composer submission did while a goal is live.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunningSubmit {
@@ -312,6 +341,303 @@ pub fn submit_running_input(
     });
     app.input.clear();
     RunningSubmit::Sent(kind)
+}
+
+/// What one slash action did while a goal was live. The pump reads this to
+/// decide whether anything else has to happen: a stop has to be asked for,
+/// a refusal has to be shown, and everything else has already said what it
+/// did in the transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunningActionOutcome {
+    /// Display-only: the action rendered into the transcript and changed
+    /// nothing else.
+    View,
+    /// Held for the next goal: the setting is in `App::deferred_config`,
+    /// the env already carries it, and the transcript says when it lands.
+    Deferred,
+    /// Not done, with the reason to show. The draft is kept so the line
+    /// can be corrected and submitted again.
+    Rejected(String),
+    /// The busy mode changed, which is the whole of the action: it sends
+    /// nothing and the next submission reads the new mode.
+    BusyMode(BusyMode),
+    /// Ask the running goal to stop. The pump owns the send, so this is
+    /// the same request the stop keys make.
+    Stop,
+}
+
+/// Apply one slash action while a goal is live, as a pure reducer over
+/// `App` plus the trace sink and the `/login` key capture the display
+/// actions share with the between-goals path.
+///
+/// The classification is the whole contract, and it is deliberately
+/// exhaustive over [`Action`]:
+///
+/// - **Display-only** — `Help`, `Unknown`, `Models`, `Context`, `Trace`,
+///   `Hotkeys`, `Diff`, `ProviderList`, `Display`, and the already
+///   unavailable `Retry`/`Approve`/`Reject`/`Undo` answers — go through
+///   [`apply_action`] exactly as they do between goals, and return
+///   [`RunningActionOutcome::View`]. They read state and write transcript
+///   lines, and a live goal is no reason to refuse a read.
+/// - **`Busy("steer" | "queue")`** sets the composer's busy mode, sends
+///   nothing, and returns the new mode. **`Busy("interrupt")`** sets
+///   `BusyMode::Interrupt` and returns [`RunningActionOutcome::Stop`]: it
+///   sends nothing itself, because the pump's one stop path does the
+///   sending and two sends would not agree.
+/// - **Knobs** — `Attempts`, `Rounds`, `Thinking`, `Effort`, `Caps`,
+///   `Model` — are appended to `App::deferred_config` in submission
+///   order, written to the env by [`apply_deferred_config`], and reported
+///   as [`RunningActionOutcome::Deferred`]. The running goal is untouched:
+///   it snapshotted its config when it started.
+/// - **Credentials** — `Login`, `Logout`, `ProviderAdd`, `ProviderRm` —
+///   are refused with [`RunningActionOutcome::Rejected`]: no credential is
+///   read, no env is written, and the store is not touched, so a running
+///   goal can never have its clients change under it.
+/// - **`Quit`** is refused too, and names the two-press stop path. It is
+///   deliberately NOT routed through [`apply_action`], whose `Quit` arm
+///   returns "end the console": one keystroke must not abandon a worker
+///   that is still writing its trace.
+///
+/// A handled line — view, deferred, busy mode, or stop — consumes the
+/// composer line, because it has been fully carried out. A refused line
+/// keeps it: nothing was done to it, so the user can fix it and submit
+/// again.
+pub fn handle_running_action(
+    app: &mut App,
+    action: Action,
+    commands: &tokio::sync::mpsc::UnboundedSender<RunCommand>,
+    raw: &str,
+    trace: &crate::obs::TraceSink,
+    awaiting_key: &mut Option<String>,
+) -> RunningActionOutcome {
+    // Every action routed here is display-only, a setting, a posture, or
+    // a refusal: none of them sends on the command channel. The parameter
+    // is part of the caller's one shape for a composer line, and the one
+    // send a live session does make — the stop — belongs to the pump, so
+    // `/busy interrupt` and the stop keys cannot drift into two
+    // disagreeing requests.
+    let _ = commands;
+    match action {
+        Action::Help
+        | Action::Unknown(_)
+        | Action::Models
+        | Action::Context
+        | Action::Trace
+        | Action::Hotkeys
+        | Action::Diff
+        | Action::ProviderList
+        | Action::Display(_)
+        | Action::Retry(_)
+        | Action::Approve(_)
+        | Action::Reject(_)
+        | Action::Undo => {
+            // The returned "quit" flag is false for every variant routed
+            // here: `Quit` is refused below instead of dispatched.
+            apply_action(app, trace, action, raw, awaiting_key);
+            app.input.clear();
+            RunningActionOutcome::View
+        }
+        Action::Quit => RunningActionOutcome::Rejected(QUIT_REFUSED.to_string()),
+        Action::Login(_) | Action::Logout(_) | Action::ProviderAdd(_) | Action::ProviderRm(_) => {
+            RunningActionOutcome::Rejected(credentials_refused(&action).to_string())
+        }
+        Action::Busy(mode) => {
+            let busy = match mode.as_str() {
+                "queue" => Some(BusyMode::Queue),
+                "interrupt" => Some(BusyMode::Interrupt),
+                // `parse` only produces the three known modes; anything
+                // else is reported the way the between-goals path reports
+                // it rather than guessed at.
+                _ => None,
+            };
+            match busy {
+                Some(busy) => {
+                    app.set_busy_mode(busy);
+                    app.input.clear();
+                    // The idle path narrates a mode change, so the live path
+                    // does too: a silent switch to `queue` would otherwise
+                    // turn the user's next Enter into a queued goal they did
+                    // not ask for.
+                    app.transcript
+                        .push(crate::tui::cmd::busy_line(busy_mode_word(busy)));
+                    if busy == BusyMode::Interrupt {
+                        RunningActionOutcome::Stop
+                    } else {
+                        RunningActionOutcome::BusyMode(busy)
+                    }
+                }
+                None => {
+                    apply_action(app, trace, Action::Busy(mode), raw, awaiting_key);
+                    app.input.clear();
+                    RunningActionOutcome::View
+                }
+            }
+        }
+        Action::Attempts(attempts) => deferred(app, DeferredConfig::Attempts(attempts)),
+        Action::Rounds(rounds) => deferred(app, DeferredConfig::Rounds(rounds)),
+        Action::Thinking(thinking) => deferred(app, DeferredConfig::Thinking(thinking)),
+        Action::Effort(effort) => deferred(app, DeferredConfig::Effort(effort)),
+        Action::Caps(implementer, reviewer) => {
+            deferred(app, DeferredConfig::Caps(implementer, reviewer))
+        }
+        Action::Model(_) => match model_change(raw) {
+            Ok(config) => deferred(app, config),
+            // The line named no model, so there is nothing to hold. The
+            // draft survives: it is one token away from being right.
+            Err(refusal) => RunningActionOutcome::Rejected(refusal.message().to_string()),
+        },
+    }
+}
+
+/// Hold one setting for the next goal, apply it to the env, say when it
+/// lands, and report it as deferred. The draft is consumed here because a
+/// deferred setting is fully carried out: the only outcome that keeps the
+/// line is a refusal.
+fn deferred(app: &mut App, config: DeferredConfig) -> RunningActionOutcome {
+    app.defer_config(config.clone());
+    let line = apply_deferred_config(&config);
+    app.transcript.push(line);
+    app.input.clear();
+    RunningActionOutcome::Deferred
+}
+
+/// What a `/model ...` line is missing. The two refusals print different
+/// advice between goals — the one-token form is a typo and gets the full
+/// command list — so they stay apart here rather than sharing a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelRefusal {
+    NeedsSpec,
+    NeedsForm,
+}
+
+impl ModelRefusal {
+    fn message(self) -> &'static str {
+        match self {
+            ModelRefusal::NeedsSpec => "/model needs <provider>/<model-id>",
+            ModelRefusal::NeedsForm => {
+                "/model needs <provider>/<model-id> (or /model ctx|verify|fallback <provider>/<model-id>)"
+            }
+        }
+    }
+
+    /// Whether the full command list follows this refusal.
+    fn shows_help(self) -> bool {
+        matches!(self, ModelRefusal::NeedsSpec)
+    }
+}
+
+/// The model setting a raw `/model ...` line names, in the one
+/// [`DeferredConfig`] shape both paths carry.
+///
+/// The two-token role forms ride the raw line: `parse()` keeps only the
+/// first token, so `Action::Model("ctx")` alone never names a model.
+fn model_change(raw: &str) -> Result<DeferredConfig, ModelRefusal> {
+    let toks: Vec<&str> = raw.split_whitespace().collect();
+    match toks.as_slice() {
+        [_, "ctx", id] => Ok(DeferredConfig::Model {
+            slot: Some("ctx".to_string()),
+            value: (*id).to_string(),
+        }),
+        [_, "verify", id] => Ok(DeferredConfig::Model {
+            slot: Some("verify".to_string()),
+            value: (*id).to_string(),
+        }),
+        [_, "fallback", id] => Ok(DeferredConfig::Model {
+            slot: Some("fallback".to_string()),
+            value: (*id).to_string(),
+        }),
+        [_, spec] if spec.contains('/') => Ok(DeferredConfig::Model {
+            slot: None,
+            value: (*spec).to_string(),
+        }),
+        [_, _] => Err(ModelRefusal::NeedsSpec),
+        _ => Err(ModelRefusal::NeedsForm),
+    }
+}
+
+/// `/quit` while a goal is live, naming the only way out that does not
+/// abandon a running worker.
+const QUIT_REFUSED: &str =
+    "/quit is available between goals — press q/Esc/Ctrl-C twice to stop the run and exit";
+
+/// Why a credential action cannot run against a live goal. The action is
+/// named, never its arguments: a refused `/login` line can carry a key.
+fn credentials_refused(action: &Action) -> &'static str {
+    match action {
+        Action::Login(_) => "/login is available between goals",
+        Action::Logout(_) => "/logout is available between goals",
+        Action::ProviderAdd(_) => "/provider add is available between goals",
+        _ => "/provider rm is available between goals",
+    }
+}
+
+/// Apply one deferred setting to the process env and return the transcript
+/// wording for it. This is the only place a knob's env name is written,
+/// so the between-goals path and the running path cannot drift apart.
+///
+/// The write happens HERE, at submission time, and never "just before the
+/// next goal starts": a QUEUED goal is started by the worker task, not by
+/// the pump, so the pump can never run at that instant for one. The next
+/// goal — queued, or typed later — reads these env names when
+/// `execute_with_control` builds its config, and the goal in flight is
+/// unaffected because it snapshotted its config and built its clients when
+/// it started. `App::deferred_config` is then only the ordered,
+/// user-visible record of what is waiting, which is why `App::begin_run`
+/// clears it: the record cannot outlive the goal the settings were waiting
+/// for. That timing is also why the wording never claims to wait past a
+/// queued goal — a setting submitted while one is queued does reach it.
+pub fn apply_deferred_config(config: &DeferredConfig) -> String {
+    let timing = "applies to the next goal";
+    match config {
+        DeferredConfig::Attempts(attempts) => {
+            std::env::set_var("ROF_ATTEMPTS", attempts.to_string());
+            format!("attempts={attempts} (ROF_ATTEMPTS, {timing})")
+        }
+        DeferredConfig::Rounds(rounds) => {
+            std::env::set_var("ROF_MAX_ROUNDS", rounds.to_string());
+            format!("rounds={rounds} (ROF_MAX_ROUNDS, {timing})")
+        }
+        DeferredConfig::Thinking(thinking) => {
+            std::env::set_var("ROF_THINKING", thinking);
+            format!("thinking={thinking} (ROF_THINKING, {timing})")
+        }
+        DeferredConfig::Effort(effort) => {
+            std::env::set_var("ROF_REASONING_EFFORT", effort);
+            format!("effort={effort} (ROF_REASONING_EFFORT, {timing})")
+        }
+        DeferredConfig::Caps(implementer, reviewer) => {
+            std::env::set_var("ROF_IMPLEMENTER_MAX_TOKENS", implementer.to_string());
+            std::env::set_var("ROF_REVIEWER_MAX_TOKENS", reviewer.to_string());
+            format!("caps implementer={implementer} reviewer={reviewer} ({timing})")
+        }
+        DeferredConfig::Model { slot, value } => {
+            match slot.as_deref() {
+                Some("ctx") => {
+                    std::env::set_var("ROF_CTX_MODEL", value);
+                    format!("context model={value} (ROF_CTX_MODEL, {timing} — clients rebuild per goal)")
+                }
+                Some("verify") => {
+                    std::env::set_var("ROF_VERIFY_MODEL", value);
+                    format!("verify model={value} (ROF_VERIFY_MODEL, {timing} — clients rebuild per goal)")
+                }
+                Some("fallback") if value == "none" => {
+                    std::env::remove_var("ROF_EXEC_FALLBACK");
+                    format!("executor fallback cleared ({timing})")
+                }
+                Some("fallback") => {
+                    std::env::set_var("ROF_EXEC_FALLBACK", value);
+                    format!("executor fallback={value} (ROF_EXEC_FALLBACK, {timing})")
+                }
+                // No slot, or one the console does not name: the executor
+                // model. `model_change` is the only producer of this variant
+                // and it uses exactly the three role slots above.
+                _ => {
+                    std::env::set_var("ROF_EXEC_MODEL", value);
+                    format!("model={value} (ROF_EXEC_MODEL, {timing} — clients rebuild per goal)")
+                }
+            }
+        }
+    }
 }
 
 /// Live session: one alternate-screen pump owns the whole console. Idle
@@ -414,40 +740,81 @@ where
                 continue;
             }
             if session.is_running() {
-                // Running posture: the composer is a scratch pad and the
-                // run is read-only. No slash action, no config mutation, no
-                // second goal is reachable from this branch.
-                //
-                // Ctrl-C is matched on the modifier first, because a bare
-                // `KeyCode` cannot tell it from typing `c`; the remaining
-                // stop keys (`q`/Esc) go through the pure helper, guarded
-                // by an empty modifier set so Shift/Alt/Ctrl+q stays draft
-                // text.
-                let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
-                let stop_key = ctrl_c
-                    || (key.modifiers.is_empty()
-                        && handle_running_key(&mut app, key.code) == RunningKeyOutcome::StopArmed);
-                // A stop key ends the key here: it must not also be typed
-                // into the draft.
-                if stop_key {
-                    // Once a stop is requested, do not clear the latch on
-                    // later typing: the user asked to stop, and a stray
-                    // draft keystroke must not silently cancel that request.
-                    if session.stop_requested() {
-                        // Second press: the call cannot be interrupted, so
-                        // the worker is detached rather than waited for.
-                        // Dropping the handle never aborts the task, and
-                        // whatever it has already written stays in the
-                        // JSONL trace.
-                        app.transcript.push(detach_hint());
-                        terminal.draw(|f| draw_frame(f, &app))?;
-                        return Ok(());
+                // Running posture: the run is watched in place, and the
+                // composer is both a steer/queue line and the place a
+                // console command is typed. `running_key_outcome` decides
+                // the key once, modifiers included, so nothing here can ask
+                // the reducer about a key it must not see.
+                match running_key_outcome(&mut app, key.code, key.modifiers) {
+                    RunningKeyOutcome::Submit => {
+                        // The reducers take `&mut App` and the line they
+                        // are to act on, so the line is read out first: the
+                        // pump must not decide anything about the draft
+                        // itself, because clearing it and keeping it belong
+                        // to the reducer.
+                        let draft = app.input.clone();
+                        match super::cmd::parse(&draft) {
+                            Some(action) => {
+                                match handle_running_action(
+                                    &mut app,
+                                    action,
+                                    session.command_sender(),
+                                    &draft,
+                                    trace,
+                                    &mut awaiting_key,
+                                ) {
+                                    // A refusal is the only outcome the
+                                    // transcript does not already carry: the
+                                    // display actions and the deferred setting
+                                    // each wrote their own line, so adding one
+                                    // here would say it twice.
+                                    RunningActionOutcome::Rejected(reason) => {
+                                        app.transcript.push(reason)
+                                    }
+                                    // The one send for a stop request lives in
+                                    // the shared path below, so `/busy
+                                    // interrupt` and the stop keys cannot
+                                    // produce two disagreeing requests.
+                                    RunningActionOutcome::Stop => {
+                                        let commands = session.command_sender().clone();
+                                        request_stop(&mut app, &mut session, &commands);
+                                    }
+                                    RunningActionOutcome::View
+                                    | RunningActionOutcome::Deferred
+                                    | RunningActionOutcome::BusyMode(_) => {}
+                                }
+                            }
+                            None => {
+                                if let RunningSubmit::Rejected(reason) =
+                                    submit_running_input(&mut app, session.command_sender(), &draft)
+                                {
+                                    app.transcript.push(reason);
+                                }
+                            }
+                        }
+                        continue;
                     }
-                    session.request_stop();
-                    app.set_stopping();
-                    app.transcript.push(stop_hint());
-                    continue;
+                    RunningKeyOutcome::StopArmed => {
+                        // Once a stop is requested, do not clear the latch on
+                        // later typing: the user asked to stop, and a stray
+                        // draft keystroke must not silently cancel that request.
+                        if session.stop_requested() {
+                            // Second press: the call cannot be interrupted, so
+                            // the worker is detached rather than waited for.
+                            // Dropping the handle never aborts the task, and
+                            // whatever it has already written stays in the
+                            // JSONL trace.
+                            app.transcript.push(detach_hint());
+                            terminal.draw(|f| draw_frame(f, &app))?;
+                            return Ok(());
+                        }
+                        let commands = session.command_sender().clone();
+                        request_stop(&mut app, &mut session, &commands);
+                        continue;
+                    }
+                    // Ignored: the key belongs to the composer or the
+                    // scrollback below.
+                    RunningKeyOutcome::Ignored => {}
                 }
                 match key.code {
                     KeyCode::Char(c)
@@ -611,6 +978,48 @@ fn quit_hint() -> String {
     "quit armed — press q/Esc/Ctrl-C again to exit".to_string()
 }
 
+/// First stop press on a live run, from either a stop key or a `/busy
+/// interrupt` action: the worker is asked to stop, and only asked. The
+/// command goes out under a fresh id so its acknowledgement is
+/// addressable, and a send that fails changes nothing else — the latch,
+/// the `Stopping` posture, and the hint the user reads are all here, and
+/// the worker still has to be asked even if the channel is gone.
+/// The composer word `/busy` uses for a mode, so the live path and the
+/// between-goals path narrate the same switch with the same text.
+fn busy_mode_word(mode: BusyMode) -> &'static str {
+    match mode {
+        BusyMode::Steer => "steer",
+        BusyMode::Queue => "queue",
+        BusyMode::Interrupt => "interrupt",
+    }
+}
+
+/// Ask the running goal to stop, once.
+///
+/// Idempotent by design: the latch and the hint belong to the FIRST request.
+/// A second `/busy interrupt` after a stop key must not send a second
+/// `RunCommand::Stop`, repeat the hint, or — above all — be mistaken for the
+/// second key press that detaches and exits; only a key press does that.
+/// A failed send changes nothing here: the latch, the stopping posture, and
+/// the hint are the P1a stop contract and do not depend on the channel.
+pub fn request_stop(
+    app: &mut App,
+    session: &mut LiveSession,
+    commands: &tokio::sync::mpsc::UnboundedSender<RunCommand>,
+) {
+    if session.stop_requested() {
+        app.transcript.push(
+            "stop already requested — press q/Esc/Ctrl-C again to detach and exit".to_string(),
+        );
+        return;
+    }
+    session.request_stop();
+    app.set_stopping();
+    let id = app.take_control_id();
+    let _ = commands.send(RunCommand::Stop { id });
+    app.transcript.push(stop_hint());
+}
+
 /// First stop press on a live run: the worker is asked, not interrupted.
 fn stop_hint() -> String {
     "stop requested — the current call cannot be interrupted; press q/Esc/Ctrl-C again to detach and exit"
@@ -644,13 +1053,14 @@ fn verify_blocking(provider: &str, key: &str) -> Result<Vec<String>, String> {
 }
 
 /// Apply a slash action between goals. Display-only actions render into the
-/// transcript; knob actions set the same env names the loop reads at call
-/// time; `/model` re-points the model vars and `/login` verifies + saves,
-/// both taking effect on the next goal because main rebuilds the config
-/// and the provider clients per goal. `raw` is the full composer line —
-/// `parse()` keeps only the first token, so the two-token `/model ctx`
-/// and `/login <prov> <key>` forms read from here. Returns true on quit.
-fn apply_action(
+/// transcript; knob actions go through [`apply_deferred_config`], which
+/// owns every env name they write; `/model` re-points the model vars and
+/// `/login` verifies + saves, both taking effect on the next goal because
+/// main rebuilds the config and the provider clients per goal. `raw` is
+/// the full composer line — `parse()` keeps only the first token, so the
+/// two-token `/model ctx` and `/login <prov> <key>` forms read from here.
+/// Returns true on quit.
+pub fn apply_action(
     app: &mut App,
     trace: &crate::obs::TraceSink,
     action: Action,
@@ -712,87 +1122,36 @@ fn apply_action(
         Action::Diff => app
             .transcript
             .push("diff view is not available in this console yet".to_string()),
-        Action::Attempts(n) => {
-            std::env::set_var("ROF_ATTEMPTS", n.to_string());
-            app.transcript.push(format!(
-                "attempts={n} (ROF_ATTEMPTS, applies to the next goal)"
-            ));
+        // The pump has already taken the composer line out of `input`
+        // before dispatch, so the shared holder's clear is a no-op here;
+        // what this path shares with the running one is the env mapping
+        // and the wording.
+        Action::Attempts(attempts) => {
+            deferred(app, DeferredConfig::Attempts(attempts));
         }
-        Action::Rounds(n) => {
-            std::env::set_var("ROF_MAX_ROUNDS", n.to_string());
-            app.transcript.push(format!(
-                "rounds={n} (ROF_MAX_ROUNDS, applies to the next goal)"
-            ));
+        Action::Rounds(rounds) => {
+            deferred(app, DeferredConfig::Rounds(rounds));
         }
-        Action::Thinking(m) => {
-            std::env::set_var("ROF_THINKING", &m);
-            app.transcript.push(format!(
-                "thinking={m} (ROF_THINKING, applies to the next goal)"
-            ));
+        Action::Thinking(thinking) => {
+            deferred(app, DeferredConfig::Thinking(thinking));
         }
-        Action::Effort(m) => {
-            std::env::set_var("ROF_REASONING_EFFORT", &m);
-            app.transcript.push(format!(
-                "effort={m} (ROF_REASONING_EFFORT, applies to the next goal)"
-            ));
+        Action::Effort(effort) => {
+            deferred(app, DeferredConfig::Effort(effort));
         }
-        Action::Caps(a, b) => {
-            std::env::set_var("ROF_IMPLEMENTER_MAX_TOKENS", a.to_string());
-            std::env::set_var("ROF_REVIEWER_MAX_TOKENS", b.to_string());
-            app.transcript.push(format!(
-                "caps implementer={a} reviewer={b} (applies to the next goal)"
-            ));
+        Action::Caps(implementer, reviewer) => {
+            deferred(app, DeferredConfig::Caps(implementer, reviewer));
         }
-        Action::Model(_) => {
-            // Two-token role forms ride the raw line: parse() keeps only
-            // the first token, so Model("ctx") alone never names a model.
-            let toks: Vec<&str> = raw.split_whitespace().collect();
-            match toks.as_slice() {
-                [_, "ctx", id] => {
-                    std::env::set_var("ROF_CTX_MODEL", id);
-                    app.transcript.push(format!(
-                        "context model={id} (ROF_CTX_MODEL, applies to the next goal — clients rebuild per goal)"
-                    ));
-                }
-                [_, "verify", id] => {
-                    std::env::set_var("ROF_VERIFY_MODEL", id);
-                    app.transcript.push(format!(
-                        "verify model={id} (ROF_VERIFY_MODEL, applies to the next goal — clients rebuild per goal)"
-                    ));
-                }
-                [_, "fallback", id] => {
-                    if *id == "none" {
-                        std::env::remove_var("ROF_EXEC_FALLBACK");
-                        app.transcript.push(
-                            "executor fallback cleared (applies to the next goal)".to_string(),
-                        );
-                    } else {
-                        std::env::set_var("ROF_EXEC_FALLBACK", id);
-                        app.transcript.push(format!(
-                            "executor fallback={id} (ROF_EXEC_FALLBACK, applies to the next goal)"
-                        ));
-                    }
-                }
-                [_, spec] => {
-                    if spec.contains('/') {
-                        std::env::set_var("ROF_EXEC_MODEL", spec);
-                        app.transcript.push(format!(
-                            "model={spec} (ROF_EXEC_MODEL, applies to the next goal — clients rebuild per goal)"
-                        ));
-                    } else {
-                        app.transcript
-                            .push("/model needs <provider>/<model-id>".to_string());
-                        app.transcript.push(super::cmd::help_text());
-                    }
-                }
-                _ => {
-                    app.transcript.push(
-                        "/model needs <provider>/<model-id> (or /model ctx|verify|fallback <provider>/<model-id>)"
-                            .to_string(),
-                    );
+        Action::Model(_) => match model_change(raw) {
+            Ok(config) => {
+                deferred(app, config);
+            }
+            Err(refusal) => {
+                app.transcript.push(refusal.message().to_string());
+                if refusal.shows_help() {
+                    app.transcript.push(super::cmd::help_text());
                 }
             }
-        }
+        },
         Action::Login(_) => {
             let toks: Vec<&str> = raw.split_whitespace().collect();
             match toks.as_slice() {
@@ -890,9 +1249,7 @@ fn apply_action(
         Action::Display(m) => app.transcript.push(format!(
             "display={m}: single fullscreen view in this console"
         )),
-        Action::Busy(m) => app.transcript.push(format!(
-            "busy={m}: one goal at a time; Enter during a run is read-only (P1a has no queue)"
-        )),
+        Action::Busy(m) => app.transcript.push(super::cmd::busy_line(&m)),
     }
     false
 }

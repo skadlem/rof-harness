@@ -266,8 +266,8 @@ While a worker is running, Enter behaves as follows:
   the existing stop request path and sends `RunCommand::Stop { id }` so a queued
   goal is dropped at the next boundary;
 - view-only slash commands: execute immediately;
-- deferred configuration commands: append to `deferred_config` and show
-  `applies to next goal`;
+- deferred configuration commands: append to `deferred_config`, write the
+  env, and show `applies to the next goal`;
 - `/login`, `/logout`, and provider mutations: reject with
   `available between goals`, without changing credentials or config;
 - the first q/Esc/Ctrl-C stop key also sends `RunCommand::Stop { id }`; the
@@ -287,18 +287,26 @@ initial goal still calls `begin_run` in the pump before its starter runs.
 
 ## Deferred configuration ordering
 
-Configuration actions are applied in this order immediately before a new
-`GoalRunner` is created:
+A setting submitted while a goal is live is written to the process env AT
+SUBMISSION, and recorded in `App.deferred_config` in submission order:
 
-1. drain `App.deferred_config` in submission order;
-2. apply each through the existing `apply_action`/env behavior;
-3. clear the list;
-4. start the goal.
+1. `defer_config` appends the setting, so the UI can show what is waiting;
+2. the env write happens immediately, through the one helper shared with the
+   between-goals path;
+3. `begin_run` clears the record, because the goal it was waiting for has now
+   started.
 
-If a queue goal is already registered, configuration submitted after that
-queue is applied before the goal after the queued one. The UI says
-`applies after queued goal` rather than implying immediate effect. No
-configuration is forwarded to the current worker.
+The timing is forced by ownership, not preference: a queued goal is started
+by the worker task, so the console can never run code immediately before it.
+The goal in flight is unaffected either way — it snapshotted its config and
+built its clients before the line was typed — and the next goal reads the env
+when it builds its own config.
+
+One consequence is worth stating plainly, because it is the opposite of the
+first draft of this design: a setting submitted while a goal is ALREADY
+QUEUED takes effect on that very goal, so the UI says `applies to the next
+goal` in every case. Promising `applies after queued goal` would misdescribe
+a live knob change. No configuration is forwarded to the current worker.
 
 ## Error handling
 

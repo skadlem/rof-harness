@@ -528,6 +528,12 @@ Before the pump starts a goal (idle or queued continuation), apply
 `deferred_config` in order through the existing action/env path and clear it.
 If a queue is already pending, label the message `applies after queued goal`.
 
+> **Superseded during implementation.** A queued goal is started by the
+> worker task, not by the pump, so the console can never run code "just
+> before" it — the env write happens at submission instead, and the queued
+> goal picks the setting up. The label is `applies to the next goal` in every
+> case. See the design doc's "Deferred configuration ordering" section.
+
 - [ ] **Step 5: Update `/busy` help/semantics**
 
 Keep the closed `Action::Busy` parser. Change the help/status copy so it says
