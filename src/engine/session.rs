@@ -791,6 +791,68 @@ pub fn answer_of(artifact: &serde_json::Value) -> String {
         .unwrap_or_else(|| "(none given)".to_string())
 }
 
+/// A changed path counts as TEST-SHAPED when it looks like a test by
+/// convention (§5's protected oracle). This is a conservative convention
+/// match, not a parser: it cannot know a file is a test unless the path says
+/// so, so it errs toward "not a test" — a test hidden as `src/foo.rs` is
+/// invisible to it. That is the deliberate trade for a rule that applies
+/// without reading a file's contents, and it is why the gate that consumes
+/// it only ever *refuses* a pass rather than asserting any coverage.
+///
+/// The list is short on purpose; each entry is a convention a mainstream
+/// community actually ships, and nothing else:
+/// - segments `tests`, `test`, `spec`: the default suite directories for Cargo,
+///   Go, RSpec, Jest and Maven, so anything inside one is part of the suite.
+/// - `test_*` basename: Rust's `#[cfg(test)]` convention, Python `unittest`,
+///   and the Go/shell harnesses that prefix rather than suffix.
+/// - `*_test.{go,py,rb,js,ts}`: Go's `*_test.go`, plus the pytest, minitest and
+///   Node suffix conventions.
+/// - `*Test.java` / `*Tests.cs`: JUnit and xUnit.net.
+/// - `*.test.*` / `*.spec.*`: the Jest/Vitest/Mocha/Jasmine mid-fixture form
+///   (`foo.test.js`), matched case-insensitively because those ecosystems do
+///   not agree on casing.
+pub fn is_test_shaped(path: &str) -> bool {
+    // Directory segments first: a change inside the suite directory is a
+    // suite change whatever its basename. Both separators, because a change
+    // set carries whatever the agent's tool wrote.
+    let is_sep = |c: char| c == '/' || c == '\\';
+    if path
+        .split(is_sep)
+        .any(|seg| matches!(seg, "tests" | "test" | "spec"))
+    {
+        return true;
+    }
+    let base = path.rsplit(is_sep).next().unwrap_or(path);
+    if base.starts_with("test_") {
+        return true;
+    }
+    if ["go", "py", "rb", "js", "ts"]
+        .iter()
+        .any(|ext| base.ends_with(&format!("_test.{ext}")))
+    {
+        return true;
+    }
+    if base.ends_with("Test.java") || base.ends_with("Tests.cs") {
+        return true;
+    }
+    // Both dots matter, so `test.js` and `foo.test` are not fixtures.
+    let lower = base.to_ascii_lowercase();
+    lower.contains(".test.") || lower.contains(".spec.")
+}
+
+/// The harness's refusal note when a run modified a protected oracle file
+/// (§5). The harness — not the reviewer — is named as the refuser and the
+/// offending paths are listed, so the feedback that reaches the next round
+/// cannot be read as a model verdict or a generic failure.
+pub fn oracle_refusal_feedback(paths: &[String]) -> String {
+    format!(
+        "harness: pass rejected — the run modified a test file it is scored \
+         against ({}). The suite is the oracle: revert the test and fix the \
+         code instead, because editing the assertion cannot pass the task.",
+        paths.join(", ")
+    )
+}
+
 fn strip_file_bodies(artifact: &serde_json::Value) -> (String, usize) {
     let mut slim = artifact.clone();
     let mut stripped = 0usize;
@@ -991,6 +1053,61 @@ mod evidence_tests {
             "(none given)"
         );
         assert_eq!(answer_of(&json!({"result": {}})), "(none given)");
+    }
+}
+
+#[cfg(test)]
+mod oracle_predicate_tests {
+    use super::is_test_shaped;
+
+    /// The suite directories are the strongest signal: a change inside one is
+    /// a change to the suite whatever the file happens to be called.
+    #[test]
+    fn a_path_inside_a_suite_directory_is_test_shaped() {
+        assert!(is_test_shaped("tests/oracle.rs"));
+        assert!(is_test_shaped("test/helpers.go"));
+        assert!(is_test_shaped("spec/models_spec.rb"));
+        assert!(is_test_shaped("src/tests/deep.rs"));
+        assert!(is_test_shaped("pkg/test/inner_test.go"));
+        // A change set carries whatever separator the agent's tool wrote.
+        assert!(is_test_shaped("a\\test\\b.go"));
+    }
+
+    /// Every basename convention the list names.
+    #[test]
+    fn a_conventional_basename_is_test_shaped() {
+        assert!(is_test_shaped("test_add.py"));
+        assert!(is_test_shaped("src/math_test.go"));
+        assert!(is_test_shaped("lib/calc_test.rb"));
+        assert!(is_test_shaped("pkg/calc_test.js"));
+        assert!(is_test_shaped("pkg/calc_test.ts"));
+        assert!(is_test_shaped("com/acme/AdderTest.java"));
+        assert!(is_test_shaped("com/acme/AdderTests.cs"));
+        assert!(is_test_shaped("src/add.test.js"));
+        assert!(is_test_shaped("src/add.spec.ts"));
+        // The mid-fixture match is case-insensitive: those ecosystems do not
+        // agree on casing.
+        assert!(is_test_shaped("src/Add.Spec.js"));
+    }
+
+    /// The conservative side of the trade: a test the convention does not name
+    /// is invisible to the gate, and ordinary source is never a test.
+    #[test]
+    fn an_ordinary_source_path_is_not_test_shaped() {
+        assert!(!is_test_shaped("src/lib.rs"));
+        assert!(!is_test_shaped("src/engine/orchestrator.rs"));
+        assert!(!is_test_shaped("internal/adder/adder.go"));
+        assert!(!is_test_shaped("app/models/user.rb"));
+        assert!(!is_test_shaped("src/index.js"));
+        assert!(!is_test_shaped("Makefile"));
+        assert!(!is_test_shaped("README.md"));
+        // The word alone is not a fixture, and `testing` is not the `test`
+        // segment — a near-miss must not become a false positive.
+        assert!(!is_test_shaped("test.go"));
+        assert!(!is_test_shaped("testing.rs"));
+        // `tests_` is not the `test_` prefix the list names.
+        assert!(!is_test_shaped("tests_helper.rs"));
+        assert!(!is_test_shaped(""));
     }
 }
 

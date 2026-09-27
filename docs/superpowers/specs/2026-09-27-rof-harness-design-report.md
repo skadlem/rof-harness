@@ -31,6 +31,19 @@ obvious reading of "meta harness layer":
 So the meta layer must be **sequential supervision over durable artifacts**,
 not parallel orchestration. **[inf]**
 
+## 1a. Ratified decisions (owner, 2026-09-27)
+
+1. **The reviewer never gains write capability.** It already holds no
+   `ToolRegistry` **[code]** `src/agents/reviewer.rs:16-24`; this is now policy,
+   not accident. When a review needs a check re-run, **the harness runs the
+   check** — the reviewer never gains the ability to modify the tree to satisfy
+   its own verdict. A reviewer that can write is a reviewer that can agree with
+   itself.
+2. **"Outperform" is cost-adjusted.** An arm ships only if it beats the
+   baseline on quality at equal or lower cost. Quality alone is not a win when
+   token spend explains 80% of performance variance **[ext]**. Absolute-quality
+   claims are not made.
+
 ## 2. What the evidence says to delete
 
 | Idea | Why it dies | Source |

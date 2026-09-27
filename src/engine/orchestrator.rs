@@ -630,6 +630,26 @@ impl Orchestrator {
                                     .to_string(),
                         };
                     }
+                    // Protected oracle (§5): a reviewer pass does not count
+                    // when the run rewrote the suite it is scored against —
+                    // the #319 "safe-tests" shape, where an agent edits a
+                    // failing assertion instead of the code it fails against.
+                    // Sibling to the write gate above, on the same evidence
+                    // (the `TreeDiff`) and the same write contract
+                    // (`expect_writes`): only a test-shaped path that existed
+                    // at baseline is protected, so a new test file — the
+                    // deliverable of an "add tests" task — never trips it.
+                    let tampered = diff.protected_oracle();
+                    if verdict.pass && session.expect_writes && !tampered.is_empty() {
+                        self.trace.emit(TraceEvent::StateTransition {
+                            from: "verdict_pass".to_string(),
+                            to: "rejected_oracle_modified".to_string(),
+                        });
+                        verdict = Verdict {
+                            pass: false,
+                            feedback: crate::engine::session::oracle_refusal_feedback(&tampered),
+                        };
+                    }
                     // v4 verify guard in the pipeline: a reviewer pass is not
                     // the final word when the outer judge is on. A veto fails
                     // the round like any other verdict, so the retry sees the
@@ -998,6 +1018,25 @@ impl Orchestrator {
                 // direct mode must not invent one.
                 let has_oracle = !check_results.is_empty() || session.expect_writes;
                 passed = has_oracle && (!session.expect_writes || writes_made > 0) && checks_ok;
+                // Protected oracle (§5), the same rule the pipeline loop's
+                // write-gate neighbour applies and on the same evidence.
+                // Direct mode has no reviewer, so the configured check suite —
+                // usually a test command — IS the oracle, which makes #319's
+                // shape the primary risk here rather than a secondary one: an
+                // agent that weakens a baseline assertion passes its own check
+                // and ships nothing. `oracle_refused` owns this round's
+                // feedback so the generic failure note below cannot talk over it.
+                let tampered = diff.protected_oracle();
+                let mut oracle_refused = false;
+                if passed && session.expect_writes && !tampered.is_empty() {
+                    self.trace.emit(TraceEvent::StateTransition {
+                        from: "direct_verdict".to_string(),
+                        to: "rejected_oracle_modified".to_string(),
+                    });
+                    passed = false;
+                    feedback = crate::engine::session::oracle_refusal_feedback(&tampered);
+                    oracle_refused = true;
+                }
                 if passed {
                     break;
                 }
@@ -1011,14 +1050,18 @@ impl Orchestrator {
                         .to_string();
                     break;
                 }
-                feedback = if writes_made == 0 && session.expect_writes {
-                    format!("no file change landed; emit the actual patch or write now{file_state}")
-                } else {
-                    format!(
-                    "the configured check failed; fix the change and retry.\nCHECK OUTPUT:\n{}{}",
-                    checks_log, file_state
-                )
-                };
+                if !oracle_refused {
+                    feedback = if writes_made == 0 && session.expect_writes {
+                        format!(
+                            "no file change landed; emit the actual patch or write now{file_state}"
+                        )
+                    } else {
+                        format!(
+                        "the configured check failed; fix the change and retry.\nCHECK OUTPUT:\n{}{}",
+                        checks_log, file_state
+                    )
+                    };
+                }
                 // §4.3: the same bounded auto-poke the pipeline loop has — a
                 // direct run used to stop at the cap even when the failure shape
                 // said "instruction problem".

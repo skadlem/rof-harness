@@ -61,6 +61,25 @@ impl TreeDiff {
     pub fn is_empty(&self) -> bool {
         self.names.is_empty()
     }
+
+    /// The test-shaped paths that existed at BASELINE — the protected oracle
+    /// (§5, build order item 1). A baseline test file the run modified or
+    /// deleted is tampering: Claude Code #319's agent "simply updated the make
+    /// file to only run tests that were passing" (its "safe-tests"), and the
+    /// corroborating reports describe edited assertions and tests kept "that
+    /// do absolutely nothing". A test-shaped path that is NEW is deliberately
+    /// excluded — `untracked` is git's own word for "not at baseline" —
+    /// because creating tests is a legitimate deliverable and a new file
+    /// cannot retroactively rewrite an existing failing assertion.
+    pub fn protected_oracle(&self) -> Vec<String> {
+        self.names
+            .iter()
+            .filter(|name| {
+                crate::engine::session::is_test_shaped(name) && !self.untracked.contains(name)
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 impl TreeService {
