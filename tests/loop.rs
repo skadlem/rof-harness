@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use rof::config::{AppConfig, PermissionPolicy};
+use rof::engine::control::{RunCommand, RunControl, RunHooks};
 use rof::engine::{Orchestrator, Session};
 use rof::llm::{ContextService, ExecutorService, LlmClient, LlmError, LlmReq, LlmResp};
-use rof::obs::{TraceEvent, TraceSink};
+use rof::obs::{ControlAck, ControlStatus, LiveEvent, TraceEvent, TraceSink};
 use rof::tools::{FsListTool, FsPatchTool, FsReadTool, ProcRunTool, ToolRegistry};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,9 @@ struct FakeClient {
     veto_guard: bool,
     /// Set when an implementer prompt carried the explorer line.
     saw_explorer: AtomicBool,
+    /// Every implementer prompt this client saw, in call order. Per client
+    /// rather than a global, so a parallel test cannot append to it.
+    impl_prompts: Mutex<Vec<String>>,
 }
 
 /// Set when a reviewer prompt carries the CHECKS section.
@@ -76,6 +80,7 @@ impl FakeClient {
             read_escape: false,
             veto_guard: false,
             saw_explorer: AtomicBool::new(false),
+            impl_prompts: Mutex::new(Vec::new()),
         }
     }
     fn fail_then_pass() -> Self {
@@ -93,6 +98,7 @@ impl FakeClient {
             read_escape: false,
             veto_guard: false,
             saw_explorer: AtomicBool::new(false),
+            impl_prompts: Mutex::new(Vec::new()),
         }
     }
     fn guess_then_fix() -> Self {
@@ -110,6 +116,7 @@ impl FakeClient {
             read_escape: false,
             veto_guard: false,
             saw_explorer: AtomicBool::new(false),
+            impl_prompts: Mutex::new(Vec::new()),
         }
     }
     fn applied_retry() -> Self {
@@ -129,6 +136,7 @@ impl FakeClient {
             read_escape: false,
             veto_guard: false,
             saw_explorer: AtomicBool::new(false),
+            impl_prompts: Mutex::new(Vec::new()),
         }
     }
     fn read_then_write() -> Self {
@@ -146,6 +154,7 @@ impl FakeClient {
             read_escape: false,
             veto_guard: false,
             saw_explorer: AtomicBool::new(false),
+            impl_prompts: Mutex::new(Vec::new()),
         }
     }
     fn read_escape() -> Self {
@@ -163,6 +172,7 @@ impl FakeClient {
             read_escape: true,
             veto_guard: false,
             saw_explorer: AtomicBool::new(false),
+            impl_prompts: Mutex::new(Vec::new()),
         }
     }
     fn resp(text: &str) -> Result<LlmResp, LlmError> {
@@ -186,6 +196,10 @@ impl LlmClient for FakeClient {
             return Self::resp("condensed: goal + task + prior feedback");
         }
         if req.system.contains("direct coding agent") {
+            // P1b boundary regression: direct mode returns before the
+            // implementer branch below, so the direct prompt has to be
+            // recorded here too for the same per-client capture to work.
+            self.impl_prompts.lock().unwrap().push(req.prompt.clone());
             let call = self.direct_calls.fetch_add(1, Ordering::SeqCst);
             if call > 0
                 && req.prompt.contains("CHECK OUTPUT:")
@@ -247,6 +261,12 @@ impl LlmClient for FakeClient {
                 return Self::resp("{\"pass\": false, \"feedback\": \"missing tests\"}");
             }
             return Self::resp("{\"pass\": true, \"feedback\": \"looks good\"}");
+        }
+        if req.system.contains("implementer") {
+            // P1b boundary regression: the steer is asserted to be absent from
+            // round 1 and present in round 2, so every implementer prompt is
+            // recorded in call order.
+            self.impl_prompts.lock().unwrap().push(req.prompt.clone());
         }
         if req.system.contains("implementer")
             && req.prompt.contains("PREVIOUS CHECKS:")
@@ -1225,4 +1245,345 @@ async fn a_read_request_outside_the_root_is_refused() {
     assert_eq!(out["passed"], false, "no writes means no pass");
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_file(&outside).ok();
+}
+
+/// P1b boundary: a steer submitted while round 1 runs is drained at that
+/// round's boundary and reaches the NEXT implementer prompt — never the one
+/// already in flight — and it does not change the run's verdict.
+#[tokio::test]
+async fn a_steer_drained_at_the_boundary_reaches_only_the_next_prompt() {
+    const STEER: &str = "focus the retry on the parser";
+    let session = || {
+        Session::new("g".into())
+            .expecting_writes(false)
+            .with_checks(vec!["echo checked".to_string()])
+    };
+
+    // Baseline: the same run with no command channel at all.
+    let base_client = Arc::new(FakeClient::fail_then_pass());
+    let (orch, reg, root) = harness(base_client, "steer-base", 2);
+    let base_out = orch.run_loop(&session(), &reg, &root).await;
+    assert_eq!(base_out["passed"], true);
+    assert_eq!(base_out["rounds"], 2);
+    std::fs::remove_dir_all(&root).ok();
+
+    // The steered run: the command is already in the channel when round 1
+    // reaches its boundary, so the drain is deterministic — no timing race.
+    let client = Arc::new(FakeClient::fail_then_pass());
+    let (orch, reg, root) = harness(client.clone(), "steer-run", 2);
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    cmd_tx
+        .send(RunCommand::Steer {
+            id: 1,
+            text: STEER.to_string(),
+        })
+        .unwrap();
+    let mut control = RunControl::new(cmd_rx);
+    let mut hooks = RunHooks {
+        control: Some(&mut control),
+        live: None,
+    };
+    let out = orch
+        .run_loop_with_hooks(&session(), &reg, &root, &mut hooks)
+        .await;
+    std::fs::remove_dir_all(&root).ok();
+
+    let prompts = client.impl_prompts.lock().unwrap().clone();
+    assert_eq!(prompts.len(), 2, "one implementer call per round");
+    assert!(
+        !prompts[0].contains(STEER),
+        "a steer must not reach the round already in flight: {}",
+        prompts[0]
+    );
+    assert!(
+        prompts[1].contains(STEER),
+        "the steer must reach the next implementer prompt: {}",
+        prompts[1]
+    );
+    // The hook is a boundary addition, not a behavior change.
+    assert_eq!(out["passed"], base_out["passed"]);
+    assert_eq!(out["rounds"], base_out["rounds"]);
+    assert_eq!(
+        out["tasks"][0]["feedback"], base_out["tasks"][0]["feedback"],
+        "a steer must not change the run's outcome"
+    );
+    assert!(control.take_queued_goal().is_none());
+}
+
+/// P1b boundary: a steer submitted while round 1 runs and drained at a round
+/// boundary that has no round behind it — round 1 was the run's last — must be
+/// refused, not acknowledged as applied and then dropped without a reader.
+/// The run's own outcome is unchanged by the refused steer.
+#[tokio::test]
+async fn a_steer_on_the_last_pipeline_round_is_rejected_not_applied() {
+    const STEER: &str = "focus the retry on the parser";
+    let session = || {
+        Session::new("g".into())
+            .expecting_writes(false)
+            .with_checks(vec!["echo checked".to_string()])
+    };
+
+    // Baseline: the same run (one round, failed) with no command channel.
+    let (orch, reg, root) = harness(Arc::new(FakeClient::fail_then_pass()), "steer-last-base", 1);
+    let base_out = orch.run_loop(&session(), &reg, &root).await;
+    assert_eq!(base_out["passed"], false);
+    assert_eq!(base_out["rounds"], 1);
+    std::fs::remove_dir_all(&root).ok();
+
+    let (orch, reg, root) = harness(Arc::new(FakeClient::fail_then_pass()), "steer-last", 1);
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    cmd_tx
+        .send(RunCommand::Steer {
+            id: 1,
+            text: STEER.to_string(),
+        })
+        .unwrap();
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut control = RunControl::new(cmd_rx);
+    let mut hooks = RunHooks {
+        control: Some(&mut control),
+        live: Some(&live_tx),
+    };
+    let out = orch
+        .run_loop_with_hooks(&session(), &reg, &root, &mut hooks)
+        .await;
+    std::fs::remove_dir_all(&root).ok();
+
+    let acks: Vec<ControlAck> = std::iter::from_fn(|| live_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            LiveEvent::Control(ack) => Some(ack),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acks.len(), 1, "the one steer is answered once: {acks:?}");
+    assert_eq!(acks[0].id, 1);
+    assert_eq!(acks[0].status, ControlStatus::Rejected);
+    assert!(
+        acks[0].note.contains("no next round"),
+        "the refusal names the missing round: {}",
+        acks[0].note
+    );
+    assert_eq!(out["passed"], base_out["passed"]);
+    assert_eq!(out["rounds"], base_out["rounds"]);
+    assert_eq!(
+        out["tasks"][0]["feedback"],
+        base_out["tasks"][0]["feedback"]
+    );
+}
+
+/// P1b boundary: the same run passes in round 1, so the steer has no later
+/// round to read it either. The refusal is the same one, and the run's output
+/// matches a no-hook run exactly.
+#[tokio::test]
+async fn a_steer_drained_when_the_first_round_passes_is_rejected_not_applied() {
+    const STEER: &str = "focus the retry on the parser";
+    let session = || {
+        Session::new("g".into())
+            .expecting_writes(false)
+            .with_checks(vec!["echo checked".to_string()])
+    };
+
+    let (orch, reg, root) = harness(Arc::new(FakeClient::pass()), "steer-pass-base", 2);
+    let base_out = orch.run_loop(&session(), &reg, &root).await;
+    assert_eq!(base_out["passed"], true);
+    assert_eq!(base_out["rounds"], 1);
+    std::fs::remove_dir_all(&root).ok();
+
+    let (orch, reg, root) = harness(Arc::new(FakeClient::pass()), "steer-pass", 2);
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    cmd_tx
+        .send(RunCommand::Steer {
+            id: 1,
+            text: STEER.to_string(),
+        })
+        .unwrap();
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut control = RunControl::new(cmd_rx);
+    let mut hooks = RunHooks {
+        control: Some(&mut control),
+        live: Some(&live_tx),
+    };
+    let out = orch
+        .run_loop_with_hooks(&session(), &reg, &root, &mut hooks)
+        .await;
+    std::fs::remove_dir_all(&root).ok();
+
+    let acks: Vec<ControlAck> = std::iter::from_fn(|| live_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            LiveEvent::Control(ack) => Some(ack),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acks.len(), 1, "the one steer is answered once: {acks:?}");
+    assert_eq!(acks[0].id, 1);
+    assert_eq!(acks[0].status, ControlStatus::Rejected);
+    assert!(
+        acks[0].note.contains("no next round"),
+        "the refusal names the missing round: {}",
+        acks[0].note
+    );
+    assert_eq!(out["passed"], base_out["passed"]);
+    assert_eq!(out["rounds"], base_out["rounds"]);
+    assert_eq!(
+        out["tasks"][0]["feedback"],
+        base_out["tasks"][0]["feedback"]
+    );
+}
+
+/// P1b boundary, direct mode: the same rule as the pipeline round hook. A
+/// steer submitted while round 1 runs and drained at that round's boundary
+/// reaches the SECOND direct prompt, never the one in flight — and when the
+/// direct run's cap is exhausted by that round, it is refused instead.
+#[tokio::test]
+async fn a_direct_steer_reaches_only_the_next_prompt() {
+    const STEER: &str = "focus the retry on the parser";
+    let client = Arc::new(FakeClient::pass());
+    let (orch, reg, root) = harness_with(client.clone(), "direct-steer", 2, |cfg| {
+        cfg.execution = "direct".to_string();
+    });
+    std::fs::write(root.join("a.txt"), "before\n").unwrap();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    cmd_tx
+        .send(RunCommand::Steer {
+            id: 1,
+            text: STEER.to_string(),
+        })
+        .unwrap();
+    let mut control = RunControl::new(cmd_rx);
+    let mut hooks = RunHooks {
+        control: Some(&mut control),
+        live: None,
+    };
+    let out = orch
+        .run_loop_with_hooks(
+            &Session::new("edit a.txt".into()).with_checks(vec!["false".to_string()]),
+            &reg,
+            &root,
+            &mut hooks,
+        )
+        .await;
+    std::fs::remove_dir_all(&root).ok();
+
+    let prompts = client.impl_prompts.lock().unwrap().clone();
+    assert_eq!(prompts.len(), 2, "one direct call per round");
+    assert!(
+        !prompts[0].contains(STEER),
+        "a steer must not reach the round already in flight: {}",
+        prompts[0]
+    );
+    assert!(
+        prompts[1].contains(STEER),
+        "the steer must reach the next direct prompt: {}",
+        prompts[1]
+    );
+    assert_eq!(out["rounds"], 2);
+    assert_eq!(out["passed"], false);
+}
+
+/// P1b boundary, direct mode: the last round of the cap has no round behind
+/// it either, so a steer drained there is refused rather than applied to a
+/// feedback string nothing will read.
+#[tokio::test]
+async fn a_direct_steer_on_the_last_cap_round_is_rejected_not_applied() {
+    const STEER: &str = "focus the retry on the parser";
+    let (orch, reg, root) = harness_with(
+        Arc::new(FakeClient::pass()),
+        "direct-steer-last",
+        1,
+        |cfg| {
+            cfg.execution = "direct".to_string();
+        },
+    );
+    std::fs::write(root.join("a.txt"), "before\n").unwrap();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    cmd_tx
+        .send(RunCommand::Steer {
+            id: 1,
+            text: STEER.to_string(),
+        })
+        .unwrap();
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut control = RunControl::new(cmd_rx);
+    let mut hooks = RunHooks {
+        control: Some(&mut control),
+        live: Some(&live_tx),
+    };
+    let out = orch
+        .run_loop_with_hooks(
+            &Session::new("edit a.txt".into()).with_checks(vec!["false".to_string()]),
+            &reg,
+            &root,
+            &mut hooks,
+        )
+        .await;
+    std::fs::remove_dir_all(&root).ok();
+
+    let acks: Vec<ControlAck> = std::iter::from_fn(|| live_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            LiveEvent::Control(ack) => Some(ack),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acks.len(), 1, "the one steer is answered once: {acks:?}");
+    assert_eq!(acks[0].id, 1);
+    assert_eq!(acks[0].status, ControlStatus::Rejected);
+    assert!(
+        acks[0].note.contains("no next round"),
+        "the refusal names the missing round: {}",
+        acks[0].note
+    );
+    assert_eq!(out["rounds"], 1);
+}
+
+/// P1b boundary: a run that cannot even prepare its git substrate still
+/// acknowledges the command it consumed, so the console's pending slot is
+/// cleared instead of waiting forever.
+#[tokio::test]
+async fn a_run_that_cannot_prepare_the_tree_still_acknowledges_its_commands() {
+    let (orch, reg, root) = harness(Arc::new(FakeClient::pass()), "steer-notree", 2);
+    // A workdir that does not exist: `git -C <missing> init` fails, so the
+    // loop returns before any round.
+    let missing = root.join("no-such-subdir");
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    cmd_tx
+        .send(RunCommand::QueueGoal {
+            id: 1,
+            goal: "next goal".into(),
+        })
+        .unwrap();
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut control = RunControl::new(cmd_rx);
+    let mut hooks = RunHooks {
+        control: Some(&mut control),
+        live: Some(&live_tx),
+    };
+    let out = orch
+        .run_loop_with_hooks(
+            &Session::new("g".into()).expecting_writes(false),
+            &reg,
+            &missing,
+            &mut hooks,
+        )
+        .await;
+    std::fs::remove_dir_all(&root).ok();
+
+    assert!(
+        out["error"].is_string(),
+        "the run still reports the substrate failure: {out}"
+    );
+    let acks: Vec<ControlAck> = std::iter::from_fn(|| live_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            LiveEvent::Control(ack) => Some(ack),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        acks.len(),
+        1,
+        "the consumed command is acknowledged: {acks:?}"
+    );
+    assert_eq!(acks[0].id, 1);
+    assert_eq!(acks[0].status, ControlStatus::Applied);
+    assert_eq!(control.take_queued_goal().map(|g| g.0), Some(1));
 }

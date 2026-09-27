@@ -1,3 +1,4 @@
+use super::control::RunHooks;
 use super::session::{checks_pass, render_checks, RoundServices};
 use super::Session;
 use crate::agents::{Agent, AgentCtx, ImplementerAgent, ReviewerAgent, Verdict};
@@ -39,11 +40,28 @@ impl Orchestrator {
         }
     }
 
+    /// The historical entry point: no live control, so every round boundary
+    /// is a no-op and the run behaves exactly as it did before the hook.
     pub async fn run_loop(
         &self,
         session: &Session,
         tools: &ToolRegistry,
         workdir: &std::path::Path,
+    ) -> serde_json::Value {
+        let mut hooks = RunHooks::none();
+        self.run_loop_with_hooks(session, tools, workdir, &mut hooks)
+            .await
+    }
+
+    /// The same loop, with the live boundary hook threaded through it. A
+    /// command is drained only after a complete implementer/reviewer round,
+    /// so it can never mutate the model call or tool invocation in flight.
+    pub async fn run_loop_with_hooks(
+        &self,
+        session: &Session,
+        tools: &ToolRegistry,
+        workdir: &std::path::Path,
+        hooks: &mut RunHooks<'_>,
     ) -> serde_json::Value {
         self.trace.emit(TraceEvent::SessionStart {
             session_id: session.id.clone(),
@@ -60,6 +78,14 @@ impl Orchestrator {
                 agent: "tree".to_string(),
                 error: e.to_string(),
             });
+            // Every exit from this function acknowledges the commands it
+            // consumed, including this one: the run stops before its first
+            // round, so this drain is the run's terminal boundary and a steer
+            // has no prompt left to reach. A queued goal is still retained for
+            // the goal loop. With no control the drain is a no-op and the
+            // returned error is unchanged.
+            let mut terminal_feedback = String::new();
+            hooks.apply_boundary(&mut terminal_feedback, true);
             return serde_json::json!({ "error": e.to_string() });
         }
         // §4.3: the shared services. Both execution modes hold one of these
@@ -75,7 +101,9 @@ impl Orchestrator {
             tools,
         };
         if self.cfg.execution == "direct" {
-            return self.run_direct_loop(session, &svc, workdir, &tree).await;
+            return self
+                .run_direct_loop(session, &svc, workdir, &tree, hooks)
+                .await;
         }
         // Stage 2: the per-layer policy owns budgets, strategy and the
         // summarize threshold. `plan_summarized` below is the first-class path.
@@ -632,6 +660,15 @@ impl Orchestrator {
                     // The retry's evidence, after the rollback: the tool verdicts,
                     // minus any content the rollback reverted (see the function).
                     refused = crate::engine::session::file_state_evidence(&artifact);
+                    // P1b round boundary: the round is complete (checks, verdict,
+                    // rollback, evidence) and the loop is about to build the next
+                    // implementer prompt. A steer drained here lands in that
+                    // prompt's feedback; a queued goal stays in the control.
+                    // Terminal when this round ends the attempt — a pass (the
+                    // attempts loop breaks on `verdict.pass` just below) or the
+                    // last round of the cap — because the attempt resets
+                    // `feedback` and no prompt would ever read the steer.
+                    hooks.apply_boundary(&mut feedback, verdict.pass || round + 1 > rounds);
                     round += 1;
                 }
                 total_rounds += ran;
@@ -672,6 +709,16 @@ impl Orchestrator {
             }
         }
 
+        // P1b terminal boundary: the run is over, so a surviving steer is
+        // rejected (no next round) and only a queued goal is retained. Every
+        // exit from the task loop above — a pass, an early `break` on a
+        // baseline/diff/budget failure — lands here, so this drains exactly
+        // once. The result is built from state the drain does not touch.
+        // The run's own terminal boundary: nothing follows this drain in the
+        // run, so a steer drained here has no prompt left to reach.
+        let mut terminal_feedback = String::new();
+        hooks.apply_boundary(&mut terminal_feedback, true);
+
         self.trace.emit(TraceEvent::StateTransition {
             from: "reviewing".to_string(),
             to: "done".to_string(),
@@ -702,6 +749,7 @@ impl Orchestrator {
         svc: &RoundServices<'_>,
         workdir: &std::path::Path,
         tree: &crate::engine::tree::TreeService,
+        hooks: &mut RunHooks<'_>,
     ) -> serde_json::Value {
         let builder = ContextBuilder::with_policy(self.cfg.context_policy());
         let retriever = Retriever::new(workdir.to_path_buf(), self.cfg.retrieval.clone());
@@ -951,6 +999,13 @@ impl Orchestrator {
                         });
                     }
                 }
+                // P1b round boundary, the same place the pipeline loop drains:
+                // after the round's checks, verdict and rollback, before the
+                // next direct prompt is built. Terminal on the last round of
+                // the cap, because the attempt resets `feedback` and no prompt
+                // would ever read the steer. A passing round cannot reach here:
+                // the `if passed { break }` above already left the round loop.
+                hooks.apply_boundary(&mut feedback, round + 1 > cap);
                 round += 1;
             }
             // v4 verify guard: one post-hoc independent-judge pass over a task
@@ -1015,6 +1070,15 @@ impl Orchestrator {
             }
         } // end attempts loop
         let _ = best_billed;
+
+        // P1b terminal boundary. Every exit from the round and attempts loops
+        // above — a pass, an early `break` on a baseline/diff/budget/oracle
+        // failure — reaches this point, so the drain happens exactly once. The
+        // snapshot it built is already inside `best_json`, which the drain does
+        // not touch, so the terminal result is unchanged by it. The run's own
+        // terminal boundary: nothing follows this drain.
+        let mut terminal_feedback = String::new();
+        hooks.apply_boundary(&mut terminal_feedback, true);
 
         self.trace.emit(TraceEvent::StateTransition {
             from: "direct_executing".to_string(),
