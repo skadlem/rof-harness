@@ -9,7 +9,9 @@ use rof::obs::{
     TraceSink,
 };
 use rof::tui::app::{App, BusyMode, DeferredConfig, RunMode};
-use rof::tui::run::{handle_running_key, LiveSession, RunningKeyOutcome};
+use rof::tui::run::{
+    handle_running_key, submit_running_input, LiveSession, RunningKeyOutcome, RunningSubmit,
+};
 use tokio::sync::mpsc::unbounded_channel;
 
 /// A live session, which owns both halves of the command channel until a
@@ -967,28 +969,298 @@ fn a_scrolled_transcript_holds_its_anchor_until_end() {
     assert_eq!(app.scroll, 0);
 }
 
-/// P1a is a read-only monitor: a running goal owns the console's attention,
-/// so Enter may only record the read-only posture. Nothing is parsed,
-/// dispatched, or cleared — the draft the user typed survives untouched.
+/// P1b: Enter submits. The key reducer only *reports* the submission — it
+/// sends nothing, clears nothing, and starts no run — so the draft the user
+/// typed survives the key and the real intent of the old P1a test holds: an
+/// ordinary composer line never becomes a goal or a run on its own.
 #[test]
-fn running_mode_does_not_dispatch_composer_text() {
+fn running_enter_reports_a_submission_and_never_starts_a_run() {
     let mut app = App::new();
     app.begin_run("busy");
     app.input.push_str("/model provider/model");
 
     assert_eq!(
         handle_running_key(&mut app, KeyCode::Enter),
-        RunningKeyOutcome::ReadOnlyNotice
+        RunningKeyOutcome::Submit
     );
     assert_eq!(app.input, "/model provider/model");
-    assert!(app.transcript.iter().any(|line| line.contains("read-only")));
-    assert_eq!(
-        app.transcript.last().map(String::as_str),
-        Some("run in progress — composer is read-only in P1a")
-    );
-    // The notice is the only thing the key produced: no run state change.
+    // The key is a report, not a dispatch: no run state change, no
+    // transcript line, and no occupied control slot.
     assert_eq!(app.run_mode, RunMode::Running);
+    assert_eq!(app.run_goal, "busy");
     assert!(app.activity.is_empty());
+    assert!(app.transcript.is_empty());
+    assert!(app.pending_steer.is_none());
+    assert!(app.pending_goal.is_none());
+
+    // An ordinary character is draft text: it is never a submission, and it
+    // never becomes a goal or a second run.
+    assert_eq!(
+        handle_running_key(&mut app, KeyCode::Char('x')),
+        RunningKeyOutcome::Ignored
+    );
+    assert_eq!(app.run_goal, "busy");
+    assert_eq!(app.run_mode, RunMode::Running);
+    assert!(app.pending_steer.is_none());
+    assert!(app.pending_goal.is_none());
+}
+
+/// A steer submission is the composer line becoming exactly one command on
+/// the worker's channel, the pending slot the console shows, and a cleared
+/// draft. Nothing else about the run moves.
+#[test]
+fn a_steer_submission_sends_the_command_and_occupies_the_slot() {
+    let (tx, mut rx) = unbounded_channel::<RunCommand>();
+    let mut app = App::new();
+    app.begin_run("busy");
+    app.set_busy_mode(BusyMode::Steer);
+    app.input.push_str("  focus on the parser  ");
+
+    let draft = app.input.clone();
+    assert_eq!(
+        submit_running_input(&mut app, &tx, &draft),
+        RunningSubmit::Sent(ControlKind::Steer)
+    );
+
+    let id = app
+        .pending_steer
+        .as_ref()
+        .expect("no occupied steer slot")
+        .id;
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        RunCommand::Steer {
+            id,
+            text: "focus on the parser".to_string(),
+        }
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the submission sent more than one command"
+    );
+    assert_eq!(app.input, "", "a sent draft was not cleared");
+    assert!(app
+        .transcript
+        .iter()
+        .any(|line| line == &format!("steer pending ({id})")));
+    assert_eq!(app.run_mode, RunMode::Running);
+}
+
+/// The same contract in queue mode, with the queue slot and its wording.
+#[test]
+fn a_queue_submission_sends_the_goal_and_occupies_the_slot() {
+    let (tx, mut rx) = unbounded_channel::<RunCommand>();
+    let mut app = App::new();
+    app.begin_run("busy");
+    app.set_busy_mode(BusyMode::Queue);
+    app.input.push_str(" then fix the lexer ");
+
+    let draft = app.input.clone();
+    assert_eq!(
+        submit_running_input(&mut app, &tx, &draft),
+        RunningSubmit::Sent(ControlKind::Queue)
+    );
+
+    let id = app
+        .pending_goal
+        .as_ref()
+        .expect("no occupied queue slot")
+        .id;
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        RunCommand::QueueGoal {
+            id,
+            goal: "then fix the lexer".to_string(),
+        }
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the submission sent more than one command"
+    );
+    assert_eq!(app.input, "");
+    assert!(app
+        .transcript
+        .iter()
+        .any(|line| line == &format!("goal queued ({id})")));
+    // A queued goal does not start a run here: the worker starts it at the
+    // next boundary, and the pump's Enter never began a second goal.
+    assert_eq!(app.run_mode, RunMode::Running);
+    assert_eq!(app.run_goal, "busy");
+}
+
+/// An empty or blank line is not a submission: no id is spent, no slot is
+/// occupied, and the draft the user typed stays exactly as it was.
+#[test]
+fn an_empty_or_blank_submission_is_ignored() {
+    let (tx, mut rx) = unbounded_channel::<RunCommand>();
+    let mut app = App::new();
+    app.begin_run("busy");
+    let before = app.next_control_id;
+
+    assert_eq!(
+        submit_running_input(&mut app, &tx, ""),
+        RunningSubmit::Ignored
+    );
+    app.input.push_str("   \t ");
+    let draft = app.input.clone();
+    assert_eq!(
+        submit_running_input(&mut app, &tx, &draft),
+        RunningSubmit::Ignored
+    );
+
+    assert_eq!(app.input, "   \t ", "a blank submission edited the draft");
+    assert_eq!(
+        app.next_control_id, before,
+        "a blank submission spent an id"
+    );
+    assert!(app.pending_steer.is_none());
+    assert!(app.pending_goal.is_none());
+    assert!(app.transcript.is_empty());
+    assert!(rx.try_recv().is_err(), "a blank submission sent a command");
+}
+
+/// A slash line is a console command, never steer text. It is rejected with
+/// a reason, the draft is kept so the pump can route it, and nothing rides
+/// the command channel.
+#[test]
+fn a_slash_line_is_rejected_and_never_rides_the_command_channel() {
+    let (tx, mut rx) = unbounded_channel::<RunCommand>();
+    let mut app = App::new();
+    app.begin_run("busy");
+    app.input.push_str("/model provider/model");
+
+    let draft = app.input.clone();
+    let outcome = submit_running_input(&mut app, &tx, &draft);
+    match outcome {
+        RunningSubmit::Rejected(reason) => {
+            assert!(!reason.is_empty(), "the rejection named no reason");
+        }
+        other => panic!("a slash line was submitted as {other:?}"),
+    }
+    assert_eq!(
+        app.input, "/model provider/model",
+        "the slash draft was cleared"
+    );
+    assert!(app.pending_steer.is_none());
+    assert!(app.pending_goal.is_none());
+    assert!(
+        rx.try_recv().is_err(),
+        "a slash line reached the worker as steer text"
+    );
+}
+
+/// Interrupt mode is the stop path, not a text path: Enter says so, names
+/// the stop keys, keeps the draft, and sends nothing.
+#[test]
+fn interrupt_mode_rejects_a_submission_and_names_the_stop_key() {
+    let (tx, mut rx) = unbounded_channel::<RunCommand>();
+    let mut app = App::new();
+    app.begin_run("busy");
+    app.set_busy_mode(BusyMode::Interrupt);
+    app.input.push_str("stop now");
+
+    let draft = app.input.clone();
+    let outcome = submit_running_input(&mut app, &tx, &draft);
+    match outcome {
+        RunningSubmit::Rejected(reason) => {
+            assert!(
+                reason.contains('q'),
+                "the rejection does not name the stop key: {reason}"
+            );
+        }
+        other => panic!("interrupt mode submitted as {other:?}"),
+    }
+    assert_eq!(
+        app.input, "stop now",
+        "a rejected interrupt submission cleared the draft"
+    );
+    assert!(app.pending_steer.is_none());
+    assert!(app.pending_goal.is_none());
+    assert!(rx.try_recv().is_err(), "interrupt mode sent a text command");
+    assert_eq!(app.run_mode, RunMode::Running);
+}
+
+/// A channel with no worker behind it fails the send. Nothing reached the
+/// worker, so nothing will ever be acknowledged: the slot must be free again
+/// or the console shows a pending steer for the rest of the run, and the
+/// draft must survive so the submission can be retried.
+#[test]
+fn a_failed_send_frees_the_slot_and_keeps_the_draft() {
+    let (tx, rx) = unbounded_channel::<RunCommand>();
+    drop(rx);
+    let mut app = App::new();
+    app.begin_run("busy");
+    app.set_busy_mode(BusyMode::Steer);
+    app.input.push_str("focus on the parser");
+
+    let draft = app.input.clone();
+    let outcome = submit_running_input(&mut app, &tx, &draft);
+    match outcome {
+        RunningSubmit::Rejected(reason) => {
+            assert!(!reason.is_empty(), "the failed send named no error");
+        }
+        other => panic!("a dropped receiver still reported {other:?}"),
+    }
+    assert!(
+        app.pending_steer.is_none(),
+        "a command that never reached the worker is left pending forever"
+    );
+    assert_eq!(
+        app.input, "focus on the parser",
+        "a failed send cleared the draft"
+    );
+    assert!(
+        app.transcript.is_empty(),
+        "a failed send announced a submission"
+    );
+}
+
+/// One slot per kind: a second submission displaces the first under a new
+/// id, and the displaced id is no longer pending. Both commands are still on
+/// the channel, so the worker can answer the older one.
+#[test]
+fn a_second_submission_replaces_the_first_slot_under_a_new_id() {
+    let (tx, mut rx) = unbounded_channel::<RunCommand>();
+    let mut app = App::new();
+    app.begin_run("busy");
+    app.set_busy_mode(BusyMode::Steer);
+
+    app.input.push_str("focus on the parser");
+    let first_draft = app.input.clone();
+    assert_eq!(
+        submit_running_input(&mut app, &tx, &first_draft),
+        RunningSubmit::Sent(ControlKind::Steer)
+    );
+    let first_id = app.pending_steer.as_ref().unwrap().id;
+
+    app.input.push_str("focus on the lexer");
+    let second_draft = app.input.clone();
+    assert_eq!(
+        submit_running_input(&mut app, &tx, &second_draft),
+        RunningSubmit::Sent(ControlKind::Steer)
+    );
+
+    let second = app.pending_steer.as_ref().unwrap();
+    assert_ne!(second.id, first_id, "the displaced submission kept its id");
+    assert_eq!(second.text, "focus on the lexer");
+    // The first submission is no longer pending, so the status row cannot
+    // claim a steer the console is not waiting for.
+    assert!(!app.control_summary().contains(&format!("({})", first_id)));
+    assert!(app.control_summary().contains(&format!("({})", second.id)));
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        RunCommand::Steer {
+            id: first_id,
+            text: "focus on the parser".to_string()
+        }
+    );
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        RunCommand::Steer {
+            id: second.id,
+            text: "focus on the lexer".to_string()
+        }
+    );
 }
 
 #[test]

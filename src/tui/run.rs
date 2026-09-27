@@ -13,12 +13,12 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Frame, Terminal};
 
-use super::app::App;
+use super::app::{App, BusyMode};
 use super::cmd::Action;
 use super::splash;
 use super::ui::draw;
 use crate::engine::control::RunCommand;
-use crate::obs::{GoalFinished, LiveEvent, TraceEvent};
+use crate::obs::{ControlKind, GoalFinished, LiveEvent, TraceEvent};
 
 /// The goal worker task: one live run, resolving to its terminal outcome.
 /// The session never reads the `JoinHandle` result synchronously: the
@@ -184,12 +184,14 @@ impl LiveSession {
 /// What one key means while a goal is live. The pump keeps ownership of
 /// ordinary character input and of the stop latch; this enum covers only
 /// the decisions that must not be reachable from a running session, which
-/// is what makes the read-only contract testable without a PTY.
+/// is what makes the running contract testable without a PTY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunningKeyOutcome {
-    /// Enter while a goal is live: the composer is inert, so the key only
-    /// records the read-only posture in the transcript.
-    ReadOnlyNotice,
+    /// Enter while a goal is live: submit the draft. This reducer only
+    /// reports the submission — [`submit_running_input`] is what sends the
+    /// command, occupies the slot, and clears the draft, because that
+    /// decision needs the command channel this key reducer does not have.
+    Submit,
     /// `q`/Esc on an empty composer: ask the running goal to stop. The
     /// worker is asked, never aborted, so it still writes its trace, and
     /// a second press detaches it instead of waiting for an
@@ -203,15 +205,13 @@ pub enum RunningKeyOutcome {
 }
 
 /// The running-mode key contract, as a pure `App` reducer. Nothing is
-/// parsed or dispatched here: a live goal owns the console, so a slash
-/// line stays composer text and is never applied.
+/// parsed or dispatched here, and no run lifecycle moves: a live goal owns
+/// the console, so Enter only reports that the composer line should be
+/// submitted and the pump hands that line to [`submit_running_input`],
+/// which is the only place a submission can become a command.
 pub fn handle_running_key(app: &mut App, code: KeyCode) -> RunningKeyOutcome {
     match code {
-        KeyCode::Enter => {
-            app.transcript
-                .push("run in progress — composer is read-only in P1a".to_string());
-            RunningKeyOutcome::ReadOnlyNotice
-        }
+        KeyCode::Enter => RunningKeyOutcome::Submit,
         KeyCode::Esc => {
             app.set_stopping();
             RunningKeyOutcome::StopArmed
@@ -224,6 +224,94 @@ pub fn handle_running_key(app: &mut App, code: KeyCode) -> RunningKeyOutcome {
         }
         _ => RunningKeyOutcome::Ignored,
     }
+}
+
+/// What one composer submission did while a goal is live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunningSubmit {
+    /// The command reached the worker's channel and the matching slot is
+    /// occupied under its id, awaiting the worker's acknowledgement.
+    Sent(ControlKind),
+    /// Held for a later boundary rather than sent now. No composer
+    /// submission produces this yet: the boundary-time consumer lands with
+    /// the pump wiring.
+    Deferred,
+    /// Not sent, with the reason to show. The draft is kept intact, so a
+    /// rejected line can be corrected and submitted again.
+    Rejected(String),
+    /// Not a submission: the draft held no text. Nothing was spent, sent,
+    /// or cleared.
+    Ignored,
+}
+
+/// Submit the composer line while a goal is live, as a pure reducer over
+/// `App` plus the one channel it writes to.
+///
+/// What the busy mode means decides everything here: `Steer` sends a
+/// [`RunCommand::Steer`], `Queue` a [`RunCommand::QueueGoal`], and
+/// `Interrupt` refuses the text and points at the stop keys. The draft is
+/// cleared only when a command actually reached the channel, and a failed
+/// send frees the slot it had occupied — a command the worker never saw is
+/// never acknowledged, so a slot left holding it would report the control
+/// as pending for the rest of the run.
+///
+/// A slash line is refused rather than sent: a command must never ride the
+/// channel as steer text. The pump routes slash lines to the console
+/// command path, so the draft is kept and the reason returned.
+pub fn submit_running_input(
+    app: &mut App,
+    commands: &tokio::sync::mpsc::UnboundedSender<RunCommand>,
+    text: &str,
+) -> RunningSubmit {
+    let text = text.trim();
+    if text.is_empty() {
+        return RunningSubmit::Ignored;
+    }
+    if text.starts_with('/') {
+        return RunningSubmit::Rejected(
+            "/ lines are console commands, not steer text — the draft was kept".to_string(),
+        );
+    }
+    let (kind, id) = match app.busy_mode {
+        BusyMode::Steer => {
+            let id = app.submit_pending_steer(text);
+            (ControlKind::Steer, id)
+        }
+        BusyMode::Queue => {
+            let id = app.submit_pending_goal(text);
+            (ControlKind::Queue, id)
+        }
+        // Interrupt is the stop path, not a text path: a goal in flight is
+        // stopped with a stop key, never with steer text.
+        BusyMode::Interrupt => {
+            return RunningSubmit::Rejected(
+                "interrupt mode takes no text — press q/Esc/Ctrl-C to stop the run".to_string(),
+            );
+        }
+    };
+    let command = match kind {
+        ControlKind::Steer => RunCommand::Steer {
+            id,
+            text: text.to_string(),
+        },
+        _ => RunCommand::QueueGoal {
+            id,
+            goal: text.to_string(),
+        },
+    };
+    if let Err(error) = commands.send(command) {
+        // The worker will never acknowledge a command it never received, so
+        // the slot has to go back or the console waits on it forever. The
+        // draft survives: the submission failed, not the text.
+        app.release_control_slot(kind, id);
+        return RunningSubmit::Rejected(format!("command not sent: {error}"));
+    }
+    app.transcript.push(match kind {
+        ControlKind::Steer => format!("steer pending ({id})"),
+        _ => format!("goal queued ({id})"),
+    });
+    app.input.clear();
+    RunningSubmit::Sent(kind)
 }
 
 /// Live session: one alternate-screen pump owns the whole console. Idle

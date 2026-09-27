@@ -329,6 +329,24 @@ impl App {
         id
     }
 
+    /// Release the slot `kind` holds when it holds `id`.
+    ///
+    /// This exists for the one case an acknowledgement can never cover: a
+    /// command whose send FAILED. Such a command never reached the worker,
+    /// so no `ControlAck` for its id will ever arrive and the ordinary
+    /// freeing paths cannot run. Left occupied, the slot would report the
+    /// command as pending for the rest of the run — forever, with nothing
+    /// coming to resolve it. Matching by id keeps the release from clearing
+    /// a newer submission that already replaced this one.
+    pub fn release_control_slot(&mut self, kind: ControlKind, id: u64) {
+        match kind {
+            ControlKind::Steer => free_slot(&mut self.pending_steer, id),
+            ControlKind::Queue => free_slot(&mut self.pending_goal, id),
+            // `Stop` occupies no slot, so it has none to release.
+            ControlKind::Stop => {}
+        }
+    }
+
     /// Hold configuration for the next goal. Settings append in
     /// submission order and are all applied at the boundary, so distinct
     /// settings never displace each other.
