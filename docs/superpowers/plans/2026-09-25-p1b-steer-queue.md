@@ -569,7 +569,13 @@ git commit -m "feat(tui): route live steer and queue input"
 
 **Interfaces:**
 - Consumes `App::{busy_mode, pending_steer, pending_goal, deferred_config, control_summary, last_control_ack}`.
-- Preserves P1a `composer_block(&str)` and the read-only title behavior.
+- Preserves P1a `composer_block(&str)`.
+
+> **Superseded during implementation.** The P1a read-only title
+> (`composer_block_with_state(thinking, true)` and the string
+> `composer · read-only (P1a)`) is REMOVED, not preserved. Nothing can render
+> that claim truthfully now that a live composer submits steers and queued
+> goals, and leaving it callable would be a trap for the next caller.
 
 - [ ] **Step 1: Write failing TestBackend tests**
 
@@ -591,8 +597,9 @@ cargo test --test tui_app
 
 Keep `composer_block(thinking)` unchanged. Add a helper that accepts the
 thinking label, busy mode label, and pending summary, producing a title such as
-`composer · queue · goal queued (7)` while the existing P1a read-only helper
-continues to work for the no-control case.
+`composer · queue · goal queued (7)`. Both segments are bounded, and the
+CONTROL segment is what survives a long thinking label: `ROF_THINKING` is
+unbounded, so it is the segment that gets clipped.
 
 - [ ] **Step 4: Extend pure UI rendering**
 

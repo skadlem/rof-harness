@@ -78,12 +78,12 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else {
         app.input.clone()
     };
-    // A live run owns the terminal, so the composer title says read-only
-    // instead of showing a thinking state the user cannot change yet.
-    let read_only = matches!(app.run_mode, RunMode::Running | RunMode::Stopping);
-    f.render_widget(
-        Paragraph::new(shown.as_str())
-            .block(theme::composer_block_with_state(&app.thinking, read_only)),
-        rows[3],
-    );
+    // A live run is not read-only: the composer submits steers and queues
+    // the next goal, so its title names the busy mode and what is pending.
+    let block = if matches!(app.run_mode, RunMode::Running | RunMode::Stopping) {
+        theme::composer_block_live(&app.thinking, &app.control_summary())
+    } else {
+        theme::composer_block(&app.thinking)
+    };
+    f.render_widget(Paragraph::new(shown.as_str()).block(block), rows[3]);
 }

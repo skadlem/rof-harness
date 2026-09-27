@@ -590,6 +590,18 @@ impl App {
         } else {
             format!("{} · ", self.run_mode.label())
         };
+        // The live control state rides the status row, but only while a run
+        // is live: idle and replay keep their exact pre-P1b strings. The
+        // summary is built only on the branch that uses it.
+        let control = match self.replay_mode {
+            // Replay is never live (`run_mode` is `Idle` there), so its
+            // string is left exactly as it was.
+            true => String::new(),
+            false if matches!(self.run_mode, RunMode::Running | RunMode::Stopping) => {
+                format!(" · {}", self.control_summary())
+            }
+            false => String::new(),
+        };
         if self.replay_mode {
             format!(
                 "{run}{counters} · replay {}/{} [{}] · help: j/k move · g/G ends · / filter · q quit",
@@ -602,7 +614,7 @@ impl App {
                 self.replay_filter
             )
         } else {
-            format!("{run}{counters}")
+            format!("{run}{counters}{control}")
         }
     }
 }
