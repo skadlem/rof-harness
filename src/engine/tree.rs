@@ -46,6 +46,10 @@ pub struct TreeDiff {
     /// `git diff --stat` plus one line per new file — the evidence a report or
     /// a reviewer quotes.
     pub stat: String,
+    /// The subset of `names` git reports as untracked. Kept so the patch
+    /// evidence can speak about a new file from the same single read, rather
+    /// than asking git a second time and risking a second answer.
+    pub untracked: Vec<String>,
 }
 
 impl TreeDiff {
@@ -122,6 +126,7 @@ impl TreeService {
                 new_files.push(path);
             }
         }
+        names.sort();
         let stat = self.git(["diff", "--stat"])?;
         let mut stat = String::from_utf8_lossy(&stat.stdout).into_owned();
         for path in &new_files {
@@ -129,8 +134,39 @@ impl TreeService {
             // evidence line matches the name set.
             stat.push_str(&format!(" {path} | new file\n"));
         }
-        names.sort();
-        Ok(TreeDiff { names, stat })
+        new_files.sort();
+        Ok(TreeDiff {
+            names,
+            stat,
+            untracked: new_files,
+        })
+    }
+
+    /// The patch text for the same change set [`Self::diff`] just named,
+    /// bounded so a model that rewrote a large file cannot make one trace
+    /// event (and one recorded JSONL line, and one console's memory) unbounded.
+    ///
+    /// This is the ONLY diff text the harness produces: a view asks the
+    /// engine for evidence rather than running its own `git diff`, which could
+    /// disagree with the write gate's read of the same tree.
+    pub fn patch(&self, diff: &TreeDiff) -> anyhow::Result<PatchText> {
+        let raw = self.git(["diff", "--patch"])?;
+        let mut text = String::from_utf8_lossy(&raw.stdout).into_owned();
+        // `git diff` is empty for a file the attempt created, so a new file
+        // would read back as "no evidence" — the pane's whole reason to exist
+        // is that a write landed. Named from the names `diff()` already
+        // collected, with the size git cannot report for an untracked path.
+        for path in &diff.untracked {
+            let size = std::fs::metadata(self.root.join(path))
+                .map(|m| m.len())
+                .ok();
+            let shown = match size {
+                Some(bytes) => format!(" (untracked, new file, {bytes} bytes)"),
+                None => " (untracked, new file)".to_string(),
+            };
+            text.push_str(&format!("--- /dev/null\n+++ b/{path}{shown}\n"));
+        }
+        Ok(bound_patch(&text))
     }
 
     /// True when HEAD names no commit — `git rev-parse` refuses it rather than
@@ -202,6 +238,51 @@ impl TreeService {
             cmd.env(key, value);
         }
         Ok(cmd)
+    }
+}
+
+/// Bounds on the patch text one snapshot carries. Both caps, because either
+/// alone leaves a hole: a diff of thousands of tiny lines fits in a few
+/// kilobytes, and one minified line is a single line however long it is.
+/// 8 KiB is a couple of screens of evidence and 200 lines is a pane's worth
+/// of scrollback, so a snapshot stays small enough to keep in memory for a
+/// whole session and to store one-per-line in the durable trace.
+pub const PATCH_MAX_BYTES: usize = 8 * 1024;
+pub const PATCH_MAX_LINES: usize = 200;
+
+/// Appended to a patch whose text was cut, so a view can say "truncated"
+/// instead of implying it showed the whole change. The flag on the event says
+/// the same thing; the marker is here so the text is honest on its own, in a
+/// pane and in the recorded JSONL alike.
+pub const PATCH_TRUNCATED_MARKER: &str = "… [diff truncated: harness evidence bound reached]";
+
+/// The bounded patch text plus whether the bound was reached.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatchText {
+    pub text: String,
+    pub truncated: bool,
+}
+
+/// Cuts `text` to both caps, whole lines only. A line that does not fit is
+/// dropped rather than sliced, which is what keeps a multi-byte codepoint
+/// from being cut in half: only complete `&str` lines are ever concatenated.
+fn bound_patch(text: &str) -> PatchText {
+    let mut out = String::new();
+    let mut truncated = false;
+    for (lines, line) in text.split_inclusive('\n').enumerate() {
+        if lines >= PATCH_MAX_LINES || out.len() + line.len() > PATCH_MAX_BYTES {
+            truncated = true;
+            break;
+        }
+        out.push_str(line);
+    }
+    if truncated {
+        out.push_str(PATCH_TRUNCATED_MARKER);
+        out.push('\n');
+    }
+    PatchText {
+        text: out,
+        truncated,
     }
 }
 
@@ -409,6 +490,7 @@ mod tests {
         let d = TreeDiff {
             names: vec!["a.rs".into(), "src/b.rs".into()],
             stat: String::new(),
+            untracked: vec!["src/b.rs".into()],
         };
         assert_eq!(d.changed(), 2);
         assert!(!d.is_empty());
@@ -481,6 +563,32 @@ mod tests {
         tree.baseline().unwrap();
         tree.baseline().unwrap();
         assert!(tree.diff().unwrap().is_empty());
+    }
+
+    /// The bound is enforced on whole lines, so a codepoint is never cut and
+    /// the cut is visible in the returned text.
+    #[test]
+    fn the_patch_bound_keeps_whole_lines_and_marks_the_cut() {
+        let long = "ü".repeat(PATCH_MAX_BYTES);
+        let cut = bound_patch(&format!("{long}\nsecond\n"));
+        assert!(cut.truncated);
+        assert!(
+            cut.text.trim_end().ends_with(PATCH_TRUNCATED_MARKER),
+            "the cut is visible: {:?}",
+            cut.text
+        );
+        assert!(!cut.text.contains('\u{FFFD}'));
+        assert!(
+            !cut.text.contains("second"),
+            "nothing past the bound is kept"
+        );
+
+        let short = (0..PATCH_MAX_LINES)
+            .map(|i| format!("l{i}\n"))
+            .collect::<String>();
+        let kept = bound_patch(&short);
+        assert!(!kept.truncated, "exactly the line cap is not over it");
+        assert_eq!(kept.text, short);
     }
 
     /// A hook copied in with the repo must not block the baseline.

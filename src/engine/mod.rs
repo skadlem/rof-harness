@@ -8,4 +8,4 @@ pub use control::{BoundaryBatch, RunCommand, RunControl, RunHooks};
 pub use orchestrator::Orchestrator;
 pub use router::{ModelRouter, Role};
 pub use session::{render_checks, veto_note_for_test, Budget, CheckResult, RoundServices, Session};
-pub use tree::{TreeDiff, TreeService};
+pub use tree::{PatchText, TreeDiff, TreeService};

@@ -81,6 +81,21 @@ pub enum TraceEvent {
         task: String,
         reason: String,
     },
+    /// The engine's own bounded read of the task copy's change set (§4.2),
+    /// recorded where the harness already computes the diff. A view renders
+    /// this instead of running a second `git diff` that could disagree with
+    /// the write gate's read; an empty snapshot after a rollback is what
+    /// keeps a pane from showing changes the tree no longer has.
+    DiffSnapshot {
+        /// The changed paths, as `git status` named them.
+        names: Vec<String>,
+        /// `git diff --stat` plus one line per new file.
+        stat: String,
+        /// Bounded patch text; a cut one ends in `PATCH_TRUNCATED_MARKER`.
+        patch: String,
+        /// True when the patch text was cut at the evidence bound.
+        truncated: bool,
+    },
     /// One ordered answer to one live command, identified by the id the
     /// console allocated. Acknowledgements are durable like every other step,
     /// so a recorded session replays its control history through the same

@@ -123,6 +123,19 @@ impl DeferredConfig {
 const ACTIVITY_MAX_LINES: usize = 200;
 const ACTIVITY_MAX_CHARS: usize = 32_000;
 
+/// The engine's own bounded read of the change set at the moment it was
+/// recorded (§4.2): what a diff pane renders instead of running its own
+/// `git diff`, which could disagree with the harness's `TreeService`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffSnapshot {
+    pub names: Vec<String>,
+    pub stat: String,
+    pub patch: String,
+    /// True when the harness cut the patch text at its evidence bound, so the
+    /// pane says "truncated" rather than implying it showed everything.
+    pub truncated: bool,
+}
+
 /// UI state for the `rof chat` console: transcript lines, running counters,
 /// the composer's input buffer, and scroll. Mutated only by `on_event` /
 /// `on_key`, so the whole state machine is testable without a terminal
@@ -187,6 +200,8 @@ pub struct App {
     pub next_control_id: u64,
     /// The most recent acknowledgement, applied or rejected.
     pub last_control_ack: Option<ControlAck>,
+    /// The latest diff evidence, or `None` before the harness has recorded any.
+    pub diff_snapshot: Option<DiffSnapshot>,
 }
 
 impl Default for App {
@@ -215,6 +230,7 @@ impl Default for App {
             deferred_config: Vec::new(),
             next_control_id: 1,
             last_control_ack: None,
+            diff_snapshot: None,
         }
     }
 }
@@ -227,6 +243,24 @@ impl App {
     /// Sole writer of transcript + counters. Plan C calls this live; replay
     /// mode calls this once per trace line.
     pub fn on_event(&mut self, ev: &TraceEvent) {
+        // Diff evidence is pane state, not scrollback: it is stored and the
+        // reducer returns, so it spends no transcript line and no activity
+        // line. A rollback's empty snapshot clears the pane the same way.
+        if let TraceEvent::DiffSnapshot {
+            names,
+            stat,
+            patch,
+            truncated,
+        } = ev
+        {
+            self.diff_snapshot = Some(DiffSnapshot {
+                names: names.clone(),
+                stat: stat.clone(),
+                patch: patch.clone(),
+                truncated: *truncated,
+            });
+            return;
+        }
         // A control acknowledgement is the one event that writes its own
         // transcript line — through the shared formatter, so the live line
         // and the replayed line cannot drift — and it deliberately adds no
@@ -292,6 +326,12 @@ impl App {
                 .map(|l| l.chars().count())
                 .sum::<usize>()
         );
+    }
+
+    /// The latest diff evidence, or `None` before any snapshot has arrived.
+    /// The only read path a diff pane needs.
+    pub fn diff_snapshot(&self) -> Option<&DiffSnapshot> {
+        self.diff_snapshot.as_ref()
     }
 
     /// The most recent `height` activity lines, oldest first, so a render
@@ -579,11 +619,19 @@ impl App {
         }
         self.transcript.clear();
         self.counters = Counters::fold(&self.replay_events);
+        // Replay rebuilds from events, so the pane state is rebuilt with it:
+        // a recorded diff snapshot restores the same evidence the live pane
+        // held, and a recorded rollback's empty snapshot clears it. They stay
+        // out of the transcript, exactly as `on_event` keeps them out.
+        self.diff_snapshot = None;
+        let horizon = self.replay_idx;
         let matching = replay_filter(&self.replay_events, &self.replay_filter);
-        for index in matching
-            .into_iter()
-            .filter(|index| *index <= self.replay_idx)
-        {
+        for index in matching.into_iter().filter(|index| *index <= horizon) {
+            if matches!(self.replay_events[index], TraceEvent::DiffSnapshot { .. }) {
+                let event = self.replay_events[index].clone();
+                self.on_event(&event);
+                continue;
+            }
             self.transcript
                 .push(render_line(&self.replay_events[index]));
         }

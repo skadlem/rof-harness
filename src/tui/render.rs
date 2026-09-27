@@ -74,6 +74,16 @@ pub fn render_line(ev: &TraceEvent) -> String {
         // The same formatter the live reducer uses, so a replayed
         // acknowledgement reads identically to the live one.
         TraceEvent::Control(ack) => super::app::control_ack_line(ack),
+        // Diff evidence is pane state, not scrollback: the reducer stores it
+        // and returns, so this arm is only reached by the lenient raw-line
+        // reader, where naming the event beats showing a patch as a line of
+        // transcript.
+        TraceEvent::DiffSnapshot { names, .. } => {
+            format!(
+                "· (diff evidence: {} file(s) — see the diff pane)",
+                names.len()
+            )
+        }
     }
 }
 

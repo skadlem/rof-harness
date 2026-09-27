@@ -4,6 +4,7 @@ use super::Session;
 use crate::agents::{Agent, AgentCtx, ImplementerAgent, ReviewerAgent, Verdict};
 use crate::config::AppConfig;
 use crate::context::{render, ContextBuilder, CtxState, LayerReport, Retriever, Snippet};
+use crate::engine::tree::{TreeDiff, TreeService};
 use crate::llm::{ContextService, ExecutorService};
 use crate::obs::{ControlAck, TraceEvent, TraceSink};
 use crate::tools::ToolRegistry;
@@ -65,6 +66,42 @@ impl Orchestrator {
         for ack in acks {
             self.trace.emit(TraceEvent::Control(ack));
         }
+    }
+
+    /// Record the engine's own bounded read of the change set (§4.2), at the
+    /// boundary that already computed it. A view that renders this can never
+    /// disagree with the write gate, because both read the same `TreeDiff`.
+    ///
+    /// A failed patch read emits the error and no snapshot: the last known
+    /// evidence is more honest than an empty one that reads as "no changes".
+    fn emit_diff_snapshot(&self, tree: &TreeService, diff: &TreeDiff) {
+        match tree.patch(diff) {
+            Ok(patch) => self.trace.emit(TraceEvent::DiffSnapshot {
+                names: diff.names.clone(),
+                stat: diff.stat.clone(),
+                patch: patch.text,
+                truncated: patch.truncated,
+            }),
+            Err(e) => self.trace.emit(TraceEvent::ModelError {
+                agent: "tree".to_string(),
+                error: format!("git diff --patch failed (no snapshot recorded): {e}"),
+            }),
+        }
+    }
+
+    /// A successful rollback leaves an empty change set, and the snapshot must
+    /// say so: a pane still showing the reverted diff is exactly the
+    /// disagreement the engine-owned evidence exists to prevent.
+    ///
+    /// Only called on success — a failed rollback is best-effort and the tree
+    /// still holds the changes, so the previous snapshot remains true.
+    fn emit_rollback_cleared(&self) {
+        self.trace.emit(TraceEvent::DiffSnapshot {
+            names: Vec::new(),
+            stat: String::new(),
+            patch: String::new(),
+            truncated: false,
+        });
     }
 
     /// The same loop, with the live boundary hook threaded through it. A
@@ -287,6 +324,8 @@ impl Orchestrator {
                             agent: "tree".to_string(),
                             error: format!("attempt rollback failed (continuing): {e}"),
                         });
+                    } else {
+                        self.emit_rollback_cleared();
                     }
                     feedback = String::new();
                     digest = crate::engine::digest::RoundDigest::new();
@@ -494,6 +533,7 @@ impl Orchestrator {
                     };
                     writes_made = diff.changed();
                     diff_stat = diff.stat.clone();
+                    self.emit_diff_snapshot(&tree, &diff);
                     for name in &diff.names {
                         if !changed_files.iter().any(|seen: &String| seen == name) {
                             changed_files.push(name.clone());
@@ -669,6 +709,8 @@ impl Orchestrator {
                                 agent: "tree".to_string(),
                                 error: format!("rollback failed (continuing): {e}"),
                             });
+                        } else {
+                            self.emit_rollback_cleared();
                         }
                     }
                     // The retry's evidence, after the rollback: the tool verdicts,
@@ -843,6 +885,8 @@ impl Orchestrator {
                         agent: "tree".to_string(),
                         error: format!("attempt rollback failed (continuing): {e}"),
                     });
+                } else {
+                    self.emit_rollback_cleared();
                 }
                 feedback = String::new();
                 artifact = serde_json::Value::Null;
@@ -939,6 +983,7 @@ impl Orchestrator {
                 };
                 writes_made = diff.changed();
                 diff_stat = diff.stat.clone();
+                self.emit_diff_snapshot(tree, &diff);
                 for name in &diff.names {
                     if !changed_files.iter().any(|seen: &String| seen == name) {
                         changed_files.push(name.clone());
@@ -1013,6 +1058,8 @@ impl Orchestrator {
                             agent: "tree".to_string(),
                             error: format!("rollback failed (continuing): {e}"),
                         });
+                    } else {
+                        self.emit_rollback_cleared();
                     }
                 }
                 // P1b round boundary, the same place the pipeline loop drains:
