@@ -728,6 +728,9 @@ async fn a_queued_goal_stays_in_one_session_and_only_finished_is_terminal() {
         error: Some("first goal failed".into()),
     }))
     .unwrap();
+    // The worker's per-goal bracket. It closes one goal, not the session:
+    // the App reads it as "this goal is over" and the worker handle stays.
+    tx.send(LiveEvent::Boundary(Boundary::Finished)).unwrap();
     // Goal two starts in the same session: the boundary consumes the goal
     // the acknowledgement left pending.
     tx.send(LiveEvent::Boundary(Boundary::Started)).unwrap();
@@ -763,6 +766,7 @@ async fn a_queued_goal_stays_in_one_session_and_only_finished_is_terminal() {
         error: None,
     }))
     .unwrap();
+    tx.send(LiveEvent::Boundary(Boundary::Finished)).unwrap();
     assert!(
         session.drain(&mut app).is_none(),
         "the last goal's outcome is per-goal, not session-terminal"

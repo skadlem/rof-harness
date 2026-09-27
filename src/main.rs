@@ -1028,7 +1028,7 @@ fn skills_cmd(cfg: &AppConfig, args: &[String]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rof::obs::{Boundary, ControlAck, ControlKind, ControlStatus, LiveEvent};
+    use rof::obs::{Boundary, ControlAck, ControlKind, ControlStatus, LiveEvent, TraceEvent};
 
     /// Serializes the tests that scrub the provider env. Tokio's mutex so
     /// the guard is async-aware: the runs below await while the env is
@@ -1140,6 +1140,21 @@ mod tests {
                 LiveEvent::Finished(_) => Some("session".to_string()),
             })
             .collect()
+    }
+
+    /// The number of implementer prompts the run actually issued, counted
+    /// from the trace: one per round. It is how the two-round configuration
+    /// below is shown to really run two rounds per goal instead of stopping
+    /// at the first one, which is the whole point of a non-terminal
+    /// boundary.
+    fn implementer_rounds(trace: &TraceSink) -> usize {
+        trace
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(event, TraceEvent::ModelCall { agent, .. } if agent == "implementer")
+            })
+            .count()
     }
 
     /// The live worker is silent: it brackets one goal on the channel,
@@ -1323,6 +1338,226 @@ mod tests {
         );
         // The session still ends, and still exactly once.
         // Take the terminal event off the end for the comparison below.
+        let delivered = match events.pop().unwrap() {
+            LiveEvent::Finished(finished) => finished,
+            other => panic!("expected Finished last, got {other:?}"),
+        };
+        assert_eq!(result, delivered);
+        assert!(
+            rx.try_recv().is_err(),
+            "expected no notification after the terminal outcome"
+        );
+    }
+
+    /// The whole P1b stack, end to end: a real `GoalRunner` over a real
+    /// `Orchestrator`, the real `RunControl` boundary drain, and the real
+    /// live channel, driven by a steer and a queued goal that are submitted
+    /// BEFORE the worker starts — so the only thing that can pick either of
+    /// them up is a real boundary drain.
+    ///
+    /// The configuration is two failing rounds per goal
+    /// (`ROF_MAX_ROUNDS=2` with a check that exits non-zero), which is what
+    /// makes the FIRST round's boundary non-terminal: the second round is
+    /// still ahead, so a steer drained there has a prompt left to reach. The
+    /// trace confirms the rounds really ran — `implementer_rounds` is two per
+    /// goal, not one.
+    #[tokio::test]
+    async fn a_steer_and_a_queued_goal_are_drained_at_a_two_round_boundary() {
+        let _env = ENV_LOCK.lock().await;
+        let worker = LiveWorker::new("two-round", Some("2"), Some("false")).await;
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Channel order is the acknowledgement order: steer, then queue.
+        command_tx
+            .send(RunCommand::Steer {
+                id: 21,
+                text: "focus on the parser".into(),
+            })
+            .unwrap();
+        command_tx
+            .send(RunCommand::QueueGoal {
+                id: 22,
+                goal: "second goal".into(),
+            })
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = worker
+            .runner
+            .run_live("first goal".into(), tx, command_rx)
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let projection = shape(&events);
+        println!("two-round sequence: {projection:?}");
+
+        // Two rounds per goal, so the first goal's round boundary was
+        // non-terminal: without this, the Applied steer below would be
+        // asserting against a configuration that never had a second round.
+        assert_eq!(
+            implementer_rounds(&worker.runner.trace),
+            4,
+            "expected two rounds per goal, not one: the first boundary was terminal"
+        );
+
+        // With the control acks projected out, the goal/session sequence is
+        // exactly the two per-goal brackets and one session end. The acks are
+        // asserted on their own below; here only the order of these matters.
+        let sequence: Vec<&str> = projection
+            .iter()
+            .filter(|s| !s.starts_with("control "))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            sequence,
+            vec!["started", "goal", "finished", "started", "goal", "finished", "session"],
+            "unexpected two-round, two-goal sequence: {projection:?}"
+        );
+        // Exactly two per-goal outcomes: the queued goal ran once, in this
+        // same worker task, and the session's terminal outcome is published
+        // once, last.
+        assert_eq!(
+            projection.iter().filter(|s| *s == "goal").count(),
+            2,
+            "expected exactly two per-goal outcomes: {projection:?}"
+        );
+        assert_eq!(
+            projection.iter().filter(|s| *s == "session").count(),
+            1,
+            "the session outcome was not published exactly once: {projection:?}"
+        );
+        assert_eq!(
+            sequence.last().copied(),
+            Some("session"),
+            "the session outcome is not last: {projection:?}"
+        );
+
+        // Both commands were answered, in channel order, and both were
+        // applied. The Applied steer is the end-to-end proof that a
+        // non-terminal boundary carried it into a following round: the very
+        // same command is Rejected with `no next round` when no round
+        // follows (the next test pins that).
+        let acks: Vec<&ControlAck> = events
+            .iter()
+            .filter_map(|event| match event {
+                LiveEvent::Control(ack) => Some(ack),
+                _ => None,
+            })
+            .collect();
+        let answered: Vec<(u64, ControlKind, ControlStatus)> = acks
+            .iter()
+            .map(|ack| (ack.id, ack.kind, ack.status))
+            .collect();
+        assert_eq!(
+            answered,
+            vec![
+                (21, ControlKind::Steer, ControlStatus::Applied),
+                (22, ControlKind::Queue, ControlStatus::Applied),
+            ],
+            "the acknowledgements did not arrive in channel order as applied: {acks:?}"
+        );
+
+        // The returned worker result is the outcome the console was told.
+        let delivered = match events.pop().unwrap() {
+            LiveEvent::Finished(finished) => finished,
+            other => panic!("expected Finished last, got {other:?}"),
+        };
+        assert_eq!(result, delivered);
+        assert!(
+            rx.try_recv().is_err(),
+            "expected no notification after the terminal outcome"
+        );
+    }
+
+    /// The same stack and the same two pre-submitted commands, with the
+    /// round cap at one so no round follows the first goal's boundary. The
+    /// pair is the claim: the steer is now `Rejected` with a note naming the
+    /// no-next-round case — a boundary that cannot deliver a steer says so
+    /// instead of dropping it — while the queued goal, which has no such
+    /// problem, is still retained and started.
+    #[tokio::test]
+    async fn a_steer_with_no_round_after_it_is_rejected_while_the_queued_goal_still_runs() {
+        let _env = ENV_LOCK.lock().await;
+        let worker = LiveWorker::new("one-round", Some("1"), Some("false")).await;
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        command_tx
+            .send(RunCommand::Steer {
+                id: 31,
+                text: "focus on the parser".into(),
+            })
+            .unwrap();
+        command_tx
+            .send(RunCommand::QueueGoal {
+                id: 32,
+                goal: "second goal".into(),
+            })
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = worker
+            .runner
+            .run_live("first goal".into(), tx, command_rx)
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let projection = shape(&events);
+        println!("one-round sequence: {projection:?}");
+
+        // One round per goal: this goal's only boundary is terminal, which is
+        // what the Rejected steer below is about.
+        assert_eq!(
+            implementer_rounds(&worker.runner.trace),
+            2,
+            "expected one round per goal: the boundary was not terminal"
+        );
+
+        let acks: Vec<&ControlAck> = events
+            .iter()
+            .filter_map(|event| match event {
+                LiveEvent::Control(ack) => Some(ack),
+                _ => None,
+            })
+            .collect();
+        let answered: Vec<(u64, ControlKind, ControlStatus)> = acks
+            .iter()
+            .map(|ack| (ack.id, ack.kind, ack.status))
+            .collect();
+        assert_eq!(
+            answered,
+            vec![
+                (31, ControlKind::Steer, ControlStatus::Rejected),
+                (32, ControlKind::Queue, ControlStatus::Applied),
+            ],
+            "the acknowledgements did not track the missing next round: {acks:?}"
+        );
+        let steer = acks
+            .iter()
+            .find(|ack| ack.id == 31)
+            .expect("the steer was never answered");
+        assert!(
+            steer.note.contains("no next round"),
+            "the rejection does not name the no-next-round case: {}",
+            steer.note
+        );
+
+        // The rejected steer cost the queued goal nothing: it was retained and
+        // it started, so the session still ran both goals and ended once.
+        let sequence: Vec<&str> = projection
+            .iter()
+            .filter(|s| !s.starts_with("control "))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            sequence,
+            vec!["started", "goal", "finished", "started", "goal", "finished", "session"],
+            "unexpected one-round, two-goal sequence: {projection:?}"
+        );
+
         let delivered = match events.pop().unwrap() {
             LiveEvent::Finished(finished) => finished,
             other => panic!("expected Finished last, got {other:?}"),

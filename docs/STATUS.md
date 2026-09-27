@@ -3480,3 +3480,88 @@ force-exit detaches the worker, so an in-flight tool process may continue
 until its own timeout; and P1b–P4 (steering/queue, diff/provider panes,
 themes/persistence) remain unstarted. The TB Slice A gate remains blocked
 until a funded/available Go endpoint produces one green run.
+
+## 2026-09-27 — P1b mid-run steering and one queued goal shipped
+
+Boundary-safe control is implemented and reviewed through subagent
+writer/reviewer cycles. Commits: `d878f1e` (live control state), `322de00`
+(engine boundary hook), `1771343` (two-goal worker session), `a1c8e56`
+(running submit reducer), `940f287` (live command + deferred config
+routing), `68538be` (control-aware rendering), plus this handoff. Design:
+`docs/superpowers/specs/2026-09-25-p1b-steer-queue-design.md`; plan:
+`docs/superpowers/plans/2026-09-25-p1b-steer-queue.md`.
+
+- **One slot each, one boundary.** `RunCommand::{Steer, QueueGoal, Stop}`
+  carries the id the console allocated. `RunControl` drains the channel only
+  at a boundary, keeps the newest steer and the newest queued goal, and
+  acknowledges every command it consumes in channel order — displaced,
+  too-late, and stopped commands are `Rejected` with a reason, never
+  silently dropped. A steer is refused at a boundary that has no following
+  round (`no next round`) instead of being acked and lost.
+- **Never mid-call.** Commands reach the model only through
+  `RunHooks::apply_boundary`, which the orchestrator calls after a complete
+  implementer/reviewer round (both pipeline and direct loops) and once more
+  at each run's terminal boundary. `tests/loop.rs` drives a real
+  `FakeClient` and asserts a steer submitted during round 1 appears in
+  round 2's prompt and not in round 1's, with the run's verdict unchanged.
+- **One worker, two goals.** `GoalRunner::run_live` brackets each goal with
+  `Boundary::Started`/`Boundary::Finished`, publishes a per-goal
+  `GoalFinished`, takes the queued goal exactly once, rebuilds config and
+  clients for it, and publishes the single session-terminal `Finished`
+  last. `LiveSession` keeps the worker handle until that one event.
+- **Deferred configuration.** Settings submitted while a goal runs write the
+  env at submission and are recorded, in order, in `App.deferred_config`,
+  which `begin_run` clears. A queued goal is started by the worker task, so
+  the console cannot run code "just before" it — the setting therefore
+  reaches that queued goal, and the UI says `applies to the next goal` in
+  every case. `/login`, `/logout`, and provider mutations are refused with
+  `available between goals` without reading a credential, touching the
+  store, or echoing the refused argument.
+- **Rendering.** The P1a `composer · read-only (P1a)` title is GONE: a live
+  composer submits. `composer · queue · steer pending (1) · goal queued…`
+  and a status row carrying the same summary replace it; the control segment
+  is what survives a long `ROF_THINKING` label. Idle and replay status
+  strings are asserted byte-identical, and the P1a four-pane geometry is
+  unchanged.
+- **Verification.** `cargo fmt -- --check` clean; `cargo test` green (329
+  tests, 0 failures, 29 binaries); `cargo clippy --all-targets
+  --all-features -- -D warnings` clean; `git diff --check` clean. The
+  end-to-end pair `a_steer_and_a_queued_goal_are_drained_at_a_two_round_boundary`
+  / `a_steer_with_no_round_after_it_is_rejected_while_the_queued_goal_still_runs`
+  drives a real `GoalRunner`, real orchestrator, and real boundary drain
+  over two failing rounds, and counts the goal rounds from the live trace:
+  the same steer is `Applied` when a round follows and `Rejected` with
+  `no next round` when one does not.
+
+Offline PTY smoke (24x100, `StubClient`, empty scratch credentials,
+`ROF_CHECK=sleep 3`, `ROF_MAX_ROUNDS=2`, `ROF_TRACE` set): a goal was
+submitted, a steer submitted while it ran, `/busy queue` switched the mode, a
+second goal was queued, and the run exited 0 through the P1a two-press quit
+path. All 14 screen/trace assertions passed. Mid-run frame:
+
+```
+status:   running · calls=3 in=281 out=60 pass=0 fail=0 · queue · steer pending (1) · goal queued (2)
+composer: composer · queue · steer pending (1) · goal queued…
+          steer rejected (1) — rejected: no next round remains to steer
+          queue applied (2) — retained for the next goal
+          goal finished: passed
+          ▶ then update the docs
+```
+
+and the settled frame ended in `goal finished: passed`,
+`run finished: passed`, `quit armed — press q/Esc/Ctrl-C again to exit`, with
+the composer back to a plain `composer`. The durable trace held both
+`SessionStart` goals in submission order from that one session. The steer
+was honestly refused there because the stub's reviewer ends the task at its
+first round; the applied path is what the two-round end-to-end test pins.
+
+Known limits carried forward: a command submitted between a goal's last
+boundary and its `GoalFinished` is answered by the goal-boundary drain
+(microseconds wide, and now acked rather than dropped); a `Stop` that lands
+after the final drain of goal N is seen at goal N+1's first boundary, so
+that goal may start and then stop; a force-exit still detaches the worker,
+so an in-flight tool may finish on its own timeout; the P1a credential
+capture can still be started from the idle prompt. Not started, and not
+claimed: diff and provider panes, token deltas, session persistence,
+multi-session state (P3), and the TB Slice A gate, which still needs a
+funded/available Go endpoint to produce one green run.
