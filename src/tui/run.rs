@@ -733,7 +733,43 @@ where
     out
 }
 
-/// The pump itself: owns `App`, the `LiveSession`, and the idle-only
+/// The `App` a console starts with: the defaults, then the allowlisted
+/// preferences restored from `path`.
+///
+/// This is the startup seam and it is a separate function from the terminal
+/// pump so the restore is testable headlessly — a test points it at a temp
+/// file, and the live path passes [`super::prefs::default_path`]. It
+/// restores ONLY what `~/.rof/tui.json` is allowed to carry (currently the
+/// theme), so a restart resumes the console's display and nothing else: no
+/// run, no goal, no transcript, no queue, no pending control, no secret.
+pub fn app_with_prefs(path: &std::path::Path) -> App {
+    let prefs = super::prefs::load(path);
+    let mut app = App::new();
+    if let Some(theme) = super::theme::Theme::parse(&prefs.theme) {
+        app.theme = theme;
+    }
+    app
+}
+
+/// Write the allowlisted preferences, and only if a command changed one.
+///
+/// `before` is the snapshot taken before the command ran, so an ordinary
+/// goal or composer line never rewrites the file: only a preference the
+/// user actually changed is persisted. A failed write is reported on the
+/// transcript rather than swallowed — the console keeps running either
+/// way, because a preference that did not save is a lost display choice,
+/// not a reason to end the session.
+fn persist_prefs(app: &mut App, before: &super::prefs::Prefs, path: &std::path::Path) {
+    let after = super::prefs::from_app(app);
+    if after == *before {
+        return;
+    }
+    if let Err(e) = super::prefs::save(path, &after) {
+        app.transcript.push(format!("preferences not saved: {e}"));
+    }
+}
+
+/// The alternate-screen event pump: owns `App`, the `LiveSession`, and the idle-only
 /// `/login` key capture. One goal at a time — Enter starts a goal
 /// immediately and the run is watched in place; a goal the worker
 /// continues after a queued one never comes back through here, because
@@ -753,7 +789,10 @@ where
 {
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let mut app = App::new();
+    // Preferences load BEFORE the first draw, so a restart repaints in the
+    // saved theme instead of flashing the default one first.
+    let prefs_path = super::prefs::default_path();
+    let mut app = app_with_prefs(&prefs_path);
     // The posture accent is startup state, not render state: read once here
     // so `draw` stays a pure function of `App`.
     app.thinking = std::env::var("ROF_THINKING").unwrap_or_default();
@@ -810,6 +849,13 @@ where
                         let draft = app.input.clone();
                         match super::cmd::parse(&draft) {
                             Some(action) => {
+                                // A command that changes an allowlisted
+                                // preference is persisted here and nowhere
+                                // else: `apply_action` itself stays a
+                                // headless reducer, and no other state
+                                // (run, goal, transcript, queue, pending
+                                // control) has a path to disk.
+                                let before = super::prefs::from_app(&app);
                                 match handle_running_action(
                                     &mut app,
                                     action,
@@ -838,6 +884,7 @@ where
                                     | RunningActionOutcome::Deferred
                                     | RunningActionOutcome::BusyMode(_) => {}
                                 }
+                                persist_prefs(&mut app, &before, &prefs_path);
                             }
                             None => {
                                 if let RunningSubmit::Rejected(reason) =
@@ -1037,9 +1084,13 @@ where
                             }
                         }
                         Some(action) => {
+                            // The same persistence seam as the running
+                            // path, for the same reason.
+                            let before = super::prefs::from_app(&app);
                             if apply_action(&mut app, trace, action, &text, &mut awaiting_key) {
                                 return Ok(());
                             }
+                            persist_prefs(&mut app, &before, &prefs_path);
                         }
                     }
                 }
@@ -1383,7 +1434,7 @@ pub fn apply_action(
             .transcript
             .push(format!("no pending proposal {id} in this console yet")),
         Action::Display(m) => app.transcript.push(format!(
-            "display={m}: single fullscreen view in this console"
+            "display={m}: not available in this console — it renders one fullscreen view"
         )),
         // Display state, so the switch is immediate: a repaint is not a
         // model knob and a running goal has no say in how the console

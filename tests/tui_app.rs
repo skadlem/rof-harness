@@ -1790,3 +1790,46 @@ fn theme_while_live_sends_nothing_on_the_command_channel() {
         rx.try_recv().ok()
     );
 }
+
+/// `/display` reports the mode as NOT available rather than pretending a
+/// switch happened. The console owns the alternate screen for the whole
+/// session and leaves it on the way out (the P1a terminal-restoration
+/// contract), so honouring `regular` would mean giving up one half of that
+/// pair. Saying "not available" is the honest answer, and the file records
+/// the posture the console actually rendered — see `tui_prefs.rs`.
+#[test]
+fn display_reports_the_mode_as_not_available_instead_of_faking_a_switch() {
+    for mode in ["fullscreen", "regular"] {
+        let mut app = App::new();
+        apply(&mut app, &format!("/display {mode}"));
+        let line = app
+            .transcript
+            .last()
+            .cloned()
+            .expect("/display wrote no line");
+        assert!(
+            line.contains(mode),
+            "the line does not name the mode: {line}"
+        );
+        assert!(
+            line.contains("not available"),
+            "/display implied a switch it cannot make: {line}"
+        );
+        // It is a report, not a state change: nothing on the console moved.
+        assert_eq!(app.theme, rof::tui::theme::Theme::default());
+    }
+}
+
+/// The closed parser refuses a mode that is not one, and the refusal names
+/// the same two the preferences file validates against.
+#[test]
+fn display_refuses_a_mode_that_is_not_a_mode() {
+    assert!(matches!(
+        rof::tui::cmd::parse("/display inline"),
+        Some(rof::tui::cmd::Action::Unknown(_))
+    ));
+    assert!(matches!(
+        rof::tui::cmd::parse("/display fullscreen"),
+        Some(rof::tui::cmd::Action::Display(ref m)) if m == "fullscreen"
+    ));
+}

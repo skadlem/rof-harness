@@ -335,9 +335,15 @@ pub fn parse(input: &str) -> Option<Action> {
             Some(id) => Action::Reject(id),
             None => Action::Unknown("/reject needs <id>".into()),
         },
-        "display" => match one(0) {
-            Some(m) if ["fullscreen", "regular"].contains(&m.as_str()) => Action::Display(m),
-            _ => Action::Unknown("/display takes fullscreen/regular".into()),
+        "display" => match one(0).and_then(|m| super::prefs::DisplayMode::parse(&m)) {
+            Some(mode) => Action::Display(mode.name().to_string()),
+            // Refused here, at the closed parser, from the same table the
+            // preferences file validates against: a name `/display` will not
+            // take is not a name `~/.rof/tui.json` can restore either.
+            None => Action::Unknown(format!(
+                "/display takes {}",
+                super::prefs::DisplayMode::valid_names()
+            )),
         },
         "theme" => match one(0) {
             // The listing: no argument is a read, not an error.

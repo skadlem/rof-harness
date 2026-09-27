@@ -132,6 +132,28 @@ pub enum Focus {
 /// from the top for a forward Tab and from the bottom for a reverse one.
 pub const FOCUS_ORDER: [Focus; 4] = [Focus::Transcript, Focus::Run, Focus::Diff, Focus::Composer];
 
+impl Focus {
+    /// The word a pane is named by, on screen and in `~/.rof/tui.json`. The
+    /// persisted focus order and the ring above are therefore the same
+    /// list, and a name the file carries can be resolved back to a pane
+    /// without a second table.
+    pub fn name(self) -> &'static str {
+        match self {
+            Focus::Transcript => "transcript",
+            Focus::Run => "run",
+            Focus::Diff => "diff",
+            Focus::Composer => "composer",
+        }
+    }
+
+    /// The pane a name selects, or `None` for a name that is not a pane.
+    /// There is deliberately no fallback here: a caller that gets `None`
+    /// must refuse the name, not quietly land on some other pane.
+    pub fn parse(name: &str) -> Option<Focus> {
+        FOCUS_ORDER.into_iter().find(|pane| pane.name() == name)
+    }
+}
+
 /// The composer is where the console starts. Typing must keep working with
 /// no focus key pressed, so focus never begins anywhere else.
 impl Default for Focus {
@@ -239,8 +261,9 @@ pub struct App {
     /// terminal-native palette, so a console that never runs `/theme`
     /// renders exactly what it rendered before themes existed.
     ///
-    /// Not persisted: a later change owns `~/.rof/tui.json`, and until then
-    /// the choice lasts for this console and is read back from here.
+    /// Restored at startup from the allowlisted preferences in
+    /// `~/.rof/tui.json` (see `prefs.rs`), and the only `App` state that
+    /// file carries.
     pub theme: crate::tui::theme::Theme,
 }
 
