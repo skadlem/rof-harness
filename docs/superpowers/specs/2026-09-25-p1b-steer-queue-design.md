@@ -313,8 +313,7 @@ a live knob change. No configuration is forwarded to the current worker.
 | Failure | Behavior |
 |---|---|
 | Command channel closed | Worker finishes current goal; queued commands are not invented |
-| Worker drops the command receiver | Current call completes; pending UI slots show rejected on the next pump tick |
-| A later goal needs a new inbox | `LiveSession` mints a fresh pair and moves the sender; commands reach the running worker, never a dead task's inbox |
+| Worker drops the command receiver | Current call completes; pending UI slots show rejected on the next pump tick || A later goal needs a new inbox | `LiveSession` mints a fresh pair and moves the sender; commands reach the running worker, never a dead task's inbox |
 | Steer received at terminal boundary | Rejected ack `no next round` |
 | Queue received at terminal boundary | Retained and started after the current `GoalFinished` |
 | Configuration rejected | Transcript and status show the exact reason; env/config unchanged |
