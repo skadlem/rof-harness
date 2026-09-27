@@ -120,7 +120,13 @@ Minimum integrity mechanisms, in dependency order:
    test files or the runner config. This is the direct counter to #319 and it is
    ~small. Claude Code's own methodology keeps the visible test suite as the
    trust boundary and adds a *separate* scoring model on top **[ext]** — copy
-   the shape, not just the tests.
+   the shape, not just the tests. **Shipped** (build item 1, commit `5e72bff` +
+   the runner-config follow-up): baseline test paths AND baseline runner config
+   are protected, using git's own tracked/untracked split so a *new* test file is
+   still a legitimate deliverable. Runner config covers
+   `Makefile`/`*.mk`/`Rakefile`/`justfile` and the test-runner configs
+   (`pytest.ini`, `tox.ini`, `conftest.py`, jest/vitest/mocha, `phpunit.xml`),
+   because the documented adversary edited the Makefile, not an assertion.
 2. **Deterministic oracle first, judge only where it cannot reach.** Checks,
    the write gate, and the test suite are evidence. The LLM reviewer is the
    fallback, not the primary. Extend the existing write-gate pattern.
@@ -131,6 +137,27 @@ Minimum integrity mechanisms, in dependency order:
    can influence recreates the trap.
 4. **Aggregate verdicts where you must judge.** One verdict flips 13.6%; if a
    decision rests on the model alone, take N judgments and aggregate.
+
+## 5a. Known holes in the shipped oracle gate (build item 1)
+
+Honest accounting, because a control that overstates itself is worse than none:
+
+- **Convention, not semantics.** A test at a non-conventional path
+  (`src/foo.rs`) is invisible to the path predicate. Documented in the code.
+- **Manifests are deliberately unprotected** — `Cargo.toml` / `package.json` /
+  `go.mod` — so adding a dependency is never blocked. A dependency edit can also
+  change what the suite runs; that hole is the price of not blocking ordinary
+  work. Closing it means pinning the check command's own file list.
+- **No opt-out.** A task whose legitimate deliverable is editing an existing
+  baseline test is now unpassable. The narrow escape (a declared allowance, or a
+  user-set opt-in) is deliberately NOT built yet: nobody has asked for it and it
+  is a security control. It is a small spec when someone does.
+- **A final-round tamper is refused but not rolled back.** The pre-retry
+  rollback only runs when a retry follows, so on the last round the work copy
+  keeps whatever the agent left — the same as any failed run. The control is
+  that the run does not report success; the work copy is the user's.
+- **Direct mode is conditioned on `has_oracle`**, not `expect_writes`, because
+  with no reviewer the configured check *is* the oracle.
 
 ## 6. Context discipline — the measured competitive axis
 

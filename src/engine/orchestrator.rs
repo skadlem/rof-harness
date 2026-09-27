@@ -1028,7 +1028,13 @@ impl Orchestrator {
                 // feedback so the generic failure note below cannot talk over it.
                 let tampered = diff.protected_oracle();
                 let mut oracle_refused = false;
-                if passed && session.expect_writes && !tampered.is_empty() {
+                // Conditioned on `has_oracle`, NOT on `expect_writes`: in
+                // direct mode there is no reviewer, so when a check is
+                // configured the check IS the oracle. Conditioning on
+                // `expect_writes` left a real hole — a
+                // `expect_writes: false` run with a check could weaken a
+                // baseline assertion, pass its own weakened check, and ship.
+                if passed && has_oracle && !tampered.is_empty() {
                     self.trace.emit(TraceEvent::StateTransition {
                         from: "direct_verdict".to_string(),
                         to: "rejected_oracle_modified".to_string(),

@@ -75,7 +75,9 @@ impl TreeDiff {
         self.names
             .iter()
             .filter(|name| {
-                crate::engine::session::is_test_shaped(name) && !self.untracked.contains(name)
+                (crate::engine::session::is_test_shaped(name)
+                    || crate::engine::session::is_runner_config(name))
+                    && !self.untracked.contains(name)
             })
             .cloned()
             .collect()
@@ -129,8 +131,16 @@ impl TreeService {
     /// The change set vs the baseline. `git status` is the source of truth for
     /// the names: `git diff` alone misses files the attempt created, and a
     /// model that wrote a new file must not read back "no writes".
+    ///
+    /// `--no-renames` because rename detection is the one way the protected
+    /// oracle could be walked around: `git status` reports a rename by its NEW
+    /// name, so moving `tests/oracle.rs` to `src/helper.rs` would report only
+    /// the new (non-test) path and read as a clean change. With renames off,
+    /// the same move reports as a delete plus a new file, and the delete is
+    /// caught. The agent cannot stage a rename either way (`git` is never on
+    /// the allowlist and `.git` is unreachable), so this costs nothing.
     pub fn diff(&self) -> anyhow::Result<TreeDiff> {
-        let porcelain = self.git(["status", "--porcelain"])?;
+        let porcelain = self.git(["status", "--porcelain", "--no-renames"])?;
         let text = String::from_utf8_lossy(&porcelain.stdout);
         let mut names: Vec<String> = Vec::new();
         let mut new_files: Vec<String> = Vec::new();

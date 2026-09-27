@@ -840,6 +840,47 @@ pub fn is_test_shaped(path: &str) -> bool {
     lower.contains(".test.") || lower.contains(".spec.")
 }
 
+/// A changed path that decides WHICH tests run, or how strictly they are
+/// scored. This is the other half of the protected oracle, and it exists
+/// because the documented failure in claude-code issue #319 was not an agent
+/// editing an assertion: it "simply updated the make file to only run tests
+/// that were passing. It called these 'safe-tests'." A path predicate that
+/// missed runner config would have left the flagship adversary standing.
+///
+/// Deliberately EXCLUDES `Cargo.toml` / `package.json` / `go.mod`: a task
+/// whose deliverable is adding a dependency must not be refused for editing
+/// the manifest. That trade is a known hole — a dependency edit can also
+/// change what the suite runs — and it is the price of not blocking ordinary
+/// work. Closing it properly means pinning the actual check command's file
+/// list, which needs the check surface to be knowable.
+pub fn is_runner_config(path: &str) -> bool {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let lower = base.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "makefile" | "gnumakefile" | "rakefile" | "justfile"
+    ) {
+        return true;
+    }
+    if lower.ends_with(".mk") {
+        return true;
+    }
+    // Test-runner configuration: the file that decides which tests execute.
+    [
+        "pytest.ini",
+        "tox.ini",
+        "conftest.py",
+        "jest.config.",
+        "vitest.config.",
+        "mocharc.",
+        "karma.conf.",
+        "phpunit.xml",
+        "pytest.cfg",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 /// The harness's refusal note when a run modified a protected oracle file
 /// (§5). The harness — not the reviewer — is named as the refuser and the
 /// offending paths are listed, so the feedback that reaches the next round
