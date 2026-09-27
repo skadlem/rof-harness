@@ -16,6 +16,51 @@ pub struct GoalFinished {
     pub error: Option<String>,
 }
 
+/// The goal's ONE lesson (learn mode §5), as it rides the run result's
+/// `lesson` value.
+///
+/// Two fields, both produced by `agents::teach`: the `concept` label the
+/// model named, and the `text` composed from the model's own `because` (plus
+/// whatever that run dropped for the one-concept-per-goal rule). The harness
+/// adds no prose of its own, so a consumer shows the text and keys the
+/// answer commands off `concept` — never by parsing prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lesson {
+    pub concept: String,
+    pub text: String,
+}
+
+impl Lesson {
+    /// Read the `lesson` field of a run result, or `None` when this run
+    /// taught nothing.
+    ///
+    /// The anti-nag gate is silence, so `null` is the COMMON case and the
+    /// ordinary one, not a fault. A value with no usable concept label is
+    /// also `None`: the two answer commands would have nothing to name, and
+    /// a concept guessed out of the prose is a concept the store would then
+    /// hold under a name nobody chose.
+    pub fn from_result(lesson: Option<&serde_json::Value>) -> Option<Self> {
+        let lesson = lesson?;
+        let concept = lesson.get("concept")?.as_str()?.trim();
+        if concept.is_empty() {
+            return None;
+        }
+        // The text is the model's own composition. A result that carried the
+        // concept without it still gets the concept shown, rather than a
+        // lesson line with nothing in it.
+        let text = lesson
+            .get("text")
+            .and_then(|t| t.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or(concept);
+        Some(Self {
+            concept: concept.to_string(),
+            text: text.to_string(),
+        })
+    }
+}
+
 /// Which pending slot a live command addressed. `Stop` carries no text:
 /// it is the request to end the run at the next boundary.
 ///
@@ -77,7 +122,11 @@ pub struct ControlAck {
 /// durable source of truth; this channel is ordered to match it.
 ///
 /// `GoalFinished` is one goal's outcome; `Finished` is the session-terminal
-/// outcome and is the only event that ends the interactive run.
+/// outcome and is the only event that ends the interactive run. `Lesson` is
+/// its own variant rather than a field on `GoalFinished` for the same reason
+/// the trace keeps its own: the outcome is constructed in every place a goal
+/// can end, and a lesson is not an outcome — it is the one concept the goal
+/// taught, and a goal that taught nothing still finished.
 ///
 /// There is deliberately no `Control` variant: an acknowledgement is a
 /// [`TraceEvent::Control`], so the live console and a recorded replay read
@@ -88,5 +137,7 @@ pub enum LiveEvent {
     Trace(TraceEvent),
     Boundary(Boundary),
     GoalFinished(GoalFinished),
+    /// The goal's one lesson, published beside that goal's outcome.
+    Lesson(Lesson),
     Finished(GoalFinished),
 }

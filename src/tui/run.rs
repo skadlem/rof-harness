@@ -159,6 +159,10 @@ impl LiveSession {
                 // replayed run uses. The worker handle stays admitted
                 // regardless: only the terminal `Finished` releases it.
                 LiveEvent::GoalFinished(finished) => app.on_goal_finished(&finished),
+                // The goal's one lesson. Its own reducer, its own line: it
+                // is the one event the user is meant to read rather than
+                // scan, and it says nothing about the run's lifecycle.
+                LiveEvent::Lesson(lesson) => app.on_lesson(&lesson),
                 LiveEvent::Finished(finished) => outcome = Some(finished),
             }
         }
@@ -469,7 +473,7 @@ pub enum RunningActionOutcome {
 ///
 /// - **Display-only** — `Help`, `Unknown`, `Models`, `Context`, `Trace`,
 ///   `Hotkeys`, `Diff`, `ProviderList`, `Providers`, `Display`, `Theme`,
-///   and the
+///   the two lesson answers `GotIt` / `StillLost`, and the
 ///   already
 ///   unavailable `Retry`/`Approve`/`Reject`/`Undo` answers — go through
 ///   [`apply_action`] exactly as they do between goals, and return
@@ -481,7 +485,10 @@ pub enum RunningActionOutcome {
 ///   stable head once, at the top of the loop, from
 ///   `context::memory::load` — so a store edit reaches the NEXT goal and
 ///   cannot change the head the running one is already using. It is still
-///   a user command and never a write the harness makes on its own.
+///   a user command and never a write the harness makes on its own. The two
+///   lesson answers write the same store by the same path, for the same
+///   reason: a user who read a lesson while the next goal runs must be able
+///   to answer it, and neither ever becomes steer text.
 /// - **`Busy("steer" | "queue")`** sets the composer's busy mode, sends
 ///   nothing, and returns the new mode. **`Busy("interrupt")`** sets
 ///   `BusyMode::Interrupt` and returns [`RunningActionOutcome::Stop`]: it
@@ -532,6 +539,8 @@ pub fn handle_running_action(
         | Action::ProviderList
         | Action::Providers
         | Action::Profile(_)
+        | Action::GotIt
+        | Action::StillLost
         | Action::Display(_)
         | Action::Theme(_)
         | Action::Retry(_)
@@ -757,6 +766,67 @@ fn profile_command(app: &mut App, cmd: super::cmd::ProfileCmd) {
         }
     }
 }
+
+/// Answer the last lesson: `/got it` claims the user understood it,
+/// `/still lost` puts it back to `not_explained` so the gate teaches it
+/// again.
+///
+/// The concept comes from [`App::last_lesson_concept`], which the lesson
+/// reducer set: the label the model named, never the prose around it. With
+/// no lesson there is nothing to answer, and the command says so and stops —
+/// an answer is about a specific concept, and applying one to a guess would
+/// be a claim about a person made by the harness.
+///
+/// The write goes through the store's one mutating entry point,
+/// [`Profile::apply`](crate::context::profile::Profile::apply), on the very
+/// same arms `/profile assume-understood` and `assume-unknown` reach. So
+/// `/got it` is the only route to `understood` this console has, it is
+/// reachable only because the user typed it, and a save is attempted only
+/// after `apply` accepted the edit: a refusal leaves the file the user also
+/// edits by hand untouched.
+///
+/// Degradation is not failure. A store that could not be READ is reported
+/// and nothing is written — `load` degrades it to an empty store, and an
+/// empty store would accept the edit and claim a state for a file the
+/// harness never understood. A save that FAILS is reported with the concept
+/// still unchanged, because `save` writes a temp file and renames it. Either
+/// way the run is untouched: this is one transcript line, and the goal that
+/// taught the lesson has already ended.
+fn lesson_answer(app: &mut App, understood: bool) {
+    let Some(concept) = app.last_lesson_concept.clone() else {
+        app.transcript.push(NO_LESSON.to_string());
+        return;
+    };
+    let mut profile = crate::context::profile::load();
+    if let Some(warning) = &profile.warning {
+        app.transcript.push(format!("lesson: {warning}"));
+        return;
+    }
+    let edit = if understood {
+        // The user's own word, and the store's arm documented as the ONLY
+        // route to `understood`: there is no argument to this call that
+        // could be produced by a goal, a heuristic, or an inference.
+        crate::context::profile::Edit::AssumeUnderstood(concept.clone())
+    } else {
+        crate::context::profile::Edit::AssumeUnknown(concept.clone())
+    };
+    match profile.apply(edit) {
+        // The store's own line, so the state the user just moved to is
+        // named in the store's own words and cannot drift from the file.
+        Ok(line) => match crate::context::profile::save(&profile) {
+            Ok(()) => app.transcript.push(line),
+            Err(e) => app.transcript.push(format!(
+                "lesson: could not write the profile ({e}) — {concept} is unchanged"
+            )),
+        },
+        Err(refusal) => app.transcript.push(format!("lesson: {refusal}")),
+    }
+}
+
+/// Said by both answers when no goal has taught a lesson yet. Names what
+/// would make it work, and claims nothing about the store.
+const NO_LESSON: &str =
+    "no lesson to answer — once a goal explains a concept, `/got it` and `/still lost` answer it";
 
 /// Print one derived set, naming the set so the two are never confused.
 fn render_set(app: &mut App, name: &str, entries: &[&crate::context::profile::Entry]) {
@@ -1615,6 +1685,15 @@ pub fn apply_action(
             .transcript
             .push(format!("no pending proposal {id} in this console yet")),
         Action::Profile(cmd) => profile_command(app, cmd),
+        // The two answers to the last lesson, the same write path
+        // `/profile assume-understood | assume-unknown` takes and for the
+        // same reason: both are one `Edit` through the store's only
+        // mutating entry point. They add nothing to `deferred_config` and
+        // send nothing, so they behave identically here and against a live
+        // goal — a user who read the lesson while the next goal runs must
+        // be able to answer it.
+        Action::GotIt => lesson_answer(app, true),
+        Action::StillLost => lesson_answer(app, false),
         Action::Display(m) => app.transcript.push(format!(
             "display={m}: not available in this console — it renders one fullscreen view"
         )),

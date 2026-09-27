@@ -31,9 +31,19 @@ pub enum Action {
     /// Inspect and correct the user-knowledge store (`~/.rof/PROFILE.md`).
     /// Display and manual edit, both explicit: the subcommands below are
     /// the ONLY way an entry is ever created or moved, and
-    /// `assume-understood` is the only route to `understood` anywhere in
-    /// the harness. See the `Action::Profile` arm in `run.rs`.
+    /// `assume-understood` is one of the two user routes to `understood`
+    /// (the other is `/got it`, which reaches the same
+    /// `Edit::AssumeUnderstood` arm). No harness turn has a third. See the
+    /// `Action::Profile` arm in `run.rs`.
     Profile(ProfileCmd),
+    /// `/got it` — the user answering the last lesson: it landed. The only
+    /// route the console has to `understood`, and it is a person saying so
+    /// (design spec §2, §6).
+    GotIt,
+    /// `/still lost` — the same answer, the other way: the concept goes back
+    /// to `not_explained` so the anti-nag gate teaches it again. A
+    /// first-class answer, not a failure.
+    StillLost,
     Approve(String),
     Reject(String),
     Display(String),
@@ -313,6 +323,21 @@ pub fn parse(input: &str) -> Option<Action> {
     if !t.starts_with('/') {
         return None;
     }
+    // The two self-report answers (learn mode §6) are PHRASES, not command
+    // names, and they are matched whole BEFORE the name split below: the
+    // registry completes single-token names, so offering `/got` there would
+    // offer a line that is not a command. Every near-miss is refused here
+    // rather than falling through to the catch-all, so a half-typed answer
+    // says what the answers are instead of echoing back the word it got.
+    if t.starts_with("/got") || t.starts_with("/still") {
+        return Some(match t {
+            "/got it" => Action::GotIt,
+            "/still lost" => Action::StillLost,
+            other => Action::Unknown(format!(
+                "{other} — the two answers are `/got it` and `/still lost`"
+            )),
+        });
+    }
     let mut parts = t[1..].split_whitespace();
     let name = parts.next().unwrap_or("");
     let rest: Vec<&str> = parts.collect();
@@ -441,7 +466,7 @@ pub fn parse(input: &str) -> Option<Action> {
 }
 
 pub fn help_text() -> String {
-    "/quit /help /model <p/m> /model ctx|verify|fallback <p/m> /models /providers /login [provider] /logout <provider> /provider add|list|rm /profile list|known|unknown|add|assume-known|assume-unknown|assume-understood|forget /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /theme [name] /busy interrupt|queue|steer /hotkeys\n/busy: steer is the default — Enter during a run steers the live goal · queue stores exactly one next goal · interrupt arms the stop path (q/Esc/Ctrl-C)".to_string()
+    "/quit /help /model <p/m> /model ctx|verify|fallback <p/m> /models /providers /login [provider] /logout <provider> /provider add|list|rm /profile list|known|unknown|add|assume-known|assume-unknown|assume-understood|forget /got it /still lost /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /theme [name] /busy interrupt|queue|steer /hotkeys\n/busy: steer is the default — Enter during a run steers the live goal · queue stores exactly one next goal · interrupt arms the stop path (q/Esc/Ctrl-C)\n/got it /still lost answer the last lesson — only what YOU typed can mark a concept understood; still lost is a first-class answer that has it explained again".to_string()
 }
 
 /// The `/profile` grammar, reused by the two refusals that name it. Lives

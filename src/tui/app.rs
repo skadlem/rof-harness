@@ -1,7 +1,35 @@
 use std::collections::VecDeque;
 
 use super::render::{format_cost, format_models, render_line, replay_filter, Counters};
+use crate::obs::live::Lesson;
 use crate::obs::{Boundary, ControlAck, ControlKind, ControlStatus, GoalFinished, TraceEvent};
+
+/// The marker that makes a lesson read as a lesson.
+///
+/// A lesson that renders like the activity around it is a lesson the user
+/// learns to ignore, which is the one outcome learn mode cannot have. The
+/// glyph is unlike any `render_line` prefix (`▶ ● ! ≡ ✓ · ▸`) and the word is
+/// spelled out, so the line is marked on a terminal with no colour and in a
+/// transcript pasted into a bug report.
+///
+/// The line is the marker plus the model's own composition — concept, then
+/// the model's `because` — and NOTHING else. The harness adds no prose about
+/// the project: it did not read the retry policy, and a paraphrase of one is
+/// a lesson that can be wrong.
+///
+const LESSON_MARK: &str = "★ lesson";
+
+/// The one suffix is not project prose, it is an affordance. The loop is
+/// BIDIRECTIONAL: a lesson the user cannot answer is a one-way street, and
+/// `/help` is not a place anyone reads after they have just watched a goal
+/// finish. Static text, printed identically every time, so it cannot become
+/// the nagging this design is built to avoid.
+const LESSON_ANSWER_HINT: &str = "  (answer: /got it or /still lost)";
+
+/// One goal's lesson as the transcript shows it.
+pub fn lesson_line(lesson: &Lesson) -> String {
+    format!("{LESSON_MARK}: {}{LESSON_ANSWER_HINT}", lesson.text)
+}
 
 /// One acknowledgement, one line — for BOTH the live view and a replayed
 /// trace. Both call this, so a recorded session cannot show different
@@ -260,6 +288,13 @@ pub struct App {
     pub last_control_ack: Option<ControlAck>,
     /// The latest diff evidence, or `None` before the harness has recorded any.
     pub diff_snapshot: Option<DiffSnapshot>,
+    /// The concept the most recent lesson explained — the LABEL, never the
+    /// prose. `/got it` and `/still lost` are answers to a lesson, so this
+    /// is what tells them which entry to move; `None` until a goal has
+    /// taught one, which is what makes an answer with no lesson refuse
+    /// rather than guess. It survives the run that taught it, because a user
+    /// is entitled to answer a lesson after the goal that taught it ended.
+    pub last_lesson_concept: Option<String>,
     /// The selected palette. Display state, so it lives here beside the
     /// focus and the scroll rather than in a global or the environment:
     /// `draw` is a pure function of `App`, and a frame is reproducible in a
@@ -303,6 +338,7 @@ impl Default for App {
             next_control_id: 1,
             last_control_ack: None,
             diff_snapshot: None,
+            last_lesson_concept: None,
             theme: crate::tui::theme::Theme::default(),
         }
     }
@@ -626,6 +662,28 @@ impl App {
                 RunMode::Failed
             };
         }
+    }
+
+    /// The goal's one lesson, made visible and made answerable.
+    ///
+    /// A MARKED transcript line (see [`lesson_line`]) and the concept label
+    /// the two answer commands act on. The concept is stored even when the
+    /// transcript has scrolled past the line, because the answers are about
+    /// the concept, not about the line.
+    ///
+    /// The run pane gets the same line while a goal is live, so a lesson is
+    /// visible in the activity the user is already watching; the transcript
+    /// is the durable half, and it is never bounded, so a long goal cannot
+    /// take the lesson away. Writing this touches nothing about the run
+    /// lifecycle: a lesson is not an outcome, and the goal it belongs to
+    /// still ends exactly as it would have.
+    pub fn on_lesson(&mut self, lesson: &Lesson) {
+        let line = lesson_line(lesson);
+        self.transcript.push(line.clone());
+        if matches!(self.run_mode, RunMode::Running | RunMode::Stopping) {
+            self.push_activity_line(line);
+        }
+        self.last_lesson_concept = Some(lesson.concept.clone());
     }
 
     /// The terminal outcome of the whole session: one concise line stored

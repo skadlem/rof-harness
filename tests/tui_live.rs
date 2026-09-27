@@ -1423,6 +1423,10 @@ async fn stub_worker_delivers_the_same_trace_order_as_the_durable_sink() {
         .filter_map(|event| match event {
             LiveEvent::Trace(event) => Some(serde_json::to_string(event).unwrap()),
             LiveEvent::Boundary(_) | LiveEvent::GoalFinished(_) | LiveEvent::Finished(_) => None,
+            // A lesson is a live notification, not a trace event: it carries
+            // the model's own words, which the durable trace keeps only as
+            // the run result's `lesson` field.
+            LiveEvent::Lesson(_) => None,
         })
         .collect();
     let durable: Vec<String> = stored
@@ -3056,4 +3060,341 @@ fn the_one_line_login_form_still_fails_the_same_way_while_masked() {
         "{masked_lines:?}"
     );
     assert_no_key_material(&masked_lines, FIXTURE_KEY);
+}
+
+// ---------------------------------------------------------------------------
+// Learn mode, slice C1: the lesson reaches the screen, and `/got it` and
+// `/still lost` answer it.
+// ---------------------------------------------------------------------------
+
+use rof::context::profile::{self, Entry, Profile, Scope, State};
+use rof::obs::live::Lesson;
+
+/// One scratch profile file for a lesson-answer test, plus the env override
+/// that points the store at it. The lock and the saved value are held for
+/// the WHOLE test, so no other test in this binary can race the override,
+/// and the directory is removed on drop.
+struct LessonProfile {
+    dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Option<String>,
+}
+
+impl LessonProfile {
+    fn new(tag: &str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(profile::PATH_ENV).ok();
+        let dir = std::env::temp_dir().join(format!(
+            "rof-lesson-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("PROFILE.md");
+        std::env::set_var(profile::PATH_ENV, &path);
+        Self {
+            dir,
+            path,
+            _lock: lock,
+            saved,
+        }
+    }
+
+    /// A store that already holds `concept` as `explained` — the state
+    /// `agents::teach` leaves a concept in once it has taught it.
+    fn with_explained(&self, concept: &str) {
+        let mut p = Profile::default();
+        p.entries.push(Entry {
+            concept: concept.to_string(),
+            state: State::Explained,
+            scope: Scope::Global,
+            evidence: "the model's own because".to_string(),
+            first_mentioned: "2026-09-27".to_string(),
+        });
+        profile::save(&p).unwrap();
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        std::fs::read(&self.path).unwrap()
+    }
+
+    fn state(&self, concept: &str) -> State {
+        profile::load()
+            .entries
+            .into_iter()
+            .find(|e| e.concept == concept)
+            .expect("the concept is in the store")
+            .state
+    }
+}
+
+impl Drop for LessonProfile {
+    fn drop(&mut self) {
+        match self.saved.take() {
+            Some(value) => std::env::set_var(profile::PATH_ENV, value),
+            None => std::env::remove_var(profile::PATH_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Answer between goals, the way the idle prompt does: parse, then
+/// `apply_action` on the raw line.
+fn answer_idle(app: &mut App, raw: &str) -> Vec<String> {
+    let action = parse(raw).unwrap_or_else(|| panic!("{raw} must parse as a command"));
+    assert!(
+        !matches!(action, Action::Unknown(_)),
+        "{raw} must not be Unknown: {action:?}"
+    );
+    let trace = TraceSink::new();
+    let mut awaiting_key: Option<String> = None;
+    let before = app.transcript.len();
+    let quit = apply_action(app, &trace, action, raw, &mut awaiting_key);
+    assert!(!quit, "{raw} must not end the console");
+    // ONLY the lines this command added: a command that says nothing has
+    // said nothing, and one that says two things has said too much.
+    app.transcript[before..].to_vec()
+}
+
+fn lesson(concept: &str) -> Lesson {
+    Lesson {
+        concept: concept.to_string(),
+        text: format!("{concept}: the model's own sentence about it"),
+    }
+}
+
+/// The lesson rides the run result as the value `agents::teach` builds, and
+/// the console reads the concept off THAT value — not off prose, and not
+/// off a field of its own invention.
+#[test]
+fn the_lesson_concept_is_read_off_the_value_the_teacher_produced() {
+    let taught = rof::agents::teach::lesson_value(
+        "retry backoff",
+        "the model's own sentence about it",
+        "retry backoff: the model's own sentence about it",
+        &[],
+    );
+    let result = serde_json::json!({ "passed": true, "lesson": taught });
+    let read = Lesson::from_result(result.get("lesson")).expect("the lesson is on the result");
+    assert_eq!(read.concept, "retry backoff");
+    assert!(read.text.contains("the model's own sentence about it"));
+
+    // No lesson is a run that taught nothing: no event, and nothing to
+    // answer. A `null` lesson and a missing one read the same way.
+    assert!(Lesson::from_result(serde_json::json!({ "passed": true }).get("lesson")).is_none());
+    let null = serde_json::Value::Null;
+    assert!(Lesson::from_result(Some(&null)).is_none());
+    // A lesson with no concept label is refused rather than guessed at: the
+    // two answers would have nothing to name.
+    let unlabelled = serde_json::json!({ "text": "why" });
+    assert!(Lesson::from_result(Some(&unlabelled)).is_none());
+}
+
+/// The live channel carries the lesson to the console: the worker publishes
+/// it with the goal's outcome and `LiveSession` hands it to the reducer, so
+/// the transcript has the line and the answer slot has the concept.
+#[test]
+fn a_lesson_event_drains_into_the_console() {
+    let (tx, rx) = unbounded_channel::<LiveEvent>();
+    let mut session = live_session(rx);
+    let mut app = App::new();
+    app.begin_run("make the parser strict");
+    tx.send(LiveEvent::Lesson(lesson("retry backoff"))).unwrap();
+    assert!(session.drain(&mut app).is_none(), "the run is still live");
+    assert_eq!(app.last_lesson_concept.as_deref(), Some("retry backoff"));
+    assert!(app
+        .transcript
+        .iter()
+        .any(|l| l.contains("retry backoff") && l.to_lowercase().contains("lesson")));
+}
+
+/// `/got it` is the user saying the lesson landed, and it is the ONLY route
+/// the console has to `understood`: it goes through the store's one
+/// mutating entry point, the same `AssumeUnderstood` arm
+/// `/profile assume-understood` reaches.
+#[test]
+fn got_it_moves_the_lesson_to_understood_and_says_so_once() {
+    let s = LessonProfile::new("got-it");
+    s.with_explained("retry backoff");
+    assert_eq!(s.state("retry backoff"), State::Explained);
+
+    let mut app = App::new();
+    app.fresh = false;
+    app.begin_run("make the parser strict");
+    app.on_lesson(&lesson("retry backoff"));
+
+    let said = answer_idle(&mut app, "/got it");
+    assert_eq!(said.len(), 1, "one line per command: {said:?}");
+    assert!(
+        said[0].contains("retry backoff") && said[0].contains("understood"),
+        "the outcome is not on the line: {said:?}"
+    );
+    assert_eq!(s.state("retry backoff"), State::Understood);
+    // And the store the next run reads is the one the file holds.
+    assert!(s.bytes().windows(10).any(|w| w == b"understood"));
+}
+
+/// `/still lost` is a first-class answer, not a failure: the concept goes
+/// back to `not_explained`, so the anti-nag gate will teach it again, and
+/// the transcript says which state it landed in.
+#[test]
+fn still_lost_moves_the_lesson_back_to_not_explained_and_says_so_once() {
+    let s = LessonProfile::new("still-lost");
+    s.with_explained("retry backoff");
+
+    let mut app = App::new();
+    app.fresh = false;
+    app.begin_run("make the parser strict");
+    app.on_lesson(&lesson("retry backoff"));
+
+    let said = answer_idle(&mut app, "/still lost");
+    assert_eq!(said.len(), 1, "one line per command: {said:?}");
+    assert!(
+        said[0].contains("retry backoff") && said[0].contains("not_explained"),
+        "the outcome is not on the line: {said:?}"
+    );
+    assert_eq!(s.state("retry backoff"), State::NotExplained);
+    // A first-class answer never reaches `understood`.
+    assert!(!s.bytes().windows(10).any(|w| w == b"understood"));
+}
+
+/// With no lesson there is nothing to answer. Both commands refuse with a
+/// plain reason, change nothing, and leave the file byte-identical.
+#[test]
+fn both_answers_refuse_with_no_lesson_and_leave_the_file_alone() {
+    for (tag, raw) in [("refuse-got", "/got it"), ("refuse-still", "/still lost")] {
+        let s = LessonProfile::new(tag);
+        s.with_explained("retry backoff");
+        let before = s.bytes();
+        let mut app = App::new();
+        app.fresh = false;
+        app.begin_run("nothing was taught");
+        assert!(
+            app.last_lesson_concept.is_none(),
+            "the fixture must have no lesson to answer"
+        );
+
+        let said = answer_idle(&mut app, raw);
+        assert_eq!(said.len(), 1, "one line per command: {said:?}");
+        assert!(
+            said[0].contains("no lesson"),
+            "the refusal must give a plain reason: {said:?}"
+        );
+        assert!(
+            !said[0].contains("understood"),
+            "a refusal must not claim a state: {said:?}"
+        );
+        assert_eq!(s.bytes(), before, "{raw} touched the store");
+        assert_eq!(s.state("retry backoff"), State::Explained);
+    }
+}
+
+/// The same two answers route while a goal is live — a user reads the
+/// lesson and answers before the run ends. Neither becomes steer text,
+/// neither is deferred as configuration, and neither sends a command.
+#[test]
+fn both_answers_route_while_a_goal_runs_without_sending_or_deferring() {
+    for (tag, raw, action, want) in [
+        ("running-got", "/got it", Action::GotIt, "understood"),
+        (
+            "running-still",
+            "/still lost",
+            Action::StillLost,
+            "not_explained",
+        ),
+    ] {
+        let s = LessonProfile::new(tag);
+        s.with_explained("retry backoff");
+        let (mut app, tx, mut rx) = live_goal();
+        app.on_lesson(&lesson("retry backoff"));
+        let before = app.transcript.len();
+
+        assert_eq!(
+            running_action(&mut app, action, &tx, raw),
+            RunningActionOutcome::View,
+            "{raw} must be carried out, not deferred"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "{raw} sent a command to the running goal"
+        );
+        assert!(
+            app.deferred_config.is_empty(),
+            "{raw} deferred a setting: {:?}",
+            app.deferred_config
+        );
+        assert!(app.pending_steer.is_none() && app.pending_goal.is_none());
+        // The run is untouched: answering a lesson is not a run control.
+        assert_eq!(app.run_mode, RunMode::Running);
+        let said = &app.transcript[before..];
+        assert_eq!(said.len(), 1, "one line per command: {said:?}");
+        assert!(said[0].contains(want), "{raw} said: {said:?}");
+        assert_eq!(s.state("retry backoff").name(), want);
+    }
+}
+
+/// A store that cannot be written degrades: the command says so, the file
+/// is byte-identical, and the run is unaffected. A store that cannot be
+/// READ is refused the same way, because a broken store and an empty one
+/// look identical and answering against either would be a guess.
+#[test]
+fn an_unusable_profile_says_so_and_changes_nothing() {
+    // Unwritable: `save` writes a temp file beside the store and renames it,
+    // so a DIRECTORY at the temp path makes the write fail without needing
+    // permissions the test would not have on a permissive machine.
+    let s = LessonProfile::new("unwritable");
+    s.with_explained("retry backoff");
+    std::fs::create_dir_all(s.dir.join("PROFILE.md.tmp")).unwrap();
+    let before = s.bytes();
+    let mut app = App::new();
+    app.fresh = false;
+    app.begin_run("make the parser strict");
+    app.on_lesson(&lesson("retry backoff"));
+    let said = answer_idle(&mut app, "/got it");
+    assert_eq!(said.len(), 1, "one line per command: {said:?}");
+    assert!(
+        said[0].contains("could not write the profile")
+            && said[0].contains("retry backoff")
+            && !said[0].contains("understood"),
+        "the refusal must say the store is unwritten and claim no state: {said:?}"
+    );
+    assert_eq!(s.bytes(), before, "a failed save changed the store");
+    assert_eq!(app.run_mode, RunMode::Running, "the run was affected");
+    drop(s);
+
+    // Unreadable: a hand-edited file with no machine block.
+    let s = LessonProfile::new("unreadable");
+    std::fs::write(&s.path, "just my notes, no json block\n").unwrap();
+    let before = s.bytes();
+    let mut app = App::new();
+    app.fresh = false;
+    app.begin_run("make the parser strict");
+    app.on_lesson(&lesson("retry backoff"));
+    let said = answer_idle(&mut app, "/got it");
+    assert_eq!(said.len(), 1, "one line per command: {said:?}");
+    assert!(
+        said[0].contains("PROFILE.md") && said[0].contains("empty"),
+        "the refusal must name the store it could not read: {said:?}"
+    );
+    assert_eq!(s.bytes(), before, "a refused answer rewrote the store");
+    assert_eq!(app.run_mode, RunMode::Running, "the run was affected");
+}
+
+/// The two answers are two words, and the closed parser is what refuses
+/// every near-miss: a partial phrase is never a guess at an answer.
+#[test]
+fn the_answers_parse_to_their_own_actions_and_near_misses_are_refused() {
+    assert!(matches!(parse("/got it"), Some(Action::GotIt)));
+    assert!(matches!(parse("/still lost"), Some(Action::StillLost)));
+    for line in ["/got", "/still", "/got it now", "/gotit", "/still-lost"] {
+        assert!(
+            matches!(parse(line), Some(Action::Unknown(_))),
+            "{line} must be refused by the parser"
+        );
+    }
+    // A goal line that merely mentions a phrase is still a goal.
+    assert!(parse("i got it working").is_none());
 }

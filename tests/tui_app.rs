@@ -1895,3 +1895,111 @@ fn the_splash_mascot_is_chosen_once_and_holds_still() {
         "every seed picked the same sprite: the mascot would never vary"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Learn mode, slice C1: the lesson is on screen and answerable.
+// ---------------------------------------------------------------------------
+
+use rof::obs::live::Lesson;
+use rof::tui::ui::draw;
+
+/// A goal's one lesson, exactly as `agents::teach` composes it: the concept
+/// label, then the model's own `because`, in the model's own words.
+fn lesson(concept: &str) -> Lesson {
+    Lesson {
+        concept: concept.to_string(),
+        text: format!("{concept}: the model's own sentence about it"),
+    }
+}
+
+/// A lesson is not another activity line the user learns to ignore. It is
+/// MARKED as a lesson, it shows the concept and the model's own words, and
+/// `App` remembers the concept label so the two answers know what they are
+/// answering.
+#[test]
+fn a_lesson_renders_as_a_marked_line_and_arms_the_answers() {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut app = App::new();
+    app.fresh = false;
+    app.begin_run("make the parser strict");
+    app.on_lesson(&lesson("retry backoff"));
+    assert_eq!(app.last_lesson_concept.as_deref(), Some("retry backoff"));
+
+    // The line is the harness's marker plus the model's own composition, and
+    // no prose of the harness's own about the project.
+    let line = app.transcript.last().expect("the lesson made a line");
+    let marker = line
+        .split_once("retry backoff")
+        .map(|(head, _)| head.to_string())
+        .expect("the concept is on the line");
+    assert!(
+        marker.trim_end().to_lowercase().contains("lesson"),
+        "the lesson line is not marked as a lesson: {line}"
+    );
+    assert!(
+        line.contains("the model's own sentence about it"),
+        "the model's own words are missing: {line}"
+    );
+
+    // The screen, not just the state: a lesson the user cannot see is a
+    // lesson nobody was taught.
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, &app)).unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    assert!(screen.contains("lesson"), "no lesson on screen: {screen}");
+    assert!(
+        screen.contains("retry backoff"),
+        "the concept is not on screen: {screen}"
+    );
+}
+
+/// The lesson survives a scroll. A lesson carried only in the bounded
+/// activity deque would be evicted by a long goal; carried in the
+/// transcript, it is still on screen when the user scrolls back to it.
+#[test]
+fn a_lesson_survives_a_long_goal_and_a_scroll_back() {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut app = App::new();
+    app.fresh = false;
+    app.begin_run("long goal");
+    app.on_lesson(&lesson("retry backoff"));
+    // Far more activity than the deque holds, so anything carried only
+    // there is gone.
+    for i in 0..400 {
+        app.on_event(&TraceEvent::StateTransition {
+            from: format!("s{i}"),
+            to: format!("n{i}"),
+        });
+    }
+    assert!(
+        !app.activity_tail(1000).iter().any(|l| l.contains("lesson")),
+        "the fixture is wrong: the lesson should already be evicted"
+    );
+    // Scroll to the HEAD, where the lesson line is: `scroll_lines` walks
+    // toward older lines, and the window above the tail is what a user
+    // reaches by scrolling up.
+    app.scroll = app.transcript.len() - 3;
+    let backend = TestBackend::new(120, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, &app)).unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    assert!(
+        screen.contains("retry backoff"),
+        "the lesson did not survive a scroll: {screen}"
+    );
+    // And the answer slot still points at what was explained.
+    assert_eq!(app.last_lesson_concept.as_deref(), Some("retry backoff"));
+}

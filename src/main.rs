@@ -4,6 +4,7 @@ use rof::engine::control::{RunCommand, RunControl, RunHooks};
 use rof::engine::{ModelRouter, Orchestrator, Role, Session};
 use rof::eval::{EvalSuite, EvaluationRunner, SuiteReport};
 use rof::llm::{ContextService, ExecutorService, LlmClient, OpenRouterClient, StubClient};
+use rof::obs::live::Lesson;
 use rof::obs::{Boundary, GoalFinished, LiveEvent, TraceEvent, TraceSink};
 use rof::skills::{SkillManager, SkillOp, SkillPolicy};
 use rof::tools::ToolRegistry;
@@ -163,11 +164,20 @@ impl GoalRunner {
                 control: Some(&mut control),
             };
             let _ = tx.send(LiveEvent::Boundary(Boundary::Started));
-            let finished = match self.execute_with_control(&goal, false, &mut hooks).await {
-                Ok(result) => GoalFinished {
-                    passed: result.passed,
-                    error: result.error,
-                },
+            // The goal's ONE lesson, read off the result `agents::teach`
+            // composed before this goal ended, published here beside the
+            // goal's outcome. `None` — the anti-nag gate's silent case, and
+            // the common one — sends nothing, so the transcript then shows no
+            // lesson at all.
+            let (finished, taught) = match self.execute_with_control(&goal, false, &mut hooks).await
+            {
+                Ok(result) => (
+                    GoalFinished {
+                        passed: result.passed,
+                        error: result.error,
+                    },
+                    Lesson::from_result(result.value.get("lesson")),
+                ),
                 // A goal that failed to run at all is still this goal's
                 // outcome: report it as one, publish the session's single
                 // terminal outcome, and return the error. `execute_with_control`
@@ -188,6 +198,9 @@ impl GoalRunner {
                     return Err(error);
                 }
             };
+            if let Some(lesson) = taught {
+                let _ = tx.send(LiveEvent::Lesson(lesson));
+            }
             let _ = tx.send(LiveEvent::GoalFinished(finished.clone()));
             let _ = tx.send(LiveEvent::Boundary(Boundary::Finished));
             last = finished;
@@ -1191,6 +1204,10 @@ mod tests {
                 LiveEvent::Boundary(Boundary::Started) => Some("started".to_string()),
                 LiveEvent::Boundary(Boundary::Finished) => Some("finished".to_string()),
                 LiveEvent::GoalFinished(_) => Some("goal".to_string()),
+                // A lesson is its own notification, between the goal's
+                // trace events and its outcome, and it is shaped separately
+                // from them: it is not a boundary and it is not an outcome.
+                LiveEvent::Lesson(_) => Some("lesson".to_string()),
                 LiveEvent::Finished(_) => Some("session".to_string()),
             })
             .collect()
