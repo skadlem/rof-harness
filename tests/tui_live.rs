@@ -2322,7 +2322,12 @@ fn providers_with_an_empty_store_lists_the_built_ins_and_says_the_store_is_empty
         !lines.iter().any(|l| l.contains("[custom,")),
         "a provider was invented from an empty registry: {lines:?}"
     );
-    assert_no_key_material(&lines, FIXTURE_KEY);
+    // No `assert_no_key_material` here, and that is deliberate: this test's
+    // subject IS the empty store, so there is no key in it for the helper to
+    // catch and the call would pass whatever `/providers` printed. The
+    // discriminating version of this guard — a store that really holds the
+    // fixture key — is
+    // `providers_reports_a_present_key_without_ever_printing_it`.
 }
 
 /// A defined provider with no key is named, and its row says the key is
@@ -2335,6 +2340,19 @@ fn providers_names_a_registry_provider_whose_key_is_absent() {
         rof::tui::auth::key_for("acme").is_none(),
         "the fixture must have no key for this test to mean anything"
     );
+    // A SECOND provider, this one with a key, so the store is not empty and
+    // the leak assertion below is discriminating: `acme`'s row is what this
+    // test is about, and it is rendered from a store that really does hold
+    // `FIXTURE_KEY` for `other`. Without that, the store is empty and
+    // `assert_no_key_material` could not fail no matter what `/providers`
+    // printed.
+    rof::tui::auth::save_provider("other", "https://llm.other.test/v1").unwrap();
+    rof::tui::auth::store().save("other", FIXTURE_KEY).unwrap();
+    assert_eq!(
+        rof::tui::auth::key_for("other").as_deref(),
+        Some(FIXTURE_KEY),
+        "the store must hold the fixture key for the leak assertion to bite"
+    );
 
     let lines = render_providers();
 
@@ -2345,8 +2363,8 @@ fn providers_names_a_registry_provider_whose_key_is_absent() {
     assert!(row.contains("acme"), "{row}");
     assert!(row.contains("https://llm.acme.test/v1"), "{row}");
     assert!(row.contains("key absent"), "{row}");
-    // Defining a provider is not logging in: the store can still be empty
-    // here, and saying so is the `Models` arm's behaviour, not a bug.
+    // Defining a provider is not logging in: the store can still hold other
+    // logins, and saying so is the `Models` arm's behaviour, not a bug.
     assert_no_key_material(&lines, FIXTURE_KEY);
 }
 
@@ -2858,4 +2876,184 @@ fn hotkeys_names_the_completion_key() {
         assert!(line.contains(kept), "/hotkeys lost {kept}: {line}");
     }
     assert_no_key_material(std::slice::from_ref(line), FIXTURE_KEY);
+}
+
+// ---- composer masking: a computed property of the draft + capture state ----
+
+/// The rendered screen as one string, so a test can ask what the composer
+/// pane actually shows. The mask is a DISPLAY property, so it can only be
+/// asserted on the screen, never on the flag alone.
+fn masked_composer_screen(app: &App) -> String {
+    use ratatui::{backend::TestBackend, Terminal};
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| rof::tui::ui::draw(f, app)).unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect()
+}
+
+/// Type `text` one character at a time, exactly as the pump's composer
+/// character arm does, and report whether the composer masked on the very
+/// last keystroke.
+fn type_draft(app: &mut App, awaiting_key: &Option<String>, text: &str) {
+    for c in text.chars() {
+        rof::tui::run::type_draft_char(app, c, awaiting_key);
+    }
+}
+
+/// The inline form carries the key on the line itself, so the composer
+/// hides it from the key's FIRST character — while idle. The refusal /
+/// verify path below proves the mask changed nothing else.
+#[test]
+fn an_inline_login_key_is_masked_from_its_first_character_while_idle() {
+    let mut app = App::new();
+    let awaiting: Option<String> = None;
+
+    type_draft(&mut app, &awaiting, "/login openrouter");
+    assert!(
+        !app.mask_input,
+        "a provider name is not a secret and must stay readable: {}",
+        app.input
+    );
+
+    type_draft(&mut app, &awaiting, " s");
+    assert!(app.mask_input, "one key character was typed unmasked");
+
+    let out = masked_composer_screen(&app);
+    assert!(
+        !out.contains("rofdanger") && !out.contains("openrouter"),
+        "the draft rendered in the clear: {out}"
+    );
+    // Bullets stand in for the whole line, so the key cannot be read back
+    // even by length-and-shape.
+    assert!(out.contains('•'), "the composer did not mask at all: {out}");
+}
+
+/// The same draft while a goal is live: the running branch keeps a refused
+/// line in the composer, so the mask is the only thing standing between the
+/// user and their own key.
+#[test]
+fn an_inline_login_key_is_masked_while_a_goal_is_live() {
+    let mut app = App::new();
+    app.begin_run("busy");
+    let awaiting: Option<String> = None;
+
+    type_draft(&mut app, &awaiting, "/login openrouter sk-rofdanger");
+    assert!(
+        app.mask_input,
+        "a typed key rendered in the clear while live"
+    );
+
+    let out = masked_composer_screen(&app);
+    assert!(
+        !out.contains("rofdanger") && !out.contains("openrouter"),
+        "the live composer rendered the line in the clear: {out}"
+    );
+    assert!(out.contains('•'), "the live composer did not mask: {out}");
+    assert_eq!(app.run_mode, RunMode::Running, "typing moved the run state");
+}
+
+/// The two-step capture still masks a bare key, and un-masking is a
+/// property of the CAPTURE ending, not of a flag someone remembered to
+/// clear: a cancelled or consumed capture takes the state away and the very
+/// next recompute puts the text back on screen.
+#[test]
+fn a_cancelled_login_capture_unmasks_the_composer() {
+    let trace = TraceSink::new();
+    let mut app = App::new();
+    let mut awaiting: Option<String> = None;
+
+    apply_action(
+        &mut app,
+        &trace,
+        Action::Login(None),
+        "/login openrouter",
+        &mut awaiting,
+    );
+    assert_eq!(awaiting.as_deref(), Some("openrouter"), "no capture armed");
+    type_draft(&mut app, &awaiting, FIXTURE_KEY);
+    assert!(app.mask_input, "the armed capture stopped masking");
+
+    // What the pump's Enter arm does with a cancelled capture: the capture
+    // state goes away, and the mask is recomputed from what is left.
+    awaiting.take();
+    rof::tui::run::refresh_mask(&mut app, &awaiting);
+
+    assert!(
+        !app.mask_input,
+        "a cancelled capture left the composer masked"
+    );
+    let out = masked_composer_screen(&app);
+    assert!(
+        out.contains("rofdanger"),
+        "the draft never came back: {out}"
+    );
+}
+
+/// Backspacing out of the key line un-masks, because the mask follows the
+/// draft rather than latching on the first secret character.
+#[test]
+fn a_normal_goal_line_is_never_masked() {
+    for line in ["fix the parser", "/help", "/login openrouter"] {
+        let mut app = App::new();
+        let awaiting: Option<String> = None;
+        type_draft(&mut app, &awaiting, line);
+        assert!(!app.mask_input, "{line} is masked");
+        let out = masked_composer_screen(&app);
+        assert!(!out.contains('•'), "{line} rendered as bullets: {out}");
+    }
+}
+
+/// Masking is display-only: the one-line form still reaches verify and the
+/// store with the SAME outcome it had before the mask existed, and the
+/// masked draft is still the text Enter parses.
+#[test]
+fn the_one_line_login_form_still_fails_the_same_way_while_masked() {
+    let _env = ProvidersEnv::new("inline-mask");
+    let raw = format!("/login acme {FIXTURE_KEY}");
+
+    let outcome = |masked: bool| -> (Vec<String>, bool) {
+        let trace = TraceSink::new();
+        let mut app = App::new();
+        app.input = raw.clone();
+        if masked {
+            rof::tui::run::refresh_mask(&mut app, &None);
+            assert!(app.mask_input, "the fixture did not mask");
+        }
+        let mut awaiting: Option<String> = None;
+        apply_action(
+            &mut app,
+            &trace,
+            Action::Login(Some("acme".into())),
+            &raw,
+            &mut awaiting,
+        );
+        // The draft survives apply_action: masking must not have eaten it.
+        assert_eq!(app.input, raw, "masking changed what the draft holds");
+        (
+            app.transcript.clone(),
+            rof::tui::auth::key_for("acme").is_some(),
+        )
+    };
+
+    let (masked_lines, masked_saved) = outcome(true);
+    let (plain_lines, plain_saved) = outcome(false);
+
+    assert_eq!(
+        masked_lines, plain_lines,
+        "masking changed what the one-line form does"
+    );
+    assert_eq!(masked_saved, plain_saved, "masking changed the save");
+    // Offline the verify cannot reach the network, so the outcome is a
+    // failure naming the provider — and never the key.
+    assert!(
+        masked_lines.iter().any(|l| l.contains("login failed")),
+        "{masked_lines:?}"
+    );
+    assert_no_key_material(&masked_lines, FIXTURE_KEY);
 }

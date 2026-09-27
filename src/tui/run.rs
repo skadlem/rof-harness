@@ -277,6 +277,49 @@ pub fn is_draft_text(code: KeyCode, modifiers: KeyModifiers) -> bool {
     matches!(code, KeyCode::Char(_)) && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT)
 }
 
+/// Whether the composer must render this draft masked: a COMPUTED property
+/// of the draft plus the capture state, never a latched flag.
+///
+/// Two ways to be holding a secret in the composer, and both hide:
+///
+/// - a `/login` key capture is armed (`awaiting_key` names the provider) and
+///   the draft is the bare key about to be submitted, and
+/// - the draft is the one-line form `/login <provider> <key>` — three or more
+///   whitespace-separated tokens starting with `/login` — where the key is
+///   already on the line. This is the case that used to render in the clear
+///   in BOTH the idle composer and the running one, where a refused line
+///   keeps its draft.
+///
+/// Pure and display-only: it reads the draft and the capture, and decides
+/// nothing about parsing, submission, or the store. A goal line, a command,
+/// and `/login <provider>` on its own (nothing typed yet) are all readable.
+pub fn draft_is_masked(draft: &str, awaiting_key: &Option<String>) -> bool {
+    if awaiting_key.is_some() {
+        return true;
+    }
+    let mut toks = draft.split_whitespace();
+    toks.next() == Some("/login") && toks.next().is_some() && toks.next().is_some()
+}
+
+/// The one owner of [`App::mask_input`]: recompute it from the draft and the
+/// capture state.
+///
+/// Every path that changes either input goes through here, so the flag
+/// cannot be stale in either direction — a key that is on the line is masked
+/// the moment its first character lands, and a draft that no longer holds a
+/// key is unmasked by the same call.
+pub fn refresh_mask(app: &mut App, awaiting_key: &Option<String>) {
+    app.mask_input = draft_is_masked(&app.input, awaiting_key);
+}
+
+/// One draft keystroke: append the character, then recompute the mask. The
+/// pump's character arms call this in both the idle and the running branch,
+/// so neither can drift from the other on when a key becomes invisible.
+pub fn type_draft_char(app: &mut App, c: char, awaiting_key: &Option<String>) {
+    app.input.push(c);
+    refresh_mask(app, awaiting_key);
+}
+
 /// One key's meaning while a goal is live, WITH the modifier decision made
 /// here rather than in the pump.
 ///
@@ -894,6 +937,11 @@ where
                                 }
                             }
                         }
+                        // A submission either consumed the draft or kept it
+                        // (a refused line stays, and a kept `/login …` line
+                        // must stay masked), so the flag is recomputed from
+                        // whatever the reducer left behind.
+                        refresh_mask(&mut app, &awaiting_key);
                         continue;
                     }
                     RunningKeyOutcome::StopArmed => {
@@ -939,6 +987,10 @@ where
                 if completion_key(key.code, key.modifiers) {
                     let result = super::cmd::complete(&app.input);
                     app.apply_completion(&result);
+                    // Completion edits the draft, so the mask follows it
+                    // here too — a completed line must not leave a masked
+                    // buffer behind.
+                    refresh_mask(&mut app, &awaiting_key);
                     continue;
                 }
                 match key.code {
@@ -948,10 +1000,11 @@ where
                             // key, so it must still reach the draft.
                             || c == 'q' =>
                     {
-                        app.input.push(c);
+                        type_draft_char(&mut app, c, &awaiting_key);
                     }
                     KeyCode::Backspace => {
                         app.input.pop();
+                        refresh_mask(&mut app, &awaiting_key);
                     }
                     // The scroll keys act on the focused pane. The composer
                     // is the default focus, so these keep scrolling the
@@ -1001,14 +1054,16 @@ where
                 KeyCode::Char('n') if completion_key(key.code, key.modifiers) => {
                     let result = super::cmd::complete(&app.input);
                     app.apply_completion(&result);
+                    refresh_mask(&mut app, &awaiting_key);
                 }
                 KeyCode::Char(c) if is_draft_text(key.code, key.modifiers) => {
                     quit_armed = false;
-                    app.input.push(c);
+                    type_draft_char(&mut app, c, &awaiting_key);
                 }
                 KeyCode::Backspace => {
                     quit_armed = false;
                     app.input.pop();
+                    refresh_mask(&mut app, &awaiting_key);
                 }
                 KeyCode::Up => app.scroll_lines(1),
                 KeyCode::Down => app.scroll_lines(-1),
@@ -1026,7 +1081,11 @@ where
                     // the next non-slash line is the key (never echoed, never
                     // run as a goal). A slash line cancels it.
                     if let Some(prov) = awaiting_key.take() {
-                        app.mask_input = false;
+                        // The capture is over — consumed or cancelled — so
+                        // the mask is recomputed from what is left rather
+                        // than cleared here: the draft is already empty, and
+                        // the same call is what re-masks a new `/login` line.
+                        refresh_mask(&mut app, &awaiting_key);
                         if text.starts_with('/') {
                             app.transcript
                                 .push(format!("/login {prov} cancelled — key was not captured"));
@@ -1091,6 +1150,10 @@ where
                                 return Ok(());
                             }
                             persist_prefs(&mut app, &before, &prefs_path);
+                            // `apply_action` may have armed a `/login` key
+                            // capture, which is one of the two things the
+                            // mask is computed from.
+                            refresh_mask(&mut app, &awaiting_key);
                         }
                     }
                 }
@@ -1306,7 +1369,10 @@ pub fn apply_action(
                 },
                 [_, prov] => {
                     *awaiting_key = Some((*prov).to_string());
-                    app.mask_input = true;
+                    // The capture is one of the two inputs to the mask, so
+                    // the flag is recomputed here rather than set: the same
+                    // owner the key arms use, and the same answer.
+                    refresh_mask(app, awaiting_key);
                     app.transcript.push(format!(
                         "/login {prov}: type the key and press Enter (input hidden)"
                     ));
