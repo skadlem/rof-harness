@@ -70,6 +70,7 @@ Extend `src/obs/live.rs` with:
 pub enum ControlKind {
     Steer,
     Queue,
+    Stop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +102,7 @@ Create `src/engine/control.rs`:
 pub enum RunCommand {
     Steer { id: u64, text: String },
     QueueGoal { id: u64, goal: String },
+    Stop,
 }
 ```
 
@@ -111,6 +113,7 @@ pub struct RunControl {
     receiver: tokio::sync::mpsc::UnboundedReceiver<RunCommand>,
     pending_steer: Option<RunCommand>,
     pending_goal: Option<RunCommand>,
+    stop_requested: bool,
     pending_acks: Vec<ControlAck>,
 }
 
@@ -119,14 +122,17 @@ impl RunControl {
     pub fn drain_boundary(&mut self) -> Vec<ControlAck>;
     pub fn take_queued_goal(&mut self) -> Option<String>;
     pub fn pending_steer(&self) -> Option<&str>;
+    pub fn stop_requested(&self) -> bool;
 }
 ```
 
 `drain_boundary` drains all currently available commands in channel order,
 keeps only the latest command of each kind, and records an `Applied` ack for
 the kept command and a `Rejected { note: "replaced" }` ack for each displaced
-command. A terminal drain rejects a remaining steer with
-`"no next round"` and keeps a queue command for the next goal.
+command. `Stop` sets `stop_requested` and acknowledges that the stop was
+accepted; the next goal boundary uses that flag to drop any queued goal. A
+terminal drain rejects a remaining steer with `"no next round"` and keeps a
+queue command for the next goal only when stop was not requested.
 
 ### Boundary hook
 
@@ -179,7 +185,9 @@ where
 2. send `Boundary::Started` and the live sink remains attached;
 3. run `execute_with_control(goal, &mut control)`;
 4. send `LiveEvent::GoalFinished` for that goal;
-5. drain terminal commands once (steer is rejected, queue is retained);
+5. drain terminal commands once (steer is rejected, queue is retained
+   unless `stop_requested` is set, in which case queue is rejected with
+   `stopped`);
 6. if `control.take_queued_goal()` returns a goal, repeat from step 2 with
    freshly rebuilt services;
 7. otherwise send `LiveEvent::Finished` and return.
@@ -240,12 +248,15 @@ While a worker is running, Enter behaves as follows:
 - text plus `BusyMode::Queue`: send `RunCommand::QueueGoal`, store
   `pending_goal`, clear the composer, and show `goal queued (id)`;
 - `/busy steer|queue|interrupt`: apply immediately to `App`; interrupt calls
-  the existing stop request path;
+  the existing stop request path and sends `RunCommand::Stop` so a queued
+  goal is dropped at the next boundary;
 - view-only slash commands: execute immediately;
 - deferred configuration commands: append to `deferred_config` and show
   `applies to next goal`;
 - `/login`, `/logout`, and provider mutations: reject with
   `available between goals`, without changing credentials or config;
+- the first q/Esc/Ctrl-C stop key also sends `RunCommand::Stop`; the
+  existing P1a second-key force-exit behavior is unchanged;
 - empty text: no-op.
 
 A new submission replaces the corresponding pending slot in `App` and on the
