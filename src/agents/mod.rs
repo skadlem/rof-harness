@@ -2,6 +2,7 @@ pub mod decompose;
 pub mod explorer;
 pub mod implementer;
 pub mod reviewer;
+pub mod teach;
 use crate::context::CtxView;
 use crate::llm::{ContextService, ExecutorService};
 use crate::obs::TraceSink;
@@ -22,6 +23,7 @@ pub struct AgentOutput {
 }
 pub use reviewer::{ReviewerAgent, Verdict};
 use std::path::Path;
+pub use teach::{Gated, Introduced};
 
 /// Everything an agent may need. Agents only use what their role allows:
 /// Implementer -> executor LLM + tools; Reviewer -> executor LLM (read-only).

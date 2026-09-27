@@ -143,6 +143,23 @@ pub enum TraceEvent {
         /// True when the patch text was cut at the evidence bound.
         truncated: bool,
     },
+    /// Learn mode (slice B): the teaching step found a concept to explain
+    /// and did not. The DEGRADED case only — an unreadable or unwritable
+    /// profile store — because a concept that is already explained is
+    /// excluded SILENTLY, and that silence is the anti-nag property
+    /// rather than a fault worth a line. A skip that said nothing would
+    /// be indistinguishable from having nothing to say.
+    ///
+    /// A degraded store must not be reported through `ModelError` or
+    /// `GoalQuality`: both increment real metrics, so a profile file that
+    /// could not be written would be counted as a model failure or a goal
+    /// defect it has nothing to do with.
+    LessonSkipped {
+        /// The concept whose lesson was skipped ("" when the store itself
+        /// could not be read, so no concept was ever chosen).
+        concept: String,
+        reason: String,
+    },
     /// One ordered answer to one live command, identified by the id the
     /// console allocated. Acknowledgements are durable like every other step,
     /// so a recorded session replays its control history through the same

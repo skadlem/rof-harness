@@ -323,6 +323,27 @@ impl Orchestrator {
         let mut total_rounds = 0u32;
         let mut checks_log = String::new();
         let mut passed = true;
+        // Learn mode §5: the goal's ONE lesson, on the run's result.
+        //
+        // Hoisted above the task loop and the round loop on purpose. The
+        // gate records the concept as `explained` on the round that taught
+        // it, so every LATER round excludes it SILENTLY (the anti-nag
+        // property is set membership, and this run is not a new run) — and
+        // the result below is built from the LAST round's artifact. A
+        // lesson attached to the artifact alone is therefore dropped on
+        // the default two-round configuration, and the user is told
+        // nothing at all: the teaching feature working perfectly and being
+        // invisible. So the FIRST lesson of the goal is carried forward
+        // here instead.
+        //
+        // The hoist is also what makes "one concept per goal" true for a
+        // DECOMPOSED goal: `teach` is only reached while this is still
+        // null, so a second task's concepts are never gated, never
+        // explained, and never recorded — they stay `not_explained` and
+        // are taught on a later goal. That ordering matters: recording a
+        // concept the user was never shown would make the store assert we
+        // explained it, and the anti-nag gate would then hide it forever.
+        let mut goal_lesson = serde_json::Value::Null;
 
         for (ti, task) in tasks.iter().enumerate() {
             let mut feedback = String::new();
@@ -542,6 +563,15 @@ impl Orchestrator {
                             artifact = serde_json::json!({"error": e.to_string()});
                         }
                     };
+                    // The end-of-goal teaching step, reached only while
+                    // the goal has no lesson yet. The artifact names the
+                    // concepts (`introduces`); the gate decides by set
+                    // membership and records only what it actually
+                    // explains.
+                    if goal_lesson.is_null() {
+                        goal_lesson = crate::agents::teach::teach(&artifact, workdir, &self.trace)
+                            .unwrap_or(serde_json::Value::Null);
+                    }
                     self.trace.emit(TraceEvent::StateTransition {
                         from: "implemented".to_string(),
                         to: "reviewing".to_string(),
@@ -832,6 +862,12 @@ impl Orchestrator {
             task_results.push(serde_json::json!({
                 "task": task,
                 "passed": verdict.pass,
+                // The goal's lesson, mirrored onto the task that taught it,
+                // so a consumer reading `tasks` (the eval runner does) sees
+                // it without having to know about the run-level key. It is
+                // null for every task after the one that taught, because the
+                // hoist above means only one is ever set.
+                "lesson": goal_lesson,
                 "rounds": ran,
                 "writes_made": writes_made,
                 "changed_files": changed_files,
@@ -867,6 +903,10 @@ impl Orchestrator {
             "tasks": task_results,
             "rounds": total_rounds,
             "passed": passed,
+            // Learn mode §5: the goal's one lesson, at the end of the goal
+            // and never as a per-round event. Null when there was nothing
+            // to teach, which is the common case and not a failure.
+            "lesson": goal_lesson,
             "retrieved_files": retrieved_files,
             "retrieved": retrieved_json,
             "summarize_calls": acc.summarize_calls,
@@ -949,6 +989,15 @@ impl Orchestrator {
         // v4 attempts: N independent round-sequences, cheapest-pass wins.
         // Default 1 = the historical single-sequence run, bit for bit.
         let attempts = self.cfg.attempts.clamp(1, 5);
+        // Learn mode §5, the same hoist the pipeline loop has and for the
+        // same reason: the gate records the concept on the round that
+        // taught it, so every later round and every later ATTEMPT excludes
+        // it silently, while the snapshot below is built from the last one.
+        // A direct run that taught on round 1 and failed round 2 would
+        // otherwise record the explanation and never deliver it. Declared
+        // above the attempts loop, so the promise is the same in both
+        // modes — a lesson is the goal's, not an attempt's.
+        let mut goal_lesson = serde_json::Value::Null;
         let mut best_json: Option<serde_json::Value> = None;
         let mut best_billed: u64 = u64::MAX;
         let mut attempt_no = 0usize;
@@ -1045,6 +1094,14 @@ impl Orchestrator {
                         feedback = e.to_string();
                         break;
                     }
+                }
+                // The end-of-goal teaching step, reached only while the goal
+                // has no lesson yet: the artifact names the concepts, the
+                // gate decides by set membership, and only what is actually
+                // explained is recorded.
+                if goal_lesson.is_null() {
+                    goal_lesson = crate::agents::teach::teach(&artifact, workdir, &self.trace)
+                        .unwrap_or(serde_json::Value::Null);
                 }
                 let task_checks = svc.run_checks(session, workdir).await;
                 checks_log = render_checks(&task_checks);
@@ -1213,11 +1270,16 @@ impl Orchestrator {
                         "artifact": artifact,
                         "check_results": check_results,
                         "feedback": feedback,
+                        // The goal's lesson, mirrored onto its single task so
+                        // a consumer reading `tasks` sees it without knowing
+                        // about the run-level key.
+                        "lesson": goal_lesson,
                     }],
                     "rounds": rounds,
                     "passed": passed,
                     "retrieved": retrieved_json,
                     "checks": checks_log,
+                    "lesson": goal_lesson,
                 }));
                 break;
             }
@@ -1234,11 +1296,13 @@ impl Orchestrator {
                         "artifact": artifact,
                         "check_results": check_results,
                         "feedback": feedback,
+                        "lesson": goal_lesson,
                     }],
                     "rounds": rounds,
                     "passed": passed,
                     "retrieved": retrieved_json,
                     "checks": checks_log,
+                    "lesson": goal_lesson,
                 }));
             }
         } // end attempts loop

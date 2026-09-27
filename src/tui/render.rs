@@ -77,6 +77,13 @@ pub fn render_line(ev: &TraceEvent) -> String {
             )
         }
         TraceEvent::GoalQuality { note, .. } => format!("· goal note: {note}"),
+        // The DEGRADED teaching step only. A concept already explained is
+        // excluded silently, so this line never fires for the anti-nag
+        // case — it fires when the profile store could not be read or
+        // written, which is a fault the user should be able to see.
+        TraceEvent::LessonSkipped { concept, reason } => {
+            format!("· lesson skipped ({concept}): {reason}")
+        }
         // §4's meta layer. The plan line names the artifact, because a
         // recorded run's plan is read from the FILE, not from scrollback.
         // A declined gate says so: silence would read as a run that never
