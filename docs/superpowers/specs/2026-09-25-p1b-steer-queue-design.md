@@ -102,7 +102,7 @@ Create `src/engine/control.rs`:
 pub enum RunCommand {
     Steer { id: u64, text: String },
     QueueGoal { id: u64, goal: String },
-    Stop,
+    Stop { id: u64 },
 }
 ```
 
@@ -248,14 +248,14 @@ While a worker is running, Enter behaves as follows:
 - text plus `BusyMode::Queue`: send `RunCommand::QueueGoal`, store
   `pending_goal`, clear the composer, and show `goal queued (id)`;
 - `/busy steer|queue|interrupt`: apply immediately to `App`; interrupt calls
-  the existing stop request path and sends `RunCommand::Stop` so a queued
+  the existing stop request path and sends `RunCommand::Stop { id }` so a queued
   goal is dropped at the next boundary;
 - view-only slash commands: execute immediately;
 - deferred configuration commands: append to `deferred_config` and show
   `applies to next goal`;
 - `/login`, `/logout`, and provider mutations: reject with
   `available between goals`, without changing credentials or config;
-- the first q/Esc/Ctrl-C stop key also sends `RunCommand::Stop`; the
+- the first q/Esc/Ctrl-C stop key also sends `RunCommand::Stop { id }`; the
   existing P1a second-key force-exit behavior is unchanged;
 - empty text: no-op.
 
