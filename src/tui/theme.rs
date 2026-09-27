@@ -44,6 +44,15 @@ pub fn composer_block(thinking: &str) -> Block<'static> {
         .border_style(Style::default().fg(AMBER))
 }
 
+/// Diff frame. A snapshot the harness cut at its evidence bound gets a
+/// `partial` title, so a short patch can never read as the whole change;
+/// the body carries the same claim in words. Every other posture uses
+/// [`pane`], which this defers to.
+pub fn diff_block(truncated: bool) -> Block<'static> {
+    let title = if truncated { "diff (partial)" } else { "diff" };
+    pane(title)
+}
+
 /// Longest control summary a live composer title may carry. The title
 /// rides the top border of a 3-row pane, so a longer summary is cut with
 /// an ellipsis: the title is one line by construction and can neither wrap

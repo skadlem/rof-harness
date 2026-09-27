@@ -545,3 +545,254 @@ fn layout_shows_transcript_status_and_composer() {
         .collect();
     assert!(text.contains("hello"), "composer visible");
 }
+
+// ---- diff pane (P3 C2): rendered only from `App::diff_snapshot()` ----
+
+/// A diff snapshot exactly as the engine emits it. This is the pane's only
+/// input: the renderer never runs `git` and never reads the tree itself.
+fn diff_event(names: &[&str], stat: &str, patch: &str, truncated: bool) -> TraceEvent {
+    TraceEvent::DiffSnapshot {
+        names: names.iter().map(|n| (*n).to_string()).collect(),
+        stat: stat.to_string(),
+        patch: patch.to_string(),
+        truncated,
+    }
+}
+
+const SAMPLE_PATCH: &str = "+ use ratatui::Frame;\n- use std::io;";
+
+/// The rows of one titled pane: from its frame's top border up to the next
+/// pane's, so a wide layout that shares rows is compared pane by pane.
+/// The title is matched on the border, never on pane text.
+fn pane_slice(rows: &[String], title: &str, next: &str) -> String {
+    let border = format!("┌{title}");
+    let stop = format!("┌{next}");
+    let start = rows
+        .iter()
+        .position(|row| row.contains(&border))
+        .unwrap_or_else(|| panic!("no {title} pane: {rows:?}"));
+    let end = rows[start + 1..]
+        .iter()
+        .position(|row| row.contains(&stop))
+        .map(|offset| start + 1 + offset)
+        .unwrap_or(rows.len());
+    rows[start..end].concat()
+}
+
+#[test]
+fn diff_pane_renders_the_snapshot_names_and_patch_in_both_layouts() {
+    let mut app = App::new();
+    app.on_event(&diff_event(
+        &["src/tui/ui.rs", "src/tui/theme.rs"],
+        "2 files changed",
+        SAMPLE_PATCH,
+        false,
+    ));
+    // 160 columns is the wide split (transcript beside the run pane, diff
+    // in the lower detail area); 60 is the narrow full-width stack. The
+    // pane renders from the same snapshot either way.
+    for (width, layout) in [(160u16, "wide"), (60, "narrow")] {
+        let rows = rendered_rows(&app, width, 40);
+        let out: String = rows.concat();
+        assert!(out.contains("src/tui/ui.rs"), "{layout}: {out}");
+        assert!(out.contains("src/tui/theme.rs"), "{layout}: {out}");
+        assert!(out.contains("+ use ratatui::Frame;"), "{layout}: {out}");
+        assert!(
+            rows.iter().any(|row| row.contains("┌diff")),
+            "{layout}: {rows:?}"
+        );
+    }
+}
+
+#[test]
+fn a_missing_snapshot_says_the_evidence_is_missing() {
+    let out: String = rendered_rows(&App::new(), 100, 24).concat();
+    assert!(out.contains("no diff evidence"), "{out}");
+    // No evidence is not the same claim as a clean tree: the pane must not
+    // read like `git` found nothing to change.
+    assert!(!out.contains("tree is clean"), "{out}");
+}
+
+#[test]
+fn a_snapshot_with_no_changed_names_says_the_tree_is_clean() {
+    let mut app = App::new();
+    app.on_event(&diff_event(&[], "", "", false));
+    let out: String = rendered_rows(&app, 100, 24).concat();
+    assert!(out.contains("tree is clean"), "{out}");
+    assert!(!out.contains("no diff evidence"), "{out}");
+}
+
+#[test]
+fn a_truncated_snapshot_is_labelled_as_part_of_the_change() {
+    let mut app = App::new();
+    app.on_event(&diff_event(
+        &["src/tui/ui.rs"],
+        "1 file changed",
+        "+ use ratatui::Frame;",
+        true,
+    ));
+    let partial: String = rendered_rows(&app, 100, 24).concat();
+    assert!(
+        partial.contains("partial"),
+        "pane is not marked partial: {partial}"
+    );
+    // The wording is the pane's own, and it differs from the whole-change
+    // render of the same evidence.
+    let mut whole = App::new();
+    whole.on_event(&diff_event(
+        &["src/tui/ui.rs"],
+        "1 file changed",
+        "+ use ratatui::Frame;",
+        false,
+    ));
+    let full = rendered_rows(&whole, 100, 24);
+    assert!(!full.concat().contains("partial"), "{full:?}");
+    assert!(full.iter().any(|row| row.contains("┌diff")));
+}
+
+#[test]
+fn the_truncated_flag_is_the_contract_not_the_patch_text() {
+    // The marker string can appear in a whole patch and be absent from a
+    // cut one; only the boolean decides how the pane labels itself.
+    let mut marked = App::new();
+    marked.on_event(&diff_event(
+        &["src/tui/ui.rs"],
+        "",
+        "+ a line\n… [diff truncated: harness evidence bound reached]",
+        false,
+    ));
+    assert!(
+        !rendered_rows(&marked, 100, 24)
+            .iter()
+            .any(|row| row.contains("diff (partial)")),
+        "marker text alone must not mark the pane partial"
+    );
+    let mut cut = App::new();
+    cut.on_event(&diff_event(&["src/tui/ui.rs"], "", "+ a line", true));
+    assert!(
+        rendered_rows(&cut, 100, 24)
+            .iter()
+            .any(|row| row.contains("diff (partial)")),
+        "the flag alone must mark the pane partial"
+    );
+}
+
+#[test]
+fn a_long_patch_clips_without_resizing_the_frame_or_losing_the_composer() {
+    let patch: String = (0..200)
+        .map(|i| format!("+ line {i:03}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut app = App::new();
+    for i in 0..40 {
+        app.transcript.push(format!("line {i:02}"));
+    }
+    app.on_event(&diff_event(&["src/tui/ui.rs"], "", &patch, false));
+    // The patch is bounded by the harness, not by the pane, so it is far
+    // taller than any frame here.
+    let rows = rendered_rows(&app, 100, 24);
+    assert_eq!(rows.len(), 24, "the patch changed the frame height");
+    let out: String = rows.concat();
+    assert!(
+        out.contains("+ line 199"),
+        "tail of the patch visible: {out}"
+    );
+    assert!(!out.contains("+ line 000"), "head clipped: {out}");
+    for title in ["transcript", "run activity", "diff", "status", "composer"] {
+        assert!(out.contains(title), "{title} lost: {out}");
+    }
+    // Scrolling moves the patch window and nothing else: same frame, same
+    // panes, composer still docked. `App` owns the one scroll position, so
+    // this is the same scroll the transcript uses, not a second one.
+    app.scroll_lines(10_000);
+    let up = rendered_rows(&app, 100, 24);
+    assert_eq!(up.len(), 24, "scrolling changed the frame height");
+    let up: String = up.concat();
+    assert!(
+        up.contains("+ line 159"),
+        "the patch window did not move: {up}"
+    );
+    assert!(
+        up.contains("composer"),
+        "composer lost while scrolling: {up}"
+    );
+}
+
+#[test]
+fn the_diff_pane_gives_way_before_the_four_pinned_panes() {
+    for height in [9u16, 12] {
+        let mut app = App::new();
+        app.transcript.push("tail line".into());
+        app.begin_run("small");
+        app.on_event(&diff_event(
+            &["src/tui/ui.rs"],
+            "1 file changed",
+            "+ use ratatui::Frame;",
+            false,
+        ));
+        let rows = rendered_rows(&app, 60, height);
+        let out: String = rows.concat();
+        assert_eq!(rows.len(), height as usize);
+        assert!(
+            !out.contains("diff"),
+            "the diff pane took rows from the pinned panes at {height}: {out}"
+        );
+        for title in ["transcript", "status", "composer"] {
+            assert!(out.contains(title), "{title} missing at {height}: {out}");
+        }
+        assert!(out.contains("tail line"), "transcript lost content: {out}");
+    }
+}
+
+#[test]
+fn a_replayed_snapshot_renders_the_same_diff_pane_as_the_live_one() {
+    let mut live = App::new();
+    live.on_event(&diff_event(
+        &["src/tui/ui.rs"],
+        "1 file changed",
+        SAMPLE_PATCH,
+        true,
+    ));
+    let live_rows = rendered_rows(&live, 100, 40);
+    // The same evidence, reached through a recorded trace instead of the
+    // live event stream.
+    let mut replayed = App::new();
+    replayed.set_replay_events(vec![
+        TraceEvent::SessionStart {
+            session_id: "s".into(),
+            goal: "add the diff pane".into(),
+        },
+        diff_event(&["src/tui/ui.rs"], "1 file changed", SAMPLE_PATCH, true),
+        TraceEvent::ReviewVerdict {
+            pass: true,
+            feedback: "pane reads well".into(),
+        },
+    ]);
+    let replay_rows = rendered_rows(&replayed, 100, 40);
+    let live_pane = pane_slice(&live_rows, "diff", "status");
+    let replay_pane = pane_slice(&replay_rows, "diff", "status");
+    assert_eq!(replay_pane, live_pane, "replay rendered a different pane");
+    assert!(replay_pane.contains("src/tui/ui.rs"), "{replay_pane}");
+    assert!(
+        replay_pane.contains("+ use ratatui::Frame;"),
+        "{replay_pane}"
+    );
+}
+
+#[test]
+fn the_diff_pane_is_wired_to_the_app_snapshot() {
+    let bare = rendered_rows(&App::new(), 160, 40);
+    let mut with_snapshot = App::new();
+    with_snapshot.on_event(&diff_event(
+        &["src/tui/ui.rs"],
+        "1 file changed",
+        "+ use ratatui::Frame;",
+        false,
+    ));
+    let with = rendered_rows(&with_snapshot, 160, 40);
+    assert_ne!(bare, with, "a snapshot changed nothing on screen");
+    assert!(with.iter().any(|row| row.contains("┌diff")), "{with:?}");
+    let out: String = with.concat();
+    assert!(out.contains("src/tui/ui.rs"), "{out}");
+    assert!(out.contains("+ use ratatui::Frame;"), "{out}");
+}
