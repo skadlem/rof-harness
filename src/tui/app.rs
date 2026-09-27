@@ -1,7 +1,16 @@
 use std::collections::VecDeque;
 
 use super::render::{render_line, replay_filter, Counters};
-use crate::obs::{Boundary, GoalFinished, TraceEvent};
+use crate::obs::{Boundary, ControlAck, ControlKind, ControlStatus, GoalFinished, TraceEvent};
+
+/// Release `slot` only when it holds the command named by `id`. The id is
+/// what makes a displaced command safe: its later rejection is answered
+/// without clearing the command that replaced it.
+fn free_slot(slot: &mut Option<PendingControl>, id: u64) {
+    if slot.as_ref().map(|slot| slot.id) == Some(id) {
+        *slot = None;
+    }
+}
 
 /// Where the one live goal run currently is. `Idle` is also the replay
 /// posture, so a recorded trace never enters the run lifecycle.
@@ -23,6 +32,69 @@ impl RunMode {
             RunMode::Stopping => "stopping",
             RunMode::Finished => "finished",
             RunMode::Failed => "failed",
+        }
+    }
+}
+
+/// What the composer submits while a goal is live. `Steer` is the default:
+/// the text is appended to the next implementer prompt, and it never
+/// touches the call in flight. `Queue` stores exactly one next goal.
+/// `Interrupt` is the stop path: the command is not a text submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyMode {
+    Steer,
+    Queue,
+    Interrupt,
+}
+
+impl BusyMode {
+    /// Composer/status wording; lowercase so a label reads as a phrase.
+    pub fn label(self) -> &'static str {
+        match self {
+            BusyMode::Steer => "steer",
+            BusyMode::Queue => "queue",
+            BusyMode::Interrupt => "interrupt",
+        }
+    }
+}
+
+/// One occupied control slot: the id the console allocated for the
+/// command and the text it carried. Steer and queue each have at most one
+/// of these; a newer submission replaces the older id, and the displaced
+/// command is answered by its own acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingControl {
+    pub id: u64,
+    pub text: String,
+}
+
+/// Configuration held back for the next goal instead of being applied to a
+/// worker that is already running. Only non-secret values belong here: a
+/// login/logout or provider mutation is rejected while live, so no
+/// credential can reach this type, `App`, or the command channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferredConfig {
+    Attempts(u8),
+    Rounds(u32),
+    Thinking(String),
+    Effort(String),
+    Caps(usize, usize),
+    Model { slot: Option<String>, value: String },
+}
+
+impl DeferredConfig {
+    /// Status wording for the deferred slot; values only, no secrets.
+    fn label(&self) -> String {
+        match self {
+            DeferredConfig::Attempts(attempts) => format!("attempts {attempts}"),
+            DeferredConfig::Rounds(rounds) => format!("rounds {rounds}"),
+            DeferredConfig::Thinking(thinking) => format!("thinking {thinking}"),
+            DeferredConfig::Effort(effort) => format!("effort {effort}"),
+            DeferredConfig::Caps(max_steps, max_bytes) => format!("caps {max_steps}/{max_bytes}"),
+            DeferredConfig::Model { slot, value } => match slot {
+                Some(slot) => format!("{slot} {value}"),
+                None => value.clone(),
+            },
         }
     }
 }
@@ -78,6 +150,23 @@ pub struct App {
     /// rescans the deque. Mutated only through the reducer, in step with
     /// `activity`.
     pub activity_chars: usize,
+    /// What the composer submits while live; `Steer` is the default.
+    pub busy_mode: BusyMode,
+    /// The one pending steer, or `None` when the slot is free.
+    pub pending_steer: Option<PendingControl>,
+    /// The one queued next goal, or `None` when the slot is free.
+    pub pending_goal: Option<PendingControl>,
+    /// Configuration held for the next goal, never for the running one,
+    /// in submission order, so the future applying path consumes every
+    /// entry and an earlier setting is never dropped by a later one.
+    /// `App` itself never clears them: [`Self::begin_run`] starts a run
+    /// and leaves the entries for that path to consume.
+    pub deferred_config: Vec<DeferredConfig>,
+    /// The next command id. Monotonic, so an acknowledgement always
+    /// matches exactly one submission.
+    pub next_control_id: u64,
+    /// The most recent acknowledgement, applied or rejected.
+    pub last_control_ack: Option<ControlAck>,
 }
 
 impl Default for App {
@@ -100,6 +189,12 @@ impl Default for App {
             run_outcome: None,
             activity: VecDeque::new(),
             activity_chars: 0,
+            busy_mode: BusyMode::Steer,
+            pending_steer: None,
+            pending_goal: None,
+            deferred_config: Vec::new(),
+            next_control_id: 1,
+            last_control_ack: None,
         }
     }
 }
@@ -196,31 +291,183 @@ impl App {
         }
     }
 
+    /// Choose what the composer submits while a goal runs. Pure state:
+    /// the mode itself sends nothing and changes no run lifecycle.
+    pub fn set_busy_mode(&mut self, mode: BusyMode) {
+        self.busy_mode = mode;
+    }
+
+    /// Allocate the next command id. Ids are monotonic for the life of
+    /// the console, so an acknowledgement matches exactly one submission
+    /// and a displaced command is still addressable when it is rejected.
+    pub fn take_control_id(&mut self) -> u64 {
+        let id = self.next_control_id;
+        self.next_control_id += 1;
+        id
+    }
+
+    /// Occupy the single steer slot with `text` and return its id. A
+    /// submission already pending is displaced: the newer id owns the slot
+    /// and the older one is answered by the worker's own rejection.
+    pub fn submit_pending_steer(&mut self, text: &str) -> u64 {
+        let id = self.take_control_id();
+        self.pending_steer = Some(PendingControl {
+            id,
+            text: text.to_string(),
+        });
+        id
+    }
+
+    /// Occupy the single queue slot with `goal` and return its id, on the
+    /// same replacement rule as [`Self::submit_pending_steer`].
+    pub fn submit_pending_goal(&mut self, goal: &str) -> u64 {
+        let id = self.take_control_id();
+        self.pending_goal = Some(PendingControl {
+            id,
+            text: goal.to_string(),
+        });
+        id
+    }
+
+    /// Hold configuration for the next goal. Settings append in
+    /// submission order and are all applied at the boundary, so distinct
+    /// settings never displace each other.
+    pub fn defer_config(&mut self, config: DeferredConfig) {
+        self.deferred_config.push(config);
+    }
+
+    /// Apply one ordered acknowledgement. The pending slot is matched by
+    /// id and kind, so a rejection for a displaced id cannot clear the
+    /// command that replaced it. Every answer is recorded, including one
+    /// whose id no longer occupies a slot.
+    ///
+    /// A slot is freed by the answer that ends the command's life, not by
+    /// every answer. A steer is consumed at the boundary that applies it,
+    /// so either answer frees the steer slot. A queued goal outlives its
+    /// acknowledgement: `Applied` only means the worker took the goal, and
+    /// the text is still owed to the next `Boundary::Started`, which
+    /// consumes it in [`Self::on_live_boundary`]. Clearing it here would
+    /// start the goal in the worker with no matching run state here. Only
+    /// `Rejected` frees the queue slot. `Stop` occupies no slot and frees
+    /// none.
+    pub fn on_control_ack(&mut self, ack: ControlAck) {
+        // Only the answer that ends a command's life frees a slot, and only
+        // the slot this ack's own kind addresses: a stop frees neither, and
+        // an applied queue ack leaves the goal owed to the next boundary.
+        let frees_slot = match (ack.kind, ack.status) {
+            (ControlKind::Steer, _) | (ControlKind::Queue, ControlStatus::Rejected) => true,
+            (ControlKind::Queue, ControlStatus::Applied) | (ControlKind::Stop, _) => false,
+        };
+        if frees_slot {
+            match ack.kind {
+                ControlKind::Steer => free_slot(&mut self.pending_steer, ack.id),
+                ControlKind::Queue => free_slot(&mut self.pending_goal, ack.id),
+                // `Stop` occupies no slot, so it has none to free.
+                ControlKind::Stop => {}
+            }
+        }
+        let line = if ack.note.is_empty() {
+            format!("{} {} ({})", ack.kind.label(), ack.status.label(), ack.id)
+        } else {
+            format!(
+                "{} {} ({}) — {}",
+                ack.kind.label(),
+                ack.status.label(),
+                ack.id,
+                ack.note
+            )
+        };
+        self.transcript.push(line);
+        self.last_control_ack = Some(ack);
+    }
+
+    /// A compact description of the live control state for the status
+    /// row: the busy mode, each occupied slot with its id, and any
+    /// configuration waiting for the next goal.
+    pub fn control_summary(&self) -> String {
+        let mut parts = vec![self.busy_mode.label().to_string()];
+        if let Some(pending) = &self.pending_steer {
+            parts.push(format!("steer pending ({})", pending.id));
+        }
+        if let Some(pending) = &self.pending_goal {
+            parts.push(format!("goal queued ({})", pending.id));
+        }
+        if !self.deferred_config.is_empty() {
+            let labels: Vec<String> = self
+                .deferred_config
+                .iter()
+                .map(DeferredConfig::label)
+                .collect();
+            parts.push(format!(
+                "{} deferred applies to next goal: {}",
+                labels.len(),
+                labels.join(", ")
+            ));
+        }
+        parts.join(" · ")
+    }
+
     /// A run boundary notification. `Started` marks the run live;
     /// `Finished` alone does not decide the outcome, which arrives with
-    /// `GoalFinished`. A resolved run is terminal, so a late `Started`
-    /// from the previous goal cannot reopen it as running. The caller must
-    /// open a new run with [`Self::begin_run`] before its `Started`
-    /// boundary arrives.
+    /// `GoalFinished`. `Started` also consumes a queued goal: that goal is
+    /// a new run, so it opens one even when the previous goal already
+    /// resolved the run. Without a queued goal, a resolved run stays
+    /// terminal and a late `Started` cannot reopen it as running.
     pub fn on_live_boundary(&mut self, boundary: Boundary) {
         match boundary {
             Boundary::Started => {
-                if !matches!(self.run_mode, RunMode::Finished | RunMode::Failed) {
-                    self.run_mode = RunMode::Running;
+                // A stop request wins over a stale Started event: do not
+                // reopen a stopping run or consume its queued goal. The
+                // terminal outcome clears the slot when the worker ends.
+                if self.run_mode != RunMode::Stopping {
+                    if let Some(pending) = self.pending_goal.take() {
+                        self.begin_run(&pending.text);
+                    } else if !matches!(self.run_mode, RunMode::Finished | RunMode::Failed) {
+                        self.run_mode = RunMode::Running;
+                    }
                 }
             }
             Boundary::Finished => {}
         }
     }
 
-    /// The terminal outcome of the run: one concise line stored as the
-    /// outcome, appended to the transcript, and mapped to the final mode.
+    /// The per-goal outcome. Only this goal ends: with a queued goal still
+    /// pending the run continues, so the lifecycle stays live and the
+    /// outcome is recorded on its own line. With nothing queued the run
+    /// itself is over, which is the terminal posture of
+    /// [`Self::on_live_finished`].
+    pub fn on_goal_finished(&mut self, finished: &GoalFinished) {
+        let line = match (&finished.passed, &finished.error) {
+            (true, _) => "goal finished: passed".to_string(),
+            (false, Some(error)) => format!("goal failed: {error}"),
+            (false, None) => "goal failed".to_string(),
+        };
+        self.run_outcome = Some(line.clone());
+        self.transcript.push(line);
+        if self.pending_goal.is_none() {
+            self.run_mode = if finished.passed {
+                RunMode::Finished
+            } else {
+                RunMode::Failed
+            };
+        }
+    }
+
+    /// The terminal outcome of the whole session: one concise line stored
+    /// as the outcome, appended to the transcript, and mapped to the final
+    /// mode regardless of what is still queued. The session is over, so
+    /// every control slot is released here: a steer and a queued goal left
+    /// behind belong to a session that will never run them, and keeping
+    /// them would let a later session consume a stale goal at its next
+    /// `Boundary::Started`.
     pub fn on_live_finished(&mut self, finished: &GoalFinished) {
         let line = match (&finished.passed, &finished.error) {
             (true, _) => "run finished: passed".to_string(),
             (false, Some(error)) => format!("run failed: {error}"),
             (false, None) => "run failed".to_string(),
         };
+        self.pending_steer = None;
+        self.pending_goal = None;
         self.run_outcome = Some(line.clone());
         self.transcript.push(line);
         self.run_mode = if finished.passed {

@@ -3,8 +3,11 @@
 //! `TraceEvent` values and real tokio channels only.
 
 use crossterm::event::KeyCode;
-use rof::obs::{Boundary, GoalFinished, LiveEvent, TraceEvent, TraceSink};
-use rof::tui::app::{App, RunMode};
+use rof::obs::{
+    Boundary, ControlAck, ControlKind, ControlStatus, GoalFinished, LiveEvent, TraceEvent,
+    TraceSink,
+};
+use rof::tui::app::{App, BusyMode, DeferredConfig, RunMode};
 use rof::tui::run::{handle_running_key, LiveSession, RunningKeyOutcome};
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -153,6 +156,258 @@ fn a_started_boundary_never_reopens_a_resolved_run() {
     assert_eq!(app.run_mode, RunMode::Failed);
 }
 
+#[test]
+fn app_tracks_pending_control_and_acknowledges_it() {
+    let mut app = App::new();
+    app.begin_run("first");
+    app.set_busy_mode(BusyMode::Queue);
+    let id = app.submit_pending_goal("second goal");
+    assert_eq!(app.pending_goal.as_ref().map(|p| p.id), Some(id));
+    assert!(app.control_summary().contains("queued"));
+
+    app.on_control_ack(ControlAck {
+        id,
+        kind: ControlKind::Queue,
+        status: ControlStatus::Applied,
+        note: "queued".into(),
+    });
+    // An applied queue ack means the worker took the goal, not that the
+    // goal is over: the slot is still owed to the next boundary.
+    assert_eq!(
+        app.pending_goal.as_ref().map(|p| p.id),
+        Some(id),
+        "an applied queue ack freed the goal before the boundary consumed it"
+    );
+    assert!(app.control_summary().contains("goal queued"));
+    assert!(app.transcript.iter().any(|line| line.contains("queued")));
+
+    app.on_live_boundary(Boundary::Started);
+    assert!(
+        app.pending_goal.is_none(),
+        "the boundary did not consume the queued goal"
+    );
+    assert_eq!(app.run_goal, "second goal");
+    assert_eq!(app.run_mode, RunMode::Running);
+}
+
+/// A queued goal that the worker refuses never reaches a boundary, so its
+/// rejection is the answer that frees the slot and leaves no goal pending.
+#[test]
+fn a_rejected_queue_ack_frees_the_goal_slot() {
+    let mut app = App::new();
+    app.begin_run("first");
+    let id = app.submit_pending_goal("second goal");
+
+    app.on_control_ack(ControlAck {
+        id,
+        kind: ControlKind::Queue,
+        status: ControlStatus::Rejected,
+        note: "queue closed".into(),
+    });
+    assert!(app.pending_goal.is_none());
+    assert!(!app.control_summary().contains("goal queued"));
+    assert_eq!(app.run_goal, "first", "a rejected goal started a run");
+    assert_eq!(app.run_mode, RunMode::Running);
+    assert_eq!(
+        app.last_control_ack.as_ref().map(|a| a.status),
+        Some(ControlStatus::Rejected)
+    );
+}
+
+#[test]
+fn started_boundary_consumes_only_a_pending_queued_goal() {
+    let mut app = App::new();
+    app.begin_run("first");
+    app.submit_pending_goal("second goal");
+    app.on_live_boundary(Boundary::Started);
+    assert_eq!(app.run_goal, "second goal");
+    assert!(app.pending_goal.is_none());
+    assert_eq!(app.run_mode, RunMode::Running);
+}
+
+/// Steer and queue each hold exactly one slot: a later submission takes it
+/// over under a new id, and the ids are monotonic so the displaced command
+/// is still addressable when the worker rejects it.
+#[test]
+fn a_later_submission_replaces_the_pending_slot_under_a_new_id() {
+    let mut app = App::new();
+    app.begin_run("busy");
+    let first_steer = app.submit_pending_steer("focus on the parser");
+    let first_goal = app.submit_pending_goal("next goal");
+    let second_steer = app.submit_pending_steer("focus on the lexer");
+    let second_goal = app.submit_pending_goal("later goal");
+
+    assert!(second_steer > first_steer && second_goal > first_goal);
+    assert_eq!(app.pending_steer.as_ref().map(|p| p.id), Some(second_steer));
+    assert_eq!(
+        app.pending_steer.as_ref().map(|p| p.text.as_str()),
+        Some("focus on the lexer")
+    );
+    assert_eq!(app.pending_goal.as_ref().map(|p| p.id), Some(second_goal));
+    assert_eq!(
+        app.pending_goal.as_ref().map(|p| p.text.as_str()),
+        Some("later goal")
+    );
+    assert!(app.take_control_id() > second_goal);
+}
+
+/// An acknowledgement is matched by id, not by slot or arrival order: a
+/// rejection for the displaced command must leave the command that
+/// replaced it pending, while its own rejection frees the slot.
+#[test]
+fn a_rejected_ack_clears_only_the_slot_it_names() {
+    let mut app = App::new();
+    app.begin_run("busy");
+    let displaced = app.submit_pending_goal("old goal");
+    let current = app.submit_pending_goal("new goal");
+
+    app.on_control_ack(ControlAck {
+        id: displaced,
+        kind: ControlKind::Queue,
+        status: ControlStatus::Rejected,
+        note: "replaced by a later queue".into(),
+    });
+    assert_eq!(
+        app.pending_goal.as_ref().map(|p| p.id),
+        Some(current),
+        "a rejection for the displaced id cleared the live slot"
+    );
+    assert_eq!(app.last_control_ack.as_ref().map(|a| a.id), Some(displaced));
+
+    app.on_control_ack(ControlAck {
+        id: current,
+        kind: ControlKind::Queue,
+        status: ControlStatus::Rejected,
+        note: "no next round".into(),
+    });
+    assert!(app.pending_goal.is_none());
+    assert!(app.transcript.iter().any(|l| l.contains("no next round")));
+    // A rejection names a kind, so an ack of the wrong kind cannot clear
+    // the other slot even when the ids agree. `Rejected` is the status
+    // that frees a queue slot, so this only passes while the kind is
+    // honored: ignored kind matching would free the steer.
+    let steer = app.submit_pending_steer("steer text");
+    app.on_control_ack(ControlAck {
+        id: steer,
+        kind: ControlKind::Queue,
+        status: ControlStatus::Rejected,
+        note: "queue closed".into(),
+    });
+    assert!(
+        app.pending_steer.is_some(),
+        "a queue ack cleared the steer slot it never named"
+    );
+    let line = app.transcript.last().unwrap();
+    assert!(line.contains("queue rejected"), "{line}");
+    assert!(line.contains(&steer.to_string()), "{line}");
+}
+
+/// `Interrupt` is a posture, not a text submission: it occupies no slot
+/// and changes no run lifecycle, and a stop acknowledgement answers
+/// without disturbing a pending steer or goal.
+#[test]
+fn the_stop_busy_mode_holds_no_text_and_moves_no_run_state() {
+    let mut app = App::new();
+    app.begin_run("busy");
+    app.submit_pending_steer("steer text");
+    app.set_busy_mode(BusyMode::Interrupt);
+
+    assert_eq!(app.busy_mode, BusyMode::Interrupt);
+    assert!(app.control_summary().contains("interrupt"));
+    assert_eq!(app.run_mode, RunMode::Running);
+    assert!(app.pending_steer.is_some());
+
+    let stop = app.take_control_id();
+    app.on_control_ack(ControlAck {
+        id: stop,
+        kind: ControlKind::Stop,
+        status: ControlStatus::Applied,
+        note: "stopping at the next boundary".into(),
+    });
+    assert!(app.pending_steer.is_some(), "a stop ack cleared a steer");
+    assert!(app.pending_goal.is_none());
+    assert_eq!(
+        app.last_control_ack.as_ref().map(|a| a.kind),
+        Some(ControlKind::Stop)
+    );
+    assert!(app.transcript.iter().any(|l| l.contains("stop applied")));
+}
+
+/// Deferred configuration is display state for the next goal: it is held
+/// on the console and named in the summary without any credential, in
+/// submission order, so an earlier setting is never dropped.
+#[test]
+fn deferred_config_is_held_for_the_next_goal_only() {
+    let mut app = App::new();
+    app.begin_run("busy");
+    assert!(app.deferred_config.is_empty());
+    assert!(!app.control_summary().contains("next goal"));
+
+    app.defer_config(DeferredConfig::Attempts(2));
+    app.defer_config(DeferredConfig::Model {
+        slot: Some("reasoning".into()),
+        value: "provider/model".into(),
+    });
+    let summary = app.control_summary();
+    assert!(summary.contains("applies to next goal"), "{summary}");
+    assert!(summary.contains("2 deferred"), "{summary}");
+    assert!(summary.contains("attempts 2"), "{summary}");
+    assert!(summary.contains("reasoning provider/model"), "{summary}");
+    assert_eq!(
+        app.deferred_config,
+        vec![
+            DeferredConfig::Attempts(2),
+            DeferredConfig::Model {
+                slot: Some("reasoning".into()),
+                value: "provider/model".into(),
+            },
+        ]
+    );
+    // A deferred setting is not a command: no slot is occupied and the
+    // running goal is untouched.
+    assert!(app.pending_goal.is_none());
+    assert!(app.pending_steer.is_none());
+    assert_eq!(app.run_mode, RunMode::Running);
+    assert!(!app.transcript.iter().any(|l| l.contains("provider/model")));
+}
+
+/// A goal outcome is per-goal, not session-terminal: while a queued goal
+/// is pending the run stays live, and the two reducers keep their own
+/// wording so a transcript reader can tell them apart.
+#[test]
+fn a_goal_finished_outcome_is_not_the_terminal_run_finished() {
+    let mut app = App::new();
+    app.begin_run("first");
+    app.submit_pending_goal("second goal");
+    app.on_goal_finished(&GoalFinished {
+        passed: true,
+        error: None,
+    });
+    assert_eq!(app.run_mode, RunMode::Running, "a queued goal lost its run");
+    assert_eq!(app.transcript.last().unwrap(), "goal finished: passed");
+    // The queued goal then opens the next run.
+    app.on_live_boundary(Boundary::Started);
+    assert_eq!(app.run_goal, "second goal");
+
+    // With nothing queued, the same per-goal reducer resolves the run and
+    // still uses its own line.
+    let mut app = App::new();
+    app.begin_run("only goal");
+    app.on_goal_finished(&GoalFinished {
+        passed: false,
+        error: Some("checks failed".into()),
+    });
+    assert_eq!(app.run_mode, RunMode::Failed);
+    assert_eq!(app.transcript.last().unwrap(), "goal failed: checks failed");
+    assert!(!app.transcript.iter().any(|l| l.contains("run failed")));
+    // The session-terminal reducer owns the run's own outcome line.
+    app.on_live_finished(&GoalFinished {
+        passed: true,
+        error: None,
+    });
+    assert_eq!(app.transcript.last().unwrap(), "run finished: passed");
+}
+
 #[tokio::test]
 async fn live_session_reports_finished_once() {
     let (tx, rx) = unbounded_channel();
@@ -193,6 +448,156 @@ async fn live_session_reports_finished_once() {
     assert!(session.drain(&mut app).is_none());
     assert!(!session.is_running());
     assert!(!session.stop_requested());
+    drop(hold_tx);
+}
+
+#[test]
+fn a_steer_ack_does_not_clear_the_queue_slot() {
+    let mut app = App::new();
+    app.begin_run("busy");
+    let steer = app.submit_pending_steer("focus on the parser");
+    let goal = app.submit_pending_goal("second goal");
+
+    app.on_control_ack(ControlAck {
+        id: steer,
+        kind: ControlKind::Steer,
+        status: ControlStatus::Applied,
+        note: "steer acknowledged".into(),
+    });
+
+    assert!(app.pending_steer.is_none());
+    assert_eq!(app.pending_goal.as_ref().map(|p| p.id), Some(goal));
+}
+
+/// A stop request must win over a stale Started event, including a queued
+/// goal that must not be consumed while the run is stopping.
+#[test]
+fn a_stopping_run_does_not_reopen_on_a_stale_started_boundary() {
+    let mut app = App::new();
+    app.begin_run("first");
+    app.submit_pending_goal("second goal");
+    app.set_stopping();
+
+    app.on_live_boundary(Boundary::Started);
+
+    assert_eq!(app.run_mode, RunMode::Stopping);
+    assert_eq!(app.run_goal, "first");
+    assert_eq!(
+        app.pending_goal.as_ref().map(|p| p.text.as_str()),
+        Some("second goal")
+    );
+}
+
+/// The session-terminal outcome releases every control slot: a steer and a
+/// queued goal that outlived the session would otherwise be consumed by the
+/// next one, which would start a run for a goal the user never submitted.
+#[test]
+fn the_terminal_outcome_releases_every_control_slot() {
+    let mut app = App::new();
+    app.begin_run("first");
+    app.submit_pending_steer("focus on the parser");
+    app.submit_pending_goal("second goal");
+
+    app.on_live_finished(&GoalFinished {
+        passed: true,
+        error: None,
+    });
+    assert!(app.pending_steer.is_none(), "a steer outlived the session");
+    assert!(
+        app.pending_goal.is_none(),
+        "a stale queued goal outlived the session and can start a later run"
+    );
+    assert_eq!(app.run_mode, RunMode::Finished);
+    assert_eq!(app.run_outcome.as_deref(), Some("run finished: passed"));
+
+    // A later session's boundary therefore has no stale goal to pick up.
+    let mut later = App::new();
+    later.begin_run("later session");
+    later.on_live_finished(&GoalFinished {
+        passed: false,
+        error: Some("checks failed".into()),
+    });
+    later.on_live_boundary(Boundary::Started);
+    assert_eq!(later.run_goal, "later session");
+    assert_eq!(later.run_mode, RunMode::Failed);
+}
+
+/// The two live notifications a channel-level worker publishes are routed
+/// by `LiveSession::drain` to the reducers that own them: a `Control` ack
+/// is transcripted and frees its own slot, a `GoalFinished` is the
+/// per-goal outcome, and the worker handle is kept until the terminal
+/// `LiveEvent::Finished` arrives.
+#[tokio::test]
+async fn the_live_channel_routes_acks_and_goal_outcomes_to_the_app() {
+    let (tx, rx) = unbounded_channel();
+    let mut app = App::new();
+    app.begin_run("first");
+    let steer = app.submit_pending_steer("focus on the parser");
+    let queued = app.submit_pending_goal("second goal");
+
+    let mut session = LiveSession::new(rx);
+    let (hold_tx, mut hold_rx) = unbounded_channel::<()>();
+    let handle = tokio::spawn(async move {
+        hold_rx.recv().await;
+        Ok(GoalFinished {
+            passed: true,
+            error: None,
+        })
+    });
+    session.begin("first", handle);
+
+    tx.send(LiveEvent::Control(ControlAck {
+        id: steer,
+        kind: ControlKind::Steer,
+        status: ControlStatus::Applied,
+        note: "steer reaches the next boundary".into(),
+    }))
+    .unwrap();
+    tx.send(LiveEvent::Control(ControlAck {
+        id: queued,
+        kind: ControlKind::Queue,
+        status: ControlStatus::Applied,
+        note: "queued for the next boundary".into(),
+    }))
+    .unwrap();
+    tx.send(LiveEvent::GoalFinished(GoalFinished {
+        passed: true,
+        error: None,
+    }))
+    .unwrap();
+
+    // The worker is still held, so the run is not over and no outcome is
+    // reported for a session that has not finished.
+    assert!(session.drain(&mut app).is_none());
+    assert!(session.is_running());
+    // The steer ack freed its slot; the applied queue ack did not, because
+    // the queued goal is still owed to the next boundary.
+    assert!(app.pending_steer.is_none(), "the steer ack freed nothing");
+    assert_eq!(app.pending_goal.as_ref().map(|p| p.id), Some(queued));
+    assert!(app
+        .transcript
+        .iter()
+        .any(|line| line.contains("steer reaches the next boundary")));
+    assert_eq!(
+        app.last_control_ack.as_ref().map(|ack| ack.id),
+        Some(queued),
+        "the acknowledgements were not recorded in channel order"
+    );
+    // The per-goal outcome with a queued goal pending keeps the run live.
+    assert_eq!(app.run_mode, RunMode::Running);
+    assert_eq!(app.transcript.last().unwrap(), "goal finished: passed");
+    assert!(!app.transcript.iter().any(|l| l.contains("run finished")));
+
+    tx.send(LiveEvent::Finished(GoalFinished {
+        passed: true,
+        error: None,
+    }))
+    .unwrap();
+    let outcome = drain_until_terminal(&mut session, &mut app).await;
+    assert!(outcome.passed);
+    assert_eq!(app.transcript.last().unwrap(), "run finished: passed");
+    assert!(app.pending_goal.is_none(), "the session kept a stale goal");
+    assert!(!session.is_running());
     drop(hold_tx);
 }
 
@@ -542,7 +947,10 @@ async fn stub_worker_delivers_the_same_trace_order_as_the_durable_sink() {
         .iter()
         .filter_map(|event| match event {
             LiveEvent::Trace(event) => Some(serde_json::to_string(event).unwrap()),
-            LiveEvent::Boundary(_) | LiveEvent::Finished(_) => None,
+            LiveEvent::Boundary(_)
+            | LiveEvent::Control(_)
+            | LiveEvent::GoalFinished(_)
+            | LiveEvent::Finished(_) => None,
         })
         .collect();
     let durable: Vec<String> = stored

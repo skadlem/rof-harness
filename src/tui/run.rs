@@ -105,6 +105,8 @@ impl LiveSession {
             match event {
                 LiveEvent::Trace(event) => app.on_event(&event),
                 LiveEvent::Boundary(boundary) => app.on_live_boundary(boundary),
+                LiveEvent::Control(ack) => app.on_control_ack(ack),
+                LiveEvent::GoalFinished(finished) => app.on_goal_finished(&finished),
                 LiveEvent::Finished(finished) => outcome = Some(finished),
             }
         }
