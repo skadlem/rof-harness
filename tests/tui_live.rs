@@ -3,6 +3,7 @@
 //! `TraceEvent` values and real tokio channels only.
 
 use crossterm::event::KeyCode;
+use rof::engine::control::RunCommand;
 use rof::obs::{
     Boundary, ControlAck, ControlKind, ControlStatus, GoalFinished, LiveEvent, TraceEvent,
     TraceSink,
@@ -10,6 +11,12 @@ use rof::obs::{
 use rof::tui::app::{App, BusyMode, DeferredConfig, RunMode};
 use rof::tui::run::{handle_running_key, LiveSession, RunningKeyOutcome};
 use tokio::sync::mpsc::unbounded_channel;
+
+/// A live session, which owns both halves of the command channel until a
+/// worker claims the receiver half.
+fn live_session(rx: tokio::sync::mpsc::UnboundedReceiver<LiveEvent>) -> LiveSession {
+    LiveSession::new(rx)
+}
 
 fn transition(from: &str, to: &str) -> TraceEvent {
     TraceEvent::StateTransition {
@@ -412,7 +419,7 @@ fn a_goal_finished_outcome_is_not_the_terminal_run_finished() {
 async fn live_session_reports_finished_once() {
     let (tx, rx) = unbounded_channel();
     let mut app = App::new();
-    let mut session = LiveSession::new(rx);
+    let mut session = live_session(rx);
     // The worker stays pending: the session reports the channel's terminal
     // event, not the task's completion.
     let (hold_tx, mut hold_rx) = unbounded_channel::<()>();
@@ -449,6 +456,83 @@ async fn live_session_reports_finished_once() {
     assert!(!session.is_running());
     assert!(!session.stop_requested());
     drop(hold_tx);
+}
+
+/// The command inbox belongs to the worker that drains it, so it dies with
+/// that task. The session therefore mints a fresh pair for every later goal
+/// and moves its write side with it, which is what keeps a submission from
+/// being written onto a channel nobody will read.
+#[tokio::test]
+async fn a_later_goal_gets_a_fresh_inbox_and_the_dead_one_receives_nothing() {
+    let (_tx, rx) = unbounded_channel();
+    let mut session = live_session(rx);
+    let first_sender = session.command_sender().clone();
+
+    let mut first_inbox = session.take_command_inbox();
+    first_sender
+        .send(RunCommand::Stop { id: 1 })
+        .expect("the first inbox is open while its worker runs");
+    assert_eq!(first_inbox.recv().await, Some(RunCommand::Stop { id: 1 }));
+
+    // The first goal ends, and its task drops the inbox it owned.
+    drop(first_inbox);
+    let mut second_inbox = session.take_command_inbox();
+
+    // The write side moved with the pair, so this is what a submission
+    // after the swap goes on. The old sender is the only thing left of
+    // that channel: its inbox is gone and cannot receive anything.
+    assert!(first_sender.send(RunCommand::Stop { id: 2 }).is_err());
+    session
+        .command_sender()
+        .send(RunCommand::Stop { id: 3 })
+        .expect("the session holds the write side of the new pair");
+    assert_eq!(second_inbox.recv().await, Some(RunCommand::Stop { id: 3 }));
+    assert!(second_inbox.try_recv().is_err());
+}
+
+/// A command the console submits while no goal is live must not be lost at
+/// the swap boundary: it was written before any worker owned a receiver, so
+/// the first inbox has to be the channel it was written on.
+#[tokio::test]
+async fn a_command_sent_before_the_first_claim_reaches_the_first_inbox() {
+    let (_tx, rx) = unbounded_channel();
+    let mut session = live_session(rx);
+    let steer = RunCommand::Steer {
+        id: 7,
+        text: "keep the parser change".to_string(),
+    };
+    session
+        .command_sender()
+        .send(steer.clone())
+        .expect("the session holds the write side");
+
+    let mut inbox = session.take_command_inbox();
+    assert_eq!(inbox.recv().await, Some(steer));
+}
+
+/// Every claim yields its own inbox: while an earlier one is still alive,
+/// a later claim is a different channel that the session's write side
+/// feeds and the earlier one never sees.
+#[tokio::test]
+async fn each_claim_yields_a_distinct_inbox() {
+    let (_tx, rx) = unbounded_channel();
+    let mut session = live_session(rx);
+    let mut first_inbox = session.take_command_inbox();
+    let mut second_inbox = session.take_command_inbox();
+
+    let queued = RunCommand::QueueGoal {
+        id: 4,
+        goal: "write the tests".to_string(),
+    };
+    session
+        .command_sender()
+        .send(queued.clone())
+        .expect("the session holds the write side");
+    assert_eq!(second_inbox.recv().await, Some(queued));
+    assert!(
+        first_inbox.try_recv().is_err(),
+        "the earlier inbox must not be fed after the swap"
+    );
 }
 
 #[test]
@@ -535,7 +619,7 @@ async fn the_live_channel_routes_acks_and_goal_outcomes_to_the_app() {
     let steer = app.submit_pending_steer("focus on the parser");
     let queued = app.submit_pending_goal("second goal");
 
-    let mut session = LiveSession::new(rx);
+    let mut session = live_session(rx);
     let (hold_tx, mut hold_rx) = unbounded_channel::<()>();
     let handle = tokio::spawn(async move {
         hold_rx.recv().await;
@@ -601,11 +685,121 @@ async fn the_live_channel_routes_acks_and_goal_outcomes_to_the_app() {
     drop(hold_tx);
 }
 
+/// The whole two-goal session through the real reducer, with the worker
+/// handle deliberately held so every claim below is about the event
+/// sequence and not about task completion: a queued goal keeps the same
+/// worker present, its `Boundary::Started` consumes the pending goal and
+/// opens the next run, both per-goal outcomes are recorded, and only the
+/// session-terminal `Finished` produces a terminal outcome and releases
+/// the handle.
+#[tokio::test]
+async fn a_queued_goal_stays_in_one_session_and_only_finished_is_terminal() {
+    let (tx, rx) = unbounded_channel();
+    let mut session = live_session(rx);
+    let mut app = App::new();
+    app.begin_run("first goal");
+    let queued = app.submit_pending_goal("second goal");
+
+    let (hold_tx, mut hold_rx) = unbounded_channel::<()>();
+    let handle = tokio::spawn(async move {
+        hold_rx.recv().await;
+        Ok(GoalFinished {
+            passed: true,
+            error: None,
+        })
+    });
+    session.begin("first goal", handle);
+
+    tx.send(LiveEvent::Control(ControlAck {
+        id: queued,
+        kind: ControlKind::Queue,
+        status: ControlStatus::Applied,
+        note: "retained for the next goal".into(),
+    }))
+    .unwrap();
+    tx.send(LiveEvent::GoalFinished(GoalFinished {
+        passed: false,
+        error: Some("first goal failed".into()),
+    }))
+    .unwrap();
+    // Goal two starts in the same session: the boundary consumes the goal
+    // the acknowledgement left pending.
+    tx.send(LiveEvent::Boundary(Boundary::Started)).unwrap();
+
+    assert!(
+        session.drain(&mut app).is_none(),
+        "a queued goal reported a terminal outcome before the session ended"
+    );
+    assert!(
+        session.is_running(),
+        "the queued goal released the worker handle"
+    );
+    assert_eq!(app.run_goal, "second goal");
+    assert!(
+        app.pending_goal.is_none(),
+        "the second started boundary did not consume the queued goal"
+    );
+    assert_eq!(app.run_mode, RunMode::Running);
+    // The first goal's outcome is recorded, and it is not the
+    // session-terminal line: a queued goal keeps the run live.
+    assert_eq!(
+        app.transcript.last().unwrap(),
+        "goal failed: first goal failed"
+    );
+    assert!(
+        !app.transcript.iter().any(|l| l.contains("run finished")),
+        "a per-goal outcome ended the session: {:?}",
+        app.transcript
+    );
+
+    tx.send(LiveEvent::GoalFinished(GoalFinished {
+        passed: true,
+        error: None,
+    }))
+    .unwrap();
+    assert!(
+        session.drain(&mut app).is_none(),
+        "the last goal's outcome is per-goal, not session-terminal"
+    );
+    // Both per-goal outcomes are recorded, in order, and neither ended the
+    // session.
+    assert_eq!(app.transcript.last().unwrap(), "goal finished: passed");
+    assert!(
+        app.transcript
+            .iter()
+            .any(|line| line == "goal failed: first goal failed"),
+        "the first goal's outcome was lost: {:?}",
+        app.transcript
+    );
+    assert_eq!(app.run_mode, RunMode::Finished);
+    assert!(session.is_running(), "the last goal finished the session");
+
+    tx.send(LiveEvent::Finished(GoalFinished {
+        passed: true,
+        error: None,
+    }))
+    .unwrap();
+    let outcome = drain_until_terminal(&mut session, &mut app).await;
+    assert!(outcome.passed);
+    assert_eq!(app.transcript.last().unwrap(), "run finished: passed");
+    assert!(!session.is_running(), "Finished did not release the handle");
+    // Exactly one terminal outcome for the whole two-goal session.
+    assert!(session.drain(&mut app).is_none());
+    assert_eq!(
+        app.transcript
+            .iter()
+            .filter(|line| line.starts_with("run finished"))
+            .count(),
+        1
+    );
+    drop(hold_tx);
+}
+
 #[tokio::test]
 async fn request_stop_does_not_abort_the_worker() {
     let (_tx, rx) = unbounded_channel::<LiveEvent>();
     let mut app = App::new();
-    let mut session = LiveSession::new(rx);
+    let mut session = live_session(rx);
     let (hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
     let (done_tx, mut done_rx) = unbounded_channel::<()>();
     let handle = tokio::spawn(async move {
@@ -640,7 +834,7 @@ async fn request_stop_does_not_abort_the_worker() {
 async fn a_worker_that_exits_without_an_outcome_fails_the_run() {
     let (tx, rx) = unbounded_channel();
     let mut app = App::new();
-    let mut session = LiveSession::new(rx);
+    let mut session = live_session(rx);
     let handle = tokio::spawn(async {
         Ok(GoalFinished {
             passed: true,
@@ -681,7 +875,7 @@ async fn a_worker_that_exits_without_an_outcome_fails_the_run() {
 async fn reset_is_a_no_op_until_the_worker_is_terminal() {
     let (tx, rx) = unbounded_channel();
     let mut app = App::new();
-    let mut session = LiveSession::new(rx);
+    let mut session = live_session(rx);
     let (hold_tx, mut hold_rx) = unbounded_channel::<()>();
     let handle = tokio::spawn(async move {
         hold_rx.recv().await;
@@ -856,7 +1050,7 @@ fn a_repeated_stop_key_leaves_the_latch_for_the_pump() {
     let (_tx, rx) = unbounded_channel::<LiveEvent>();
     let mut app = App::new();
     app.begin_run("busy");
-    let mut session = LiveSession::new(rx);
+    let mut session = live_session(rx);
 
     assert_eq!(
         handle_running_key(&mut app, KeyCode::Esc),

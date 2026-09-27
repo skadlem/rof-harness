@@ -17,6 +17,7 @@ use super::app::App;
 use super::cmd::Action;
 use super::splash;
 use super::ui::draw;
+use crate::engine::control::RunCommand;
 use crate::obs::{GoalFinished, LiveEvent, TraceEvent};
 
 /// The goal worker task: one live run, resolving to its terminal outcome.
@@ -32,25 +33,73 @@ pub type WorkerHandle = tokio::task::JoinHandle<anyhow::Result<GoalFinished>>;
 /// whole live state machine is testable headlessly.
 pub struct LiveSession {
     receiver: tokio::sync::mpsc::UnboundedReceiver<LiveEvent>,
+    /// The write side of the command channel for the goal that is next to
+    /// run. The session holds it for as long as the worker can, so the
+    /// worker's inbox is never closed by a dropped sender: a `RunControl`
+    /// that sees a closed channel cannot tell an empty inbox from a
+    /// console that went away. Nothing writes here yet — command submission
+    /// is the next task — but the field is the session's, not the starter's,
+    /// for exactly that reason. `take_command_inbox` replaces it together
+    /// with the receiver when a later goal needs a fresh pair.
+    command_tx: tokio::sync::mpsc::UnboundedSender<RunCommand>,
+    /// The receiver half of the command channel that no worker has claimed
+    /// yet. `None` once a worker owns it, which is what makes the next
+    /// claim mint a fresh pair.
+    command_rx: Option<tokio::sync::mpsc::UnboundedReceiver<RunCommand>>,
     worker: Option<WorkerHandle>,
     stop_requested: bool,
 }
 
 impl LiveSession {
-    /// Take ownership of the channel a goal worker publishes to. The
-    /// channel outlives any single run; `reset` prepares it for the next.
+    /// Take ownership of the channel a goal worker publishes to. The session
+    /// creates the command channel itself and keeps both halves until a
+    /// worker claims the receiver, so no caller can hand out a receiver that
+    /// a dead task owned. The event channel outlives any single run; `reset`
+    /// prepares it for the next.
     pub fn new(receiver: tokio::sync::mpsc::UnboundedReceiver<LiveEvent>) -> Self {
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             receiver,
+            command_tx,
+            command_rx: Some(command_rx),
             worker: None,
             stop_requested: false,
         }
     }
 
-    /// Admit one worker task. A previous handle is dropped (detached, never
-    /// aborted) and the stop latch clears for the new goal. The goal text is
-    /// display state and lives on `App::begin_run`; the session itself is
-    /// goal-agnostic.
+    /// The write side of the command channel for the next goal. A console
+    /// submission goes here; it reaches whichever worker holds the matching
+    /// inbox.
+    pub fn command_sender(&self) -> &tokio::sync::mpsc::UnboundedSender<RunCommand> {
+        &self.command_tx
+    }
+
+    /// Hand the next goal worker the command inbox it will drain for the
+    /// life of its task, and return the sender for the channel that inbox
+    /// belongs to.
+    ///
+    /// The first call returns the receiver created in `new` — with the
+    /// channel already open, so anything the console submitted while idle is
+    /// still queued on it. Every later call mints a fresh pair, replaces the
+    /// session's write side with the new sender, and returns the new
+    /// receiver: the inbox a finished worker owned is unreachable from here,
+    /// so a submission can never be written onto a channel nobody reads.
+    pub fn take_command_inbox(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<RunCommand> {
+        match self.command_rx.take() {
+            Some(rx) => rx,
+            None => {
+                let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+                self.command_tx = command_tx;
+                command_rx
+            }
+        }
+    }
+
+    /// Begin a run, keeping the worker present until the session-terminal
+    /// `LiveEvent::Finished`. `Control` and `GoalFinished` are per-goal
+    /// and per-command, so they route to their own reducers and leave the
+    /// handle alone: a queued goal keeps the same worker task alive after
+    /// one `GoalFinished`.
     pub fn begin(&mut self, _goal: &str, worker: WorkerHandle) {
         self.worker = Some(worker);
         self.stop_requested = false;
@@ -194,11 +243,19 @@ pub fn handle_running_key(app: &mut App, code: KeyCode) -> RunningKeyOutcome {
 /// cannot drift out of the loop's reach on an error exit.
 pub fn run_live<F>(trace: &crate::obs::TraceSink, mut start_goal: F) -> anyhow::Result<()>
 where
-    F: FnMut(String, tokio::sync::mpsc::UnboundedSender<LiveEvent>) -> anyhow::Result<WorkerHandle>,
+    F: FnMut(
+        String,
+        tokio::sync::mpsc::UnboundedSender<LiveEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<RunCommand>,
+    ) -> anyhow::Result<WorkerHandle>,
 {
     enable_raw_mode()?;
     std::io::stdout().execute(EnterAlternateScreen)?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // The command channel is the session's: it creates one pair in `new`
+    // and mints a fresh one for every later goal (the receiver dies with
+    // the task that drains it). This function only owns the live event
+    // channel, which every goal in the console shares.
     trace.attach_live(tx.clone());
     let out = run_live_inner(trace, rx, &tx, &mut start_goal);
     trace.detach_live();
@@ -208,8 +265,10 @@ where
 }
 
 /// The pump itself: owns `App`, the `LiveSession`, and the idle-only
-/// `/login` key capture. One goal at a time — P1a has no queue, so Enter
-/// starts a goal immediately and the run is watched in place.
+/// `/login` key capture. One goal at a time — Enter starts a goal
+/// immediately and the run is watched in place; a goal the worker
+/// continues after a queued one never comes back through here, because
+/// that is the same worker task.
 fn run_live_inner<F>(
     trace: &crate::obs::TraceSink,
     rx: tokio::sync::mpsc::UnboundedReceiver<LiveEvent>,
@@ -217,7 +276,11 @@ fn run_live_inner<F>(
     start_goal: &mut F,
 ) -> anyhow::Result<()>
 where
-    F: FnMut(String, tokio::sync::mpsc::UnboundedSender<LiveEvent>) -> anyhow::Result<WorkerHandle>,
+    F: FnMut(
+        String,
+        tokio::sync::mpsc::UnboundedSender<LiveEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<RunCommand>,
+    ) -> anyhow::Result<WorkerHandle>,
 {
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -399,15 +462,26 @@ where
                     }
                     match super::cmd::parse(&text) {
                         None => {
-                            // P1a has no goal queue: a non-slash line starts
-                            // immediately and is watched in place. The run
-                            // state opens first so the worker's first event
-                            // is already a `Running` activity line.
+                            // A non-slash line starts a goal immediately and
+                            // is watched in place; a goal the worker
+                            // continues after a queued one never comes back
+                            // through here. The run state opens first so the
+                            // worker's first event is already a `Running`
+                            // activity line.
                             if session.is_running() {
                                 continue;
                             }
                             app.begin_run(&text);
-                            match start_goal(text.clone(), tx.clone()) {
+                            // The worker owns the command inbox for the
+                            // life of its task, so the session hands out a
+                            // fresh pair for every goal: the first claim
+                            // takes the one it opened, and a later goal in
+                            // the same console gets a new one because the
+                            // old receiver died with its task. A queued goal
+                            // never reaches here: that is the same worker
+                            // task, continuing.
+                            let command_rx = session.take_command_inbox();
+                            match start_goal(text.clone(), tx.clone(), command_rx) {
                                 Ok(handle) => session.begin(&text, handle),
                                 // A starter that cannot spawn must not take
                                 // the terminal with it: record the failure and

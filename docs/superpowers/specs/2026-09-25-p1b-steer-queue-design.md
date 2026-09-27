@@ -163,8 +163,8 @@ Direct mode and pipeline mode call the same hook. The hook is a no-op for
 
 ## Worker/goal lifecycle
 
-`run_live` creates one command channel for the whole interactive session and
-passes its receiver to the injected starter:
+`run_live` owns the console's write side of the command channel and passes
+each worker the receiver that worker drains:
 
 ```rust
 pub fn run_live<F>(
@@ -185,23 +185,38 @@ where
 2. send `Boundary::Started` and the live sink remains attached;
 3. run `execute_with_control(goal, &mut control)`;
 4. send `LiveEvent::GoalFinished` for that goal;
-5. drain terminal commands once (steer is rejected, queue is retained
-   unless `stop_requested` is set, in which case queue is rejected with
-   `stopped`);
+5. drain terminal commands once after `GoalFinished` (steer is rejected
+   with `no next round`, queue is retained unless `stop_requested` is set,
+   in which case queue is rejected naming the stop);
 6. if `control.take_queued_goal()` returns a goal, repeat from step 2 with
    freshly rebuilt services;
 7. otherwise send `LiveEvent::Finished` and return.
 
 The live sender is never reattached between goals. The trace sink remains the
-single durable source, and the same `RunControl` receiver carries commands
-across goal boundaries.
+single durable source.
+
+A command receiver is owned by the task that drains it, so its lifetime is
+one worker task, not one console session: a goal the worker continues after a
+queued goal needs no new channel, but a second interactive goal started from
+the idle prompt does. `LiveSession` therefore holds the write side and mints a
+fresh pair when it admits a later worker, moving the sender with the receiver
+so the two halves cannot disagree.
+
+A submission made before the first worker claims its inbox is safe: the pair
+exists from the moment the session does, so the command waits on exactly the
+channel that worker will drain. After a worker owns a pair, the session's
+write side names that pair until the next claim, so submission is only valid
+while a worker is admitted — the running branch, or the idle branch that
+claims the inbox before it sends. A send outside those windows names a
+receiver no worker owns; it fails loudly rather than reaching another goal,
+which is why the sender is never dropped while a worker can still drain.
 
 A queue goal is started exactly once: `take_queued_goal` removes it before
 the next `execute`. If a second queue command arrives before that start, the
 latest replaces the pending slot and the earlier command is rejected.
 
 If the user requests stop while a queue is pending, the queue is dropped and
-its command receives a rejected acknowledgement with `stopped` unless the
+its command receives a rejected acknowledgement naming the stop unless the
 user has already force-exited. A force exit still ends the pump and detaches
 the worker; the P1a limitation about an in-flight tool child still applies.
 
@@ -291,11 +306,12 @@ configuration is forwarded to the current worker.
 |---|---|
 | Command channel closed | Worker finishes current goal; queued commands are not invented |
 | Worker drops the command receiver | Current call completes; pending UI slots show rejected on the next pump tick |
+| A later goal needs a new inbox | `LiveSession` mints a fresh pair and moves the sender; commands reach the running worker, never a dead task's inbox |
 | Steer received at terminal boundary | Rejected ack `no next round` |
 | Queue received at terminal boundary | Retained and started after the current `GoalFinished` |
 | Configuration rejected | Transcript and status show the exact reason; env/config unchanged |
 | Login/provider command while live | Rejected; no secret enters `App` or the channel |
-| Stop with pending queue | Queue dropped with `stopped` ack unless force-exit already ended the session |
+| Stop with pending queue | Queue dropped with a rejected ack naming the stop, unless force-exit already ended the session |
 | Worker error | Existing generic failure outcome; terminal restoration unchanged |
 
 ## Testing strategy

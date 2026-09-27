@@ -1,5 +1,6 @@
 use rof::config::AppConfig;
 use rof::context::LayerKind;
+use rof::engine::control::{RunCommand, RunControl, RunHooks};
 use rof::engine::{ModelRouter, Orchestrator, Role, Session};
 use rof::eval::{EvalSuite, EvaluationRunner, SuiteReport};
 use rof::llm::{ContextService, ExecutorService, LlmClient, OpenRouterClient, StubClient};
@@ -43,7 +44,30 @@ impl GoalRunner {
     /// `run` path already announced during setup and the live worker is
     /// silent, so both pass `false`; the parameter keeps the boundary
     /// explicit for a future multi-goal printing caller.
+    ///
+    /// The `run` CLI path has no console to steer, so it runs with no
+    /// boundary hook at all: every boundary is then a no-op and the goal
+    /// behaves exactly as it did before P1b.
     async fn execute(&self, goal: &str, announce: bool) -> anyhow::Result<GoalResult> {
+        let mut hooks = RunHooks::none();
+        self.execute_with_control(goal, announce, &mut hooks).await
+    }
+
+    /// The one goal body, with the live boundary hook threaded through it.
+    /// The live worker's hook drains the console's command inbox at round
+    /// boundaries; every other caller passes [`RunHooks::none`].
+    ///
+    /// Everything here is per goal, including the environment and the
+    /// provider clients: `apply_env` re-reads the knob names a `/attempts`
+    /// or `/model` set between goals, and `build_services` constructs new
+    /// clients. A queued goal must not ride the finished goal's clients,
+    /// so the goal loop rebuilds them rather than reusing anything here.
+    async fn execute_with_control(
+        &self,
+        goal: &str,
+        announce: bool,
+        hooks: &mut RunHooks<'_>,
+    ) -> anyhow::Result<GoalResult> {
         let mut cfg = self.cfg.clone();
         apply_env(&mut cfg);
         rof::tui::auth::store().export_missing_env();
@@ -65,12 +89,13 @@ impl GoalRunner {
         );
         let orch = Orchestrator::new(cfg, self.trace.clone(), context, executor, verify);
         let value = orch
-            .run_loop(
+            .run_loop_with_hooks(
                 &Session::new(goal.to_string())
                     .with_checks(checks)
                     .expecting_writes(expect_writes),
                 &registry,
                 &self.root,
+                hooks,
             )
             .await;
         let passed = value["passed"].as_bool().unwrap_or(false);
@@ -85,27 +110,100 @@ impl GoalRunner {
         })
     }
 
-    /// The silent worker entry point: bracket the run on the live channel
-    /// and report the terminal outcome. It writes nothing to stdout (the
-    /// `llm:` announce is what `announce` gates); `apply_env` validation
-    /// warnings still go to stderr. A closed channel is ignored because the
-    /// durable trace stays authoritative. This is the closure the terminal
-    /// pump hands each goal to, so the pump owns the live session while
-    /// this task runs.
+    /// The silent worker entry point: run the initial goal and then every
+    /// goal the console queues, all in this one task, and report the
+    /// session's terminal outcome exactly once. It writes nothing to
+    /// stdout (the `llm:` announce is what `announce` gates);
+    /// `apply_env` validation warnings still go to stderr. A closed live
+    /// channel is ignored because the durable trace stays authoritative.
+    /// This is the closure the terminal pump hands the session to, so the
+    /// pump owns the live session while this task runs.
+    ///
+    /// Per goal, in order: `Boundary::Started`, the goal, its
+    /// `GoalFinished` outcome, and the P1a per-goal `Boundary::Finished`
+    /// bracket. The bracket is what the run pane reads as "this goal is
+    /// over"; a queued goal is a new goal and gets its own bracket.
+    ///
+    /// One honest race, which is the price of draining commands only at
+    /// boundaries: a `Stop` that arrives after the last boundary drain of
+    /// goal N is not seen until goal N+1's first boundary, so goal N+1 can
+    /// start and then stop at that first boundary. Draining anywhere else
+    /// — polling between rounds, or on a timer — could steal a steer before
+    /// the boundary that is supposed to deliver it, so the boundary stays
+    /// the only drain point and the race stays documented rather than
+    /// papered over.
     async fn run_live(
         &self,
         goal: String,
         tx: tokio::sync::mpsc::UnboundedSender<LiveEvent>,
+        command_rx: tokio::sync::mpsc::UnboundedReceiver<RunCommand>,
     ) -> anyhow::Result<GoalFinished> {
-        let _ = tx.send(LiveEvent::Boundary(Boundary::Started));
-        let result = self.execute(&goal, false).await?;
-        let finished = GoalFinished {
-            passed: result.passed,
-            error: result.error,
+        let mut control = RunControl::new(command_rx);
+        let mut next = Some(goal);
+        let mut last = GoalFinished {
+            passed: false,
+            error: Some("no goal ran".to_string()),
         };
-        let _ = tx.send(LiveEvent::Boundary(Boundary::Finished));
-        let _ = tx.send(LiveEvent::Finished(finished.clone()));
-        Ok(finished)
+        while let Some(goal) = next {
+            let mut hooks = RunHooks {
+                control: Some(&mut control),
+                live: Some(&tx),
+            };
+            let _ = tx.send(LiveEvent::Boundary(Boundary::Started));
+            let finished = match self.execute_with_control(&goal, false, &mut hooks).await {
+                Ok(result) => GoalFinished {
+                    passed: result.passed,
+                    error: result.error,
+                },
+                // A goal that failed to run at all is still this goal's
+                // outcome: report it as one, publish the session's single
+                // terminal outcome, and return the error. `execute_with_control`
+                // is infallible today — nothing in its body can fail — so this
+                // arm is defensive, kept because the moment a fallible step
+                // lands here, swallowing it would show the user the generic
+                // "worker exited without a terminal outcome" instead of the
+                // real failure. The pump ignores a handle's `Err` in favour
+                // of the published outcome, so the outcome must carry it.
+                Err(error) => {
+                    let failed = GoalFinished {
+                        passed: false,
+                        error: Some(error.to_string()),
+                    };
+                    let _ = tx.send(LiveEvent::GoalFinished(failed.clone()));
+                    let _ = tx.send(LiveEvent::Boundary(Boundary::Finished));
+                    let _ = tx.send(LiveEvent::Finished(failed));
+                    return Err(error);
+                }
+            };
+            let _ = tx.send(LiveEvent::GoalFinished(finished.clone()));
+            let _ = tx.send(LiveEvent::Boundary(Boundary::Finished));
+            last = finished;
+            // The goal boundary is a boundary: drain once more so a command
+            // that arrived after the orchestrator's own terminal drain — in
+            // the window between the run ending and this goal finishing — is
+            // answered rather than silently dropped. A steer is refused here
+            // (`no next round`): the next goal builds its own feedback from
+            // empty, so a surviving steer would have nowhere to land. A queued
+            // goal is retained and starts next, and only a stop discards it.
+            // With an empty inbox this is a no-op that publishes nothing.
+            let mut goal_boundary = String::new();
+            hooks.apply_boundary(&mut goal_boundary, true);
+            // A stop ends the session: whatever is queued is dropped, and
+            // the queued command has already been acknowledged as rejected
+            // by the boundary drain that saw the stop.
+            if control.stop_requested() {
+                break;
+            }
+            // The queued goal is taken exactly once, and runs next with
+            // freshly rebuilt services (`execute_with_control` re-applies the
+            // env and rebuilds the clients on every call).
+            next = control.take_queued_goal().map(|(_, queued)| queued);
+        }
+        // The one session-terminal event, after the last goal. The console
+        // keeps drawing until it arrives: a queued goal is what keeps this
+        // task alive after the previous `GoalFinished`.
+        let _ = tx.send(LiveEvent::Finished(last.clone()));
+        Ok(last)
     }
 }
 
@@ -715,9 +813,11 @@ async fn main() -> anyhow::Result<()> {
                     // worker task while the terminal keeps drawing and
                     // reading keys beside it.
                     let s = setup(load_config(cfg_path.as_deref())?)?;
-                    rof::tui::run::run_live(&s.trace, |goal, tx| {
+                    rof::tui::run::run_live(&s.trace, |goal, tx, command_rx| {
                         let runner = GoalRunner::from_setup(&s);
-                        Ok(tokio::spawn(async move { runner.run_live(goal, tx).await }))
+                        Ok(tokio::spawn(async move {
+                            runner.run_live(goal, tx, command_rx).await
+                        }))
                     })?;
                     Ok(())
                 }
@@ -928,72 +1028,309 @@ fn skills_cmd(cfg: &AppConfig, args: &[String]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rof::obs::{Boundary, LiveEvent};
+    use rof::obs::{Boundary, ControlAck, ControlKind, ControlStatus, LiveEvent};
 
-    /// The live worker is silent: it brackets the run on the channel and
-    /// reports the same terminal outcome it returns. Provider env is
-    /// removed so `build_services` deterministically picks the stub client,
-    /// and `ROF_CREDENTIALS` is pointed at an empty scratch store so
+    /// Serializes the tests that scrub the provider env. Tokio's mutex so
+    /// the guard is async-aware: the runs below await while the env is
+    /// scrubbed, and a std mutex would poison on the first re-entrant
+    /// await.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A deterministic offline live worker.
+    ///
+    /// The provider env is removed so `build_services` picks the stub
+    /// client, and `ROF_CREDENTIALS` points at an empty scratch store so
     /// `export_missing_env` cannot refill the removed keys from the
-    /// developer's ~/.rof logins. The mutex keeps the provider-env reads of
-    /// other main unit tests from racing this one.
+    /// developer's ~/.rof logins. The env each test sets on top is
+    /// restored with the guard, so one test's boundary-forcing knobs never
+    /// reach the next.
+    struct LiveWorker {
+        runner: GoalRunner,
+        /// The env this worker changed, with the prior value.
+        env: Vec<(&'static str, Option<String>)>,
+        root: PathBuf,
+    }
+
+    impl LiveWorker {
+        /// `rounds` and `checks` force a real boundary without any
+        /// timing: one review round and an allowlisted check command that
+        /// exits non-zero, so the goal reaches its boundary and fails
+        /// deterministically instead of passing on the stub's happy path.
+        async fn new(name: &str, rounds: Option<&str>, checks: Option<&str>) -> Self {
+            let env: Vec<(&'static str, Option<String>)> = [
+                "ROF_TOKEN",
+                "OR_TOKEN",
+                "ROF_CHAT_BASE",
+                "ROF_CREDENTIALS",
+                "ROF_MAX_ROUNDS",
+                "ROF_CHECK",
+                "ROF_ALLOW_CMDS",
+                "ROF_EXPECT_WRITES",
+            ]
+            .into_iter()
+            .map(|k| (k, std::env::var(k).ok()))
+            .collect();
+            for key in ["ROF_TOKEN", "OR_TOKEN", "ROF_CHAT_BASE"] {
+                std::env::remove_var(key);
+            }
+            // One round: the goal ends at the first boundary drain, so a
+            // command submitted before the worker started is drained by a
+            // real boundary rather than by the terminal one only.
+            if let Some(rounds) = rounds {
+                std::env::set_var("ROF_MAX_ROUNDS", rounds);
+            }
+            if let Some(cmd) = checks {
+                // The bare word `false` is resolved on `PATH` to the
+                // shell builtin/`/usr/bin/false`, which exits 1, so the
+                // check fails for a reason that has nothing to do with the
+                // model.
+                std::env::set_var("ROF_CHECK", cmd);
+                std::env::set_var("ROF_ALLOW_CMDS", cmd);
+            }
+            let root = std::env::temp_dir().join(format!("rof-p1b-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            // The scratch store is empty/nonexistent: `export_missing_env`
+            // resolves no keys, so no provider can be selected by a login
+            // that happened to exist on this machine.
+            let credentials = root.join("scratch").join("credentials");
+            std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+            let _ = std::fs::remove_file(&credentials);
+            std::env::set_var("ROF_CREDENTIALS", &credentials);
+            let runner = GoalRunner {
+                cfg: AppConfig::default(),
+                trace: Arc::new(TraceSink::new()),
+                root: root.clone(),
+            };
+            Self { runner, env, root }
+        }
+
+        /// Restore every env var this worker touched, then remove its
+        /// temp root.
+        fn restore(&mut self) {
+            for (key, value) in self.env.drain(..) {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl Drop for LiveWorker {
+        fn drop(&mut self) {
+            self.restore();
+        }
+    }
+
+    /// The ordered per-goal notifications, with the trace events the
+    /// durable sink interleaves projected out: the claim under test is
+    /// about the goal/control sequence, and the trace projection is
+    /// already covered by the P1a stub-worker test.
+    fn shape(events: &[LiveEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                LiveEvent::Trace(_) => None,
+                LiveEvent::Boundary(Boundary::Started) => Some("started".to_string()),
+                LiveEvent::Boundary(Boundary::Finished) => Some("finished".to_string()),
+                LiveEvent::Control(ack) => Some(format!("control {} {}", ack.kind.label(), ack.id)),
+                LiveEvent::GoalFinished(_) => Some("goal".to_string()),
+                LiveEvent::Finished(_) => Some("session".to_string()),
+            })
+            .collect()
+    }
+
+    /// The live worker is silent: it brackets one goal on the channel,
+    /// reports that goal's outcome, and publishes the same terminal outcome
+    /// it returns. An empty command inbox ends the session after the first
+    /// goal.
     #[tokio::test]
     async fn goal_runner_reports_a_terminal_live_outcome() {
-        // Tokio's mutex so the guard is async-aware: the run below awaits
-        // while the provider env is scrubbed.
-        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _env = ENV_LOCK.lock().await;
-        // Capture the developer's env so the scrub is invisible to the rest
-        // of the suite and to the process that ran the test.
-        let prior: Vec<(&str, Option<String>)> =
-            ["ROF_TOKEN", "OR_TOKEN", "ROF_CHAT_BASE", "ROF_CREDENTIALS"]
-                .into_iter()
-                .map(|k| (k, std::env::var(k).ok()))
-                .collect();
-        for key in ["ROF_TOKEN", "OR_TOKEN", "ROF_CHAT_BASE"] {
-            std::env::remove_var(key);
-        }
-        let root = std::env::temp_dir().join(format!("rof-p1a-runner-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        // The scratch store is empty/nonexistent: `export_missing_env`
-        // resolves no keys, so no provider can be selected by a login that
-        // happened to exist on this machine.
-        let credentials = root.join("scratch").join("credentials");
-        std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
-        let _ = std::fs::remove_file(&credentials);
-        std::env::set_var("ROF_CREDENTIALS", &credentials);
-        let runner = GoalRunner {
-            cfg: AppConfig::default(),
-            trace: Arc::new(TraceSink::new()),
-            root: root.clone(),
-        };
+        let worker = LiveWorker::new("single", None, None).await;
+        let (_command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let result = runner.run_live("stub smoke goal".into(), tx).await.unwrap();
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(LiveEvent::Boundary(Boundary::Started))
-        ));
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(LiveEvent::Boundary(Boundary::Finished))
-        ));
-        let delivered = match rx.try_recv().unwrap() {
+        let result = worker
+            .runner
+            .run_live("stub smoke goal".into(), tx, command_rx)
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        // The single-goal sequence: the per-goal bracket, then that goal's
+        // outcome, then the one session-terminal event.
+        let projection = shape(&events);
+        assert_eq!(
+            projection.first().map(String::as_str),
+            Some("started"),
+            "the goal did not start first: {projection:?}"
+        );
+        assert_eq!(
+            projection,
+            vec![
+                "started".to_string(),
+                "goal".to_string(),
+                "finished".to_string(),
+                "session".to_string(),
+            ],
+            "unexpected single-goal sequence"
+        );
+        let delivered = match events.pop().unwrap() {
             LiveEvent::Finished(finished) => finished,
-            other => panic!("expected Finished, got {other:?}"),
+            other => panic!("expected Finished last, got {other:?}"),
         };
         assert_eq!(result, delivered);
-        // Exactly three notifications: Started, Finished, Finished(outcome).
+        // Nothing follows the terminal outcome: no second session event, no
+        // second bracket.
         assert!(
             rx.try_recv().is_err(),
             "expected no notification after the terminal outcome"
         );
-        for (key, value) in prior {
-            match value {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
+    }
+
+    /// A queued goal runs in the same worker task: the second goal opens
+    /// with its own `Boundary::Started` after the first goal's outcome, and
+    /// the session-terminal `Finished` arrives exactly once, after the last
+    /// goal.
+    ///
+    /// The queue command is submitted BEFORE the worker starts, so the only
+    /// thing that can pick it up is a real boundary drain inside the
+    /// orchestrator. One review round plus a failing check makes that
+    /// boundary deterministic: the run reaches it and fails, rather than
+    /// depending on how the stub happens to score.
+    #[tokio::test]
+    async fn a_queued_goal_runs_after_the_first_goal_in_one_session() {
+        let _env = ENV_LOCK.lock().await;
+        let worker = LiveWorker::new("two-goal", Some("1"), Some("false")).await;
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        command_tx
+            .send(RunCommand::QueueGoal {
+                id: 7,
+                goal: "second goal".into(),
+            })
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = worker
+            .runner
+            .run_live("first goal".into(), tx, command_rx)
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
         }
-        let _ = std::fs::remove_dir_all(root);
+        let projection = shape(&events);
+        println!("two-goal sequence: {projection:?}");
+        let goals = projection.iter().filter(|s| *s == "goal").count();
+        assert_eq!(goals, 2, "expected two per-goal outcomes: {projection:?}");
+        // The two goals each open with their own start and close with their
+        // own bracket: started, goal, finished, started, goal, finished.
+        let sequence: Vec<&str> = projection
+            .iter()
+            .filter(|s| s.as_str() != "control queue 7")
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            sequence,
+            vec!["started", "goal", "finished", "started", "goal", "finished", "session"],
+            "unexpected two-goal sequence"
+        );
+        // The queued command was answered, not silently dropped.
+        let acks: Vec<&ControlAck> = events
+            .iter()
+            .filter_map(|event| match event {
+                LiveEvent::Control(ack) => Some(ack),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            acks.iter().any(|ack| {
+                ack.id == 7
+                    && ack.kind == ControlKind::Queue
+                    && ack.status == ControlStatus::Applied
+            }),
+            "the queued command was never acknowledged as applied: {acks:?}"
+        );
+
+        // Take the terminal event off the end for the comparison below.
+        let delivered = match events.pop().unwrap() {
+            LiveEvent::Finished(finished) => finished,
+            other => panic!("expected Finished last, got {other:?}"),
+        };
+        // The returned outcome is the one the console was told about.
+        assert_eq!(result, delivered);
+        assert!(
+            rx.try_recv().is_err(),
+            "expected no notification after the terminal outcome"
+        );
+    }
+
+    /// A stop submitted with a queued goal ends the session after the
+    /// current goal: the queued goal never starts, and its command is
+    /// answered as rejected with a note naming the stop rather than
+    /// silently vanishing.
+    #[tokio::test]
+    async fn a_stop_drops_the_queued_goal_and_ends_the_session() {
+        let _env = ENV_LOCK.lock().await;
+        let worker = LiveWorker::new("stop", Some("1"), Some("false")).await;
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        command_tx
+            .send(RunCommand::QueueGoal {
+                id: 11,
+                goal: "queued goal".into(),
+            })
+            .unwrap();
+        command_tx.send(RunCommand::Stop { id: 12 }).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = worker
+            .runner
+            .run_live("first goal".into(), tx, command_rx)
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let projection = shape(&events);
+        println!("stop sequence: {projection:?}");
+        assert_eq!(
+            projection.iter().filter(|s| *s == "goal").count(),
+            1,
+            "the stop did not keep the session to one goal: {projection:?}"
+        );
+        assert_eq!(
+            projection.iter().filter(|s| *s == "started").count(),
+            1,
+            "a second goal started after the stop: {projection:?}"
+        );
+        let rejected = events.iter().find_map(|event| match event {
+            LiveEvent::Control(ack) if ack.id == 11 => Some(ack),
+            _ => None,
+        });
+        let rejected = rejected.expect("the queued command was never answered");
+        assert_eq!(rejected.kind, ControlKind::Queue);
+        assert_eq!(rejected.status, ControlStatus::Rejected);
+        assert!(
+            rejected.note.contains("stop"),
+            "the rejection does not name the stop: {}",
+            rejected.note
+        );
+        // The session still ends, and still exactly once.
+        // Take the terminal event off the end for the comparison below.
+        let delivered = match events.pop().unwrap() {
+            LiveEvent::Finished(finished) => finished,
+            other => panic!("expected Finished last, got {other:?}"),
+        };
+        assert_eq!(result, delivered);
+        assert!(
+            rx.try_recv().is_err(),
+            "expected no notification after the terminal outcome"
+        );
     }
 }
