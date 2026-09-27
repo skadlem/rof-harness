@@ -7,7 +7,7 @@ pub mod retriever;
 pub mod state;
 pub mod symbols;
 pub use assembler::{Assembly, ContextAssembler, ContextItem, Fidelity, ItemKey, PromptParts};
-pub use builder::ContextBuilder;
+pub use builder::{split_volatile_head, ContextBuilder, PER_ROUND_MARKER};
 pub use measure::{measure_turn, TURN_ASK, TURN_CALL, TURN_REASK};
 pub use memory::{load as load_memory, render as render_memory, Memory};
 pub use policy::{ContextPolicy, LayerKind, LayerPolicy, LayerReport, LayerStrategy, SummaryStat};

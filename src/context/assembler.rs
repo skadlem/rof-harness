@@ -18,7 +18,8 @@
 //!   path it arrived by. The metric is [`Self::eliminated_chars`].
 //! - **Order for the cache, don't type it.** The caller adds stable parts first
 //!   and volatile parts last, so the tail rides the prefix cache. Same effect
-//!   as a typed head/tail partition, without the abstraction.
+//!   as a typed head/tail partition, without the abstraction. The head's own
+//!   per-round block rides last too — see [`PromptParts::volatile_head`].
 //!
 //! The layers keep their own policy: that path is the measured, content-cached
 //! summarization, and it is already bounded. What was unbounded is below it.
@@ -75,6 +76,19 @@ pub struct PromptParts {
     pub head: String,
     /// Everything this assembler placed, in the order it was added.
     pub tail: String,
+    /// The head's per-round block, delivered AFTER `tail` — the round counter,
+    /// the reviewer feedback, the check log. Empty when the caller's head has
+    /// no per-round block, in which case this is the pre-§6 shape exactly.
+    ///
+    /// It carries the separator that joined it to `head` in the first place (see
+    /// [`split_volatile_head`](super::builder::split_volatile_head)), so
+    /// `head + "\n\n" + tail + volatile_head` is the same bytes as the unsplit
+    /// `head + "\n\n" + tail`, in an order that keeps the stable tail cacheable.
+    pub volatile_head: String,
+    /// What [`ContextAssembler::add_volatile`] placed: the items that exist only
+    /// on this turn, delivered last so a turn that re-sends a previous one
+    /// extends it byte for byte instead of rewriting its tail.
+    pub volatile_tail: String,
 }
 
 /// The outcome of one assembly. [`Assembly::SelectionFailure`] carries the
@@ -91,13 +105,26 @@ pub enum Assembly {
 }
 
 impl PromptParts {
-    /// The assembled prompt: the layers, then everything the assembler placed.
+    /// The assembled prompt: the stable head, then everything the assembler
+    /// placed, then the per-round block, then the items that exist only on this
+    /// turn — the order §6's cache prefix needs. Empty parts contribute
+    /// nothing, and an absent per-round block leaves the string byte-identical
+    /// to the unsplit shape.
     pub fn full(&self) -> String {
-        if self.tail.is_empty() {
-            self.head.clone()
-        } else {
-            format!("{}\n\n{}", self.head, self.tail)
+        let mut out = self.head.clone();
+        if !self.tail.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&self.tail);
         }
+        // The per-round block carries its own separator, then the turn's own
+        // items go below it: a re-ask is this turn's ask plus those, so the
+        // second turn of a round reads the first turn's cache.
+        out.push_str(&self.volatile_head);
+        if !self.volatile_tail.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&self.volatile_tail);
+        }
+        out
     }
 }
 
@@ -105,8 +132,15 @@ impl PromptParts {
 /// first, the volatile parts last, then [`Self::assemble`].
 pub struct ContextAssembler<'a> {
     head: &'a str,
+    /// The head's per-round block, kept aside so [`PromptParts::full`] can
+    /// deliver it after `tail`. See [`ContextAssembler::with_volatile_head`].
+    volatile: &'a str,
     budget: usize,
     items: Vec<ContextItem>,
+    /// Items that exist only on this turn (what a `reads` request answered).
+    /// They are fitted against the same budget, in the same order they were
+    /// added, and delivered last — see [`Self::add_volatile`].
+    volatile_items: Vec<ContextItem>,
     placed: HashSet<ItemKey>,
     /// Chars a duplicate carried. The metric §4.1 names.
     eliminated: usize,
@@ -114,10 +148,28 @@ pub struct ContextAssembler<'a> {
 
 impl<'a> ContextAssembler<'a> {
     pub fn new(head: &'a str, budget: usize) -> Self {
+        Self::with_volatile_head(head, "", budget)
+    }
+
+    /// An assembler whose head carries a per-round block, delivered after
+    /// everything it places instead of inside `head`.
+    ///
+    /// §6: a per-round counter in the middle of a request invalidates every
+    /// byte below it, so the largest stable thing the harness has — the file
+    /// map and the goal-named file — was re-sent from scratch on every round
+    /// because a 20-char counter sat above it. Splitting the head here is the
+    /// fix, and it moves content: `head + "\n\n" + tail` becomes
+    /// `stable + "\n\n" + tail + per_round`, the same bytes in an order the
+    /// provider's cache can hold on to. Get the two halves from
+    /// [`split_volatile_head`](super::builder::split_volatile_head), which
+    /// leaves the separator with the per-round half.
+    pub fn with_volatile_head(head: &'a str, volatile: &'a str, budget: usize) -> Self {
         Self {
             head,
+            volatile,
             budget,
             items: Vec::new(),
+            volatile_items: Vec::new(),
             placed: HashSet::new(),
             eliminated: 0,
         }
@@ -127,12 +179,33 @@ impl<'a> ContextAssembler<'a> {
     /// duplicate is counted whether or not its original was delivered: the
     /// dedupe is on the request, not on the placement.
     pub fn add(&mut self, item: ContextItem) -> &mut Self {
+        self.place(item, false)
+    }
+
+    /// Registers an item that exists only on THIS turn — what a `reads` request
+    /// answered, a skill body asked for on the spot — and delivers it last.
+    ///
+    /// §6: the re-ask re-sends the ask's whole context and adds these. Keeping
+    /// them below the per-round block as well as below the stable tail is what
+    /// makes the re-ask a byte-exact extension of the ask instead of a rewrite
+    /// of its middle, so the second turn of a round reads the first turn's
+    /// cache. The budget accounting is unchanged: they are fitted in the order
+    /// they were added, against the same budget as [`Self::add`].
+    pub fn add_volatile(&mut self, item: ContextItem) -> &mut Self {
+        self.place(item, true)
+    }
+
+    fn place(&mut self, item: ContextItem, volatile: bool) -> &mut Self {
         if self.placed.contains(&item.key) {
             self.eliminated += item.text.chars().count();
             return self;
         }
         self.placed.insert(item.key.clone());
-        self.items.push(item);
+        if volatile {
+            self.volatile_items.push(item);
+        } else {
+            self.items.push(item);
+        }
         self
     }
 
@@ -170,9 +243,18 @@ impl<'a> ContextAssembler<'a> {
 
     pub fn assemble(&mut self) -> Assembly {
         let mut tail = String::new();
+        let mut volatile_tail = String::new();
         let mut used = 0usize;
         let mut excess = Vec::new();
-        for item in &self.items {
+        // One budget, one pass, in the order the items were added: the split
+        // below is a delivery order, not a second fitting pass, so nothing here
+        // can be delivered that the unsplit assembler would not have delivered.
+        for (item, volatile) in self
+            .items
+            .iter()
+            .map(|i| (i, false))
+            .chain(self.volatile_items.iter().map(|i| (i, true)))
+        {
             let (text, fits) = self.fit(item, self.budget.saturating_sub(used));
             if !fits {
                 if item.must_include {
@@ -182,15 +264,22 @@ impl<'a> ContextAssembler<'a> {
                 // so the next item gets the whole remainder.
                 continue;
             }
-            tail.push_str(&item.label);
-            tail.push('\n');
-            tail.push_str(&text);
-            tail.push('\n');
+            let target = if volatile {
+                &mut volatile_tail
+            } else {
+                &mut tail
+            };
+            target.push_str(&item.label);
+            target.push('\n');
+            target.push_str(&text);
+            target.push('\n');
             used += item.label.chars().count() + 1 + text.chars().count() + 1;
         }
         let parts = PromptParts {
             head: self.head.to_string(),
             tail,
+            volatile_head: self.volatile.to_string(),
+            volatile_tail,
         };
         if excess.is_empty() {
             Assembly::Ok(parts)

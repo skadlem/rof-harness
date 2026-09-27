@@ -169,10 +169,46 @@ impl ContextBuilder {
     }
 }
 
+/// The layer boundary `join` writes before the one layer that is rebuilt
+/// every round. Kept as a constant because the split that puts the per-round
+/// block LAST in a request is defined by exactly this string.
+pub const PER_ROUND_MARKER: &str = "\n\n[SHORT-TERM]\n";
+
+/// A rendered view, split at the per-round boundary: `(stable, per_round)`.
+///
+/// `stable` is everything up to [`PER_ROUND_MARKER`] — the long-term head
+/// (project memory, conventions, skill index) and the mid-term (goal,
+/// retrieval, plan, task line) — which is byte-identical on every round of a
+/// task. `per_round` is the marker and the short-term layer that follows it,
+/// which carries the round counter, the reviewer feedback and the check log, and
+/// is the ONE place two rounds of a task are allowed to differ.
+///
+/// `per_round` keeps the separator that joined it to `stable`, so an agent can
+/// deliver `stable`, then whatever else belongs above the volatile block, then
+/// `per_round` and get back the same bytes in a different order. A view with no
+/// short-term layer is all stable.
+///
+/// §6: the split is the whole point. A per-turn counter sitting in the middle of
+/// a request invalidates every byte under it, so "placing dynamic content at the
+/// end" is not a style preference — it is the difference between re-sending the
+/// context once and re-sending it every round.
+pub fn split_volatile_head(view: &str) -> (&str, &str) {
+    match view.rfind(PER_ROUND_MARKER) {
+        Some(at) => (&view[..at], &view[at..]),
+        None => (view, ""),
+    }
+}
+
 fn join(fitted: Vec<String>, reports: &[LayerReport]) -> CtxView {
+    // `PER_ROUND_MARKER` is written by the format, not re-spelled beside it, so
+    // the boundary `split_volatile_head` looks for cannot drift from the one
+    // this produces.
     let prompt = format!(
-        "[LONG-TERM]\n{}\n\n[MID-TERM]\n{}\n\n[SHORT-TERM]\n{}",
-        fitted[0], fitted[1], fitted[2]
+        "[LONG-TERM]\n{long}\n\n[MID-TERM]\n{mid}{marker}{short}",
+        long = fitted[0],
+        mid = fitted[1],
+        marker = PER_ROUND_MARKER,
+        short = fitted[2],
     );
     CtxView {
         used_tokens: prompt.len() / 4,

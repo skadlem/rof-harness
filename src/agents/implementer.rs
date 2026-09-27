@@ -82,7 +82,17 @@ impl ImplementerAgent<'_> {
         // request for a path already delivered is refused and counted.
         let map = ctx.workdir.map(Self::file_map).unwrap_or_default();
         let files_seen = map.lines().count();
-        let mut asm = ContextAssembler::new(&ctx.view.prompt, ctx.volatile_budget);
+        // §6: the head's per-round block (the round counter, the reviewer
+        // feedback, the check log) is split off and delivered BELOW everything
+        // the assembler places. It is the one part of the layers that changes
+        // every round, and in the middle of the request it invalidated the
+        // whole tail under it: the file map and the goal-named file are
+        // byte-identical on every round of a task, and a 20-char counter was
+        // re-sending all of it. Moving the block to the end is a move, not a
+        // cut — `parts.full()` carries the same bytes either way.
+        let (stable_head, per_round_head) = crate::context::split_volatile_head(&ctx.view.prompt);
+        let mut asm =
+            ContextAssembler::with_volatile_head(stable_head, per_round_head, ctx.volatile_budget);
         // The paths whose *content* is in the prompt. A request for one of
         // these is the read-before-patch reflex, and honoring it costs a
         // round that produces no patch. The [REPO FILES] map below is only a
@@ -200,7 +210,11 @@ impl ImplementerAgent<'_> {
                 } else {
                     format!("--- {}", f.path)
                 };
-                asm.add(ContextItem {
+                // §6: delivered last, below the per-round block, so this
+                // re-ask is a byte-exact extension of the ask above it rather
+                // than a rewrite of its middle — which is what lets the second
+                // turn of the round read the first turn's cache.
+                asm.add_volatile(ContextItem {
                     key: ItemKey {
                         path: f.path,
                         region: "requested".to_string(),
@@ -234,7 +248,9 @@ impl ImplementerAgent<'_> {
                 got_any = true;
             }
             for s in self.skill_bodies(&ctx, &wanted_skills).await {
-                asm.add(ContextItem {
+                // A body asked for on the spot is this turn's content: last,
+                // for the same reason as the requested files above.
+                asm.add_volatile(ContextItem {
                     key: ItemKey {
                         path: format!("<skill:{}>", s.name),
                         region: "body".to_string(),
