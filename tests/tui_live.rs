@@ -2563,3 +2563,299 @@ fn focus_keys_are_never_draft_text_while_a_run_is_live() {
     assert_eq!(idle.input, "a", "the composer path changed");
     assert_eq!(idle.focus, Focus::Composer, "typing moved the focus");
 }
+
+// ---- P3 F2: the completion key in the console ---------------------------
+
+/// The keys the console claims besides typing, and the order they are
+/// consulted in. `Ctrl-N` is completion because Tab is already the pane
+/// focus key and `q`/`Esc`/`Ctrl-C` are the stop keys; Enter submits and
+/// nothing else does. It is a CONTROL chord, and the draft's character arm
+/// accepts only a bare or Shift-modified character, so the key can never
+/// reach the draft as a letter however the order below changes.
+#[test]
+fn the_completion_key_collides_with_nothing() {
+    use crossterm::event::KeyModifiers;
+    use rof::tui::run::{completion_key, focus_step, is_draft_text};
+
+    let none = KeyModifiers::NONE;
+    let ctrl = KeyModifiers::CONTROL;
+
+    // The key itself.
+    assert!(completion_key(KeyCode::Char('n'), ctrl));
+    assert!(completion_key(KeyCode::Char('N'), ctrl));
+    assert!(
+        !is_draft_text(KeyCode::Char('n'), ctrl),
+        "Ctrl-N typed a letter"
+    );
+    // An unmodified `n` is still ordinary text: typing edits the composer
+    // by default, and completion is opt-in.
+    assert!(!completion_key(KeyCode::Char('n'), none));
+    assert!(
+        is_draft_text(KeyCode::Char('n'), none),
+        "plain n stopped typing"
+    );
+
+    // Pane focus keeps Tab; completion does not take it.
+    assert!(!completion_key(KeyCode::Tab, none));
+    assert!(!completion_key(KeyCode::BackTab, KeyModifiers::SHIFT));
+    // The stop keys and submission are untouched.
+    for (code, modifiers) in [
+        (KeyCode::Char('c'), ctrl),
+        (KeyCode::Char('C'), ctrl),
+        (KeyCode::Char('q'), none),
+        (KeyCode::Esc, none),
+        (KeyCode::Enter, none),
+    ] {
+        assert!(
+            !completion_key(code, modifiers),
+            "{code:?}/{modifiers:?} must keep its own meaning"
+        );
+    }
+
+    // Dispatch order, not just the happy path: the running reducer is
+    // asked first and must leave Ctrl-N to the composer, and the focus
+    // keys are asked next and must not claim it either.
+    let mut app = App::new();
+    app.begin_run("busy");
+    assert_eq!(
+        running_key_outcome(&mut app, KeyCode::Char('n'), ctrl),
+        RunningKeyOutcome::Ignored,
+        "the running reducer must not claim the completion key"
+    );
+    assert_eq!(app.input, "", "the running reducer edited the draft");
+    assert_eq!(
+        app.run_mode,
+        RunMode::Running,
+        "the running reducer moved the run"
+    );
+    assert_eq!(
+        focus_step(KeyCode::Char('n'), ctrl),
+        None,
+        "the focus cycle claimed the completion key"
+    );
+}
+
+/// One press, in the running posture: the draft is completed in place and
+/// NOTHING else moves. A completion is not a submission, so the busy mode,
+/// the deferred configuration, and both pending slots are exactly as they
+/// were, and the run keeps running.
+#[test]
+fn completion_edits_only_the_draft() {
+    use rof::tui::cmd::Completion;
+
+    let mut app = App::new();
+    app.begin_run("busy");
+    app.set_busy_mode(BusyMode::Interrupt);
+    app.deferred_config.push(DeferredConfig::Rounds(4));
+    app.pending_goal = Some(rof::tui::app::PendingControl {
+        id: app.next_control_id,
+        text: "queued goal".to_string(),
+    });
+    app.input = "/round".to_string();
+    let lines_before = app.transcript.len();
+
+    let changed = app.apply_completion(&Completion::Completed {
+        text: "/rounds".to_string(),
+        candidates: vec![],
+    });
+
+    assert!(changed, "the draft was completed but reported no change");
+    assert_eq!(app.input, "/rounds", "the draft was cleared or altered");
+    assert_eq!(
+        app.transcript.len(),
+        lines_before,
+        "a settled line spoke anyway"
+    );
+    assert_eq!(
+        app.busy_mode,
+        BusyMode::Interrupt,
+        "completion moved the busy mode"
+    );
+    assert_eq!(
+        app.deferred_config,
+        vec![DeferredConfig::Rounds(4)],
+        "completion touched the deferred configuration"
+    );
+    assert_eq!(
+        app.pending_goal.as_ref().map(|c| c.text.clone()),
+        Some("queued goal".to_string()),
+        "completion moved a pending slot"
+    );
+    assert_eq!(app.run_mode, RunMode::Running, "completion moved the run");
+}
+
+/// An ambiguous press inserts the common prefix AND says which candidates
+/// are still open, so the user is never quietly handed one of them. The
+/// line names candidates only: no credential can be in one.
+#[test]
+fn an_ambiguous_press_inserts_the_prefix_and_reports_the_candidates() {
+    use rof::tui::cmd::Completion;
+
+    let mut app = App::new();
+    app.input = "/pro".to_string();
+
+    let changed = app.apply_completion(&Completion::Completed {
+        text: "/provider".to_string(),
+        candidates: vec!["/provider".to_string(), "/providers".to_string()],
+    });
+
+    assert!(changed);
+    assert_eq!(app.input, "/provider", "the common prefix was not inserted");
+    let line = app.transcript.last().expect("no line for the candidates");
+    assert!(
+        line.contains("/provider") && line.contains("/providers"),
+        "{line}"
+    );
+    assert_no_key_material(std::slice::from_ref(line), FIXTURE_KEY);
+}
+
+/// No match: the draft is untouched, the reason is shown, and a rejected
+/// line is not a submission.
+#[test]
+fn a_press_with_no_match_reports_and_leaves_the_draft_alone() {
+    use rof::tui::cmd::Completion;
+
+    let mut app = App::new();
+    app.input = "/zzz".to_string();
+
+    let changed = app.apply_completion(&Completion::NoMatch {
+        text: "/zzz".to_string(),
+        reason: "nothing completes /zzz".to_string(),
+    });
+
+    assert!(!changed, "a no-match reported a change");
+    assert_eq!(app.input, "/zzz");
+    let line = app.transcript.last().expect("no line for the reason");
+    assert!(line.contains("/zzz"), "{line}");
+}
+
+/// The credential boundary, at the point where it could be crossed: while
+/// a `/login` key capture is on, the buffer holds a secret, so completion
+/// does nothing at all — no draft edit, no transcript line, nothing that
+/// could echo what was typed.
+#[test]
+fn completion_is_inert_while_a_login_key_capture_is_masked() {
+    use rof::tui::cmd::Completion;
+
+    let mut app = App::new();
+    app.mask_input = true;
+    app.input = FIXTURE_KEY.to_string();
+    let before = app.transcript.len();
+
+    for result in [
+        Completion::Completed {
+            text: "/quit".to_string(),
+            candidates: vec![],
+        },
+        Completion::NoMatch {
+            text: FIXTURE_KEY.to_string(),
+            reason: format!("nothing completes {FIXTURE_KEY}"),
+        },
+    ] {
+        assert!(
+            !app.apply_completion(&result),
+            "completion acted on a masked buffer"
+        );
+    }
+    assert_eq!(app.input, FIXTURE_KEY, "a masked buffer was rewritten");
+    assert_eq!(
+        app.transcript.len(),
+        before,
+        "a masked buffer produced a line"
+    );
+    assert!(!app.transcript.iter().any(|l| l.contains(FIXTURE_KEY)));
+}
+
+/// Replay is inert: typing there never executes anything, and completion
+/// is a composer edit, so it does nothing there either.
+#[test]
+fn completion_is_inert_in_replay_mode() {
+    use rof::tui::cmd::Completion;
+
+    let mut app = App::new();
+    app.set_replay_events(vec![transition("a", "b")]);
+    assert!(app.replay_mode, "the fixture did not enter replay");
+    app.input = "/pro".to_string();
+    let before = app.transcript.len();
+    let cursor = app.replay_idx;
+
+    assert!(!app.apply_completion(&Completion::Completed {
+        text: "/provider".to_string(),
+        candidates: vec!["/provider".to_string(), "/providers".to_string()],
+    }));
+    assert_eq!(app.input, "/pro", "replay completion edited the draft");
+    assert_eq!(app.transcript.len(), before, "replay completion spoke");
+    assert_eq!(app.replay_idx, cursor, "replay cursor moved");
+}
+
+/// End to end through the real metadata: with a provider logged in, a
+/// prefix still completes to the provider id and nothing else, and no
+/// assertion here can see the key.
+#[test]
+fn a_logged_in_provider_completes_to_its_id_and_nothing_else() {
+    use rof::tui::cmd::complete;
+    let _env = ProvidersEnv::new("complete");
+    rof::tui::auth::save_provider("acme", "https://llm.acme.test/v1").unwrap();
+    rof::tui::auth::store().save("acme", FIXTURE_KEY).unwrap();
+    assert_eq!(
+        rof::tui::auth::key_for("acme").as_deref(),
+        Some(FIXTURE_KEY),
+        "the fixture key did not reach the store"
+    );
+
+    let result = complete("/login acm");
+
+    assert_eq!(result.text(), "/login acme", "the prefix did not complete");
+    assert!(
+        result.candidates().is_empty(),
+        "one provider matched, so there is no choice to report: {:?}",
+        result.candidates()
+    );
+    // The base URL is not a candidate, and the key is nowhere: not in the
+    // draft, not in the reported candidates, not in the reason.
+    let said = format!(
+        "{} {:?} {}",
+        result.text(),
+        result.candidates(),
+        result.reason()
+    );
+    assert!(
+        !said.contains("llm.acme.test"),
+        "the base became a candidate: {said}"
+    );
+    assert_no_key_material(std::slice::from_ref(&said), FIXTURE_KEY);
+
+    // The same provider through the model form completes to the separator,
+    // because `auth` keeps no offline catalog of model ids.
+    let model = complete("/model acm");
+    assert_eq!(model.text(), "/model acme/");
+    assert!(!said.contains("sk-"), "a credential shape appeared: {said}");
+}
+
+/// The key is discoverable: `/hotkeys` names it, so a user who never reads
+/// the source can still find the one chord that completes.
+#[test]
+fn hotkeys_names_the_completion_key() {
+    let _env = ProvidersEnv::new("hotkeys");
+    let trace = TraceSink::new();
+    let mut app = App::new();
+    let mut awaiting_key: Option<String> = None;
+    let quit = apply_action(
+        &mut app,
+        &trace,
+        Action::Hotkeys,
+        "/hotkeys",
+        &mut awaiting_key,
+    );
+    assert!(!quit, "/hotkeys ended the console");
+    let line = app.transcript.last().expect("/hotkeys wrote no line");
+    assert!(
+        line.contains("Ctrl-N"),
+        "the completion key is undiscoverable: {line}"
+    );
+    // It keeps every key it already named, and names no credential.
+    for kept in ["q/Esc/Ctrl-C", "Enter", "Backspace"] {
+        assert!(line.contains(kept), "/hotkeys lost {kept}: {line}");
+    }
+    assert_no_key_material(std::slice::from_ref(line), FIXTURE_KEY);
+}

@@ -151,3 +151,219 @@ fn help_names_the_three_busy_modes_and_what_they_do() {
         "help still carries the pre-queue wording: {h}"
     );
 }
+
+// ---- P3 F2: composer completion off the registry -------------------------
+
+use rof::tui::cmd::{
+    command_candidates, complete, provider_candidates, Completion, BUILTIN_PROVIDERS, COMMANDS,
+};
+
+/// The registry is the candidate list, so nothing can be missing from
+/// completion: every registered name is offered, and completion offers
+/// nothing the registry does not name.
+#[test]
+fn every_registered_command_is_a_completion_candidate() {
+    let candidates = command_candidates();
+    assert_eq!(
+        candidates.len(),
+        COMMANDS.len(),
+        "completion and the registry disagree in size: {candidates:?} vs {COMMANDS:?}"
+    );
+    for name in COMMANDS {
+        let want = format!("/{name}");
+        assert!(
+            candidates.contains(&want),
+            "the registry names {want} but completion does not offer it: {candidates:?}"
+        );
+    }
+}
+
+/// The drift guard: a command added to the parser without being registered
+/// is offered by nobody, and this fails. The arms of `parse` are read out
+/// of the source, because a name the registry has never heard of cannot be
+/// discovered any other way.
+#[test]
+fn a_command_added_to_the_parser_but_not_to_the_registry_fails() {
+    let source = include_str!("../src/tui/cmd.rs");
+    // Only `parse`'s own body: `busy_line` below it matches the same
+    // indentation with posture names, which are not commands.
+    let body = source
+        .split_once("pub fn parse(")
+        .expect("cmd.rs has no parse")
+        .1
+        .split_once("pub fn help_text(")
+        .expect("cmd.rs has no help_text")
+        .0;
+    let mut seen = 0;
+    for line in body.lines() {
+        // The top-level arms of `match name {` are the only lines indented
+        // eight spaces that start with a quoted name and dispatch on it.
+        let Some(rest) = line.strip_prefix("        \"") else {
+            continue;
+        };
+        let Some(name) = rest.split("\" =>").next() else {
+            continue;
+        };
+        seen += 1;
+        assert!(
+            COMMANDS.contains(&name),
+            "/{name} parses but is not registered, so completion never offers it"
+        );
+    }
+    assert!(seen >= 20, "the arm scan found nothing to check: {seen}");
+}
+
+/// A prefix with exactly one match completes on the first press, and says
+/// nothing else: no candidate list, because there is no choice to make.
+#[test]
+fn one_match_completes_without_a_second_keystroke() {
+    assert_eq!(
+        complete("/att"),
+        Completion::Completed {
+            text: "/attempts".to_string(),
+            candidates: vec![],
+        }
+    );
+    // Pressing again once the line is already the full command changes
+    // nothing and reports no choice: there is nothing left to decide.
+    assert_eq!(
+        complete("/attempts"),
+        Completion::Completed {
+            text: "/attempts".to_string(),
+            candidates: vec![],
+        }
+    );
+    // A trailing space moves past the name into the argument, which for
+    // `/attempts` is a number this process has no metadata for.
+    assert!(
+        matches!(complete("/att "), Completion::NoMatch { .. }),
+        "a completed name plus a space is the argument position"
+    );
+    // A bare `/` matches everything: the whole list is reported and
+    // nothing is inserted, because every command shares the `/`.
+    let all = complete("/");
+    assert_eq!(all.text(), "/", "the bare slash must not grow a name");
+    assert_eq!(
+        all.candidates().len(),
+        COMMANDS.len(),
+        "the bare slash must offer the whole registry: {:?}",
+        all.candidates()
+    );
+}
+
+/// Several matches complete to their longest common prefix and REPORT the
+/// candidates: the completion never picks one silently. Pressing it again
+/// at the common prefix adds nothing and repeats the same list, so the
+/// behaviour is deterministic rather than a slow auto-pick.
+#[test]
+fn several_matches_complete_to_the_common_prefix_and_list_the_rest() {
+    let first = complete("/pro");
+    let candidates = first.candidates();
+    assert_eq!(
+        candidates,
+        vec!["/provider".to_string(), "/providers".to_string()],
+        "the ambiguous set is not what the registry says"
+    );
+    assert_eq!(
+        first.text(),
+        "/provider",
+        "the common prefix was not inserted"
+    );
+    // Deterministic: the second press is the same answer, not a pick.
+    assert_eq!(
+        complete(first.text()),
+        first,
+        "completion is not idempotent"
+    );
+    // An ambiguous answer always carries its candidates, and a unique one
+    // never does: that is the difference between "here is your line" and
+    // "here are your options".
+    assert!(
+        !first.candidates().is_empty(),
+        "ambiguous, so it must report"
+    );
+    assert_eq!(
+        complete("/att").candidates(),
+        Vec::<String>::new(),
+        "unique, so it must not report"
+    );
+}
+
+/// No match changes nothing and says so: the draft is returned exactly as
+/// it was typed, and the reason names the prefix that failed.
+#[test]
+fn no_match_changes_nothing_and_says_so() {
+    for draft in ["/zzz", "/zzz ", "fix the composer"] {
+        match complete(draft) {
+            Completion::NoMatch { text, reason } => {
+                assert_eq!(text, draft, "a no-match rewrote the draft");
+                assert!(!reason.is_empty(), "a no-match said nothing");
+            }
+            other => panic!("{draft} should not complete, got {other:?}"),
+        }
+    }
+    assert!(
+        complete("/zzz").reason().contains("/zzz"),
+        "the reason does not name the prefix: {}",
+        complete("/zzz").reason()
+    );
+}
+
+/// Provider candidates are ids, and every id is a provider `auth` can
+/// resolve a base for. Built-ins are the same set `/providers` prints.
+#[test]
+fn provider_candidates_are_resolvable_ids_never_a_base_or_a_key() {
+    let candidates = provider_candidates();
+    for builtin in BUILTIN_PROVIDERS {
+        assert!(
+            candidates.contains(&builtin.to_string()),
+            "the built-in provider {builtin} is not a candidate: {candidates:?}"
+        );
+    }
+    let mut sorted = candidates.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted, candidates, "candidates must be sorted and unique");
+    for candidate in &candidates {
+        assert!(
+            !candidate.contains("://"),
+            "a base URL reached the candidates: {candidate}"
+        );
+        assert!(
+            !candidate.contains("sk-"),
+            "credential-shaped text reached the candidates: {candidate}"
+        );
+    }
+    // `custom` is env-gated, so the three fixed-base built-ins are what can
+    // be checked offline: a name here that auth cannot resolve would be a
+    // candidate that no `/login` could ever use.
+    for builtin in BUILTIN_PROVIDERS.iter().filter(|b| **b != "custom") {
+        assert!(
+            rof::tui::auth::base_for_test(builtin).is_ok(),
+            "{builtin} is a candidate but has no base"
+        );
+    }
+}
+
+/// The provider-taking commands complete their argument, and the other
+/// commands say there is nothing there rather than guessing.
+#[test]
+fn provider_commands_complete_their_argument_and_others_do_not() {
+    assert_eq!(
+        complete("/login openr"),
+        Completion::Completed {
+            text: "/login openrouter".to_string(),
+            candidates: vec![],
+        }
+    );
+    assert_eq!(complete("/logout at").text(), "/logout atria");
+    // A model id is `provider/model`, so the provider half completes to
+    // the separator and the model half is left to the user.
+    assert_eq!(complete("/model openr").text(), "/model openrouter/");
+    for draft in ["/attempts 3", "/retry note", "/busy queue"] {
+        assert!(
+            matches!(complete(draft), Completion::NoMatch { .. }),
+            "{draft} has no completable argument"
+        );
+    }
+}

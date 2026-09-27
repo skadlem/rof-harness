@@ -253,6 +253,30 @@ pub fn focus_step(code: KeyCode, modifiers: KeyModifiers) -> Option<FocusStep> {
     }
 }
 
+/// Whether one key press asks for composer completion: `Ctrl-N`.
+///
+/// Not Tab, because Tab is the pane-focus cycle. Not `q`/`Esc`/`Ctrl-C`,
+/// because those stop the run. Not Enter, because that submits. It is a
+/// CONTROL chord precisely so it cannot be typed: the composer's character
+/// arm takes a bare or Shift-modified character only, so no terminal can
+/// deliver this key as a letter in the draft.
+pub fn completion_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(code, KeyCode::Char('n') | KeyCode::Char('N'))
+}
+
+/// Whether one key press is ordinary draft text.
+///
+/// The single rule the two composer character arms share, so a test can
+/// assert that the completion key is not one of them instead of reading
+/// both arms. `q` is excluded from the bare case here because whether it
+/// quits or types depends on the composer being empty, which the pump
+/// decides; either way it is text here, since the stop arms are asked
+/// first.
+pub fn is_draft_text(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    matches!(code, KeyCode::Char(_)) && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT)
+}
+
 /// One key's meaning while a goal is live, WITH the modifier decision made
 /// here rather than in the pump.
 ///
@@ -860,10 +884,19 @@ where
                     }
                     continue;
                 }
+                // The completion key is answered before the character arm,
+                // so it edits the draft through `apply_completion` and can
+                // never be appended as a letter. `apply_completion` refuses
+                // while a `/login` key capture is masked and in replay, so
+                // the secret buffer is never read here.
+                if completion_key(key.code, key.modifiers) {
+                    let result = super::cmd::complete(&app.input);
+                    app.apply_completion(&result);
+                    continue;
+                }
                 match key.code {
                     KeyCode::Char(c)
-                        if key.modifiers.is_empty()
-                            || key.modifiers == KeyModifiers::SHIFT
+                        if is_draft_text(key.code, key.modifiers)
                             // A modified `q` is ordinary text, not a stop
                             // key, so it must still reach the draft.
                             || c == 'q' =>
@@ -914,9 +947,15 @@ where
                     quit_armed = true;
                     app.transcript.push(quit_hint());
                 }
-                KeyCode::Char(c)
-                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-                {
+                // Completion before the character arm, and after the
+                // `q`/Esc quit arms above: a chord is never draft text, and
+                // this one only ever edits the draft. `apply_completion`
+                // refuses while a `/login` key capture is masked.
+                KeyCode::Char('n') if completion_key(key.code, key.modifiers) => {
+                    let result = super::cmd::complete(&app.input);
+                    app.apply_completion(&result);
+                }
+                KeyCode::Char(c) if is_draft_text(key.code, key.modifiers) => {
                     quit_armed = false;
                     app.input.push(c);
                 }
@@ -1163,9 +1202,9 @@ pub fn apply_action(
         Action::Trace => app
             .transcript
             .push(format!("trace events: {}", trace.len())),
-        Action::Hotkeys => app
-            .transcript
-            .push("hotkeys: q/Esc/Ctrl-C (twice) quit · Enter send · Backspace delete".to_string()),
+        Action::Hotkeys => app.transcript.push(
+            "hotkeys: q/Esc/Ctrl-C (twice) quit · Enter send · Backspace delete · Ctrl-N complete a /command or provider".to_string(),
+        ),
         Action::Diff => app
             .transcript
             .push("diff view is not available in this console yet".to_string()),

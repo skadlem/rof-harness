@@ -395,6 +395,45 @@ impl App {
         self.busy_mode = mode;
     }
 
+    /// Apply one [`Completion`](super::cmd::Completion) to the composer,
+    /// and report whether the draft changed.
+    ///
+    /// Completion is a text edit and nothing else: it writes `input` and
+    /// at most one transcript line. It never submits, so it cannot become
+    /// a steer or a queued goal; it never writes `deferred_config`, the
+    /// busy mode, or a pending slot, so a keystroke cannot configure
+    /// anything.
+    ///
+    /// Two buffers refuse it outright. A masked composer is a `/login` key
+    /// capture: its text is a secret, so nothing is written and nothing is
+    /// said. Replay is inert — typing there never executes anything, and
+    /// completing a draft is the same kind of keystroke.
+    pub fn apply_completion(&mut self, result: &super::cmd::Completion) -> bool {
+        if self.mask_input || self.replay_mode {
+            return false;
+        }
+        match result {
+            super::cmd::Completion::Completed { text, candidates } => {
+                let changed = text != &self.input;
+                self.input = text.clone();
+                if !candidates.is_empty() {
+                    // The prefix was ambiguous. Say so rather than picking:
+                    // the candidates are names, never a value.
+                    self.transcript.push(format!(
+                        "completion: {} (still matches: {})",
+                        text,
+                        candidates.join(" ")
+                    ));
+                }
+                changed
+            }
+            super::cmd::Completion::NoMatch { reason, .. } => {
+                self.transcript.push(format!("completion: {reason}"));
+                false
+            }
+        }
+    }
+
     /// Allocate the next command id. Ids are monotonic for the life of
     /// the console, so an acknowledgement matches exactly one submission
     /// and a displaced command is still addressable when it is rejected.
