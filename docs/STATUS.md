@@ -3561,10 +3561,13 @@ boundary and its `GoalFinished` is answered by the goal-boundary drain
 after the final drain of goal N is seen at goal N+1's first boundary, so
 that goal may start and then stop; a force-exit still detaches the worker,
 so an in-flight tool may finish on its own timeout; the P1a credential
-capture can still be started from the idle prompt. Not started, and not
-claimed: diff and provider panes, token deltas, session persistence,
-multi-session state (P3), and the TB Slice A gate, which still needs a
-funded/available Go endpoint to produce one green run.
+capture can still be started from the idle prompt. Superseded by the P3/P4
+entry below: the diff and provider panes, the deferred-config record, and
+the non-secret preferences are now shipped and measured. Still not started,
+and not claimed: token deltas and multi-session state (an explicit non-goal
+in the full-TUI spec, so a new product decision rather than deferred work),
+and the TB Slice A gate, which still needs a funded/available Go endpoint to
+produce one green run.
 
 ## 2026-09-27 — P3/P4 batch shipped: replay parity, providers, diff pane, focus, metrics, themes, completion, preferences
 
