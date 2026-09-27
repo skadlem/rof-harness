@@ -197,6 +197,22 @@ fn masked_composer_hides_key_entry() {
     assert!(screen(&app).contains("sk-secret"), "unmasked renders");
 }
 
+/// The splash frame, rendered the way the pump renders it: the overlay while
+/// `App::fresh` is set, using the App's own chosen sprite.
+fn rendered_rows_splash(app: &App, width: u16, height: u16) -> Vec<String> {
+    use ratatui::{backend::TestBackend, Terminal};
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| rof::tui::splash::draw(f, app.mascot))
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    buf.content()
+        .chunks(width as usize)
+        .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+        .collect()
+}
+
 /// Row text of a rendered screen: one `String` per terminal row.
 fn rendered_rows(app: &App, width: u16, height: u16) -> Vec<String> {
     use ratatui::{backend::TestBackend, Terminal};
@@ -1832,4 +1848,50 @@ fn display_refuses_a_mode_that_is_not_a_mode() {
         rof::tui::cmd::parse("/display fullscreen"),
         Some(rof::tui::cmd::Action::Display(ref m)) if m == "fullscreen"
     ));
+}
+
+/// The splash mascot is chosen ONCE per console, not once per frame.
+///
+/// The bug this pins: `splash::draw` read the clock itself, so every one of
+/// the pump's ~30 frames a second rolled a new sprite and the mascot
+/// flickered through all twelve while you were still reading the title.
+/// The index is `App` state now, and this asserts the rendered frame is
+/// byte-identical across repeated draws of the same `App`.
+#[test]
+fn the_splash_mascot_is_chosen_once_and_holds_still() {
+    let app = App::new();
+    assert!(
+        app.mascot < rof::tui::splash::SPRITE_COUNT,
+        "the chosen sprite is out of range: {}",
+        app.mascot
+    );
+
+    // Repeated draws of the same App are identical. Comparing rendered
+    // frames, not the index, is the point: a clock read inside `draw` would
+    // produce a different frame every time.
+    let first = rendered_rows_splash(&app, 100, 30);
+    for _ in 0..5 {
+        assert_eq!(
+            first,
+            rendered_rows_splash(&app, 100, 30),
+            "the splash redrew a different mascot"
+        );
+    }
+
+    // The pick is a pure function of its seed, so a console is reproducible
+    // once chosen, and the whole set stays reachable.
+    for seed in [0u32, 1, 7, 999, u32::MAX] {
+        assert_eq!(
+            rof::tui::splash::pick(seed),
+            rof::tui::splash::pick(seed),
+            "the pick is not stable for seed {seed}"
+        );
+        assert!(rof::tui::splash::pick(seed) < rof::tui::splash::SPRITE_COUNT);
+    }
+    let seen: std::collections::HashSet<usize> =
+        (0..64).map(|n| rof::tui::splash::pick(n * 97)).collect();
+    assert!(
+        seen.len() > 1,
+        "every seed picked the same sprite: the mascot would never vary"
+    );
 }

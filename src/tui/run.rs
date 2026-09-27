@@ -1168,7 +1168,7 @@ where
 /// frame a user sees is drawn exactly like every other one.
 fn draw_frame(f: &mut Frame, app: &App) {
     if app.fresh {
-        splash::draw(f);
+        splash::draw(f, app.mascot);
     } else {
         draw(f, app);
     }
@@ -1578,7 +1578,7 @@ fn pump(
     loop {
         terminal.draw(|f| {
             if app.fresh {
-                splash::draw(f);
+                splash::draw(f, app.mascot);
             } else {
                 draw(f, app);
             }

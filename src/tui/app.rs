@@ -201,6 +201,12 @@ pub struct App {
     /// True until the first keypress; `run.rs` draws the splash overlay
     /// while set and consumes that keypress.
     pub fresh: bool,
+    /// Which splash sprite this console greets you with, chosen ONCE at
+    /// construction. It lives here rather than in a clock read inside
+    /// `draw` because `draw` is a pure function of `App`: rolling the
+    /// mascot per frame made it flicker through all twelve sprites at the
+    /// pump's frame rate.
+    pub mascot: usize,
     /// Thinking posture for the composer's title accent. Read once from
     /// `ROF_THINKING` at startup by `run.rs`, never at render time: `draw`
     /// is a pure function of `App`.
@@ -277,6 +283,7 @@ impl Default for App {
             focus: Focus::Composer,
             diff_scroll: 0,
             fresh: true,
+            mascot: super::splash::pick(super::splash::now_nanos()),
             thinking: String::new(),
             mask_input: false,
             replay_idx: 0,

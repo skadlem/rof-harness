@@ -71,16 +71,33 @@ pub fn art(mood: Mood) -> Text<'static> {
     }
 }
 
-/// Splash art: a uniform-random sprite per launch, so every `rof chat`
-/// greets you with a different cheetah. No rand dependency — the clock's
-/// sub-second nanos pick the index; weighting or repetition across launches
-/// is explicitly not a goal.
-pub fn load() -> Text<'static> {
-    let nanos = std::time::SystemTime::now()
+/// Pick the splash sprite index for a launch, from a seed.
+///
+/// Pure, so the choice is made ONCE and then carried as render state. The
+/// previous version called the clock inside `draw`, which meant a fresh roll
+/// on every one of the pump's ~30 frames a second: the mascot flickered
+/// through all twelve sprites while you were still reading the title.
+pub fn pick(seed_nanos: u32) -> usize {
+    seed_nanos as usize % ALL_RAW.len()
+}
+
+/// The clock the pick reads, isolated so a test can pin it.
+pub fn now_nanos() -> u32 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as usize)
-        .unwrap_or(0);
-    parse(ALL_RAW[nanos % ALL_RAW.len()])
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0)
+}
+
+/// How many sprites [`pick`] can choose from.
+pub const SPRITE_COUNT: usize = ALL_RAW.len();
+
+/// Splash art: a uniform-random sprite per launch, so every `rof chat`
+/// greets you with a different cheetah. The index comes from the CALLER
+/// (`App` holds it for the life of the console); no rand dependency, and
+/// weighting or repetition across launches is explicitly not a goal.
+pub fn art_at(index: usize) -> Text<'static> {
+    parse(ALL_RAW[index % ALL_RAW.len()])
 }
 
 /// Title block under the art: "rof chat" in amber bold, the version, and a
@@ -108,9 +125,9 @@ pub fn title_lines() -> Vec<Line<'static>> {
 /// Draw the splash overlay: art, blank separator, titles — horizontally
 /// centered, vertically centered when it fits. On short screens the art is
 /// cropped from the bottom so the titles (and the begin hint) stay visible.
-pub fn draw(f: &mut Frame) {
+pub fn draw(f: &mut Frame, mascot: usize) {
     let area = f.area();
-    let art = load();
+    let art = art_at(mascot);
     let art_len = art.lines.len();
     let titles = title_lines();
     let reserved = titles.len() + 1; // blank separator + titles
@@ -165,12 +182,31 @@ mod tests {
                 "{mood:?}: first art line must be non-empty"
             );
         }
-        // `load()` is a random sprite per launch: assert it is always one
-        // of the set (any sprite clears the floor, none is empty).
-        for _ in 0..12 {
-            let text = load();
-            assert!(text.lines.len() >= 15);
-            assert!(text.lines[0].width() > 0);
+        // The splash sprite is picked ONCE per console from a seed, so every
+        // index in the set must be drawable: assert the whole set clears the
+        // floor (no sprite is empty), not just the one this launch rolled.
+        for index in 0..super::SPRITE_COUNT {
+            let text = super::art_at(index);
+            assert!(text.lines.len() >= 15, "sprite {index} is too short");
+            assert!(text.lines[0].width() > 0, "sprite {index} is empty");
         }
+    }
+
+    #[test]
+    fn the_pick_is_stable_for_a_seed_and_stays_in_range() {
+        for seed in [0u32, 1, 12, 13, 999, u32::MAX] {
+            let first = super::pick(seed);
+            assert_eq!(first, super::pick(seed), "seed {seed} is not stable");
+            assert!(
+                first < super::SPRITE_COUNT,
+                "seed {seed} picked out of range: {first}"
+            );
+        }
+        // The set stays reachable: a pick that always returned one index
+        // would make every launch greet identically.
+        let seen: std::collections::HashSet<usize> = (0..64u32)
+            .map(|n| super::pick(n.wrapping_mul(2_654_435_761)))
+            .collect();
+        assert!(seen.len() > 1, "the pick never varies: {seen:?}");
     }
 }
