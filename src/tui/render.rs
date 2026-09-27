@@ -77,6 +77,21 @@ pub fn render_line(ev: &TraceEvent) -> String {
             )
         }
         TraceEvent::GoalQuality { note, .. } => format!("· goal note: {note}"),
+        // §4's meta layer. The plan line names the artifact, because a
+        // recorded run's plan is read from the FILE, not from scrollback.
+        // A declined gate says so: silence would read as a run that never
+        // considered decomposing.
+        TraceEvent::Plan {
+            tasks,
+            path,
+            reason,
+        } => {
+            if tasks.is_empty() {
+                format!("· plan: single task — {reason}")
+            } else {
+                format!("· plan: {} task(s) → {path}", tasks.len())
+            }
+        }
         TraceEvent::AutoPoke { task, reason } => format!("· auto-poke {task}: {reason}"),
         // The same formatter the live reducer uses, so a replayed
         // acknowledgement reads identically to the live one.

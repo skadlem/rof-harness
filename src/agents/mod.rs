@@ -1,3 +1,4 @@
+pub mod decompose;
 pub mod explorer;
 pub mod implementer;
 pub mod reviewer;
@@ -6,6 +7,7 @@ use crate::llm::{ContextService, ExecutorService};
 use crate::obs::TraceSink;
 use crate::tools::ToolRegistry;
 use async_trait::async_trait;
+pub use decompose::{cached_plan_count, DecomposerAgent, Plan, DECOMPOSER_MAX_TASKS};
 pub use explorer::{
     explorer_block, explorer_report_for_test, ExplorerAgent, ExplorerReport, KeyFile, Quote,
 };

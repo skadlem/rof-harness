@@ -81,6 +81,26 @@ pub enum TraceEvent {
         tokens: u64,
         limit: u64,
     },
+    /// §4's meta layer, v1: the plan this run is executing, and where its
+    /// durable copy lives. Emitted for EVERY goal the gate considered, so a
+    /// recorded run distinguishes a deliberate single-task run from a run
+    /// that never considered decomposing — a distinction the arm measurement
+    /// reads directly. A task-shaped goal emits this with an empty `tasks`,
+    /// which is the record of a decision, not of a failure.
+    Plan {
+        /// The task list the run is executing, in order. Empty when the goal
+        /// ran as a single task (the fallback shape) or the gate declined.
+        tasks: Vec<String>,
+        /// Absolute path of the plan artifact written for this run, or ""
+        /// when no artifact was written (nothing to write, or the write
+        /// failed). The path is per RUN, never per goal: two runs of one
+        /// goal must not clobber each other's plan while their traces still
+        /// point at it.
+        path: String,
+        /// Why the gate decided what it did, and — when it fired and the
+        /// answer was unusable — why the run degraded to the fallback.
+        reason: String,
+    },
     /// Anything an agent did with the skill store, plus the harness handing a
     /// skill's text to a model. `op` is one of: `list` (index delivered to an
     /// agent), `view` (a body the model asked for), `reuse` (a body injected

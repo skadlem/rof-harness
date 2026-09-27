@@ -70,6 +70,84 @@ const TASK_VERBS: [&str; 19] = [
     "split",
 ];
 
+/// Why the meta layer did or did not buy a decomposition for a goal.
+///
+/// Two cheap local checks, no model call, and the answer is recorded rather
+/// than inferred: a reader of a trace must be able to tell a DELIBERATE
+/// single-task run from a run that never considered decomposing, because
+/// the arm measurement later reads exactly that difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecompositionGate {
+    /// The goal already names one task. The measured win in this repo was
+    /// SKIPPING the planner, so this is the case that must stay free.
+    AlreadyOneTask,
+    /// Too brief, or too untethered, to split into tasks that each name a
+    /// file and an expected result. A decomposition of "make it better"
+    /// produces three tasks that each do nothing.
+    TooThinToSplit,
+    /// Not one task, and substantial enough to be worth splitting. This is
+    /// the only arm that spends a call.
+    Fire,
+}
+
+impl DecompositionGate {
+    /// Does this goal buy a decomposition call?
+    pub fn fires(self) -> bool {
+        matches!(self, DecompositionGate::Fire)
+    }
+
+    /// Why the gate decided what it did, in the words a reader sees.
+    pub fn reason(self) -> &'static str {
+        match self {
+            DecompositionGate::AlreadyOneTask => {
+                "goal is already one task (imperative verb + a file/symbol anchor)"
+            }
+            DecompositionGate::TooThinToSplit => {
+                "goal is too brief or names no file/symbol to split into tasks that each do \
+                 something"
+            }
+            DecompositionGate::Fire => {
+                "goal is not one task and is substantial and anchored enough to split"
+            }
+        }
+    }
+}
+
+/// The gate on the meta layer's one paid call (design report §9 item 4).
+///
+/// It is the CONJUNCTION of two cheap local checks, and both are necessary:
+///
+/// 1. `!goal_is_task_shaped(goal)` — the goal is not already one task.
+/// 2. `check_goal_quality(goal).is_none()` — the goal is substantial enough
+///    (MIN_CHARS / MIN_WORDS) and names a file, symbol or code-shaped token.
+///
+/// Check 1 alone is NOT a price control, and that was measured rather than
+/// assumed: over the 30 goals in `eval/suites/*.json` it fires on 24 (80%),
+/// because it demands the goal OPEN WITH an imperative verb and almost every
+/// real ticket opens with "In src/foo.rs," or "Explain ...". A gate that
+/// fires on four goals in five is not a gate.
+///
+/// Check 2 is what makes it one. It reuses the thresholds the quality note
+/// already applies, so there is one notion of "too thin to act on" rather
+/// than two. Together they fire on 20 of the 30 suite goals (67%) and on
+/// none of the goals the existing tests use, so the stage costs those runs
+/// exactly what they cost before it existed.
+///
+/// Read the 67% as an UPPER BOUND, not a typical rate: these suites are a
+/// curated corpus of deliberately hard, multi-part tickets, the most
+/// decomposition-friendly traffic that exists. The price question is not
+/// answered by this rate at all — it needs an arm (decomposition on vs off,
+/// quality at equal or lower cost).
+pub fn decomposition_gate(goal: &str) -> DecompositionGate {
+    if goal_is_task_shaped(goal) {
+        return DecompositionGate::AlreadyOneTask;
+    }
+    if check_goal_quality(goal).is_some() {
+        return DecompositionGate::TooThinToSplit;
+    }
+    DecompositionGate::Fire
+}
+
 pub fn goal_is_task_shaped(goal: &str) -> bool {
     let first = goal.split_whitespace().next().unwrap_or("");
     let verb = first
@@ -185,6 +263,37 @@ mod tests {
         assert!(!goal_is_task_shaped("fix it"));
         assert!(!goal_is_task_shaped("How does the retriever work?"));
         assert!(!goal_is_task_shaped("Verify the build is green"));
+    }
+
+    #[test]
+    fn the_decomposition_gate_is_the_conjunction_of_both_checks() {
+        // One task already: never pay.
+        assert_eq!(
+            decomposition_gate("Fix the login redirect in src/auth.rs"),
+            DecompositionGate::AlreadyOneTask
+        );
+        // Not one task, and too thin to split: still never pay. A plan for
+        // "make it better" is three tasks that each do nothing.
+        assert_eq!(
+            decomposition_gate("make it better"),
+            DecompositionGate::TooThinToSplit
+        );
+        // Not one task, substantial, anchored: the one arm that pays.
+        assert_eq!(
+            decomposition_gate(
+                "The retry policy in src/llm/openrouter.rs must back off, must cap total time, \
+                 and must say which limit it hit"
+            ),
+            DecompositionGate::Fire
+        );
+        // Every decision names itself, so the trace never shows a bare "no".
+        for g in [
+            "Fix src/a.rs",
+            "make it better",
+            "The retry policy in src/b.rs must back off and cap time",
+        ] {
+            assert!(!decomposition_gate(g).reason().is_empty(), "{g:?}");
+        }
     }
 
     #[test]

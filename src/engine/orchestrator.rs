@@ -225,17 +225,78 @@ impl Orchestrator {
         };
         let impl_head = RoundServices::head_with_index(&long_with_mem, &impl_skills.text);
         let reviewer_head = RoundServices::head_with_index(&long_with_mem, &reviewer_skills.text);
-        // No planner: every goal is one task. Decomposition lives outside the
-        // run (TUI goal queue, eval suite task lists) — the measured win was
-        // skipping, so the stage is gone, not defaulted off. The canned plan
-        // keeps the downstream shape (tasks/acceptance) stable.
-        // A pre-check cheaper than the model that will consume the goal — the
-        // one shared path, so direct mode cannot drift out of it again.
+        // No planner as a stage that always runs: the measured win in this
+        // repo was SKIPPING decomposition, so it sits behind a cheap local
+        // gate instead. A pre-check cheaper than the model that will consume
+        // the goal — the one shared path, so direct mode cannot drift out of
+        // it again.
         let goal_note = svc.goal_note(&session.goal);
-        let plan_out = crate::agents::AgentOutput {
+        // §4 / §9 item 4: the meta layer, v1. The canned single-task plan is
+        // the output of ONE bounded call — but only for a goal the gate says
+        // is not already one task. A task-shaped goal reaches none of that:
+        // no call, no artifact, no `Plan` event, and a run byte-identical to
+        // the one before this stage existed.
+        //
+        // The gate decision is always recorded, so a trace distinguishes a
+        // deliberate single-task run from a run that never considered
+        // decomposing. The plan lives in a FILE under the work root (the
+        // trace names it), never in the prompt context.
+        let gate = crate::eval::goal_quality::decomposition_gate(&session.goal);
+        let mut plan_out = crate::agents::AgentOutput {
             summary: "no planner".to_string(),
             data: serde_json::json!({ "tasks": [], "acceptance": [], "skipped": true }),
         };
+        if gate.fires() {
+            let decomposer = crate::agents::DecomposerAgent::new(&self.executor);
+            match decomposer
+                .plan(&session.goal, workdir, &session.id, &self.trace)
+                .await
+            {
+                Ok(plan) => {
+                    // Degrade, never fail: an empty list is not a plan, and
+                    // the run continues on the goal as a single task exactly
+                    // as the empty-plan path always did.
+                    if plan.tasks.is_empty() {
+                        self.trace.emit(TraceEvent::ModelError {
+                            agent: "decomposer".to_string(),
+                            error: "decomposition produced no tasks; using the goal as one task"
+                                .to_string(),
+                        });
+                    } else {
+                        plan_out.data = serde_json::json!({
+                            "tasks": plan.tasks,
+                            "acceptance": [],
+                            "skipped": false,
+                            "cached": plan.cached,
+                        });
+                    }
+                    self.trace.emit(TraceEvent::Plan {
+                        tasks: plan.tasks,
+                        path: plan.path,
+                        reason: plan.reason,
+                    });
+                }
+                Err(e) => {
+                    // The reason is recorded, never swallowed: a reader must
+                    // be able to see that a call was bought and lost.
+                    self.trace.emit(TraceEvent::ModelError {
+                        agent: "decomposer".to_string(),
+                        error: e.clone(),
+                    });
+                    self.trace.emit(TraceEvent::Plan {
+                        tasks: Vec::new(),
+                        path: String::new(),
+                        reason: format!("degraded to the goal as one task: {e}"),
+                    });
+                }
+            }
+        } else {
+            self.trace.emit(TraceEvent::Plan {
+                tasks: Vec::new(),
+                path: String::new(),
+                reason: gate.reason().to_string(),
+            });
+        }
         self.trace.emit(TraceEvent::StateTransition {
             from: "ready".to_string(),
             to: "implementing".to_string(),
