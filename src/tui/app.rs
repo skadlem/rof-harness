@@ -3,6 +3,24 @@ use std::collections::VecDeque;
 use super::render::{render_line, replay_filter, Counters};
 use crate::obs::{Boundary, ControlAck, ControlKind, ControlStatus, GoalFinished, TraceEvent};
 
+/// One acknowledgement, one line — for BOTH the live view and a replayed
+/// trace. Both call this, so a recorded session cannot show different
+/// wording from the run that produced it. The line carries the kind, the id,
+/// the status, and the note only: never command text, never a credential.
+pub fn control_ack_line(ack: &ControlAck) -> String {
+    if ack.note.is_empty() {
+        format!("{} {} ({})", ack.kind.label(), ack.status.label(), ack.id)
+    } else {
+        format!(
+            "{} {} ({}) — {}",
+            ack.kind.label(),
+            ack.status.label(),
+            ack.id,
+            ack.note
+        )
+    }
+}
+
 /// Release `slot` only when it holds the command named by `id`. The id is
 /// what makes a displaced command safe: its later rejection is answered
 /// without clearing the command that replaced it.
@@ -209,6 +227,14 @@ impl App {
     /// Sole writer of transcript + counters. Plan C calls this live; replay
     /// mode calls this once per trace line.
     pub fn on_event(&mut self, ev: &TraceEvent) {
+        // A control acknowledgement is the one event that writes its own
+        // transcript line — through the shared formatter, so the live line
+        // and the replayed line cannot drift — and it deliberately adds no
+        // activity line, exactly as the P1b live path did.
+        if let TraceEvent::Control(ack) = ev {
+            self.on_control_ack(ack.clone());
+            return;
+        }
         // One render per event: the transcript line and the live activity
         // line are the same string, so the caps are measured on real text.
         let line = render_line(ev);
@@ -390,17 +416,7 @@ impl App {
                 ControlKind::Stop => {}
             }
         }
-        let line = if ack.note.is_empty() {
-            format!("{} {} ({})", ack.kind.label(), ack.status.label(), ack.id)
-        } else {
-            format!(
-                "{} {} ({}) — {}",
-                ack.kind.label(),
-                ack.status.label(),
-                ack.id,
-                ack.note
-            )
-        };
+        let line = control_ack_line(&ack);
         self.transcript.push(line);
         self.last_control_ack = Some(ack);
     }

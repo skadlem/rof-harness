@@ -71,6 +71,9 @@ pub fn render_line(ev: &TraceEvent) -> String {
         }
         TraceEvent::GoalQuality { note, .. } => format!("· goal note: {note}"),
         TraceEvent::AutoPoke { task, reason } => format!("· auto-poke {task}: {reason}"),
+        // The same formatter the live reducer uses, so a replayed
+        // acknowledgement reads identically to the live one.
+        TraceEvent::Control(ack) => super::app::control_ack_line(ack),
     }
 }
 

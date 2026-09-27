@@ -4,7 +4,7 @@ use rof::engine::control::{RunCommand, RunControl, RunHooks};
 use rof::engine::{ModelRouter, Orchestrator, Role, Session};
 use rof::eval::{EvalSuite, EvaluationRunner, SuiteReport};
 use rof::llm::{ContextService, ExecutorService, LlmClient, OpenRouterClient, StubClient};
-use rof::obs::{Boundary, GoalFinished, LiveEvent, TraceSink};
+use rof::obs::{Boundary, GoalFinished, LiveEvent, TraceEvent, TraceSink};
 use rof::skills::{SkillManager, SkillOp, SkillPolicy};
 use rof::tools::ToolRegistry;
 use std::path::PathBuf;
@@ -31,6 +31,16 @@ struct GoalRunner {
 }
 
 impl GoalRunner {
+    /// The durable sink this worker's goals record into, including the
+    /// control acknowledgements the boundary drains produce. Only the
+    /// test module reads it — production reaches the same sink through the
+    /// orchestrator it builds — so it is scoped to tests rather than left
+    /// as dead code in the binary build.
+    #[cfg(test)]
+    fn trace(&self) -> &Arc<TraceSink> {
+        &self.trace
+    }
+
     fn from_setup(s: &Setup) -> Self {
         Self {
             cfg: s.cfg.clone(),
@@ -145,9 +155,12 @@ impl GoalRunner {
             error: Some("no goal ran".to_string()),
         };
         while let Some(goal) = next {
+            // The hook drains commands and hands back the acknowledgements;
+            // the orchestrator records them on the durable sink, and the
+            // sink's live forwarding is what `tx` receives them on. One
+            // emission path, so a recorded session replays the same history.
             let mut hooks = RunHooks {
                 control: Some(&mut control),
-                live: Some(&tx),
             };
             let _ = tx.send(LiveEvent::Boundary(Boundary::Started));
             let finished = match self.execute_with_control(&goal, false, &mut hooks).await {
@@ -187,7 +200,15 @@ impl GoalRunner {
             // goal is retained and starts next, and only a stop discards it.
             // With an empty inbox this is a no-op that publishes nothing.
             let mut goal_boundary = String::new();
-            hooks.apply_boundary(&mut goal_boundary, true);
+            // The acknowledgements MUST be emitted here: this drain is the
+            // only thing that answers a command arriving after the
+            // orchestrator's terminal drain, so discarding them would leave
+            // the console's pending slot occupied forever. Same rule as
+            // every other boundary — the orchestrator emits, and the sink
+            // forwards to whatever console is listening.
+            for ack in hooks.apply_boundary(&mut goal_boundary, true) {
+                self.trace.emit(TraceEvent::Control(ack));
+            }
             // A stop ends the session: whatever is queued is dropped, and
             // the queued command has already been acknowledged as rejected
             // by the boundary drain that saw the stop.
@@ -1128,6 +1149,24 @@ mod tests {
     /// durable sink interleaves projected out: the claim under test is
     /// about the goal/control sequence, and the trace projection is
     /// already covered by the P1a stub-worker test.
+    /// The acknowledgements the run RECORDED, in emission order. The goal
+    /// channel no longer carries them: the orchestrator emits every
+    /// acknowledgement on the durable sink, and the console reads them from
+    /// the sink's live forwarding. One emission path, so the record and the
+    /// live view are the same events.
+    fn recorded_acks(worker: &LiveWorker) -> Vec<ControlAck> {
+        worker
+            .runner
+            .trace()
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::Control(ack) => Some(ack.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn shape(events: &[LiveEvent]) -> Vec<String> {
         events
             .iter()
@@ -1135,7 +1174,6 @@ mod tests {
                 LiveEvent::Trace(_) => None,
                 LiveEvent::Boundary(Boundary::Started) => Some("started".to_string()),
                 LiveEvent::Boundary(Boundary::Finished) => Some("finished".to_string()),
-                LiveEvent::Control(ack) => Some(format!("control {} {}", ack.kind.label(), ack.id)),
                 LiveEvent::GoalFinished(_) => Some("goal".to_string()),
                 LiveEvent::Finished(_) => Some("session".to_string()),
             })
@@ -1256,13 +1294,7 @@ mod tests {
             "unexpected two-goal sequence"
         );
         // The queued command was answered, not silently dropped.
-        let acks: Vec<&ControlAck> = events
-            .iter()
-            .filter_map(|event| match event {
-                LiveEvent::Control(ack) => Some(ack),
-                _ => None,
-            })
-            .collect();
+        let acks: Vec<ControlAck> = recorded_acks(&worker);
         assert!(
             acks.iter().any(|ack| {
                 ack.id == 7
@@ -1324,11 +1356,10 @@ mod tests {
             1,
             "a second goal started after the stop: {projection:?}"
         );
-        let rejected = events.iter().find_map(|event| match event {
-            LiveEvent::Control(ack) if ack.id == 11 => Some(ack),
-            _ => None,
-        });
-        let rejected = rejected.expect("the queued command was never answered");
+        let rejected = recorded_acks(&worker)
+            .into_iter()
+            .find(|ack| ack.id == 11)
+            .expect("the queued command was never answered");
         assert_eq!(rejected.kind, ControlKind::Queue);
         assert_eq!(rejected.status, ControlStatus::Rejected);
         assert!(
@@ -1439,13 +1470,7 @@ mod tests {
         // non-terminal boundary carried it into a following round: the very
         // same command is Rejected with `no next round` when no round
         // follows (the next test pins that).
-        let acks: Vec<&ControlAck> = events
-            .iter()
-            .filter_map(|event| match event {
-                LiveEvent::Control(ack) => Some(ack),
-                _ => None,
-            })
-            .collect();
+        let acks: Vec<ControlAck> = recorded_acks(&worker);
         let answered: Vec<(u64, ControlKind, ControlStatus)> = acks
             .iter()
             .map(|ack| (ack.id, ack.kind, ack.status))
@@ -1516,13 +1541,7 @@ mod tests {
             "expected one round per goal: the boundary was not terminal"
         );
 
-        let acks: Vec<&ControlAck> = events
-            .iter()
-            .filter_map(|event| match event {
-                LiveEvent::Control(ack) => Some(ack),
-                _ => None,
-            })
-            .collect();
+        let acks: Vec<ControlAck> = recorded_acks(&worker);
         let answered: Vec<(u64, ControlKind, ControlStatus)> = acks
             .iter()
             .map(|ack| (ack.id, ack.kind, ack.status))

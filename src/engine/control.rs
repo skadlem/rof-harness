@@ -1,5 +1,5 @@
-use crate::obs::{ControlAck, ControlKind, ControlStatus, LiveEvent};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use crate::obs::{ControlAck, ControlKind, ControlStatus};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 /// One live command from the console to a running worker. Every command is
 /// answered at the next round boundary with a `ControlAck` carrying the same
@@ -211,49 +211,45 @@ fn stop_note(stop_id: Option<u64>) -> String {
     }
 }
 
-/// The engine-level boundary hook. `control` and `live` are both optional so
-/// the orchestrator stays independent of the console: a caller that supplies
-/// neither gets the pre-P1b behavior exactly.
+/// The engine-level boundary hook: it drains the console's commands and hands
+/// the surviving steer to the next prompt, and it RETURNS the ordered
+/// acknowledgements rather than publishing them itself.
+///
+/// The caller — the orchestrator, which owns the durable sink — is the only
+/// emitter. That is the whole reason this type carries no channel: one
+/// emission seam means the live console and a later replay read the same
+/// recorded events, in the same order, and a run whose console has gone away
+/// still leaves its control history in the trace.
 pub struct RunHooks<'a> {
     pub control: Option<&'a mut RunControl>,
-    pub live: Option<&'a UnboundedSender<LiveEvent>>,
 }
 
 impl<'a> RunHooks<'a> {
-    /// No control and no live channel: every boundary is a no-op.
+    /// No control: every boundary is a no-op that reports nothing.
     pub fn none() -> Self {
-        Self {
-            control: None,
-            live: None,
-        }
+        Self { control: None }
     }
 
-    /// One round boundary: drain the console's commands, publish the ordered
-    /// acknowledgements, and hand a surviving steer to the next implementer
-    /// prompt through the same `feedback` string the round loop already
-    /// carries.
+    /// One round boundary: drain the console's commands, return the ordered
+    /// acknowledgements for the caller to emit, and hand a surviving steer
+    /// to the next implementer prompt through the same `feedback` string the
+    /// round loop already carries.
     ///
     /// `terminal` means no further round will consume this feedback: the run's
     /// last round, a round that ends the attempt, or the run's terminal
     /// boundary. A terminal boundary drains for the same reason but no prompt
     /// follows it, so no steer survives it — while a queued goal is still
     /// retained unless a stop was requested.
-    pub fn apply_boundary(&mut self, feedback: &mut String, terminal: bool) {
+    ///
+    /// `#[must_use]` because dropping the returned list is exactly how a
+    /// command goes unanswered: the caller is the only emitter, so a
+    /// discarded acknowledgement is neither recorded nor ever shown.
+    #[must_use = "the caller must emit these acknowledgements; dropping them leaves a command unanswered"]
+    pub fn apply_boundary(&mut self, feedback: &mut String, terminal: bool) -> Vec<ControlAck> {
         let Some(control) = self.control.as_deref_mut() else {
-            return;
+            return Vec::new();
         };
         let batch = control.drain_boundary(terminal);
-        if let Some(live) = self.live.as_ref() {
-            for ack in &batch.acks {
-                // The live channel is the only channel control acks travel in
-                // P1b: there is no ControlAck trace variant yet, so a console
-                // that has dropped its receiver loses the ack silently. That
-                // is the console's choice and must not fail a run — the run's
-                // own trace still records the rounds and their outcome, and a
-                // later task can put acks on the trace.
-                let _ = live.send(LiveEvent::Control(ack.clone()));
-            }
-        }
         if let Some((_, text)) = batch.steer {
             if !feedback.is_empty() {
                 feedback.push('\n');
@@ -262,5 +258,6 @@ impl<'a> RunHooks<'a> {
             feedback.push_str(&text);
             feedback.push_str("\n[end of user steer]\n");
         }
+        batch.acks
     }
 }

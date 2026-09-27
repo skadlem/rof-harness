@@ -154,7 +154,10 @@ impl LiveSession {
             match event {
                 LiveEvent::Trace(event) => app.on_event(&event),
                 LiveEvent::Boundary(boundary) => app.on_live_boundary(boundary),
-                LiveEvent::Control(ack) => app.on_control_ack(ack),
+                // A control acknowledgement arrives as a trace event, folded
+                // by `on_event` through the same `on_control_ack` reducer a
+                // replayed run uses. The worker handle stays admitted
+                // regardless: only the terminal `Finished` releases it.
                 LiveEvent::GoalFinished(finished) => app.on_goal_finished(&finished),
                 LiveEvent::Finished(finished) => outcome = Some(finished),
             }
@@ -1256,10 +1259,13 @@ pub fn apply_action(
 
 /// Render a recorded trace file in the fullscreen console. `q`/Esc/Ctrl-C
 /// quits; anything else edits the (replay-inert) composer.
-pub fn replay(path: &std::path::Path) -> anyhow::Result<()> {
-    let text = std::fs::read_to_string(path)?;
-    let mut app = App::new();
-    app.thinking = std::env::var("ROF_THINKING").unwrap_or_default();
+/// Parse a recorded trace into the events and the unrecognized lines.
+///
+/// Shared by [`replay`] and by the replay tests, so a test cannot pass by
+/// re-implementing the parser: a line this function cannot parse becomes the
+/// lenient marker, and a newer event a later harness wrote is displayed rather
+/// than counted.
+pub fn ingest_trace(text: &str) -> (Vec<TraceEvent>, Vec<String>) {
     let mut events = Vec::new();
     let mut unknown = Vec::new();
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -1268,6 +1274,14 @@ pub fn replay(path: &std::path::Path) -> anyhow::Result<()> {
             Err(_) => unknown.push(super::render::parse_lenient_line(line)),
         }
     }
+    (events, unknown)
+}
+
+pub fn replay(path: &std::path::Path) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path)?;
+    let mut app = App::new();
+    app.thinking = std::env::var("ROF_THINKING").unwrap_or_default();
+    let (events, unknown) = ingest_trace(&text);
     app.set_replay_events(events);
     app.set_replay_unknown(unknown);
     run_repl(app)

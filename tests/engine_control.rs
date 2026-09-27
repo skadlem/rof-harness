@@ -1,5 +1,5 @@
 use rof::engine::control::{RunCommand, RunControl, RunHooks};
-use rof::obs::{ControlAck, ControlStatus, LiveEvent};
+use rof::obs::{ControlAck, ControlStatus};
 
 /// A goal retained from an earlier boundary was submitted before anything this
 /// drain sees, so the stop that drops it is acknowledged in that order: the
@@ -218,8 +218,12 @@ async fn stop_drops_the_queued_goal_at_the_terminal_boundary() {
 fn no_hooks_leave_feedback_untouched() {
     let mut feedback = String::from("reviewer feedback: missing tests");
     let mut hooks = RunHooks::none();
-    hooks.apply_boundary(&mut feedback, false);
-    hooks.apply_boundary(&mut feedback, true);
+    // No control and therefore nothing to report: a hookless boundary is a
+    // no-op that RETURNS no acknowledgements, so a caller that records what
+    // it gets has nothing to record. This is the pre-P1b behavior, and it is
+    // asserted on the return value too, not only on the feedback.
+    assert!(hooks.apply_boundary(&mut feedback, false).is_empty());
+    assert!(hooks.apply_boundary(&mut feedback, true).is_empty());
     assert_eq!(feedback, "reviewer feedback: missing tests");
 }
 
@@ -229,7 +233,6 @@ fn no_hooks_leave_feedback_untouched() {
 async fn hooks_publish_every_ack_in_order_and_apply_a_surviving_steer() {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut control = RunControl::new(cmd_rx);
-    let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
     cmd_tx
         .send(RunCommand::Steer {
             id: 1,
@@ -252,16 +255,11 @@ async fn hooks_publish_every_ack_in_order_and_apply_a_surviving_steer() {
     let mut feedback = String::from("reviewer feedback: missing tests");
     let mut hooks = RunHooks {
         control: Some(&mut control),
-        live: Some(&live_tx),
     };
-    hooks.apply_boundary(&mut feedback, false);
-
-    let ids: Vec<u64> = std::iter::from_fn(|| live_rx.try_recv().ok())
-        .map(|event| match event {
-            LiveEvent::Control(ack) => ack.id,
-            other => panic!("unexpected live event: {other:?}"),
-        })
-        .collect();
+    // The hook RETURNS the acknowledgements; the orchestrator is the only
+    // emitter, and the sink's live forwarding is how a console sees them.
+    let acks = hooks.apply_boundary(&mut feedback, false);
+    let ids: Vec<u64> = acks.iter().map(|ack| ack.id).collect();
     assert_eq!(ids, vec![1, 2, 3]);
     assert!(
         feedback.contains("focus on the parser"),
@@ -280,7 +278,6 @@ async fn hooks_publish_every_ack_in_order_and_apply_a_surviving_steer() {
 async fn terminal_hook_rejects_the_steer_and_keeps_the_queue() {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut control = RunControl::new(cmd_rx);
-    let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
     cmd_tx
         .send(RunCommand::Steer {
             id: 1,
@@ -297,17 +294,10 @@ async fn terminal_hook_rejects_the_steer_and_keeps_the_queue() {
     let mut feedback = String::from("reviewer feedback: missing tests");
     let mut hooks = RunHooks {
         control: Some(&mut control),
-        live: Some(&live_tx),
     };
-    hooks.apply_boundary(&mut feedback, true);
+    let acks: Vec<ControlAck> = hooks.apply_boundary(&mut feedback, true);
 
     assert_eq!(feedback, "reviewer feedback: missing tests");
-    let acks: Vec<ControlAck> = std::iter::from_fn(|| live_rx.try_recv().ok())
-        .map(|event| match event {
-            LiveEvent::Control(ack) => ack,
-            other => panic!("unexpected live event: {other:?}"),
-        })
-        .collect();
     assert_eq!(acks.len(), 2);
     assert_eq!(acks[0].id, 1);
     assert_eq!(acks[0].status, ControlStatus::Rejected);

@@ -1281,7 +1281,6 @@ async fn a_steer_drained_at_the_boundary_reaches_only_the_next_prompt() {
     let mut control = RunControl::new(cmd_rx);
     let mut hooks = RunHooks {
         control: Some(&mut control),
-        live: None,
     };
     let out = orch
         .run_loop_with_hooks(&session(), &reg, &root, &mut hooks)
@@ -1340,9 +1339,9 @@ async fn a_steer_on_the_last_pipeline_round_is_rejected_not_applied() {
         .unwrap();
     let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut control = RunControl::new(cmd_rx);
+    orch.trace().attach_live(live_tx.clone());
     let mut hooks = RunHooks {
         control: Some(&mut control),
-        live: Some(&live_tx),
     };
     let out = orch
         .run_loop_with_hooks(&session(), &reg, &root, &mut hooks)
@@ -1351,7 +1350,7 @@ async fn a_steer_on_the_last_pipeline_round_is_rejected_not_applied() {
 
     let acks: Vec<ControlAck> = std::iter::from_fn(|| live_rx.try_recv().ok())
         .filter_map(|event| match event {
-            LiveEvent::Control(ack) => Some(ack),
+            LiveEvent::Trace(TraceEvent::Control(ack)) => Some(ack),
             _ => None,
         })
         .collect();
@@ -1399,9 +1398,9 @@ async fn a_steer_drained_when_the_first_round_passes_is_rejected_not_applied() {
         .unwrap();
     let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut control = RunControl::new(cmd_rx);
+    orch.trace().attach_live(live_tx.clone());
     let mut hooks = RunHooks {
         control: Some(&mut control),
-        live: Some(&live_tx),
     };
     let out = orch
         .run_loop_with_hooks(&session(), &reg, &root, &mut hooks)
@@ -1410,7 +1409,7 @@ async fn a_steer_drained_when_the_first_round_passes_is_rejected_not_applied() {
 
     let acks: Vec<ControlAck> = std::iter::from_fn(|| live_rx.try_recv().ok())
         .filter_map(|event| match event {
-            LiveEvent::Control(ack) => Some(ack),
+            LiveEvent::Trace(TraceEvent::Control(ack)) => Some(ack),
             _ => None,
         })
         .collect();
@@ -1452,7 +1451,6 @@ async fn a_direct_steer_reaches_only_the_next_prompt() {
     let mut control = RunControl::new(cmd_rx);
     let mut hooks = RunHooks {
         control: Some(&mut control),
-        live: None,
     };
     let out = orch
         .run_loop_with_hooks(
@@ -1504,9 +1502,9 @@ async fn a_direct_steer_on_the_last_cap_round_is_rejected_not_applied() {
         .unwrap();
     let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut control = RunControl::new(cmd_rx);
+    orch.trace().attach_live(live_tx.clone());
     let mut hooks = RunHooks {
         control: Some(&mut control),
-        live: Some(&live_tx),
     };
     let out = orch
         .run_loop_with_hooks(
@@ -1520,7 +1518,7 @@ async fn a_direct_steer_on_the_last_cap_round_is_rejected_not_applied() {
 
     let acks: Vec<ControlAck> = std::iter::from_fn(|| live_rx.try_recv().ok())
         .filter_map(|event| match event {
-            LiveEvent::Control(ack) => Some(ack),
+            LiveEvent::Trace(TraceEvent::Control(ack)) => Some(ack),
             _ => None,
         })
         .collect();
@@ -1554,9 +1552,9 @@ async fn a_run_that_cannot_prepare_the_tree_still_acknowledges_its_commands() {
         .unwrap();
     let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut control = RunControl::new(cmd_rx);
+    orch.trace().attach_live(live_tx.clone());
     let mut hooks = RunHooks {
         control: Some(&mut control),
-        live: Some(&live_tx),
     };
     let out = orch
         .run_loop_with_hooks(
@@ -1574,7 +1572,7 @@ async fn a_run_that_cannot_prepare_the_tree_still_acknowledges_its_commands() {
     );
     let acks: Vec<ControlAck> = std::iter::from_fn(|| live_rx.try_recv().ok())
         .filter_map(|event| match event {
-            LiveEvent::Control(ack) => Some(ack),
+            LiveEvent::Trace(TraceEvent::Control(ack)) => Some(ack),
             _ => None,
         })
         .collect();

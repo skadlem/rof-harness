@@ -5,7 +5,7 @@ use crate::agents::{Agent, AgentCtx, ImplementerAgent, ReviewerAgent, Verdict};
 use crate::config::AppConfig;
 use crate::context::{render, ContextBuilder, CtxState, LayerReport, Retriever, Snippet};
 use crate::llm::{ContextService, ExecutorService};
-use crate::obs::{TraceEvent, TraceSink};
+use crate::obs::{ControlAck, TraceEvent, TraceSink};
 use crate::tools::ToolRegistry;
 use std::sync::Arc;
 
@@ -53,6 +53,20 @@ impl Orchestrator {
             .await
     }
 
+    /// Record the acknowledgements one boundary produced.
+    ///
+    /// The orchestrator is the only emitter, which is what makes the record
+    /// mandatory rather than opt-in: every control answer lands on the
+    /// durable sink, and the sink's live forwarding is what an attached
+    /// console reads. So the live view and a later replay see the same
+    /// ordered events, and a run nobody watched still leaves its control
+    /// history behind.
+    fn emit_control_acks(&self, acks: Vec<ControlAck>) {
+        for ack in acks {
+            self.trace.emit(TraceEvent::Control(ack));
+        }
+    }
+
     /// The same loop, with the live boundary hook threaded through it. A
     /// command is drained only after a complete implementer/reviewer round,
     /// so it can never mutate the model call or tool invocation in flight.
@@ -85,7 +99,7 @@ impl Orchestrator {
             // the goal loop. With no control the drain is a no-op and the
             // returned error is unchanged.
             let mut terminal_feedback = String::new();
-            hooks.apply_boundary(&mut terminal_feedback, true);
+            self.emit_control_acks(hooks.apply_boundary(&mut terminal_feedback, true));
             return serde_json::json!({ "error": e.to_string() });
         }
         // §4.3: the shared services. Both execution modes hold one of these
@@ -668,7 +682,9 @@ impl Orchestrator {
                     // attempts loop breaks on `verdict.pass` just below) or the
                     // last round of the cap — because the attempt resets
                     // `feedback` and no prompt would ever read the steer.
-                    hooks.apply_boundary(&mut feedback, verdict.pass || round + 1 > rounds);
+                    self.emit_control_acks(
+                        hooks.apply_boundary(&mut feedback, verdict.pass || round + 1 > rounds),
+                    );
                     round += 1;
                 }
                 total_rounds += ran;
@@ -717,7 +733,7 @@ impl Orchestrator {
         // The run's own terminal boundary: nothing follows this drain in the
         // run, so a steer drained here has no prompt left to reach.
         let mut terminal_feedback = String::new();
-        hooks.apply_boundary(&mut terminal_feedback, true);
+        self.emit_control_acks(hooks.apply_boundary(&mut terminal_feedback, true));
 
         self.trace.emit(TraceEvent::StateTransition {
             from: "reviewing".to_string(),
@@ -1005,7 +1021,7 @@ impl Orchestrator {
                 // the cap, because the attempt resets `feedback` and no prompt
                 // would ever read the steer. A passing round cannot reach here:
                 // the `if passed { break }` above already left the round loop.
-                hooks.apply_boundary(&mut feedback, round + 1 > cap);
+                self.emit_control_acks(hooks.apply_boundary(&mut feedback, round + 1 > cap));
                 round += 1;
             }
             // v4 verify guard: one post-hoc independent-judge pass over a task
@@ -1078,7 +1094,7 @@ impl Orchestrator {
         // not touch, so the terminal result is unchanged by it. The run's own
         // terminal boundary: nothing follows this drain.
         let mut terminal_feedback = String::new();
-        hooks.apply_boundary(&mut terminal_feedback, true);
+        self.emit_control_acks(hooks.apply_boundary(&mut terminal_feedback, true));
 
         self.trace.emit(TraceEvent::StateTransition {
             from: "direct_executing".to_string(),
@@ -1094,6 +1110,15 @@ impl Orchestrator {
         out["layer_truncations"] = serde_json::json!(acc.layer_truncations);
         out["eliminated_chars"] = serde_json::json!(acc.eliminated_chars);
         out
+    }
+
+    /// The durable sink this run records into. The orchestrator emits every
+    /// event here, including the control acknowledgements, so anything that
+    /// needs the run's own record — a caller attaching a live view, a test
+    /// reading the emitted order — reads it from here rather than from a
+    /// second channel.
+    pub fn trace(&self) -> &Arc<TraceSink> {
+        &self.trace
     }
 
     /// Test hook: the configured default ceiling.

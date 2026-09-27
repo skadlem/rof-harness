@@ -1,4 +1,4 @@
-use super::live::LiveEvent;
+use super::live::{ControlAck, LiveEvent};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -81,6 +81,12 @@ pub enum TraceEvent {
         task: String,
         reason: String,
     },
+    /// One ordered answer to one live command, identified by the id the
+    /// console allocated. Acknowledgements are durable like every other step,
+    /// so a recorded session replays its control history through the same
+    /// reducer the live view uses. The note never carries command text or a
+    /// credential, which is what makes the recorded copy safe to keep.
+    Control(ControlAck),
 }
 
 /// In-memory event stream, optionally mirrored to a JSONL file so each run

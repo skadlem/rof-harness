@@ -1,4 +1,5 @@
 use super::trace::TraceEvent;
+use serde::{Deserialize, Serialize};
 
 /// A goal's run boundary, so a live view can bracket activity without
 /// re-deriving it from the trace.
@@ -17,7 +18,10 @@ pub struct GoalFinished {
 
 /// Which pending slot a live command addressed. `Stop` carries no text:
 /// it is the request to end the run at the next boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialized with the acknowledgement, so a recorded trace replays the same
+/// words the console saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlKind {
     Steer,
     Queue,
@@ -37,7 +41,7 @@ impl ControlKind {
 
 /// Whether a command was honored at a boundary or refused. A displaced
 /// or too-late command is `Rejected`, never silently dropped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlStatus {
     Applied,
     Rejected,
@@ -56,7 +60,10 @@ impl ControlStatus {
 /// console allocated when the user submitted it. Acknowledgements are
 /// ordered by the channel, so a console matches them to its pending slot
 /// by `id` and never by arrival time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable because an acknowledgement is durable evidence: the recorded
+/// trace replays the same control history the live view showed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlAck {
     pub id: u64,
     pub kind: ControlKind,
@@ -71,11 +78,15 @@ pub struct ControlAck {
 ///
 /// `GoalFinished` is one goal's outcome; `Finished` is the session-terminal
 /// outcome and is the only event that ends the interactive run.
+///
+/// There is deliberately no `Control` variant: an acknowledgement is a
+/// [`TraceEvent::Control`], so the live console and a recorded replay read
+/// the same event from one emission seam, and a run nobody watched still
+/// leaves its control history in the trace.
 #[derive(Debug, Clone)]
 pub enum LiveEvent {
     Trace(TraceEvent),
     Boundary(Boundary),
-    Control(ControlAck),
     GoalFinished(GoalFinished),
     Finished(GoalFinished),
 }

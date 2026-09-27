@@ -8,8 +8,9 @@ use rof::obs::{
     Boundary, ControlAck, ControlKind, ControlStatus, GoalFinished, LiveEvent, TraceEvent,
     TraceSink,
 };
-use rof::tui::app::{App, BusyMode, DeferredConfig, RunMode};
+use rof::tui::app::{control_ack_line, App, BusyMode, DeferredConfig, RunMode};
 use rof::tui::cmd::{parse, Action};
+use rof::tui::render::render_line;
 use rof::tui::run::{
     apply_action, apply_deferred_config, handle_running_action, handle_running_key, request_stop,
     running_key_outcome, submit_running_input, LiveSession, RunningActionOutcome,
@@ -636,19 +637,19 @@ async fn the_live_channel_routes_acks_and_goal_outcomes_to_the_app() {
     });
     session.begin("first", handle);
 
-    tx.send(LiveEvent::Control(ControlAck {
+    tx.send(LiveEvent::Trace(TraceEvent::Control(ControlAck {
         id: steer,
         kind: ControlKind::Steer,
         status: ControlStatus::Applied,
         note: "steer reaches the next boundary".into(),
-    }))
+    })))
     .unwrap();
-    tx.send(LiveEvent::Control(ControlAck {
+    tx.send(LiveEvent::Trace(TraceEvent::Control(ControlAck {
         id: queued,
         kind: ControlKind::Queue,
         status: ControlStatus::Applied,
         note: "queued for the next boundary".into(),
-    }))
+    })))
     .unwrap();
     tx.send(LiveEvent::GoalFinished(GoalFinished {
         passed: true,
@@ -716,12 +717,12 @@ async fn a_queued_goal_stays_in_one_session_and_only_finished_is_terminal() {
     });
     session.begin("first goal", handle);
 
-    tx.send(LiveEvent::Control(ControlAck {
+    tx.send(LiveEvent::Trace(TraceEvent::Control(ControlAck {
         id: queued,
         kind: ControlKind::Queue,
         status: ControlStatus::Applied,
         note: "retained for the next goal".into(),
-    }))
+    })))
     .unwrap();
     tx.send(LiveEvent::GoalFinished(GoalFinished {
         passed: false,
@@ -1421,10 +1422,7 @@ async fn stub_worker_delivers_the_same_trace_order_as_the_durable_sink() {
         .iter()
         .filter_map(|event| match event {
             LiveEvent::Trace(event) => Some(serde_json::to_string(event).unwrap()),
-            LiveEvent::Boundary(_)
-            | LiveEvent::Control(_)
-            | LiveEvent::GoalFinished(_)
-            | LiveEvent::Finished(_) => None,
+            LiveEvent::Boundary(_) | LiveEvent::GoalFinished(_) | LiveEvent::Finished(_) => None,
         })
         .collect();
     let durable: Vec<String> = stored
@@ -2062,4 +2060,118 @@ fn a_busy_mode_change_is_narrated_while_a_goal_runs() {
         "the mode change was silent: {:?}",
         app.transcript
     );
+}
+
+/// The drift guard between the live view and a replayed one: an
+/// acknowledgement is formatted in exactly one place, so the line the live
+/// reducer pushes and the line `render_line` produces for the same recorded
+/// event are byte-identical — in BOTH branches, the noted one and the
+/// empty-note one. Two copies of this format would be how a recorded
+/// session ends up reading differently from the run that produced it.
+#[test]
+fn the_live_and_replayed_ack_lines_are_byte_identical() {
+    let acks = vec![
+        ControlAck {
+            id: 1,
+            kind: ControlKind::Steer,
+            status: ControlStatus::Applied,
+            note: "applies to the next implementer prompt".into(),
+        },
+        // The empty-note branch: an answer with nothing to add must render
+        // the same on both paths, with no trailing separator.
+        ControlAck {
+            id: 2,
+            kind: ControlKind::Queue,
+            status: ControlStatus::Rejected,
+            note: String::new(),
+        },
+        ControlAck {
+            id: 3,
+            kind: ControlKind::Stop,
+            status: ControlStatus::Applied,
+            note: "accepted: the run stops at this boundary".into(),
+        },
+    ];
+    for ack in acks {
+        let mut app = App::new();
+        app.begin_run("busy");
+        app.on_control_ack(ack.clone());
+        let live_line = app
+            .transcript
+            .last()
+            .expect("the ack wrote no line")
+            .clone();
+
+        let replayed_line = render_line(&TraceEvent::Control(ack.clone()));
+        assert_eq!(
+            live_line, replayed_line,
+            "live and replayed wording diverged for {ack:?}"
+        );
+        assert_eq!(live_line, control_ack_line(&ack));
+        // One acknowledgement is one line: the live path adds no activity
+        // line for it either, so nothing about it is doubled.
+        assert_eq!(app.transcript.len(), 1, "{:?}", app.transcript);
+        assert!(app.activity_tail(10).is_empty());
+    }
+}
+
+/// Exactly once in a live session: the sink is the one emission seam, so an
+/// acknowledgement it emits reaches an attached console once — not dropped
+/// (the record is durable, the live forward is a copy) and not doubled (one
+/// emit is one delivery). The App's own transcript is the witness.
+#[tokio::test]
+async fn one_emitted_ack_reaches_the_live_console_exactly_once() {
+    let trace = TraceSink::new();
+    let (tx, rx) = unbounded_channel();
+    trace.attach_live(tx);
+
+    let mut app = App::new();
+    app.begin_run("busy");
+    let steer = app.submit_pending_steer("focus on the parser");
+    let mut session = live_session(rx);
+    let (hold_tx, mut hold_rx) = unbounded_channel::<()>();
+    let handle = tokio::spawn(async move {
+        hold_rx.recv().await;
+        Ok(GoalFinished {
+            passed: true,
+            error: None,
+        })
+    });
+    session.begin("busy", handle);
+
+    let ack = ControlAck {
+        id: steer,
+        kind: ControlKind::Steer,
+        status: ControlStatus::Applied,
+        note: "applies to the next implementer prompt".into(),
+    };
+    trace.emit(TraceEvent::Control(ack.clone()));
+
+    // Draining with nothing more to come is deterministic: the emit above
+    // already happened, so no yield or sleep is needed to see the event.
+    assert!(session.drain(&mut app).is_none());
+    let line = control_ack_line(&ack);
+    assert_eq!(
+        app.transcript.iter().filter(|seen| *seen == &line).count(),
+        1,
+        "the acknowledgement was dropped or doubled: {:?}",
+        app.transcript
+    );
+    assert_eq!(app.transcript.len(), 1, "{:?}", app.transcript);
+    // The reducer really ran on it: the slot it names is free and the last
+    // answer is recorded, so the line is a transcript of the ack rather
+    // than a coincidental match.
+    assert!(app.pending_steer.is_none());
+    assert_eq!(app.last_control_ack.as_ref(), Some(&ack));
+
+    // And the durable side holds exactly one copy of it too.
+    assert_eq!(
+        trace
+            .events()
+            .iter()
+            .filter(|event| matches!(event, TraceEvent::Control(_)))
+            .count(),
+        1
+    );
+    drop(hold_tx);
 }
