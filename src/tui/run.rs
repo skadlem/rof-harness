@@ -401,7 +401,8 @@ pub enum RunningActionOutcome {
 /// exhaustive over [`Action`]:
 ///
 /// - **Display-only** — `Help`, `Unknown`, `Models`, `Context`, `Trace`,
-///   `Hotkeys`, `Diff`, `ProviderList`, `Providers`, `Display`, and the
+///   `Hotkeys`, `Diff`, `ProviderList`, `Providers`, `Display`, `Theme`,
+///   and the
 ///   already
 ///   unavailable `Retry`/`Approve`/`Reject`/`Undo` answers — go through
 ///   [`apply_action`] exactly as they do between goals, and return
@@ -456,6 +457,7 @@ pub fn handle_running_action(
         | Action::ProviderList
         | Action::Providers
         | Action::Display(_)
+        | Action::Theme(_)
         | Action::Retry(_)
         | Action::Approve(_)
         | Action::Reject(_)
@@ -1344,6 +1346,23 @@ pub fn apply_action(
         Action::Display(m) => app.transcript.push(format!(
             "display={m}: single fullscreen view in this console"
         )),
+        // Display state, so the switch is immediate: a repaint is not a
+        // model knob and a running goal has no say in how the console
+        // looks. `None` is the listing, which is a pure read. The name is
+        // already validated by `parse`, so the fallback arm here is
+        // unreachable from the composer and is a refusal rather than a
+        // default: a name that somehow is not a theme must not repaint the
+        // screen with the default palette.
+        Action::Theme(None) => app.transcript.push(super::theme::Theme::listing(app.theme)),
+        Action::Theme(Some(name)) => match super::theme::Theme::parse(&name) {
+            Some(theme) => {
+                app.theme = theme;
+                app.transcript.push(theme.applied_line());
+            }
+            None => app
+                .transcript
+                .push(super::theme::Theme::unknown_name_line(&name)),
+        },
         Action::Busy(m) => app.transcript.push(super::cmd::busy_line(&m)),
     }
     false

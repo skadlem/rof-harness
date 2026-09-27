@@ -232,6 +232,16 @@ pub struct App {
     pub last_control_ack: Option<ControlAck>,
     /// The latest diff evidence, or `None` before the harness has recorded any.
     pub diff_snapshot: Option<DiffSnapshot>,
+    /// The selected palette. Display state, so it lives here beside the
+    /// focus and the scroll rather than in a global or the environment:
+    /// `draw` is a pure function of `App`, and a frame is reproducible in a
+    /// headless `TestBackend` with no setup between tests. `Default` is the
+    /// terminal-native palette, so a console that never runs `/theme`
+    /// renders exactly what it rendered before themes existed.
+    ///
+    /// Not persisted: a later change owns `~/.rof/tui.json`, and until then
+    /// the choice lasts for this console and is read back from here.
+    pub theme: crate::tui::theme::Theme,
 }
 
 impl Default for App {
@@ -263,6 +273,7 @@ impl Default for App {
             next_control_id: 1,
             last_control_ack: None,
             diff_snapshot: None,
+            theme: crate::tui::theme::Theme::default(),
         }
     }
 }

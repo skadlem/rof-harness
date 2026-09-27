@@ -55,6 +55,46 @@ fn providers_parses_to_its_own_action_and_neighbours_still_parse() {
     }
 }
 
+/// `/theme` is the one command whose argument is optional: with no name it
+/// LISTS, with a name it switches. Both forms parse to the same action, so
+/// the listing and the switch cannot be two different commands.
+#[test]
+fn theme_parses_as_a_listing_without_a_name_and_a_switch_with_one() {
+    assert!(matches!(parse("/theme"), Some(Action::Theme(None))));
+    for name in ["default", "dark", "light"] {
+        assert!(
+            matches!(parse(&format!("/theme {name}")), Some(Action::Theme(Some(ref got))) if got == name),
+            "/theme {name} must parse to its own name"
+        );
+    }
+}
+
+/// An unknown name is REFUSED by the closed parser and never resolved
+/// later: nothing downstream can turn it into a quiet fallback to the
+/// default theme. The refusal names the valid names, so the user can fix
+/// the line without reading `/help` first.
+#[test]
+fn an_unknown_theme_name_is_refused_with_the_valid_names() {
+    let action = parse("/theme neon").expect("/theme neon must parse");
+    let message = match action {
+        Action::Unknown(message) => message,
+        other => panic!("/theme neon must be refused, got {other:?}"),
+    };
+    for name in ["default", "dark", "light"] {
+        assert!(
+            message.contains(name),
+            "refusal omits the valid name {name}: {message}"
+        );
+    }
+    assert!(
+        !message.contains("neon dark") && !message.contains("silently"),
+        "refusal does not report what it got: {message}"
+    );
+    // `/theme` alone still lists: a typo in the argument must not cost the
+    // user the listing.
+    assert!(matches!(parse("/theme"), Some(Action::Theme(None))));
+}
+
 #[test]
 fn help_lists_everything_with_current_values_placeholder() {
     let h = rof::tui::cmd::help_text();
@@ -67,6 +107,7 @@ fn help_lists_everything_with_current_values_placeholder() {
         "/undo",
         "/diff",
         "/providers",
+        "/theme",
     ] {
         assert!(h.contains(cmd), "help mentions {cmd}");
     }

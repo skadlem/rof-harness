@@ -29,6 +29,11 @@ pub enum Action {
     Approve(String),
     Reject(String),
     Display(String),
+    /// `/theme` with no name LISTS the themes and the current one; with a
+    /// name it selects that theme. The name is validated in the closed
+    /// parser, so an unknown one arrives as [`Action::Unknown`] and can
+    /// never be resolved later into a quiet fallback.
+    Theme(Option<String>),
     Busy(String),
     Unknown(String),
 }
@@ -112,6 +117,17 @@ pub fn parse(input: &str) -> Option<Action> {
             Some(m) if ["fullscreen", "regular"].contains(&m.as_str()) => Action::Display(m),
             _ => Action::Unknown("/display takes fullscreen/regular".into()),
         },
+        "theme" => match one(0) {
+            // The listing: no argument is a read, not an error.
+            None => Action::Theme(None),
+            Some(name) => match super::theme::Theme::parse(&name) {
+                Some(_) => Action::Theme(Some(name)),
+                // Refused here, at the closed parser, naming the valid
+                // choices. Nothing downstream can turn this into the
+                // default theme by omission.
+                None => Action::Unknown(super::theme::Theme::unknown_name_line(&name)),
+            },
+        },
         "busy" => match one(0) {
             Some(m) if ["interrupt", "queue", "steer"].contains(&m.as_str()) => Action::Busy(m),
             _ => Action::Unknown("/busy takes interrupt/queue/steer".into()),
@@ -121,7 +137,7 @@ pub fn parse(input: &str) -> Option<Action> {
 }
 
 pub fn help_text() -> String {
-    "/quit /help /model <p/m> /model ctx|verify|fallback <p/m> /models /providers /login [provider] /logout <provider> /provider add|list|rm /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /busy interrupt|queue|steer /hotkeys\n/busy: steer is the default — Enter during a run steers the live goal · queue stores exactly one next goal · interrupt arms the stop path (q/Esc/Ctrl-C)".to_string()
+    "/quit /help /model <p/m> /model ctx|verify|fallback <p/m> /models /providers /login [provider] /logout <provider> /provider add|list|rm /attempts 1-5 /rounds N /thinking off|low|on /effort low|medium|high|none /caps <i> <r> /retry [note] /approve|reject <id> /context /undo /diff /trace /display fullscreen|regular /theme [name] /busy interrupt|queue|steer /hotkeys\n/busy: steer is the default — Enter during a run steers the live goal · queue stores exactly one next goal · interrupt arms the stop path (q/Esc/Ctrl-C)".to_string()
 }
 
 /// What `/busy <mode>` reports, per mode. The modes are postures, not

@@ -1371,3 +1371,422 @@ fn the_status_row_fits_the_short_terminals() {
         );
     }
 }
+
+// ---- P3 F1: built-in themes chosen through `/theme` ----
+//
+// A theme is visible only through the rendered cells, so these tests read
+// the TestBackend buffer's colors, not just its text. Every assertion here
+// is a claim about what a user would SEE change.
+
+use ratatui::style::Color;
+
+/// The foreground color of every rendered cell, row-major. Two frames with
+/// the same colors here are the same picture as far as a terminal is
+/// concerned, so this is what the round-trip compatibility claim compares.
+fn rendered_colors(app: &App, width: u16, height: u16) -> Vec<Color> {
+    use ratatui::{backend::TestBackend, Terminal};
+    use rof::tui::ui::draw;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|f| draw(f, app)).unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.fg)
+        .collect()
+}
+
+/// The full frame: every cell's symbol AND color. The compatibility round
+/// trip compares this, because a theme that moved a color but also shifted
+/// a glyph would still be a visible change.
+fn rendered_frame(app: &App, width: u16, height: u16) -> Vec<(String, Color)> {
+    use ratatui::{backend::TestBackend, Terminal};
+    use rof::tui::ui::draw;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|f| draw(f, app)).unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| (cell.symbol().to_string(), cell.fg))
+        .collect()
+}
+
+/// The color of one titled pane's top border: the `┌` cell that opens the
+/// frame, found by locating the pane's title on its own border. Asserting
+/// per-pane is what stops "one pane changed" from passing as "the theme
+/// applied".
+fn pane_border_color(app: &App, title: &str, width: u16, height: u16) -> Color {
+    use ratatui::{backend::TestBackend, Terminal};
+    use rof::tui::ui::draw;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|f| draw(f, app)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let cols = width as usize;
+    for row in buf.content().chunks(cols) {
+        let text: String = row.iter().map(|c| c.symbol()).collect();
+        // EVERY `┌` on the row, not just the first: the wide layout puts
+        // the transcript and the run pane side by side, so two pane frames
+        // open on the same row and checking only the first would report a
+        // present pane as missing.
+        for (offset, _) in text.match_indices('┌') {
+            if text[offset..].starts_with(&format!("┌{title}")) {
+                return row[text[..offset].chars().count()].fg;
+            }
+        }
+    }
+    panic!("no {title} pane at {width}x{height}");
+}
+
+/// The five panes a theme has to reach, and the frame each one owns.
+const ALL_PANES: [(&str, &str); 5] = [
+    ("transcript", "transcript"),
+    ("run activity", "run activity"),
+    ("diff", "diff"),
+    ("status", "status"),
+    ("composer", "composer"),
+];
+
+/// A console with the same content in it every time, under one theme. The
+/// tests compare frames across themes, so the CONTENT has to be held fixed
+/// and only the palette varies; `App` is deliberately not `Clone` (its
+/// reducer owns the coupling between fields), so the content is rebuilt
+/// rather than copied.
+fn themed(theme: rof::tui::theme::Theme, goal: &str) -> App {
+    let mut app = App::new();
+    app.theme = theme;
+    if !goal.is_empty() {
+        app.begin_run(goal);
+        app.on_event(&TraceEvent::SessionStart {
+            session_id: "s".into(),
+            goal: goal.to_string(),
+        });
+    }
+    app.on_event(&diff_event(
+        &["src/tui/theme.rs"],
+        "1 file changed",
+        SAMPLE_PATCH,
+        false,
+    ));
+    app
+}
+
+/// Apply one slash action the way the between-goals path does.
+fn apply(app: &mut App, raw: &str) {
+    let trace = TraceSink::new();
+    let mut awaiting_key: Option<String> = None;
+    let action = rof::tui::cmd::parse(raw).expect("test raw is a command");
+    assert!(
+        !rof::tui::run::apply_action(app, &trace, action, raw, &mut awaiting_key),
+        "{raw} must not end the console"
+    );
+}
+
+/// `/theme` with no name LISTS: every available theme is named and the
+/// current one is marked, so a user can see both the choices and where they
+/// are without reading anything else.
+#[test]
+fn theme_listing_names_every_choice_and_reports_the_current_one() {
+    let mut app = App::new();
+    apply(&mut app, "/theme");
+    let listing = app
+        .transcript
+        .last()
+        .cloned()
+        .expect("/theme wrote no line");
+    for name in ["default", "dark", "light"] {
+        assert!(
+            listing.contains(name),
+            "the listing omits {name}: {listing}"
+        );
+    }
+    assert!(
+        listing.contains("default (current)") || listing.contains("current: default"),
+        "the listing does not report the current theme: {listing}"
+    );
+    // Listing is a read: it must not have moved the selection.
+    assert_eq!(app.theme, rof::tui::theme::Theme::default());
+}
+
+/// Every named theme repaints the frame a user can see, and returning to
+/// `default` restores the pre-change frame cell for cell. That round trip IS
+/// the terminal-compatibility guarantee: a user who never picks a theme
+/// sees exactly the frame they saw before this feature existed.
+#[test]
+fn each_theme_repaints_the_frame_and_default_restores_it_exactly() {
+    use rof::tui::theme::Theme;
+    let baseline = App::new();
+    let before = rendered_frame(&baseline, 100, 30);
+    for theme in [Theme::Dark, Theme::Light] {
+        let mut app = App::new();
+        app.theme = theme;
+        let after = rendered_frame(&app, 100, 30);
+        assert_ne!(
+            before, after,
+            "{theme:?} rendered a byte-identical frame: the palette did not reach the panes"
+        );
+        // A theme that changes the picture must change MORE THAN ONE pane:
+        // a single repainted frame is not a theme.
+        let recolored = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(a, b)| a.1 != b.1)
+            .count();
+        assert!(
+            recolored > 1,
+            "{theme:?} changed only {recolored} cell colors"
+        );
+        // And the glyphs did not move: a theme is a palette, not a layout.
+        assert!(
+            before.iter().map(|c| &c.0).eq(after.iter().map(|c| &c.0)),
+            "{theme:?} changed the layout, not just the colors"
+        );
+        // Back to the default palette, the frame is the pre-change frame.
+        app.theme = Theme::default();
+        assert_eq!(
+            before,
+            rendered_frame(&app, 100, 30),
+            "{theme:?} -> default did not restore the original frame"
+        );
+    }
+}
+
+/// An unknown theme name is refused and repaints nothing: not the
+/// selection, not the palette, not the frame. A quiet fallback to the
+/// default theme would be the worst possible outcome, because the user's
+/// terminal would be repainted by a command they got wrong. The refusal
+/// itself does add a transcript line — the user is owed the reason — so
+/// what is compared is the frame's COLORS, which is the claim that no
+/// palette was applied.
+#[test]
+fn an_unknown_theme_name_is_refused_and_repaints_nothing() {
+    let app_before = App::new();
+    let colors_before = rendered_colors(&app_before, 100, 30);
+    let mut app = App::new();
+    apply(&mut app, "/theme neon");
+    assert_eq!(
+        app.theme,
+        rof::tui::theme::Theme::default(),
+        "a refused name still moved the selection"
+    );
+    assert_eq!(
+        colors_before,
+        rendered_colors(&app, 100, 30),
+        "a refused name still repainted the frame"
+    );
+    let said: String = app.transcript.join("\n");
+    for name in ["default", "dark", "light"] {
+        assert!(
+            said.contains(name),
+            "the refusal omits the valid name {name}: {said}"
+        );
+    }
+    assert!(
+        !said.contains("theme=default") && !said.contains("theme=neon"),
+        "a refused name reported a switch it did not make: {said}"
+    );
+}
+
+/// A switch names the theme it applied, so the transcript confirms the
+/// selection instead of leaving the user to guess from the repaint.
+#[test]
+fn switching_a_theme_confirms_the_new_theme_by_name() {
+    let mut app = App::new();
+    apply(&mut app, "/theme dark");
+    assert_eq!(app.theme, rof::tui::theme::Theme::Dark);
+    let said = app
+        .transcript
+        .last()
+        .cloned()
+        .expect("no confirmation line");
+    assert!(said.contains("dark"), "no confirmation by name: {said}");
+    assert!(
+        !said.contains("next goal") && !said.contains("next session"),
+        "a display-only switch must not claim it is deferred: {said}"
+    );
+}
+
+/// The selection is App state, so it outlives a run. A theme that reverted
+/// on `begin_run` would repaint the screen under the user mid-session, and
+/// the goal in flight has no reason to touch the display.
+#[test]
+fn a_theme_survives_the_run_lifecycle_and_renders_in_both_layouts() {
+    use rof::tui::theme::Theme;
+    let mut app = App::new();
+    app.theme = Theme::Light;
+    app.begin_run("watch the run");
+    assert_eq!(app.run_mode, RunMode::Running);
+    assert_eq!(app.theme, Theme::Light, "begin_run reverted the theme");
+    app.run_mode = RunMode::Finished;
+    assert_eq!(app.theme, Theme::Light, "finish reverted the theme");
+
+    // 60 columns is the narrow full-width stack, 160 the wide workspace
+    // split. The theme follows the selection in both.
+    for (width, layout) in [(60u16, "narrow"), (160, "wide")] {
+        let dark = rendered_frame(&themed(Theme::Dark, "watch the run"), width, 40);
+        assert_ne!(
+            dark,
+            rendered_frame(&app, width, 40),
+            "{layout}: the theme did not reach the {layout} layout"
+        );
+    }
+    // The panes a user reads are all present and all themed, in both sizes.
+    for (width, layout) in [(60u16, "narrow"), (160, "wide")] {
+        for (title, pane) in ALL_PANES {
+            let light = pane_border_color(&app, pane, width, 40);
+            let dark = pane_border_color(&themed(Theme::Dark, "watch the run"), pane, width, 40);
+            assert_ne!(
+                light, dark,
+                "{layout}/{title}: the {title} pane ignored the theme"
+            );
+        }
+    }
+}
+
+/// Replay renders through the same `draw`, so the selection must reach it
+/// too: a user who picks a theme and then replays a trace is still looking
+/// at the same console.
+#[test]
+fn a_theme_applies_in_replay_mode() {
+    use rof::tui::theme::Theme;
+    let mut app = App::new();
+    app.set_replay_events(replay_events());
+    assert!(app.replay_mode, "replay mode was not entered");
+    let default_frame = rendered_frame(&app, 100, 30);
+    app.theme = Theme::Light;
+    let light_frame = rendered_frame(&app, 100, 30);
+    assert_ne!(
+        default_frame, light_frame,
+        "replay rendered a byte-identical frame: the theme did not apply"
+    );
+    // The replay panes follow it, not just the composer's border.
+    for (_, pane) in ALL_PANES {
+        assert_ne!(
+            pane_border_color(&app, pane, 100, 30),
+            pane_border_color(&themed(Theme::Dark, ""), pane, 100, 30),
+            "replay/{pane}: the pane ignored the theme"
+        );
+    }
+    app.theme = Theme::default();
+    assert_eq!(
+        default_frame,
+        rendered_frame(&app, 100, 30),
+        "replay round trip to default did not restore the frame"
+    );
+}
+
+/// Every pane the user reads follows the selection: the diff, the run
+/// activity, the status row, the transcript, and the composer. Asserting
+/// more than one pane is what makes "the theme applied" mean something
+/// stronger than "some frame got repainted".
+#[test]
+fn diff_activity_status_transcript_and_composer_all_follow_the_theme() {
+    use rof::tui::theme::Theme;
+    let mut app = App::new();
+    app.begin_run("ship the feature");
+    app.on_event(&diff_event(
+        &["src/tui/theme.rs"],
+        "1 file changed",
+        SAMPLE_PATCH,
+        false,
+    ));
+    app.on_event(&TraceEvent::SessionStart {
+        session_id: "s".into(),
+        goal: "ship it".into(),
+    });
+    let mut repainted = 0;
+    for (title, pane) in ALL_PANES {
+        let light = pane_border_color(&app, pane, 160, 40);
+        let dark = pane_border_color(&themed(Theme::Dark, "ship the feature"), pane, 160, 40);
+        assert_ne!(
+            light, dark,
+            "{title}: the {title} pane ignored the selected theme"
+        );
+        repainted += 1;
+    }
+    assert_eq!(repainted, ALL_PANES.len(), "a pane was not checked");
+}
+
+/// A focused pane is the one with the highlight accent, so the focus
+/// indicator is part of what a theme owns: a theme that repainted only
+/// unfocused borders would leave the focus mark invisible.
+#[test]
+fn the_focus_accent_follows_the_theme_too() {
+    use rof::tui::theme::Theme;
+    let mut app = App::new();
+    app.focus = Focus::Diff;
+    let default_focus = pane_border_color(&app, "diff", 100, 30);
+    app.theme = Theme::Light;
+    assert_ne!(
+        default_focus,
+        pane_border_color(&app, "diff", 100, 30),
+        "the focused pane's accent ignored the theme"
+    );
+}
+
+/// While a goal is live, `/theme` is a view-style action: it applies at
+/// once, to the display only. This test fails if the live route refuses it,
+/// because a repaint never needs a running goal's permission.
+#[test]
+fn theme_applies_while_a_goal_is_live_and_is_not_refused() {
+    let mut app = live_control_app();
+    app.theme = rof::tui::theme::Theme::default();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<rof::engine::control::RunCommand>();
+    let trace = TraceSink::new();
+    let mut awaiting_key: Option<String> = None;
+    let outcome = handle_running_action(
+        &mut app,
+        Action::Theme(Some("light".into())),
+        &tx,
+        "/theme light",
+        &trace,
+        &mut awaiting_key,
+    );
+    assert_eq!(
+        outcome,
+        RunningActionOutcome::View,
+        "/theme must be a view action while live, not a refusal"
+    );
+    assert_eq!(
+        app.theme,
+        rof::tui::theme::Theme::Light,
+        "/theme did not take effect immediately while live"
+    );
+    // It is a DISPLAY change: nothing is waiting for the next goal.
+    assert!(
+        app.deferred_config.is_empty(),
+        "/theme deferred a setting: {:?}",
+        app.deferred_config
+    );
+}
+
+/// The same live action must send nothing on the command channel: a theme
+/// is a palette, and the worker has no use for one. A send here would mean
+/// the action reached into the run it was only supposed to repaint.
+#[test]
+fn theme_while_live_sends_nothing_on_the_command_channel() {
+    let mut app = live_control_app();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<rof::engine::control::RunCommand>();
+    let trace = TraceSink::new();
+    let mut awaiting_key: Option<String> = None;
+    let _ = handle_running_action(
+        &mut app,
+        Action::Theme(Some("dark".into())),
+        &tx,
+        "/theme dark",
+        &trace,
+        &mut awaiting_key,
+    );
+    assert_eq!(
+        app.theme,
+        rof::tui::theme::Theme::Dark,
+        "the theme did not apply, so this test proved nothing"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "/theme sent a command to the running goal: {:?}",
+        rx.try_recv().ok()
+    );
+}

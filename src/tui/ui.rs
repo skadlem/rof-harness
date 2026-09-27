@@ -244,6 +244,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let shown: Vec<String> = tail.into_iter().rev().collect();
     f.render_widget(
         Paragraph::new(shown.join("\n")).block(theme::pane_or_focused(
+            app.theme,
             "transcript",
             app.focus == Focus::Transcript,
         )),
@@ -271,6 +272,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     };
     f.render_widget(
         Paragraph::new(activity.join("\n")).block(theme::pane_or_focused(
+            app.theme,
             "run activity",
             app.focus == Focus::Run,
         )),
@@ -286,13 +288,14 @@ pub fn draw(f: &mut Frame, app: &App) {
     );
     f.render_widget(
         Paragraph::new(diff.join("\n")).block(theme::diff_block(
+            app.theme,
             snapshot.is_some_and(|recorded| recorded.truncated),
             app.focus == Focus::Diff,
         )),
         panes.diff,
     );
     f.render_widget(
-        Paragraph::new(app.status_line()).block(theme::pane("status")),
+        Paragraph::new(app.status_line()).block(theme::pane(app.theme, "status")),
         panes.status,
     );
     let shown = if app.mask_input {
@@ -304,12 +307,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     // the next goal, so its title names the busy mode and what is pending.
     let block = if matches!(app.run_mode, RunMode::Running | RunMode::Stopping) {
         theme::composer_block_live(
+            app.theme,
             &app.thinking,
             &app.control_summary(),
             app.focus == Focus::Composer,
         )
     } else {
-        theme::composer_block(&app.thinking, app.focus == Focus::Composer)
+        theme::composer_block(app.theme, &app.thinking, app.focus == Focus::Composer)
     };
     f.render_widget(Paragraph::new(shown.as_str()).block(block), panes.composer);
 }
