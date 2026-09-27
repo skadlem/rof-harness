@@ -210,7 +210,7 @@ it came from. The corrected numbers above are what the stored evidence actually 
 
 The 18/18 comes from the red-suite arm: a seeded test asserted the *buggy* value
 and was rejecting correct fixes; the harness now surfaces the failing assertion to
-the model (`8230015`).
+the model (`ae6608b`).
 
 Three findings changed what the numbers mean, and each was caught by decomposing the measurement
 rather than trusting the aggregate: a direct-mode run that scored 16/20 was passing the five

@@ -948,7 +948,7 @@ reverted; only the volatile-delivery part survived.
 
 ## Arm 3: the volatile fix landed, the endpoint did not (2026-09-18)
 
-Run on `63fffd1` (20 tasks, `--jobs 2`): 7/20 again, but **21 model errors**
+Run on `17a4762` (20 tasks, `--jobs 2`): 7/20 again, but **21 model errors**
 against 1 in arm 1, so the headline is not comparable to arm 1. Atria's
 endpoint returned 502s through the run; `multi-config-env` spent all 7 rounds
 on them and its artifact came back an API error.
@@ -998,7 +998,7 @@ pre-exists — that task documents it).
 
 ## Arm 4: +1, and the analysis prompt did not land (2026-09-18)
 
-Run on `0d16841`: **8/20** (arm 1 and arm 3 were 7/20), still 17 model errors.
+Run on `358c03a`: **8/20** (arm 1 and arm 3 were 7/20), still 17 model errors.
 `http-deny-test` converted FAIL→PASS at one round, and every task that names a
 big file stayed fixed (`metrics-model-call-rate`, `summarize-doc`, `budget-doc`,
 `regression-test-cache-rate` all PASS in one round now).
@@ -1029,10 +1029,10 @@ clean gains and no losses:
 
 | arm | pass | model errors | input tokens | agents |
 |---|---|---|---|---|
-| 1 (`ab6aa34`) | 7/20 | 1 | 444k | impl/planner/reviewer/summarizer |
-| 3 (`63fffd1`) | 7/20 | 21 | 624k | impl/planner/reviewer/summarizer |
-| 4 (`0d16841`) | 8/20 | 17 | 606k | impl/planner/reviewer/summarizer |
-| 5 (`0d16841` + `ROF_PLANNER=skip`) | **12/20** | 15 | **441k** | impl/reviewer only |
+| 1 (`15a5248`) | 7/20 | 1 | 444k | impl/planner/reviewer/summarizer |
+| 3 (`17a4762`) | 7/20 | 21 | 624k | impl/planner/reviewer/summarizer |
+| 4 (`358c03a`) | 8/20 | 17 | 606k | impl/planner/reviewer/summarizer |
+| 5 (`358c03a` + `ROF_PLANNER=skip`) | **12/20** | 15 | **441k** | impl/reviewer only |
 
 The gains are the mechanism, not luck: `workspace-flag` went from delivering 1
 of 4 required pieces in 2 rounds to **all 4 in 1 round** — with the goal as one
@@ -1050,14 +1050,14 @@ this suite has none, so `skip` is right for it and wrong in general. The lever
 stays env-gated (`ROF_PLANNER`) rather than becoming the default.
 ## Arms 5-7: three reps, the planner result holds (2026-09-18)
 
-Three independent runs of `0d16841` with `ROF_PLANNER=skip` against three runs
+Three independent runs of `358c03a` with `ROF_PLANNER=skip` against three runs
 with the planner on:
 
 | arm | config | pass | model errors | input tokens |
 |---|---|---|---|---|
-| 1 (`ab6aa34`) | planner on | 7/20 | 1 | 444k |
-| 3 (`63fffd1`) | planner on | 7/20 | 21 | 624k |
-| 4 (`0d16841`) | planner on | 8/20 | 17 | 606k |
+| 1 (`15a5248`) | planner on | 7/20 | 1 | 444k |
+| 3 (`17a4762`) | planner on | 7/20 | 21 | 624k |
+| 4 (`358c03a`) | planner on | 8/20 | 17 | 606k |
 | 5 | planner skip | **12/20** | 15 | 441k |
 | 6 | planner skip | **13/20** | 15 | 423k |
 | 7 | planner skip | **13/20** | 15 | 404k |
@@ -1713,7 +1713,7 @@ The reasoning-budget ladder was armed and the multi-file suite re-run, same
 small enough that the reasoning-budget class never fires — so this arm was
 never going to move it, and it did not:
 
-| rep | before (`21de3ec`) | after (`a184bb3`) |
+| rep | before (`fda3cad`) | after (`6892648`) |
 |---|---|---|
 | 1 | 4/6 | 6/6 |
 | 2 | 6/6 | 3/6 |
@@ -1752,7 +1752,7 @@ artifact, which is the only channel the model has. It only fires when the
 policy grants a command the run can use, so a shell-free configuration is
 unchanged; `file_state_evidence` carries it to the retry.
 
-| rep | before (`a184bb3`) | after (`8230015`) |
+| rep | before (`6892648`) | after (`ae6608b`) |
 |---|---|---|
 | 1 | 6/6 | 5/6 |
 | 2 | 3/6 | 6/6 |
@@ -1888,7 +1888,7 @@ harvest correctly. The moment a stronger model is available, this is a runnable
 comparison. Today it measures a floor of zero.
 
 **Next measurement that could discriminate:** the in-house suite is where rof's
-levers actually show. Re-run hermes and pi there against the `8230015` tree so
+levers actually show. Re-run hermes and pi there against the `ae6608b` tree so
 the 17/18 is compared like-for-like — that is the honest test of whether the
 red-suite arm is a rof-specific gain or a property of the task.
 
@@ -1896,7 +1896,7 @@ red-suite arm is a rof-specific gain or a property of the task.
 
 The tbench comparison cannot discriminate on Atria — 8/8 CPU tasks at zero — so
 the informative measurement had to be the in-house suite, run like-for-like
-against the `8230015` tree. That means re-running hermes and pi, not quoting the
+against the `ae6608b` tree. That means re-running hermes and pi, not quoting the
 old numbers, because rof's score moved while theirs had not.
 
 All three agents, same 6 tasks, 3 reps, same model, same key, same oracle:
@@ -2239,7 +2239,7 @@ about the behavior.** Verify the test can fail before trusting that it can pass.
 
 | arm | tree | mf-test-coverage (3 reps) | ladder fired? |
 |---|---|---|---|
-| baseline | `8230015` | `.PP` 2/3 | — |
+| baseline | `ae6608b` | `.PP` 2/3 | — |
 | + `enable_thinking` rung | this tree | `PPP` 3/3 | **no — 1 call per run** |
 
 The 3/3 is recorded as variance. The rung is recorded as unexercised.
@@ -2518,7 +2518,7 @@ died on `AgentTimeoutError ... timed out after 900.0 seconds`, a timeout, not ex
 **So the real tbench failure is correctness, not content emission.** Running the task's
 own test suite against rof's output: **25 tests failed.** The work is real and substantial
 — every module touched — and it is still wrong. That is the same conclusion the artifact
-diffing reached at `d5d0bc4`, now confirmed against the model's own benchmark: a 744B
+diffing reached at `c2fdb97`, now confirmed against the model's own benchmark: a 744B
 GLM-5 model that scores 78.3 on Terminal-Bench 2.1 produces real edits on a 6-hour expert
 task and gets them wrong inside rof's bounded 2–4 turn loop.
 
@@ -2606,7 +2606,7 @@ removed — the measurement bounds it, it does not forbid it.
 
 ## The cost axis is measurable, and it is where rof separates (2026-09-21)
 
-The `535d481` decision to abandon cost accounting was wrong: it was a
+The `cc7e3af` decision to abandon cost accounting was wrong: it was a
 Harbor-path artifact, not a property of the endpoint. Atria returns a full
 `usage` block on every response (`prompt_tokens`, `completion_tokens`,
 `prompt_tokens_details.cached_tokens`, `completion_tokens_details.reasoning_tokens`),
@@ -3358,17 +3358,17 @@ full-TUI vision doc, (5) self-review inner / judge on release arms.
 Plans: `docs/superpowers/plans/2026-09-25-{byok-providers,planner-removal,
 release-preset,tui-replay-vision}.md`. Full suite green 2× (27 binaries).
 
-- BYOK (`658dc32,b3e5657,ae7b4eb`): `~/.rof/providers.json` registry
+- BYOK (`6aeac9b,4bc34bf,4fad359`): `~/.rof/providers.json` registry
   (non-secret, ROF_PROVIDERS override) + existing 0600 credentials store;
   per-role `provider/model` clients (bare ids ride the shared client,
   byte-identical); `/provider add|list|rm`, `/model verify|fallback`,
   masked key entry. Secrets never hit transcripts.
-- Planner gone (`2e78912`, breaking): stage + knob + env + grants + agent
+- Planner gone (`a487ac0`, breaking): stage + knob + env + grants + agent
   deleted; every goal is one task; `goal_is_task_shaped` kept as the router
   primitive. Old configs still load (serde ignores the key — tested).
   Rethink (decided): decomposition lives outside the run (TUI queue, suite
   task lists); goal-quality note preserved into the implementer prompt.
-- Release gate (`a560e49`): `rof eval --release` = reps floor 3 (explicit
+- Release gate (`5b7d76f`): `rof eval --release` = reps floor 3 (explicit
   N>1 wins) + verify_guard on + hard error without a judge. Verified live
   on the binary both paths.
 
@@ -3443,10 +3443,10 @@ from the verifier oracle.
 ## 2026-09-25 — P1a live read-only monitor shipped
 
 The first full-TUI slice is implemented and reviewed through subagent
-writer/reviewer cycles. Commits: `b02d7fc` (Clippy baseline),
-`efb8320` (ordered live notifications), `3c8ce50` (App/LiveSession state),
-`ea1f5b6` (silent GoalRunner), `f4227bc` (activity pane), `743008e` (worker
-beside the terminal pump), `56f9467` (stub-worker order integration).
+writer/reviewer cycles. Commits: `160b801` (Clippy baseline),
+`1a3d938` (ordered live notifications), `02d7d0f` (App/LiveSession state),
+`8f8f480` (silent GoalRunner), `cb68f72` (activity pane), `5b7ac0a` (worker
+beside the terminal pump), `cd5112d` (stub-worker order integration).
 
 - `TraceSink` forwards `LiveEvent::Trace` under the same emission order as
   its durable in-memory/JSONL write; attach/detach is optional and forks do
@@ -3484,10 +3484,10 @@ until a funded/available Go endpoint produces one green run.
 ## 2026-09-27 — P1b mid-run steering and one queued goal shipped
 
 Boundary-safe control is implemented and reviewed through subagent
-writer/reviewer cycles. Commits: `d878f1e` (live control state), `322de00`
-(engine boundary hook), `1771343` (two-goal worker session), `a1c8e56`
-(running submit reducer), `940f287` (live command + deferred config
-routing), `68538be` (control-aware rendering), plus this handoff. Design:
+writer/reviewer cycles. Commits: `1fe4553` (live control state), `85efb96`
+(engine boundary hook), `eaa51a4` (two-goal worker session), `414cb4e`
+(running submit reducer), `a24df05` (live command + deferred config
+routing), `bbac775` (control-aware rendering), plus this handoff. Design:
 `docs/superpowers/specs/2026-09-25-p1b-steer-queue-design.md`; plan:
 `docs/superpowers/plans/2026-09-25-p1b-steer-queue.md`.
 
@@ -3572,11 +3572,11 @@ produce one green run.
 ## 2026-09-27 — P3/P4 batch shipped: replay parity, providers, diff pane, focus, metrics, themes, completion, preferences
 
 The six unblocked items from the P1b handoff are implemented, each through a
-fresh writer plus review. Commits: `dfcfe00` (design note), `4fdee7d` (durable
-control acks), `5a20af0` (`/providers`), `0b249bf` (bounded diff evidence),
-`1af3d2c` (diff pane), `6b092e8` (focus + per-pane scroll), `61a552e` (status
-metrics), `6ed6cdc` (themes), `03b314f` (completion), `437ecdf` (preferences),
-`fdbc32a` (trace-in-work-root warning), `207c67f` (mask an inline login key).
+fresh writer plus review. Commits: `da7ba58` (design note), `e26c4f6` (durable
+control acks), `1b6eae6` (`/providers`), `c8e9424` (bounded diff evidence),
+`42de1c3` (diff pane), `f81d30c` (focus + per-pane scroll), `2b114a5` (status
+metrics), `369eefd` (themes), `e518a9b` (completion), `4744c0c` (preferences),
+`fbe9afb` (trace-in-work-root warning), `4045217` (mask an inline login key).
 
 - **Replay parity (the P1b gap).** `LiveEvent::Control` is REMOVED. An
   acknowledgement is `TraceEvent::Control`, emitted by the orchestrator — the
@@ -3634,7 +3634,7 @@ exit 0).
 
 Found and fixed while verifying: with `ROF_TRACE` inside the work root, the
 harness diffed its OWN telemetry — the trace file appeared in the diff pane and
-counted toward `writes_made`. That is now a startup warning (`fdbc32a`) rather
+counted toward `writes_made`. That is now a startup warning (`fbe9afb`) rather
 than a silent self-measurement. A batch review also caught that the
 goal-boundary drain discarded its acknowledgements — a real P0, since that
 drain is the only thing answering a command arriving after the orchestrator's

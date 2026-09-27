@@ -15,7 +15,7 @@ starts, and never silently applied underneath the current worker.
 
 ## Baseline
 
-P1a is landed in `ef19b2a` and its preceding commits:
+P1a is landed in `5b2e308` and its preceding commits:
 
 - `TraceSink` emits ordered `LiveEvent` notifications alongside durable trace
   records.
