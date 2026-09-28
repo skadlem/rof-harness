@@ -128,6 +128,20 @@ pub fn render_line(ev: &TraceEvent) -> String {
             }
             line
         }
+        // §7's retrieval-before-fetch. A run that consulted the folder says so
+        // here, and the reason names WHICH way it went: a fresh note served the
+        // run for nothing, or one bounded call was bought because nothing did.
+        TraceEvent::ResearchStep {
+            topic,
+            action,
+            reason,
+        } => {
+            if reason.is_empty() {
+                format!("· research {action} {topic}")
+            } else {
+                format!("· research {action} {topic}: {reason}")
+            }
+        }
         // The same formatter the live reducer uses, so a replayed
         // acknowledgement reads identically to the live one.
         TraceEvent::Control(ack) => super::app::control_ack_line(ack),

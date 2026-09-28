@@ -1,6 +1,7 @@
 pub mod decompose;
 pub mod explorer;
 pub mod implementer;
+pub mod research;
 pub mod reviewer;
 pub mod teach;
 use crate::context::CtxView;
@@ -13,6 +14,7 @@ pub use explorer::{
     explorer_block, explorer_report_for_test, ExplorerAgent, ExplorerReport, KeyFile, Quote,
 };
 pub use implementer::ImplementerAgent;
+pub use research::Consulted as ResearchConsulted;
 /// Shared agent output envelope. (The planner that used to fill `data` with
 /// tasks/acceptance is gone — every goal runs as one task; this shape stays
 /// because implementer and reviewer both return it.)

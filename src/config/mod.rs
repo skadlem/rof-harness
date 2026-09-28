@@ -300,6 +300,38 @@ pub struct AppConfig {
     /// on the task result, and it never flips `verdict.pass`.
     #[serde(default)]
     pub oracle_discrimination: bool,
+
+    /// §7, build item 5's second half: **retrieval before research**. Before a
+    /// run shapes its first prompt it asks `.rof/research/` whether the
+    /// question its goal names is already answered. The answer is the store's
+    /// `Verdict` — a set lookup plus a commit comparison — never a score:
+    ///
+    /// * a FRESH note's body joins the stable head, beside the project
+    ///   conventions, and NOTHING is bought;
+    /// * `NotAnswered` (no note, or a note whose pinned commit the tree has
+    ///   moved off) buys exactly ONE bounded model call, and the body that
+    ///   call produces is written back as a note pinning the commit the
+    ///   research ran against — otherwise the next run re-buys it;
+    /// * a model that produces nothing usable writes NOTHING and the trace says
+    ///   why. The harness never authors research prose of its own.
+    ///
+    /// **What an enabled run costs.** At most one extra bounded model call per
+    /// run (the research step), one `git rev-parse`, and one read of the
+    /// index. It buys NOTHING — zero calls — when a fresh note answers, when
+    /// the index cannot be read, or when the goal yields no addressable topic.
+    /// A call that produces a body is still free of the write-gate: the note is
+    /// written after the run's last change-set read, so a `.rof/` entry can
+    /// never stand in for the agent's deliverable.
+    ///
+    /// **Off by default, and the default is a measurement, not a shrug.** An
+    /// enabled run changes the prompt (a retrieved note) and can add one model
+    /// call and one untracked `.rof/` file, so a run must be able to state that
+    /// before paying it. With the knob off the folder is not read at all: no
+    /// lookup, no call, no trace event, and a result byte-identical to a run
+    /// from before this knob existed — including on a repo whose research
+    /// folder is full of fresh notes.
+    #[serde(default)]
+    pub research_before_work: bool,
 }
 
 fn one_job() -> usize {
@@ -402,6 +434,9 @@ impl Default for AppConfig {
             // Off: it doubles the check executions of a passing task. Opt in
             // when the run's oracle is the thing under suspicion.
             oracle_discrimination: false,
+            // Off: it adds a lookup, and at most one bounded model call, to
+            // every run. Opt in per repo, once the folder has notes in it.
+            research_before_work: false,
         }
     }
 }

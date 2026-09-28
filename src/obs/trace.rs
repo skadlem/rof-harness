@@ -191,6 +191,32 @@ pub enum TraceEvent {
         /// True when the change set was restored byte-identically.
         restored: bool,
     },
+    /// §7's retrieval-before-fetch, as a run performs it: what the run asked
+    /// the research folder, and what came back. Emitted ONCE per run, before
+    /// the first model call, because a decision recorded after the spend
+    /// cannot say the spend was avoided.
+    ///
+    /// `action` is one of:
+    ///
+    /// * `retrieved` — a FRESH note answered. No model call was bought and
+    ///   nothing was written; the answer and the commit it was verified
+    ///   against are in the prompt.
+    /// * `bought` — nothing answered (absent, or present and STALE), so one
+    ///   bounded call was paid for. `reason` carries the computed verdict, so
+    ///   "bought" and "bought because the pin had moved" are different facts.
+    /// * `declined` — nothing usable came back, or the store could not be
+    ///   read, so the store is unchanged. Never silent: a skip that said
+    ///   nothing is indistinguishable from having nothing to say.
+    /// * `not-recorded` — a body the model DID produce, refused by the store's
+    ///   own write path (a stale topic already holds a claim). Named, because a
+    ///   research answer that was paid for and dropped is a fact a reader needs.
+    ResearchStep {
+        /// The topic the lookup addressed ("" when the goal yields no
+        /// addressable topic at all).
+        topic: String,
+        action: String,
+        reason: String,
+    },
     /// One ordered answer to one live command, identified by the id the
     /// console allocated. Acknowledgements are durable like every other step,
     /// so a recorded session replays its control history through the same

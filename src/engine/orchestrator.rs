@@ -318,10 +318,39 @@ impl Orchestrator {
             verify: &self.verify,
             tools,
         };
+        // §7: retrieval BEFORE research, at the one point both execution modes
+        // share and before either of them has spent anything.
+        //
+        // Why HERE and not later: this sits between `tree.ensure()` (so the
+        // work root is a repo with a commit a note can pin) and every model
+        // call the run will make — the decomposer's, the implementer's, the
+        // reviewer's. A lookup placed after the rounds could report what the
+        // folder said and change nothing about what the run already paid for;
+        // placed here, a FRESH note ends the step with zero calls made, and
+        // that is the whole property.
+        //
+        // It is also the only placement where the answer can join the stable
+        // head: `impl_head` is built once, below, and every round's prompt is
+        // derived from it, so a note injected after the first round would reach
+        // the model one round late.
+        let research = if self.cfg.research_before_work {
+            crate::agents::research::consult(&session.goal, workdir, &self.executor, &self.trace)
+                .await
+        } else {
+            // The knob off is not a cheaper ON: nothing is read, nothing is
+            // bought, no event is emitted, and the head block is empty, so the
+            // run is byte-identical to one from before this existed.
+            crate::agents::research::Consulted::Off
+        };
         if self.cfg.execution == "direct" {
-            return self
-                .run_direct_loop(session, &svc, workdir, &tree, hooks)
+            let out = self
+                .run_direct_loop(session, &svc, workdir, &tree, hooks, &research)
                 .await;
+            // The note is recorded only now, after the last change-set read of
+            // the run — see `agents::research` for why that placement is the
+            // property rather than a detail.
+            research.write_back(workdir, &self.trace);
+            return out;
         }
         // Stage 2: the per-layer policy owns budgets, strategy and the
         // summarize threshold. `plan_summarized` below is the first-class path.
@@ -385,6 +414,7 @@ impl Orchestrator {
         // v4 memory (pipeline mode): same stable-head prepend as direct mode.
         // Empty when no memory files exist, so the default run is unchanged.
         let mem_text = crate::context::memory::render(&crate::context::memory::load(workdir));
+        let mem_text = self.head_with_research(mem_text, &research);
         let long_with_mem = if mem_text.trim().is_empty() {
             session.ctx.long_term.clone()
         } else {
@@ -1084,7 +1114,7 @@ impl Orchestrator {
             from: "reviewing".to_string(),
             to: "done".to_string(),
         });
-        serde_json::json!({
+        let out = serde_json::json!({
             "plan": plan_out.data,
             "tasks": task_results,
             "rounds": total_rounds,
@@ -1105,7 +1135,13 @@ impl Orchestrator {
             // No planner view exists anymore; the planner's one-shot tokens
             // were never folded into the layer accounts anyway.
             "ctx_tokens": 0,
-        })
+        });
+        // The run's terminal boundary for the research note: after the last
+        // change-set read and after the drain above, so a `.rof/` entry can
+        // never be the change that opened a write-gated task, and so the next
+        // run finds the note this one paid for.
+        research.write_back(workdir, &self.trace);
+        out
     }
 
     async fn run_direct_loop(
@@ -1115,6 +1151,7 @@ impl Orchestrator {
         workdir: &std::path::Path,
         tree: &crate::engine::tree::TreeService,
         hooks: &mut RunHooks<'_>,
+        research: &crate::agents::research::Consulted,
     ) -> serde_json::Value {
         let builder = ContextBuilder::with_policy(self.cfg.context_policy());
         let retriever = Retriever::new(workdir.to_path_buf(), self.cfg.retrieval.clone());
@@ -1147,10 +1184,12 @@ impl Orchestrator {
         // all three used to be written into `run_loop` only, so a direct run
         // silently saw no skills, no note and no poke.
         let impl_skills = svc.skill_index("implementer").await;
-        // v4 memory: project + user conventions ride the stable head.
+        // v4 memory: project + user conventions ride the stable head, with a
+        // retrieved research note behind them when one answered.
         // Empty when no memory files exist, so the default run is unchanged.
         let mem = crate::context::memory::load(workdir);
         let mem_text = crate::context::memory::render(&mem);
+        let mem_text = self.head_with_research(mem_text, research);
         let long_with_mem = if mem_text.trim().is_empty() {
             session.ctx.long_term.clone()
         } else {
@@ -1536,7 +1575,33 @@ impl Orchestrator {
         out["layer_summaries"] = serde_json::json!(acc.layer_summaries);
         out["layer_truncations"] = serde_json::json!(acc.layer_truncations);
         out["eliminated_chars"] = serde_json::json!(acc.eliminated_chars);
+        // Terminal boundary for the research note, for the same reason the
+        // pipeline loop does it there: after every change-set read.
+        research.write_back(workdir, &self.trace);
         out
+    }
+
+    /// Append a retrieved research note to a loop's memory head, if one
+    /// answered. One method for both execution modes, so a note cannot be
+    /// injected into the pipeline prompt and missed in the direct one.
+    ///
+    /// The note goes AFTER the memory sections, and that order is the memory
+    /// module's own discipline: project conventions lead, so a section a note
+    /// can grow without bound can never crowd them out. The note is
+    /// additionally head-capped in [`crate::agents::research`], so the
+    /// ordering is not the only thing standing between a long note and a
+    /// displaced convention. With nothing answered the input comes back
+    /// unchanged, which is what keeps the default run byte-identical.
+    fn head_with_research(
+        &self,
+        mem_text: String,
+        research: &crate::agents::research::Consulted,
+    ) -> String {
+        let note = research.head_block();
+        if mem_text.trim().is_empty() && note.trim().is_empty() {
+            return String::new();
+        }
+        format!("{mem_text}{note}")
     }
 
     /// The durable sink this run records into. The orchestrator emits every

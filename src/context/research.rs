@@ -56,14 +56,28 @@
 //! A tree whose HEAD cannot be read is `TreeState::unknown()`, which is
 //! STALE. "Could not confirm" is never reported as "confirmed".
 //!
+//! # Who writes here
+//!
+//! Two callers, and both go through [`Research::apply`] — the one mutating
+//! entry point — so a refusal leaves the folder exactly as it was:
+//!
+//! * a `/research` subcommand, which is what the user typed; and
+//! * the run, when the retrieval-before-fetch step (`config`'s
+//!   `research_before_work`, off by default) consulted this folder, got
+//!   `NotAnswered`, and bought research for it. That caller may only ever
+//!   [`Edit::Write`] a body the MODEL produced: the harness authors no research
+//!   prose of its own, and an unusable answer writes nothing.
+//!
+//! Everything else about the store is unchanged by the wiring: the staleness
+//! rule is the rule above, computed, and `needs_research` is still a total
+//! function of the index and the tree.
+//!
 //! # What is deliberately NOT here
 //!
-//! Nothing in this slice consults the folder. There is no orchestrator read,
-//! no model call, and no prompt text: the store, the staleness computation
-//! and the user commands ship, and wiring the run to ask the store before it
-//! buys research is a separate change (design report §9 item 5's second half).
-//! Until that lands, a run does zero research of any kind and this module is
-//! reachable only from a `/research` line the user typed.
+//! No similarity, no ranking and no confidence, in either the user path or the
+//! run path. The run addresses exactly the one topic its goal derives and
+//! takes whatever [`Research::needs_research`] says about it; a note is served
+//! because a path says so, or it is not served.
 //!
 //! # Safety
 //!
@@ -129,7 +143,11 @@ pub const ROOT_ENV: &str = "ROF_RESEARCH_ROOT";
 
 /// Longest topic accepted, in chars. A topic is a filename; a megabyte-long
 /// one is a paste accident, not a concept.
-const MAX_TOPIC_CHARS: usize = 64;
+///
+/// Public because the run's own topic derivation has to stay inside the same
+/// bound: a run that names an address the store would refuse is a run that
+/// looks up nothing and says nothing about why.
+pub const MAX_TOPIC_CHARS: usize = 64;
 
 /// The work root the commands act on: `ROF_RESEARCH_ROOT`, else the process
 /// working directory. `None` only when neither can be had.
@@ -401,8 +419,9 @@ impl Verdict {
     }
 }
 
-/// What the user asked the store to do. Every variant is reachable only from
-/// a `/research` subcommand, exactly as `profile::Edit` is.
+/// What the user asked the store to do. Every variant is reachable from a
+/// `/research` subcommand, exactly as `profile::Edit` is; the run's research
+/// step reaches only `Write`, with a body the model produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Edit {
     /// A new note. `body` is the user's text; the harness writes no research
@@ -572,8 +591,9 @@ impl Research {
         split_note(&text).map(|(_, _, body)| body)
     }
 
-    /// The store's ONE mutating entry point. Every caller is a user command,
-    /// and this is where a refused edit is refused. No write happens here:
+    /// The store's ONE mutating entry point. Every caller reaches it through
+    /// here — a `/research` subcommand, or the run's research step — and this
+    /// is where a refused edit is refused. No write happens here:
     /// bodies are staged for [`Research::save`], so a refusal leaves the
     /// folder exactly as it was.
     pub fn apply(&mut self, edit: Edit, tree: &TreeState) -> Result<String, String> {
