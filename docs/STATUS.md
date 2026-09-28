@@ -4002,3 +4002,23 @@ binding constraint tonight; endpoint variance is. The last hunk needs
 one lucky round (correct anchor + no transport death), which is a
 fresh-quota-window job, not a 14th consecutive run. Stopping live arms
 here with the 6/7 tree intact and committed in the work copy's git.
+
+## 2026-09-29 — last hunk diagnosed by hand (shape known, not applied)
+
+Fifteen consecutive re-ask deaths (alternating truncation/transport at
+8-10k chars, below every historical success size) says window, not size:
+In place of a 16th run, the remaining hunk was diagnosed by reading,
+not by model calls. Only the idle test calls
+`advance_time`, and the clock ticks only there and on session creation,
+so the fix is unconstrained except by that one test: stamp per-source
+last-activity clock on ingest/register; on advance, set idle-expired
+sources to `max(event_watermark, clock)` — the max() guard is what the
+model's one attempt lacked (it overwrote unconditionally). Any
+IDLE_TIMEOUT in 1..30 passes; ~10 mirrors the gap scale. ~15 lines in
+`app/events.py`, no other file.
+
+Deliberately NOT applied: a hand-fixed tree teaches nothing about the
+loop, and feeding the shape to the agent would make any green weaker
+than hermes' unaided 7/7. The shape is recorded so the next agent patch
+can be verified instantly instead of diagnosed again. Slice A green
+still needs one lucky agent round; Slice B stays gated on it.
