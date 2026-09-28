@@ -119,12 +119,24 @@ impl Retriever {
     }
 
     /// A file named in the query text, e.g. `src/engine/router.rs`.
+    /// Paths the query names, by existence — deliberately NOT extension-gated.
+    /// A goal naming `app/events.py` is explicit about what it wants; refusing
+    /// it for its suffix (measured: the default list is Rust-centric, so every
+    /// `.py` patch target resolved to nothing) sends the model on a reads
+    /// round-trip for files the goal had already named. The extension filter
+    /// stays where it belongs: the keyword walk and the file map, where an
+    /// ungated listing would drown the prompt.
     fn named_paths(&self, query: &str) -> Vec<PathBuf> {
         let mut v = Vec::new();
         for tok in query.split(|c: char| c.is_whitespace() || c == ',') {
             let t = tok
-                .trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '_' && c != '-');
-            if t.len() < 4 || !self.ext_ok(Path::new(t)) {
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '_' && c != '-')
+                // Sentence punctuation rides on filenames ("...app/foo.py.
+                // Do not..."): strip trailing dots/quotes/brackets so the
+                // existence check below sees the path. Leading dots stay —
+                // dotfiles (`.env`) are real paths.
+                .trim_end_matches(['.', ')', ']', '"', '\'']);
+            if t.len() < 4 {
                 continue;
             }
             let p = self.root.join(t);
