@@ -134,6 +134,7 @@ A suite run never touches `ROF_WORKDIR`: every task runs in its own copy
 | `ROF_IMPLEMENTER_MAX_TOKENS` | per-call output cap for implementer calls (default 8192, clamped to [1024, 32768]) |
 | `ROF_REVIEWER_MAX_TOKENS` | per-call output cap for reviewer calls (default 4096, clamped to [1024, 32768]) |
 | `ROF_REASONING_EFFORT` | `low`/`medium`/`high`/`none` — top-level effort field; the knob Go-style endpoints honor (vLLM switches are ignored there); unset = absent from the wire |
+| `ROF_REASK_BUDGET` | chars of volatile budget the implementer's re-ask assembles under, evidence first (unset = whole volatile budget = historical run; set lower so the second turn stays emittable) |
 
 Precedence: defaults < config file < environment < CLI flags. `rof eval <suite> --report out.json`
 writes the suite report (per-task verdicts + feedback, folded metrics) next to the trace, so a

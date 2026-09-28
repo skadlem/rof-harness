@@ -242,6 +242,19 @@ impl<'a> ContextAssembler<'a> {
     }
 
     pub fn assemble(&mut self) -> Assembly {
+        self.assemble_inner(self.budget, false)
+    }
+
+    /// Re-ask assembly under a diet budget: the turn's own evidence (volatile
+    /// items: requested files, skill bodies) is fitted FIRST, so a tight
+    /// budget starves background (map, goal-named files) before evidence.
+    /// Delivery order is unchanged (tail, then volatile tail), so when
+    /// everything fits the bytes equal [`Self::assemble`] exactly.
+    pub fn assemble_reask(&mut self, budget: usize) -> Assembly {
+        self.assemble_inner(budget, true)
+    }
+
+    fn assemble_inner(&mut self, budget: usize, volatiles_first: bool) -> Assembly {
         let mut tail = String::new();
         let mut volatile_tail = String::new();
         let mut used = 0usize;
@@ -249,13 +262,24 @@ impl<'a> ContextAssembler<'a> {
         // One budget, one pass, in the order the items were added: the split
         // below is a delivery order, not a second fitting pass, so nothing here
         // can be delivered that the unsplit assembler would not have delivered.
-        for (item, volatile) in self
-            .items
-            .iter()
-            .map(|i| (i, false))
-            .chain(self.volatile_items.iter().map(|i| (i, true)))
-        {
-            let (text, fits) = self.fit(item, self.budget.saturating_sub(used));
+        // The re-ask is the one exception to the order: its evidence goes
+        // first for fitting purposes only — delivery still appends tail
+        // before volatile tail, so the bytes match whenever all items fit.
+        let ordered: Vec<(&ContextItem, bool)> = if volatiles_first {
+            self.volatile_items
+                .iter()
+                .map(|i| (i, true))
+                .chain(self.items.iter().map(|i| (i, false)))
+                .collect()
+        } else {
+            self.items
+                .iter()
+                .map(|i| (i, false))
+                .chain(self.volatile_items.iter().map(|i| (i, true)))
+                .collect()
+        };
+        for (item, volatile) in ordered {
+            let (text, fits) = self.fit(item, budget.saturating_sub(used));
             if !fits {
                 if item.must_include {
                     excess.push(item.clone());

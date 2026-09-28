@@ -91,6 +91,30 @@ pub fn max_tokens_from_env(var: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Opt-in re-ask diet (`ROF_REASK_BUDGET`, chars of volatile budget the
+/// implementer's second turn assembles under). `None` means the historical
+/// run: unset, unparsable, at/above the volatile budget, or a degenerate
+/// configured budget — every one of those leaves the old assemble path in
+/// place, byte for byte. Pure over Option<&str> (the caller reads the env)
+/// so no test can race another binary's vars.
+///
+/// The floor is the assembler's own: below [`MIN_WINDOW`](crate::context::assembler::MIN_WINDOW)
+/// an item can only vanish, never narrow, so a diet there would delete
+/// evidence instead of shrinking it.
+pub fn reask_diet_budget(raw: Option<&str>, default_budget: usize) -> Option<usize> {
+    use crate::context::assembler::MIN_WINDOW;
+    if default_budget <= MIN_WINDOW {
+        return None;
+    }
+    let parsed: usize = raw?.trim().parse().ok()?;
+    let capped = parsed.max(MIN_WINDOW).min(default_budget);
+    if capped >= default_budget {
+        None
+    } else {
+        Some(capped)
+    }
+}
+
 #[async_trait]
 pub trait Agent: Send + Sync {
     fn name(&self) -> &'static str;

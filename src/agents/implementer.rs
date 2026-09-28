@@ -1,4 +1,4 @@
-use super::{max_tokens_from_env, thinking_start, Agent, AgentCtx, AgentOutput};
+use super::{max_tokens_from_env, reask_diet_budget, thinking_start, Agent, AgentCtx, AgentOutput};
 use crate::context::retriever::window_on;
 use crate::context::{Assembly, ContextAssembler, ContextItem, Fidelity, ItemKey};
 use crate::llm::LlmReq;
@@ -264,7 +264,20 @@ impl ImplementerAgent<'_> {
                 got_any = true;
             }
             if got_any {
-                let parts = match asm.assemble() {
+                // Re-ask diet: the second turn re-sends the whole assembled
+                // context plus the requested files (measured 11-15k chars,
+                // dying ~50% at truncation and transport). An operator-set
+                // ROF_REASK_BUDGET assembles the re-ask lean with the turn's
+                // own evidence first; unset is the historical full re-send.
+                let diet = reask_diet_budget(
+                    std::env::var("ROF_REASK_BUDGET").ok().as_deref(),
+                    ctx.volatile_budget,
+                );
+                let assembly = match diet {
+                    None => asm.assemble(),
+                    Some(b) => asm.assemble_reask(b),
+                };
+                let parts = match assembly {
                     Assembly::Ok(parts) => {
                         cuts.clear();
                         parts
@@ -284,7 +297,14 @@ impl ImplementerAgent<'_> {
                         parts
                     }
                 };
-                let reask = reask_with_delivery(&parts.full(), &already, &cuts);
+                let full = parts.full();
+                // Honest delivery list: `already` names what past turns were
+                // shown, but a diet assembly may have starved some of it, and
+                // a dropped request is not evidence. Only paths actually in
+                // this prompt may be claimed; the rest join the cuts the
+                // marker already knows how to name.
+                let (delivered, cuts) = honest_delivery(&already, &wanted, cuts, &full);
+                let reask = reask_with_delivery(&full, &delivered, &cuts);
                 // §6: the re-ask is its own turn, and its own measurement. It
                 // re-sends the whole assembled context plus the requested
                 // files, so averaging it into the first ask would hide exactly
@@ -501,6 +521,29 @@ fn reask_with_delivery(base: &str, delivered: &[String], cuts: &[String]) -> Str
     p
 }
 
+/// The delivery list the re-ask marker may honestly claim. `already` names
+/// what past turns were shown and `wanted` what this turn requested, but a
+/// diet assembly may have starved either — and a path not in this prompt is
+/// not evidence, however it got here. Presence is a label search: every
+/// delivered file travels as `--- path\n`, whether as the assembler's label
+/// or as the unreadable-content line that carries its own.
+fn honest_delivery(
+    already: &[String],
+    wanted: &[String],
+    cuts: Vec<String>,
+    full: &str,
+) -> (Vec<String>, Vec<String>) {
+    let present = |p: &str| full.contains(&format!("--- {}\n", p));
+    let delivered: Vec<String> = already.iter().filter(|p| present(p)).cloned().collect();
+    let mut cuts = cuts;
+    for p in already.iter().chain(wanted.iter()) {
+        if !present(p) && !cuts.iter().any(|c| c == p) {
+            cuts.push(p.clone());
+        }
+    }
+    (delivered, cuts)
+}
+
 /// The re-ask marker stops a second `reads` deferral, and it must survive
 /// being appended to any prompt: a marker that silently vanished, or that
 /// reordered the goal text, would leave the deferral loop in place.
@@ -548,6 +591,42 @@ fn the_reask_marker_without_cuts_is_the_plain_marker() {
     let p = reask_with_delivery("GOAL: fix the parser", &[], &[]);
     assert!(p.contains("[RE-ASK]"));
     assert!(!p.contains("NOT in context"), "no phantom cuts");
+}
+
+/// The marker may only claim files actually in the prompt: a diet assembly
+/// starves background before evidence, so `already` overpromises unless it
+/// is checked against what was delivered.
+#[test]
+fn delivery_names_only_files_actually_in_the_prompt() {
+    let already = vec!["a.rs".to_string(), "gone.rs".to_string()];
+    let wanted = vec!["b.rs".to_string(), "missing.rs".to_string()];
+    let full = "HEAD\n--- a.rs\ncontent a\n--- b.rs\ncontent b\n";
+    let (delivered, cuts) = honest_delivery(&already, &wanted, vec![], full);
+    assert_eq!(delivered, vec!["a.rs".to_string()]);
+    assert_eq!(cuts, vec!["gone.rs".to_string(), "missing.rs".to_string()]);
+}
+
+/// Nothing starved, nothing cut: the lists pass through exactly as the old
+/// marker received them.
+#[test]
+fn delivery_without_loss_is_the_old_marker() {
+    let already = vec!["a.rs".to_string()];
+    let wanted = vec!["b.rs".to_string()];
+    let full = "HEAD\n--- a.rs\ncontent a\n--- b.rs\ncontent b\n";
+    let (delivered, cuts) = honest_delivery(&already, &wanted, vec![], full);
+    assert_eq!(delivered, already);
+    assert!(cuts.is_empty(), "no phantom cuts: {cuts:?}");
+}
+
+/// A path already named as cut is not named twice.
+#[test]
+fn delivery_dedupes_cuts() {
+    let already: Vec<String> = vec![];
+    let wanted = vec!["missing.rs".to_string()];
+    let (delivered, cuts) =
+        honest_delivery(&already, &wanted, vec!["missing.rs".to_string()], "HEAD\n");
+    assert!(delivered.is_empty());
+    assert_eq!(cuts, vec!["missing.rs".to_string()]);
 }
 
 /// The files an artifact asked to read.
