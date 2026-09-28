@@ -3735,3 +3735,82 @@ by Ctrl-N completion. The research folder is NOT yet read by any run: it is
 store, staleness and commands only, and its help says so in the product's own
 words. Nothing here is measured against a live model: TB Slice A and the
 crossbench still need a funded endpoint for one green run.
+
+## 2026-09-28 — research wiring, judge appeal, and a session handoff
+
+Two build items closed and the tree is clean at `cad66ad`. **Measured:**
+`cargo fmt -- --check` clean; `cargo test` green (559 tests, 0 failures, 42
+binaries); `cargo clippy --all-targets --all-features -- -D warnings` clean;
+`git diff --check` clean.
+
+- **Research folder, wired** (`eb176e9`) — the folder landed inert in the
+  previous entry; a run now consults it BEFORE the first model call, and buys
+  research only on `NotAnswered`. A fresh note joins the stable head through
+  the existing layer machinery, and an absent note is bought once and
+  retrieved thereafter. **The write-gate hazard recorded earlier is now
+  structurally unreachable**: the note is written back only AFTER the run's
+  last change-set read, so a `.rof/` entry can never be the change that opens
+  a write-gated task — no gate change, and no filter to keep in step with one.
+  Knob `ROF_RESEARCH`-shaped and off by default; off means byte-identical.
+- **Judge appeal** (`cad66ad`) — the judge is measured to flip on ~13.6% of
+  identical re-runs, so one verdict is under-powered. Majority aggregation is
+  refused: 11 samples is 11x the reviewer cost. Instead, ONE compact re-ask at
+  the task's failure boundary, only when checks are green, writes landed and
+  the oracle is intact.
+  **OFF by default, and that is a judgement about risk, not cost.** The
+  appeal only ever runs where a task is ALREADY failing, so the flip it buys
+  can manufacture a false pass on a task whose checks are green but weak —
+  the exact failure this harness exists to prevent. A P1b test caught this
+  mid-build and the default was flipped for that reason. The reliable output
+  is the MEASUREMENT: `TraceEvent::JudgeAppeal` fires only on disagreement, so
+  the event count IS the flake count, and it is gathered without promoting
+  anything.
+
+## Handoff: where this stands
+
+**Done and measured (all stub-verified).** Verification integrity — protected
+oracle over baseline tests AND runner config, `.rof/` excluded so harness
+bookkeeping is not read as tampering. Cost discipline — context-per-turn
+measurement, the `reads` re-ask's second full context, cache prefix 5.5%→99.6%
+stable, an opt-in oracle-discrimination probe, an opt-in judge appeal. Meta
+layer v1 — sequential decomposition, plan as a durable per-run artifact,
+degrade-never-fail. Research — per-repo folder with COMPUTED staleness, wired
+into the run. Learn mode — the profile store, teaching one concept per goal in
+the model's own words, the lesson rendered with `/got it` and `/still lost`
+as the user's routes to `understood` and back.
+
+**Next, in the order they pay off.** (1) Skills driven by recorded
+preferences — `PROFILE.md` captures assumptions but nothing yet acts on them,
+so "adapts to how you work" is recorded and inert. (2) `/probe`, the third
+route to `understood`, which the owner asked for by name. (3) Make the eval rig
+emit a COST-ADJUSTED comparison instead of a rate: the old crossbench's table
+is marked unquotable, and spend explains 80% of variance, so an arm should
+report quality at equal-or-lower cost. Observed competence (learn-mode D)
+stays last, blocked on a competence signal that does not fire on beginners.
+
+**Blocked, unchanged.** TB Slice A's green verifier run and any live-model
+measurement need a funded endpoint (Go `429`, Zen `402`). Nothing claimed here
+was measured against a live model.
+
+**Verification the repo does NOT have.** There is no CI and no gate script:
+`scripts/` holds `live-eval.sh`, `live-go.sh`, `measure-arm.sh` but no
+`scripts/gate.sh`, and the PTY smoke lives only in a session tmpdir. The
+highest-value unblocked work is making the gate and the TUI end-to-end
+reproducible by anyone but the session that ran it.
+
+**Traps worth inheriting.** (a) Subagent briefs with long read lists burn the
+30-minute budget reading and write nothing — three timeouts this session; give
+a narrow file list, forbid surveying, one deliverable. (b) A worker waiting on
+a supervisor reply can time out before the answer lands; pre-authorise the
+mechanical edits a compile error forces. (c) Three tests in this session passed
+VACCUOUSLY (two found by me, one by a worker) — a test that cannot fail is
+worse than no test, so always ask what breaks if the feature is removed.
+(d) Worker summaries are leads, not findings: verify the central invariant by
+grepping (the `understood` single-construction, the `verdict.pass` never
+assigned) and mutation-test anything load-bearing. (e) Rewriting authorship
+rewrites every descendant hash; repoint doc citations and prove none dangle.
+
+**Housekeeping.** `history-backup`, `old-history` and `rewrite-base` are
+stale branches from an earlier rewrite attempt and are the only place the old
+`rof@local` attribution survives; `old-history` is also the only local trace
+of what that attempt dropped. They are the owner's call to delete.
