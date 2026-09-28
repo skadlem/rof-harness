@@ -141,3 +141,27 @@ fn file_map_lists_sources_and_skips_build_dirs() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A goal naming `app/events.py` must resolve it: the default extension
+/// list was Rust-centric and dropped `.py` from goal-named delivery and the
+/// file map alike, so on a Python task the patch target never reached the
+/// ask turn and every round burned its read-request on files the goal had
+/// already named (measured on Terminal-Bench session-window-debug).
+#[test]
+fn default_extensions_cover_python_sources() {
+    let root = std::env::temp_dir().join(format!("rof-retr-py-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("app")).unwrap();
+    std::fs::write(root.join("app/events.py"), "class EventSource:\n    pass\n").unwrap();
+    std::fs::write(root.join("app/notes.bin"), "binary").unwrap();
+    let r = Retriever::new(root.clone(), RetrievalConfig::default());
+    let map = r.file_map();
+    assert!(
+        map.contains("app/events.py"),
+        "a goal-named .py file must be listed and resolvable: {map}"
+    );
+    assert!(
+        !map.contains("notes.bin"),
+        "the filter still applies to binaries: {map}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

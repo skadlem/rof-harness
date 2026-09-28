@@ -133,7 +133,10 @@ impl Default for RetrievalConfig {
             max_snippets: 5,
             max_bytes_per_file: 4000,
             max_total_chars: 12_000,
-            extensions: ["rs", "md", "toml", "json", "yaml", "yml", "txt"]
+            // `py` rides along because the harness targets Python repos too
+            // (Terminal-Bench tasks): without it a goal naming `app/foo.py`
+            // resolves to nothing and the file map hides the patch target.
+            extensions: ["rs", "md", "toml", "json", "yaml", "yml", "txt", "py"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
