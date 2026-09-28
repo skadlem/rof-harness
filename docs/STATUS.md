@@ -3972,3 +3972,33 @@ The accumulation lever is now empirically #1 — ahead of the re-ask diet
 (which fires but is unmeasured) and ahead of any model swap. Slice B
 (adapter) is unblocked by method (manual seam + rival protocol both
 proven); Slice A green is still the gate for rof itself.
+
+## 2026-09-29 — keep-partial built and proven live: 6/7 on disk
+
+`1c10a03` (`ROF_KEEP_PARTIAL`, README row): failed rounds keep landed
+patches for the next round of the same attempt; attempts still start
+clean; the retry evidence carries kept text with a do-not-reapply guard
+instead of the rollback line. Tests: 2 loop tests (off pins the
+rollback, on proves two hunks accumulate) + config default/round-trip +
+a kept-text evidence unit test — all three production gates
+mutation-verified (inverted rollback, always-rolled-back evidence,
+default-true). Full suite green, clippy clean, fmt clean. Unset =
+historical path byte for byte.
+
+Live, lean a1r4 + keep (no diet, one variable): **the tree now scores
+6/7** (only idle-source fails), with fixes visibly accumulating across
+rounds (2 patches round 2, 1 more round 3) and ZERO `rolled_back`
+transitions in the trace. First lever tonight with a live score move:
+floor 3/7 sustained → 6/7 on disk. The run itself scored failed (final
+round transport-died with 0 writes), so the gate is still red — no
+green RUN yet, but any future run builds on kept baselines instead of
+from zero.
+
+Follow-ups, both red: single-hunk events.py runs (keep, then
+keep+diet-4000 at rounds=6) died on the transport lottery (4 and 5
+errors, one refused anchor guess). The diet holds re-asks at 8-10k but
+transport kills them at the same rate — prompt size is no longer the
+binding constraint tonight; endpoint variance is. The last hunk needs
+one lucky round (correct anchor + no transport death), which is a
+fresh-quota-window job, not a 14th consecutive run. Stopping live arms
+here with the 6/7 tree intact and committed in the work copy's git.
