@@ -3938,3 +3938,37 @@ fixes on disk across turns (no per-round rollback); rof discards every
 failed round and must land all-at-once. Pi's stall matches its Atria
 shape (30 min, 14 turns, zero edits). Single reps measure nothing —
 full 3-rep matrix running next.
+
+## 2026-09-29 — three-way verdict: hermes 19/21, rof 3/7, pi 6/21
+
+Matrix complete (same seed/model/oracle, fresh copy per rep):
+
+| agent | c1 | c2 | c3 | total |
+|---|---|---|---|---|
+| hermes | 6/7 (killed working) | **7/7**, rc=0, 832s | 6/7, rc=0 | **19/21** |
+| rof | 3/7 floor over 10 runs, 6/7 peak once (rolled back) | | | sustained 3/7 |
+| pi | 2/7, 0 edits | 2/7, 0 edits | 2/7, 0 edits | 6/21, never acts |
+
+Hermes c2 is a true green verified by name (all 7 PASSED, 4 files
+changed: events/gc/merger/sessions, oracle resolves to the work copy).
+Every hermes rep fixes gc+merger cumulatively; the last bug standing in
+c1 and c3 is idle-source timeout semantics — the same fix rof's near-miss
+missed, so it is the hardest hunk for every loop here, not a rof deficit.
+Pi timed out three times with byte-clean trees: on this task shape it
+never converts deliberation into an edit (contrast bug02, where the same
+pi harness passed 3/3 in ~1 min — the stall is task-shaped).
+
+Fairness ledger: rof's cell spans evolving configs while rivals ran one
+fixed shape each; rivals got the symptom-level goal while rof's later
+runs carried mechanism hints — both differences favor rof, which still
+trails. One task is narrow, but it is an external one, and this is the
+first external scoreboard with all three measured like-for-like.
+
+The finding that outranks everything else tonight: **accumulation beats
+rollback, measured against independent agents.** Hermes keeps partial
+fixes on disk across turns; rof's per-round rollback forces all-at-once
+artifacts and threw away a 3-patch round that was one hunk from green.
+The accumulation lever is now empirically #1 — ahead of the re-ask diet
+(which fires but is unmeasured) and ahead of any model swap. Slice B
+(adapter) is unblocked by method (manual seam + rival protocol both
+proven); Slice A green is still the gate for rof itself.
