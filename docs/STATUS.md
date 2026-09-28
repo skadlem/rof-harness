@@ -3879,3 +3879,36 @@ lever (patches surviving failed rounds), (b) the re-ask prompt diet, or
 (c) a model whose reasoning converges on 12k+ prompts. The seam itself
 is proven end-to-end 8 times over (host copy \u2192 mounts \u2192 docker-exec
 checks \u2192 traces); what is missing is one green run, not plumbing.
+
+## 2026-09-28 — re-ask diet built, mechanism fires live, effect unmeasured
+
+Lever (b) is now code (`033cdc6`, `ROF_REASK_BUDGET`, README row):
+`assemble_reask` fits the turn's own evidence first under a diet budget
+(same delivery order, so ample budget renders byte-identical — pinned by
+test), and the delivery list only claims paths actually in the prompt
+(the old marker promised starved files as present). Tests:
+`tests/v4_reask.rs` (4) + 3 implementer unit tests, each mutation-verified
+(order flip, floor drop, unfiltered delivery all fail); full suite green,
+clippy `-D warnings` clean, fmt clean. Unset = historical path exactly.
+
+Two live arms, same lean shape (a1r4, explorer off, this tree):
+
+- **diet=8000: mis-aimed no-op.** Re-asks came back full-size
+  (10.0/15.3/15.5/15.4k). Post-mortem: tail+volatile measured ~6.6k
+  against the 8000 budget, so everything fit and the bytes were
+  identical by construction. Composition finding that fell out: the tail
+  is only the file map (~0.3k) — the bulk is head (~8.6k, carrying
+  mid-term retrieval) plus requested files (~6.3k). A diet above actual
+  tail+volatile cannot bite, by design.
+- **diet=4000: mechanism fires.** Re-asks 10.2/12.4/12.2/11.5k — ~3k off
+  every 3-read turn — with the lowest billed cost yet (11755) and 88%
+  cache hits. But all four re-asks died at transport, so the score effect
+  is UNMEASURED, not negative: the rep says nothing about whether leaner
+  re-asks truncate less, only that the endpoint lottery ate this one.
+
+Standing result unchanged: floor 4-failed/3-passed (gc fix baselined),
+peak 6/7, gate red. The diet needs a 3-rep arm in a quieter endpoint
+window, not more hammering tonight — 10 live runs is the grind line.
+The next diet target is also named: head's retrieval (~4k of files the
+model then re-requests) duplicates what the re-ask carries, and no
+assembler budget can touch it.
