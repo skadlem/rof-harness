@@ -120,7 +120,7 @@ Minimum integrity mechanisms, in dependency order:
    test files or the runner config. This is the direct counter to #319 and it is
    ~small. Claude Code's own methodology keeps the visible test suite as the
    trust boundary and adds a *separate* scoring model on top **[ext]** — copy
-   the shape, not just the tests. **Shipped** (build item 1, commit `504ca48` +
+   the shape, not just the tests. **Shipped** (build item 1, commit `01c8f66` +
    the runner-config follow-up): baseline test paths AND baseline runner config
    are protected, using git's own tracked/untracked split so a *new* test file is
    still a legitimate deliverable. Runner config covers
