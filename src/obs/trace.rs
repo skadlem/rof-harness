@@ -160,6 +160,37 @@ pub enum TraceEvent {
         concept: String,
         reason: String,
     },
+    /// §P3 item 6: the task's own checks, re-run against the task's PRE-CHANGE
+    /// baseline. Emitted only when the probe actually ran — a skipped probe
+    /// says nothing, so a reader cannot mistake "not measured" for "measured
+    /// and found discriminating".
+    ///
+    /// An empty `failed_at_baseline` with a non-empty `vacuous` is the
+    /// signal worth reading: every check that granted the pass was ALREADY
+    /// green on the untouched tree, so the oracle proved nothing about this
+    /// change. `failed_at_baseline` names the checks that were red at the
+    /// baseline and are green now — the ones actually doing the work.
+    ///
+    /// **This is a report, never a gate.** It cannot and does not change
+    /// `verdict.pass`: "add a comment" and "rename" are legitimate tasks
+    /// whose checks pass at baseline, and refusing them would be the harness
+    /// judging work it has no evidence against.
+    ///
+    /// `restored` is the probe's own honesty flag: the work root was put back
+    /// and the restore was verified by re-reading the changed files, not by
+    /// trusting the order of operations. `false` means the run's tree is not
+    /// what the result claims and a reader must treat it as suspect.
+    OracleDiscrimination {
+        /// The task the probe belongs to.
+        task: String,
+        /// Checks that passed at the pre-change baseline: vacuous for this
+        /// change, whatever the final state says.
+        vacuous: Vec<String>,
+        /// Checks that failed at the pre-change baseline and pass now.
+        failed_at_baseline: Vec<String>,
+        /// True when the change set was restored byte-identically.
+        restored: bool,
+    },
     /// One ordered answer to one live command, identified by the id the
     /// console allocated. Acknowledgements are durable like every other step,
     /// so a recorded session replays its control history through the same

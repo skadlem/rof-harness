@@ -100,6 +100,34 @@ pub fn render_line(ev: &TraceEvent) -> String {
             }
         }
         TraceEvent::AutoPoke { task, reason } => format!("· auto-poke {task}: {reason}"),
+        // The oracle-discrimination probe (§P3 item 6). A vacuous oracle is
+        // the line worth reading — the pass it granted proves nothing about
+        // this change — and it is worded as a report, never as a refusal.
+        TraceEvent::OracleDiscrimination {
+            vacuous,
+            failed_at_baseline,
+            restored,
+            ..
+        } => {
+            let mut line = if vacuous.is_empty() {
+                format!(
+                    "· oracle probe: {} check(s) discriminate this change",
+                    failed_at_baseline.len()
+                )
+            } else {
+                format!(
+                    "· oracle probe: VACUOUS — {} check(s) also pass without the change ({})",
+                    vacuous.len(),
+                    vacuous.join(", ")
+                )
+            };
+            if !*restored {
+                // Never printed as if the run were fine: the work root could
+                // not be put back, so a reader must treat the tree as suspect.
+                line.push_str(" — WORK ROOT NOT RESTORED");
+            }
+            line
+        }
         // The same formatter the live reducer uses, so a replayed
         // acknowledgement reads identically to the live one.
         TraceEvent::Control(ack) => super::app::control_ack_line(ack),

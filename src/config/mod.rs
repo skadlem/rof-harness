@@ -272,6 +272,34 @@ pub struct AppConfig {
     /// it was, so a run is byte-identical to one from before the knob existed.
     #[serde(default)]
     pub per_turn_context_cap: usize,
+
+    /// §P3 item 6: after a task's checks PASS, re-run the SAME commands
+    /// against the task's pre-change baseline and report whether they pass
+    /// there too. A check that is green on an untouched tree proves nothing
+    /// about this change, and this repo has shipped that defect once
+    /// (`checks_pass(&[])` on an empty list read as a pass).
+    ///
+    /// This is NOT mutation testing. No mutant is generated, no source line
+    /// is changed and the suite is not re-run per mutant; the only thing
+    /// re-executed is the oracle itself, against the baseline commit the
+    /// attempt already started from. The cost is therefore ONE extra
+    /// execution of the commands the task already ran — paid only when the
+    /// task already passed, so a failing task costs nothing — plus a
+    /// rollback and a byte-verified restore of the change set.
+    ///
+    /// **Off by default, and the default is a measurement, not a shrug.**
+    /// Doubling the check executions of every passing task is a real cost,
+    /// and a run must be able to say what it cost before paying it; the
+    /// eval path, which already pays exactly this against its own baseline
+    /// (`eval::suite::oracle_ok`), is unaffected either way. With the knob
+    /// off, a run executes its checks exactly once and its result carries no
+    /// `oracle_probe` key at all, so the default run is byte-identical to
+    /// one from before the probe existed.
+    ///
+    /// Reported, never a gate: a vacuous oracle is a signal in the trace and
+    /// on the task result, and it never flips `verdict.pass`.
+    #[serde(default)]
+    pub oracle_discrimination: bool,
 }
 
 fn one_job() -> usize {
@@ -371,6 +399,9 @@ impl Default for AppConfig {
             endpoint: crate::llm::profile::EndpointProfile::default(),
             // §6: measured, not cut. See the field's doc comment.
             per_turn_context_cap: 0,
+            // Off: it doubles the check executions of a passing task. Opt in
+            // when the run's oracle is the thing under suspicion.
+            oracle_discrimination: false,
         }
     }
 }

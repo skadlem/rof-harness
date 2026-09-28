@@ -104,6 +104,173 @@ impl Orchestrator {
         });
     }
 
+    /// §P3 item 6: does this task's oracle DISCRIMINATE?
+    ///
+    /// After a task's checks pass, the same commands are re-run against the
+    /// task's pre-change baseline (the commit the passing attempt started
+    /// from, §4.2) and the answer is reported: a check that is green there
+    /// too proves nothing about THIS change. That is fault injection at the
+    /// ORACLE level, not source mutation — no mutant is generated, no source
+    /// line is touched, and the suite is not re-run per mutant. The eval path
+    /// already owns the same property over its own baseline
+    /// (`eval::suite::oracle_ok`); this is the live path's missing half.
+    ///
+    /// **Reported, never a gate.** Nothing here writes `verdict.pass` or
+    /// returns a refusal. "Add a comment" and "rename" are legitimate tasks
+    /// whose checks pass at baseline, and the harness has no evidence that a
+    /// vacuous oracle means the work was not done. The signal goes in the
+    /// trace and on the task result; the pass stands.
+    ///
+    /// Skipped, silently, where it cannot apply: the knob off, no checks
+    /// configured, `expect_writes == false` (an analysis task has no baseline
+    /// behaviour for a check to discriminate), no git baseline to restore, or
+    /// an empty change set. A skip emits nothing, because a reader must not
+    /// be able to mistake "not measured" for "measured and discriminating".
+    ///
+    /// The baseline is the start of the PASSING ROUND, not the task's first
+    /// round: that is the state the oracle just judged, so it is the state the
+    /// question is about. For a single-round pass — the common case — the two
+    /// are the same commit.
+    ///
+    /// Cost: one extra execution of the checks the task already ran, plus a
+    /// rollback and a restore of the change set. Never paid for a failing
+    /// task, and never paid at all unless the knob is on.
+    async fn probe_oracle_discrimination(
+        &self,
+        session: &Session,
+        svc: &RoundServices<'_>,
+        tree: &TreeService,
+        workdir: &std::path::Path,
+        task: &str,
+    ) -> Option<serde_json::Value> {
+        if !self.cfg.oracle_discrimination
+            || session.checks.is_empty()
+            || !session.expect_writes
+            || !tree.is_repo()
+        {
+            return None;
+        }
+        // An empty change set means the tree already IS the baseline, so the
+        // probe would report every check as vacuous and mean nothing by it.
+        let diff = tree.diff().ok()?;
+        if diff.is_empty() {
+            return None;
+        }
+        // The bytes, taken before anything is touched: the restore is a
+        // re-write of exactly what was there, not a re-derivation from git.
+        let saved = Self::snapshot_change_set(tree.root(), &diff.names)?;
+        if let Err(e) = tree.rollback() {
+            // Best effort in the other direction too: a rollback that failed
+            // halfway may already have moved the tree, so put back whatever
+            // was captured and report the fault. Then skip — a probe that
+            // could not reach the baseline has no answer to give.
+            Self::restore_change_set(tree.root(), &saved);
+            self.trace.emit(TraceEvent::ModelError {
+                agent: "tree".to_string(),
+                error: format!("oracle probe: baseline restore failed (probe skipped): {e}"),
+            });
+            return None;
+        }
+        let baseline = svc.run_checks(session, workdir).await;
+        // The restore is verified by reading the files back, not by trusting
+        // the order of the operations above: a probe that can leave a user's
+        // work tree modified is worse than no probe at all.
+        let restored = Self::restore_change_set(tree.root(), &saved)
+            && tree
+                .diff()
+                .map(|after| after.names == diff.names)
+                .unwrap_or(false);
+        let mut vacuous = Vec::new();
+        let mut failed_at_baseline = Vec::new();
+        for c in &baseline {
+            if c.passed {
+                vacuous.push(c.name.clone());
+            } else {
+                failed_at_baseline.push(c.name.clone());
+            }
+        }
+        self.trace.emit(TraceEvent::OracleDiscrimination {
+            task: task.to_string(),
+            vacuous: vacuous.clone(),
+            failed_at_baseline: failed_at_baseline.clone(),
+            restored,
+        });
+        Some(serde_json::json!({
+            "vacuous": vacuous,
+            "failed_at_baseline": failed_at_baseline,
+            "restored": restored,
+        }))
+    }
+
+    /// The change set as bytes, so the probe can put the work root back
+    /// exactly. A path that is not on disk is recorded as `None`: the rollback
+    /// brings it back and the restore has to take it away again.
+    ///
+    /// Returns `None` — skip the probe, silently — on anything it cannot
+    /// round-trip faithfully: a symlink (writing the bytes back would replace
+    /// the link with a regular file) or an unreadable path.
+    fn snapshot_change_set(
+        root: &std::path::Path,
+        names: &[String],
+    ) -> Option<Vec<(String, Option<Vec<u8>>)>> {
+        let mut out: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+        for name in names {
+            let path = root.join(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => return None,
+                // `git status --porcelain` collapses an untracked directory
+                // into one entry, so the bytes that matter are the files in it.
+                Ok(meta) if meta.is_dir() => {
+                    let mut files = Vec::new();
+                    Self::collect_files(&path, &mut files)?;
+                    for file in files {
+                        let rel = file.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+                        out.push((rel, Some(std::fs::read(&file).ok()?)));
+                    }
+                }
+                _ => out.push((name.clone(), std::fs::read(&path).ok())),
+            }
+        }
+        Some(out)
+    }
+
+    fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Option<()> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::collect_files(&path, out)?;
+            } else {
+                out.push(path);
+            }
+        }
+        Some(())
+    }
+
+    /// Writes the snapshot back and RE-READS it to confirm. Returns whether
+    /// the work root is byte-identical to what it was.
+    fn restore_change_set(root: &std::path::Path, saved: &[(String, Option<Vec<u8>>)]) -> bool {
+        for (name, bytes) in saved {
+            let path = root.join(name);
+            match bytes {
+                Some(b) => {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::write(&path, b).is_err() {
+                        return false;
+                    }
+                }
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        // Verified by reading, not by trusting the writes above.
+        saved
+            .iter()
+            .all(|(name, bytes)| std::fs::read(root.join(name)).ok() == *bytes)
+    }
+
     /// The same loop, with the live boundary hook threaded through it. A
     /// command is drained only after a complete implementer/reviewer round,
     /// so it can never mutate the model call or tool invocation in flight.
@@ -848,6 +1015,18 @@ impl Orchestrator {
                     break;
                 }
             } // end attempts loop
+              // §P3 item 6: the oracle-discrimination probe, here because this
+              // is the one point where the task's outcome is final AND the tree
+              // still holds the passing attempt's change set (a failed round
+              // rolled it back; this one did not). Reported, never a gate: a
+              // null result means the probe did not apply, a filled one never
+              // changes `verdict.pass` above.
+            let oracle_probe = if verdict.pass {
+                self.probe_oracle_discrimination(session, &svc, &tree, workdir, task)
+                    .await
+            } else {
+                None
+            };
             let aborted = budget_hit.is_some();
             if aborted {
                 verdict = Verdict {
@@ -859,7 +1038,7 @@ impl Orchestrator {
                     ),
                 };
             }
-            task_results.push(serde_json::json!({
+            let mut task_row = serde_json::json!({
                 "task": task,
                 "passed": verdict.pass,
                 // The goal's lesson, mirrored onto the task that taught it,
@@ -877,7 +1056,14 @@ impl Orchestrator {
                 "check_results": check_results,
                 "artifact": artifact,
                 "feedback": verdict.feedback,
-            }));
+            });
+            // Absent, not null, when the probe did not run: a key that only
+            // exists when something was measured is what keeps the default
+            // (knob off) result byte-identical to one from before this code.
+            if let Some(probe) = oracle_probe {
+                task_row["oracle_probe"] = probe;
+            }
+            task_results.push(task_row);
             if !verdict.pass {
                 passed = false;
                 break;
@@ -1257,24 +1443,44 @@ impl Orchestrator {
             // Cheapest-pass wins; a failure only replaces "nothing yet".
             // Sequential attempts bill in order, so the first pass is the cheapest.
             let billed_now = self.trace.total_tokens();
+            // §P3 item 6: the oracle-discrimination probe, in the same place
+            // as the pipeline loop's — after the verify guard (so a vetoed
+            // task is not probed) and while the tree still holds the passing
+            // attempt's change set. Direct mode gets the identical probe for
+            // the same reason its protected-oracle gate is applied there
+            // unconditionally: with no reviewer, the configured check suite
+            // IS the oracle, so a vacuous one is at least as dangerous here.
+            let oracle_probe = if passed {
+                self.probe_oracle_discrimination(session, svc, tree, workdir, &session.goal)
+                    .await
+            } else {
+                None
+            };
             if passed && best_json.is_none() {
                 best_billed = billed_now;
+                let mut row = serde_json::json!({
+                    "task": session.goal,
+                    "passed": passed,
+                    "rounds": rounds,
+                    "writes_made": writes_made,
+                    "changed_files": changed_files,
+                    "diff_stat": diff_stat,
+                    "artifact": artifact,
+                    "check_results": check_results,
+                    "feedback": feedback,
+                    // The goal's lesson, mirrored onto its single task so
+                    // a consumer reading `tasks` sees it without knowing
+                    // about the run-level key.
+                    "lesson": goal_lesson,
+                });
+                // Absent when the probe did not run, for the same reason the
+                // pipeline loop omits it: the default result stays
+                // byte-identical to one from before the probe existed.
+                if let Some(probe) = oracle_probe {
+                    row["oracle_probe"] = probe;
+                }
                 best_json = Some(serde_json::json!({
-                    "tasks": [{
-                        "task": session.goal,
-                        "passed": passed,
-                        "rounds": rounds,
-                        "writes_made": writes_made,
-                        "changed_files": changed_files,
-                        "diff_stat": diff_stat,
-                        "artifact": artifact,
-                        "check_results": check_results,
-                        "feedback": feedback,
-                        // The goal's lesson, mirrored onto its single task so
-                        // a consumer reading `tasks` sees it without knowing
-                        // about the run-level key.
-                        "lesson": goal_lesson,
-                    }],
+                    "tasks": [row],
                     "rounds": rounds,
                     "passed": passed,
                     "retrieved": retrieved_json,
