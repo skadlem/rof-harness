@@ -103,6 +103,15 @@ pub fn render_line(ev: &TraceEvent) -> String {
         // The oracle-discrimination probe (§P3 item 6). A vacuous oracle is
         // the line worth reading — the pass it granted proves nothing about
         // this change — and it is worded as a report, never as a refusal.
+        TraceEvent::JudgeAppeal {
+            task,
+            first_pass,
+            second_pass,
+        } => format!(
+            "⚖ judge appeal on {task}: first verdict {}, second {} — same evidence",
+            if *first_pass { "pass" } else { "fail" },
+            if *second_pass { "pass" } else { "fail" }
+        ),
         TraceEvent::OracleDiscrimination {
             vacuous,
             failed_at_baseline,

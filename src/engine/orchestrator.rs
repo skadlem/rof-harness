@@ -566,6 +566,11 @@ impl Orchestrator {
             };
             let mut ran = 0;
             let mut writes_made = 0usize;
+            // Carried out of the round loop so the judge appeal at the task
+            // boundary can ask "was the oracle intact?" without taking a
+            // second git read at a point where the answer has to be the same
+            // one the gate saw.
+            let mut task_oracle_tampered: Vec<String> = Vec::new();
             let limit = session.max_tokens.unwrap_or(self.cfg.max_tokens_per_task);
             let budget = svc.budget(limit);
             let mut budget_hit: Option<u64> = None;
@@ -928,6 +933,7 @@ impl Orchestrator {
                     // at baseline is protected, so a new test file — the
                     // deliverable of an "add tests" task — never trips it.
                     let tampered = diff.protected_oracle();
+                    task_oracle_tampered = tampered.clone();
                     if verdict.pass && session.expect_writes && !tampered.is_empty() {
                         self.trace.emit(TraceEvent::StateTransition {
                             from: "verdict_pass".to_string(),
@@ -1067,6 +1073,39 @@ impl Orchestrator {
                         limit
                     ),
                 };
+            }
+            // §5 item 7: ONE compact appeal, at the failure boundary only.
+            //
+            // The judge flips on ~13.6% of identical re-runs, so one verdict
+            // is under-powered — and majority aggregation costs 11 samples,
+            // which this harness will not pay silently. The appeal buys one,
+            // and only where a false FAILURE is already the expensive
+            // outcome: the task is heading for a fail while every
+            // deterministic signal is green.
+            //
+            // The conditions are the point. No checks, or a failing one, and
+            // there is no green evidence to appeal with. No writes under
+            // `expect_writes`, same. A protected path modified, same. An
+            // aborted task never appeals — the budget, not the judge, decided
+            // that one.
+            let deterministics_green = !check_results.is_empty()
+                && crate::engine::session::checks_pass(&check_results)
+                && (!session.expect_writes || writes_made > 0)
+                && task_oracle_tampered.is_empty();
+            if self.cfg.judge_appeal && !verdict.pass && !aborted && deterministics_green {
+                if let Some(second) = svc
+                    .appeal_verdict(task, &artifact, &check_results, &verdict)
+                    .await
+                {
+                    if second.pass != verdict.pass {
+                        self.trace.emit(TraceEvent::JudgeAppeal {
+                            task: task.clone(),
+                            first_pass: verdict.pass,
+                            second_pass: second.pass,
+                        });
+                    }
+                    verdict = second;
+                }
             }
             let mut task_row = serde_json::json!({
                 "task": task,
@@ -1602,6 +1641,13 @@ impl Orchestrator {
             return String::new();
         }
         format!("{mem_text}{note}")
+    }
+
+    /// Test hook: force the execution mode, so a test can drive the DIRECT
+    /// loop without a config file. Narrow on purpose — production selects the
+    /// mode from `AppConfig`, and nothing else should be able to reach here.
+    pub fn set_execution_for_test(&mut self, mode: &str) {
+        self.cfg.execution = mode.to_string();
     }
 
     /// The durable sink this run records into. The orchestrator emits every

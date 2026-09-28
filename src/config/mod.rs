@@ -301,6 +301,33 @@ pub struct AppConfig {
     #[serde(default)]
     pub oracle_discrimination: bool,
 
+    /// §5, build item 7: **one compact appeal of a failing verdict**, and only
+    /// where every deterministic signal is green.
+    ///
+    /// The judge is measured to flip on ~13.6% of identical re-runs, so a
+    /// single verdict is under-powered. Majority aggregation is the textbook
+    /// fix and is refused here: 11 samples is 11x the reviewer cost, and this
+    /// harness treats spend as the dominant quality axis. The appeal buys
+    /// exactly ONE more sample, at the task's failure boundary.
+    ///
+    /// **OFF by default, and the default is a judgement about RISK, not
+    /// cost.** The appeal only ever runs where a task is already failing, so
+    /// the flip it is buying is in the dangerous direction: on a task whose
+    /// checks are green but weak, a second agreeing sample turns bad work into
+    /// a pass. The 13.6% is symmetric, so the appeal recovers some false
+    /// failures AND manufactures false passes, and the false pass is the
+    /// failure this whole harness is built to prevent. The honest summary is
+    /// that the appeal's reliable value is the MEASUREMENT — every
+    /// disagreement is recorded, so the trace counts the harness's own judge
+    /// instability on real tasks — and the promotion is a gamble.
+    ///
+    /// So the promotion is opt-in. With the knob off, nothing is bought, no
+    /// verdict moves, and a run is byte-identical to one from before this
+    /// existed. With it on, a disagreement event is still recorded either way,
+    /// so the flake count can be gathered WITHOUT ever promoting a task.
+    #[serde(default)]
+    pub judge_appeal: bool,
+
     /// §7, build item 5's second half: **retrieval before research**. Before a
     /// run shapes its first prompt it asks `.rof/research/` whether the
     /// question its goal names is already answered. The answer is the store's
@@ -434,6 +461,7 @@ impl Default for AppConfig {
             // Off: it doubles the check executions of a passing task. Opt in
             // when the run's oracle is the thing under suspicion.
             oracle_discrimination: false,
+            judge_appeal: false,
             // Off: it adds a lookup, and at most one bounded model call, to
             // every run. Opt in per repo, once the folder has notes in it.
             research_before_work: false,

@@ -191,6 +191,24 @@ pub enum TraceEvent {
         /// True when the change set was restored byte-identically.
         restored: bool,
     },
+    /// Two judge verdicts on the same evidence DISAGREED.
+    ///
+    /// This is a measurement, not noise: the judge is measured to flip on
+    /// ~13.6% of identical re-runs, and a disagreement under green
+    /// deterministic evidence is this harness observing that instability on a
+    /// real task. Emitted ONLY when the two differ, so the count of these
+    /// events IS the flake count.
+    ///
+    /// `first_pass`/`second_pass` are the two verdicts. The second turning
+    /// the task's failure into a pass does NOT mean the work was correct: two
+    /// samples can be wrong the same way, and the residual case — green
+    /// checks, wrong work — is the vacuous-oracle problem
+    /// `OracleDiscrimination` exists to find.
+    JudgeAppeal {
+        task: String,
+        first_pass: bool,
+        second_pass: bool,
+    },
     /// §7's retrieval-before-fetch, as a run performs it: what the run asked
     /// the research folder, and what came back. Emitted ONCE per run, before
     /// the first model call, because a decision recorded after the spend

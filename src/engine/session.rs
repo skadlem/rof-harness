@@ -266,6 +266,70 @@ impl<'a> RoundServices<'a> {
         }
     }
 
+    /// ONE compact re-ask of the reviewer, used only by the judge appeal.
+    ///
+    /// A measured property of the judge is that its verdict flips on ~13.6% of
+    /// identical re-runs, so one sample is statistically under-powered. The
+    /// honest fix is more samples — and 11 of them, which is what a 95%
+    /// majority actually costs, is not a trade this harness should make
+    /// silently. So the appeal buys exactly ONE more sample, and only where a
+    /// false FAILURE is already the expensive outcome: a task about to be
+    /// recorded as failed while every deterministic signal is green.
+    ///
+    /// The prompt is deliberately compact — the artifact's answer, the check
+    /// log, and the verdict under appeal. This is a yes/no on "is this done",
+    /// not a fresh review, so it needs none of the layer machinery and costs
+    /// far less than the round it follows.
+    ///
+    /// It does NOT make the verdict sound. Two samples can be wrong the same
+    /// way; the residual case is "deterministic checks green, work still
+    /// wrong", which is the vacuous-oracle problem the discrimination sensor
+    /// exists to find. The appeal buys a second opinion, not a proof.
+    ///
+    /// And the direction matters: this only ever runs where a task is ALREADY
+    /// failing, so the flip it buys can manufacture a false PASS. That is why
+    /// `judge_appeal` is off by default — the disagreement it records is the
+    /// reliable output; the promotion is the gamble.
+    pub async fn appeal_verdict(
+        &self,
+        task: &str,
+        artifact: &serde_json::Value,
+        checks: &[CheckResult],
+        first: &Verdict,
+    ) -> Option<Verdict> {
+        if !self.cfg.judge_appeal {
+            return None;
+        }
+        use crate::agents::Agent;
+        let reviewer = crate::agents::ReviewerAgent::new(self.verify);
+        let view = crate::context::CtxView {
+            prompt: format!(
+                "APPEAL task: {task}\nThe first verdict was pass={} with this note: {}\n\
+                 Re-read the evidence and give your own verdict. Pass only if the \
+                 work is genuinely complete.\nARTIFACT: {}\nCHECKS:\n{}",
+                first.pass,
+                first.feedback,
+                answer_of(artifact),
+                render_checks(checks)
+            ),
+            used_tokens: 0,
+            truncated: false,
+        };
+        let out = reviewer
+            .run(crate::agents::AgentCtx {
+                view: &view,
+                context: None,
+                executor: Some(self.verify),
+                tools: Some(self.tools),
+                workdir: None,
+                trace: self.trace,
+                volatile_budget: 0,
+            })
+            .await
+            .ok()?;
+        serde_json::from_value(out.data).ok()
+    }
+
     /// The skill index as `agent` may see it. Empty when the grant does not
     /// cover `skills.list`, when the store is empty, or when the tool fails —
     /// an agent that may not list skills simply gets no `[SKILLS]` block.
