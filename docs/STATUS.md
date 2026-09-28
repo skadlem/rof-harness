@@ -4022,3 +4022,26 @@ loop, and feeding the shape to the agent would make any green weaker
 than hermes' unaided 7/7. The shape is recorded so the next agent patch
 can be verified instantly instead of diagnosed again. Slice A green
 still needs one lucky agent round; Slice B stays gated on it.
+
+## 2026-09-29 — named-paths fix: prompt arc 22k → 5k, endpoint still red
+
+Two findings banked as code. First, the `py` default experiment
+backfired instructively: mid-term keyword retrieval flooded to its 12k
+cap and asks hit 22-24k (ask-side death). Reverted. Second, the real
+gap was narrower: `named_paths` applied the Rust-centric extension
+filter AND choked on trailing sentence punctuation (`app/foo.py.` never
+matched), so explicitly named patch targets resolved to nothing.
+`7257874` drops the ext gate for named paths only (existence is the
+relevance signal; keyword walk and file map keep the filter) and strips
+trailing punctuation while preserving leading dots for dotfiles.
+Tests: named-resolution with and without trailing punctuation,
+mutation-verified (ext gate restored → fails); full suite green, clippy
+clean, fmt clean.
+
+Live single-file run: asks now 4.2-5.9k (flood gone, events.py whole in
+tail) — the best-shaped prompts of the campaign — but 3/4 asks and the
+re-ask died at transport, 1 at truncation. Nineteen live runs: every
+harness lever is built and the prompts are finally right-sized, while
+the endpoint kills ~80% of turns regardless of size. Stopping live arms
+until a genuinely fresh window; the 6/7 tree and the diagnosed hunk
+shape both wait on disk.
