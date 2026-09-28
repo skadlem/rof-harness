@@ -23,6 +23,9 @@ struct FakeClient {
     /// Patch a file successfully in round 1, then answer round 2 from the file
     /// state it was handed (exercises the applied-change evidence path).
     applied_retry: bool,
+    /// Land one hunk per round and keep them across rounds (exercises the
+    /// keep-partial path: no rollback between rounds of one attempt).
+    keep_accumulates: bool,
     /// Ask to read a file, then write with it (exercises the read-request turn).
     read_then_write: bool,
     /// Ask for a path outside the workdir, then answer.
@@ -50,6 +53,10 @@ static SAW_SUMMARY: AtomicBool = AtomicBool::new(false);
 static IMPL_RETRY_PROMPT: Mutex<String> = Mutex::new(String::new());
 /// Same, for the applied-change test (separate slot: tests run in parallel).
 static IMPL_RETRY_PROMPT_APPLIED: Mutex<String> = Mutex::new(String::new());
+/// Same, for the keep-partial tests. One slot for the pair, so the two tests
+/// serialize on the guard below instead of racing on the capture.
+static IMPL_RETRY_PROMPT_KEEP: Mutex<String> = Mutex::new(String::new());
+static KEEP_TEST_ORDER: Mutex<()> = Mutex::new(());
 /// The prompt of the implementer turn that carried requested files.
 static IMPL_READ_PROMPT: Mutex<String> = Mutex::new(String::new());
 // The tests that read it run in parallel and the capture is a global, so a
@@ -78,6 +85,7 @@ impl FakeClient {
             applied_retry: false,
             read_then_write: false,
             read_escape: false,
+            keep_accumulates: false,
             veto_guard: false,
             saw_explorer: AtomicBool::new(false),
             impl_prompts: Mutex::new(Vec::new()),
@@ -96,6 +104,7 @@ impl FakeClient {
             applied_retry: false,
             read_then_write: false,
             read_escape: false,
+            keep_accumulates: false,
             veto_guard: false,
             saw_explorer: AtomicBool::new(false),
             impl_prompts: Mutex::new(Vec::new()),
@@ -111,6 +120,7 @@ impl FakeClient {
             fail_first_review: false,
             plan_tasks: vec!["t1"],
             guess_then_fix: true,
+            keep_accumulates: false,
             applied_retry: false,
             read_then_write: false,
             read_escape: false,
@@ -132,6 +142,28 @@ impl FakeClient {
             plan_tasks: vec!["t1"],
             guess_then_fix: false,
             applied_retry: true,
+            keep_accumulates: false,
+            read_then_write: false,
+            read_escape: false,
+            veto_guard: false,
+            saw_explorer: AtomicBool::new(false),
+            impl_prompts: Mutex::new(Vec::new()),
+        }
+    }
+    fn keep_accumulates() -> Self {
+        Self {
+            direct_calls: AtomicUsize::new(0),
+            direct_saw_feedback: AtomicBool::new(false),
+            review_saw_verified_file: AtomicBool::new(false),
+            planner_calls: AtomicUsize::new(0),
+            review_calls: AtomicUsize::new(0),
+            // round 1 lands the first hunk, so round 2 only runs if the
+            // reviewer fails it — exactly the shape partial progress takes
+            fail_first_review: true,
+            plan_tasks: vec!["t1"],
+            guess_then_fix: false,
+            applied_retry: false,
+            keep_accumulates: true,
             read_then_write: false,
             read_escape: false,
             veto_guard: false,
@@ -151,6 +183,7 @@ impl FakeClient {
             guess_then_fix: false,
             applied_retry: false,
             read_then_write: true,
+            keep_accumulates: false,
             read_escape: false,
             veto_guard: false,
             saw_explorer: AtomicBool::new(false),
@@ -170,6 +203,7 @@ impl FakeClient {
             applied_retry: false,
             read_then_write: false,
             read_escape: true,
+            keep_accumulates: false,
             veto_guard: false,
             saw_explorer: AtomicBool::new(false),
             impl_prompts: Mutex::new(Vec::new()),
@@ -321,6 +355,19 @@ impl LlmClient for FakeClient {
             }
             return Self::resp(
                 "{\"patches\":[{\"path\":\"a.txt\",\"search\":\"beta_real_line\",\"replace\":\"beta_fixed\"}],\"notes\":\"first attempt\"}",
+            );
+        }
+        if req.system.contains("implementer") && self.keep_accumulates {
+            if req.prompt.contains("round 2/2") {
+                *IMPL_RETRY_PROMPT_KEEP.lock().unwrap() = req.prompt.clone();
+                // Second hunk on top of the first: anchors on text present in
+                // both the baseline and the kept tree.
+                return Self::resp(
+                    "{\"patches\":[{\"path\":\"a.txt\",\"search\":\"gamma\",\"replace\":\"gamma_fixed\"}],\"notes\":\"second hunk\"}",
+                );
+            }
+            return Self::resp(
+                "{\"patches\":[{\"path\":\"a.txt\",\"search\":\"beta_real_line\",\"replace\":\"beta_fixed\"}],\"notes\":\"first hunk\"}",
             );
         }
         Self::resp("{\"artifact\": \"did t1\", \"notes\": \"ok\"}")
@@ -1584,4 +1631,75 @@ async fn a_run_that_cannot_prepare_the_tree_still_acknowledges_its_commands() {
     assert_eq!(acks[0].id, 1);
     assert_eq!(acks[0].status, ControlStatus::Applied);
     assert_eq!(control.take_queued_goal().map(|g| g.0), Some(1));
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: the KEEP_TEST_ORDER guard is the serializer
+async fn without_keep_partial_a_failed_round_rolls_back() {
+    // Baseline behavior, pinned: round 1's landed hunk is reverted, so the
+    // retry sees the baseline and the final tree holds only round 2's hunk.
+    let _o = KEEP_TEST_ORDER.lock().unwrap();
+    let (orch, reg, root) = harness(Arc::new(FakeClient::keep_accumulates()), "keep-off", 2);
+    std::fs::write(root.join("a.txt"), "alpha\nbeta_real_line\ngamma\n").unwrap();
+    let out = orch
+        .run_loop(
+            &Session::new("g".into()).expecting_writes(false),
+            &reg,
+            &root,
+        )
+        .await;
+    let retry = IMPL_RETRY_PROMPT_KEEP.lock().unwrap().clone();
+    assert!(
+        retry.contains("ROLLED BACK"),
+        "retry must say the change is gone: {retry}"
+    );
+    assert!(
+        !retry.contains("beta_fixed"),
+        "retry carries text the tree no longer has: {retry}"
+    );
+    assert_eq!(out["rounds"], 2);
+    assert_eq!(out["passed"], true);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "alpha\nbeta_real_line\ngamma_fixed\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: the KEEP_TEST_ORDER guard is the serializer
+async fn with_keep_partial_rounds_accumulate_on_disk() {
+    // The lever: no rollback between rounds of one attempt, so round 2
+    // builds on round 1's landed hunk and the final tree holds both.
+    let _o = KEEP_TEST_ORDER.lock().unwrap();
+    let (orch, reg, root) = harness_with(
+        Arc::new(FakeClient::keep_accumulates()),
+        "keep-on",
+        2,
+        |cfg| cfg.keep_partial = true,
+    );
+    std::fs::write(root.join("a.txt"), "alpha\nbeta_real_line\ngamma\n").unwrap();
+    let out = orch
+        .run_loop(
+            &Session::new("g".into()).expecting_writes(false),
+            &reg,
+            &root,
+        )
+        .await;
+    let retry = IMPL_RETRY_PROMPT_KEEP.lock().unwrap().clone();
+    assert!(
+        !retry.contains("ROLLED BACK"),
+        "nothing was reverted, so the retry must not claim it was: {retry}"
+    );
+    assert!(
+        retry.contains("beta_fixed"),
+        "retry must see round 1's change still on disk: {retry}"
+    );
+    assert_eq!(out["rounds"], 2);
+    assert_eq!(out["passed"], true);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "alpha\nbeta_fixed\ngamma_fixed\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
 }

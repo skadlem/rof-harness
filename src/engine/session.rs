@@ -788,7 +788,12 @@ pub fn skill_changes_line(artifact: &serde_json::Value) -> String {
 /// both measured: "search string not found" with no file in front of the model
 /// makes it guess again, and a retry told an applied edit is in place neither
 /// re-applies it nor re-reads the file (duplicate definitions, E0592/E0428).
-pub fn file_state_evidence(artifact: &serde_json::Value) -> String {
+/// `rolled_back` says whether the tree went back to the baseline after the
+/// artifact's writes landed. With rollback the post-attempt text is not on
+/// disk and must not be handed over; with keep-partial rounds nothing was
+/// reverted, so the text is still current and the retry extends it instead
+/// of re-applying it.
+pub fn file_state_evidence(artifact: &serde_json::Value, rolled_back: bool) -> String {
     // ponytail: one shared budget, first file takes it; split it per file when
     // a run shows two touched files that both need their text.
     const CAP: usize = 12_000;
@@ -822,13 +827,31 @@ pub fn file_state_evidence(artifact: &serde_json::Value) -> String {
         let path = e.get("path").and_then(|v| v.as_str()).unwrap_or("?");
         let why = e.get("why").and_then(|v| v.as_str()).unwrap_or("changed");
         if why == "applied" || why == "rewritten" {
-            // The text is deliberately not included: the harness restored the
-            // baseline, so this content is not on disk. `retrieved:` and a
-            // fresh read show the file as it is.
+            if rolled_back {
+                // The text is deliberately not included: the harness restored the
+                // baseline, so this content is not on disk. `retrieved:` and a
+                // fresh read show the file as it is.
+                out.push_str(&format!(
+                    "\nFILE {path} ({why} by your previous round, then ROLLED BACK by the harness: \
+                     the tree is back to its baseline and the change is NOT in it now — re-read \
+                     the file and re-apply the change if the task still needs it).\n"
+                ));
+                continue;
+            }
+            // Kept: nothing was reverted, so this text is still on disk.
+            // Hand it over with the one rule that prevents the duplicate
+            // class: extend what is there, do not apply the same change
+            // a second time.
+            let text = e
+                .get("current_content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let win: String = text.chars().take(left).collect();
             out.push_str(&format!(
-                "\nFILE {path} ({why} by your previous round, then ROLLED BACK by the harness: \
-                 the tree is back to its baseline and the change is NOT in it now — re-read \
-                 the file and re-apply the change if the task still needs it).\n"
+                "\nFILE {path} ({why} by your previous round and still on disk — \
+                 the change was NOT rolled back. This is its content NOW: do not \
+                 re-apply the same change, extend it if the task still needs more).\
+                 \n--- {path} (current content) ---\n{win}\n"
             ));
         } else {
             let text = e
@@ -1056,7 +1079,7 @@ mod file_state_tests {
             "file_state": [],
             "test_report": "the suite is red; assert total() == 22 fails",
         });
-        let ev = file_state_evidence(&artifact);
+        let ev = file_state_evidence(&artifact, true);
         assert!(
             ev.contains("TEST REPORT"),
             "the report must reach the retry: {ev}"
@@ -1069,10 +1092,10 @@ mod file_state_tests {
     #[test]
     fn no_test_report_adds_nothing() {
         let artifact = serde_json::json!({"file_state": []});
-        assert_eq!(file_state_evidence(&artifact), "");
+        assert_eq!(file_state_evidence(&artifact, true), "");
         let artifact = serde_json::json!({"file_state": [], "test_report": ""});
         assert_eq!(
-            file_state_evidence(&artifact),
+            file_state_evidence(&artifact, true),
             "",
             "an empty report is not carried"
         );
@@ -1093,7 +1116,7 @@ mod file_state_tests {
                 {"path": "src/a.rs", "why": "search string not found", "current_content": "NEW"},
             ]
         });
-        let out = file_state_evidence(&artifact);
+        let out = file_state_evidence(&artifact, true);
         assert!(out.contains("NEW"), "{out}");
         assert!(!out.contains("OLD"), "{out}");
         assert!(out.contains("PATCH REFUSED for src/a.rs"), "{out}");
@@ -1106,9 +1129,26 @@ mod file_state_tests {
         let artifact = serde_json::json!({
             "file_state": [{"path": "src/a.rs", "why": "applied", "current_content": "LANDED"}]
         });
-        let out = file_state_evidence(&artifact);
+        let out = file_state_evidence(&artifact, true);
         assert!(out.contains("ROLLED BACK"), "{out}");
         assert!(!out.contains("LANDED"), "{out}");
+    }
+
+    #[test]
+    fn a_kept_change_is_reported_with_its_text_and_no_rollback_line() {
+        // Keep-partial: nothing was reverted, so the text is still on disk.
+        // The retry extends it; the one rule it carries is the duplicate
+        // guard, not a re-apply instruction.
+        let artifact = serde_json::json!({
+            "file_state": [{"path": "src/a.rs", "why": "applied", "current_content": "LANDED"}]
+        });
+        let out = file_state_evidence(&artifact, false);
+        assert!(!out.contains("ROLLED BACK"), "{out}");
+        assert!(out.contains("LANDED"), "{out}");
+        assert!(
+            out.contains("do not"),
+            "the duplicate guard must ride along: {out}"
+        );
     }
 
     #[test]
@@ -1121,7 +1161,7 @@ mod file_state_tests {
                 {"path": "src/b.rs", "why": "search string not found", "current_content": "BBB"},
             ]
         });
-        let out = file_state_evidence(&artifact);
+        let out = file_state_evidence(&artifact, true);
         assert!(out.contains("ROLLED BACK"), "{out}");
         assert!(out.contains("BBB"), "{out}");
         assert!(!out.contains("AAA"), "{out}");

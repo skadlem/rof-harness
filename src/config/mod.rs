@@ -248,6 +248,12 @@ pub struct AppConfig {
     /// v4: outer verify guard after inner pass (ROF_VERIFY_GUARD=yes). Off by default.
     #[serde(default)]
     pub verify_guard: bool,
+    /// Keep-partial rounds (ROF_KEEP_PARTIAL=yes). Off by default: a failed
+    /// round rolls back to the baseline. On: landed patches survive to the
+    /// next round of the same attempt, so fixes accumulate on disk the way
+    /// an uninterrupted loop accumulates them; attempts still start clean.
+    #[serde(default)]
+    pub keep_partial: bool,
     /// Per-endpoint capability: the prompt ceiling and retry-ladder order.
     /// Defaults reproduce the shipped DeepSeek/vLLM behavior bit for bit.
     #[serde(default)]
@@ -455,6 +461,7 @@ impl Default for AppConfig {
             explorer: false,
             attempts: 1,
             verify_guard: false,
+            keep_partial: false,
             endpoint: crate::llm::profile::EndpointProfile::default(),
             // §6: measured, not cut. See the field's doc comment.
             per_turn_context_cap: 0,

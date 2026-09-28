@@ -1010,7 +1010,11 @@ impl Orchestrator {
                     // §4.2: a failed attempt is discarded when a retry follows, so
                     // the retry starts from the baseline its snapshot shows. The
                     // last round keeps its state in the copy for reading.
-                    if round < rounds {
+                    // Keep-partial: landed patches survive to the next round of
+                    // the same attempt instead, so fixes accumulate on disk;
+                    // the file-state evidence below is still current because
+                    // nothing was reverted. Attempts still start clean.
+                    if round < rounds && !self.cfg.keep_partial {
                         self.trace.emit(TraceEvent::StateTransition {
                             from: "reviewing".to_string(),
                             to: "rolled_back".to_string(),
@@ -1029,7 +1033,12 @@ impl Orchestrator {
                     }
                     // The retry's evidence, after the rollback: the tool verdicts,
                     // minus any content the rollback reverted (see the function).
-                    refused = crate::engine::session::file_state_evidence(&artifact);
+                    // The flag mirrors the rollback gate above: kept rounds
+                    // were not reverted, so the evidence carries their text.
+                    refused = crate::engine::session::file_state_evidence(
+                        &artifact,
+                        !self.cfg.keep_partial,
+                    );
                     // P1b round boundary: the round is complete (checks, verdict,
                     // rollback, evidence) and the loop is about to build the next
                     // implementer prompt. A steer drained here lands in that
@@ -1428,7 +1437,8 @@ impl Orchestrator {
                 if passed {
                     break;
                 }
-                let file_state = crate::engine::session::file_state_evidence(&artifact);
+                let file_state =
+                    crate::engine::session::file_state_evidence(&artifact, !self.cfg.keep_partial);
                 if !has_oracle {
                     // No retry can conjure an oracle, so stop instead of spending
                     // the cap rediscovering that nothing can pass.
@@ -1479,7 +1489,9 @@ impl Orchestrator {
                 }
                 // §4.2: a failed attempt is discarded when a retry follows; the
                 // last round keeps its state in the copy for reading.
-                if round < cap {
+                // Keep-partial (same rule as the pipeline loop): rounds of one
+                // attempt accumulate on disk instead.
+                if round < cap && !self.cfg.keep_partial {
                     self.trace.emit(TraceEvent::StateTransition {
                         from: "direct_executing".to_string(),
                         to: "rolled_back".to_string(),

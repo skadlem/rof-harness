@@ -363,6 +363,9 @@ fn apply_env(cfg: &mut AppConfig) {
     if let Some(v) = get("ROF_VERIFY_GUARD") {
         cfg.verify_guard = matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1");
     }
+    if let Some(v) = get("ROF_KEEP_PARTIAL") {
+        cfg.keep_partial = matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1");
+    }
     if let Some(t) = get("ROF_MAX_TASK_TOKENS") {
         if let Ok(n) = t.trim().parse::<u64>() {
             cfg.max_tokens_per_task = n;
