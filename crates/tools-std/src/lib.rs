@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +28,74 @@ pub struct Policy {
     pub root: PathBuf,
     pub allowed_commands: Vec<String>,
     pub allowed_prefixes: Vec<String>,
+    /// Optional edit-gate argv prefix (e.g. `["python3", "-m", "py_compile"]`);
+    /// `None` skips the check with zero behavior change.
+    pub syntax_cmd: Option<Vec<String>>,
+    /// Deny-globs matched against the root-relative path (e.g. `**/*.env`).
+    pub denied_globs: Vec<String>,
+}
+
+/// The stock secrets deny-glob. Callers constructing `Policy` literally
+/// should start here.
+pub fn default_denied_globs() -> Vec<String> {
+    vec!["**/*.env".to_string()]
+}
+
+/// Hand-rolled glob: `*` matches any run without `/`, `**` any run with
+/// `/`, and a leading `**/` also matches zero dirs (so `**/*.env` hits
+/// root-level `.env` but never `.env.example`).
+// ponytail: no glob crate for one pattern; add `glob` if patterns grow.
+pub fn glob_match(pat: &str, path: &str) -> bool {
+    fn go(p: &[u8], s: &[u8]) -> bool {
+        if p.is_empty() {
+            return s.is_empty();
+        }
+        if p.len() >= 3 && p[0] == b'*' && p[1] == b'*' && p[2] == b'/' {
+            if go(&p[3..], s) {
+                return true;
+            }
+            let mut i = 0;
+            while i < s.len() {
+                while i < s.len() && s[i] != b'/' {
+                    i += 1;
+                }
+                if i >= s.len() {
+                    break;
+                }
+                i += 1;
+                if go(&p[3..], &s[i..]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if p[0] == b'*' {
+            let mut q = 1;
+            while q < p.len() && p[q] == b'*' {
+                q += 1;
+            }
+            let rest = &p[q..];
+            if rest.is_empty() {
+                // `**` matches all; single `*` stops at `/`.
+                return q >= 2 || !s.contains(&b'/');
+            }
+            let mut i = 0;
+            loop {
+                if go(rest, &s[i..]) {
+                    return true;
+                }
+                if i >= s.len() || s[i] == b'/' {
+                    return false;
+                }
+                i += 1;
+            }
+        }
+        if s.is_empty() || p[0] != s[0] {
+            return false;
+        }
+        go(&p[1..], &s[1..])
+    }
+    go(pat.as_bytes(), path.as_bytes())
 }
 
 #[derive(Debug, Clone)]
@@ -55,15 +124,31 @@ fn under(root: &Path, cand: &Path) -> bool {
     normalize(cand).starts_with(normalize(root))
 }
 
-/// Containment: lexical check, `.git` denied at any depth, then canonical
-/// parent + symlinked-final check. A missing parent is `MissingParent`
-/// (recoverable: "create it first, re-issue"), never a denial.
-pub fn resolve_under(root: &Path, path: &str) -> Result<PathBuf, ToolPathError> {
+/// Containment: lexical check, secrets deny-glob, `.git` denied on writes
+/// (reads may traverse it, still root-anchored + symlink-safe), then
+/// canonical parent + symlinked-final check. A missing parent is
+/// `MissingParent` (recoverable: "create it first, re-issue"), never a denial.
+pub fn resolve_under(
+    root: &Path,
+    path: &str,
+    write: bool,
+    denied_globs: &[String],
+) -> Result<PathBuf, ToolPathError> {
     let p = root.join(path);
     if !under(root, &p) {
         return Err(ToolPathError::Denied("path escapes tool root".to_string()));
     }
-    if p.components().any(|c| c.as_os_str() == ".git") {
+    let rel = normalize(&p)
+        .strip_prefix(normalize(root))
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let rel = rel.trim_start_matches('/');
+    if denied_globs.iter().any(|g| glob_match(g, rel)) {
+        return Err(ToolPathError::Denied(format!(
+            "path matches denied glob: {rel}"
+        )));
+    }
+    if write && p.components().any(|c| c.as_os_str() == ".git") {
         return Err(ToolPathError::Denied(
             "path is the git substrate (.git): harness-only".to_string(),
         ));
@@ -274,7 +359,13 @@ impl Tool for ViewTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: ViewArgs = parse_args(&inv.args)?;
-        let p = resolve_under(&self.policy.root, &args.path).map_err(path_err)?;
+        let p = resolve_under(
+            &self.policy.root,
+            &args.path,
+            false,
+            &self.policy.denied_globs,
+        )
+        .map_err(path_err)?;
         let data = std::fs::read(&p).map_err(|e| ToolError::Failed(e.to_string()))?;
         let cap = args
             .max_bytes
@@ -377,8 +468,13 @@ impl Tool for SearchTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: SearchArgs = parse_args(&inv.args)?;
-        let base = resolve_under(&self.policy.root, args.path.as_deref().unwrap_or("."))
-            .map_err(path_err)?;
+        let base = resolve_under(
+            &self.policy.root,
+            args.path.as_deref().unwrap_or("."),
+            false,
+            &self.policy.denied_globs,
+        )
+        .map_err(path_err)?;
         let limit = args.max_results.unwrap_or(50).clamp(1, 200) as usize;
         let mut hits = Vec::new();
         if base.is_file() {
@@ -451,7 +547,13 @@ impl Tool for EditTool {
         if args.replace.len() > EDIT_REPLACE_CAP {
             return Err(ToolError::Failed("replace over 256KB cap".to_string()));
         }
-        let p = resolve_under(&self.policy.root, &args.path).map_err(path_err)?;
+        let p = resolve_under(
+            &self.policy.root,
+            &args.path,
+            true,
+            &self.policy.denied_globs,
+        )
+        .map_err(path_err)?;
         if p.is_dir() {
             return Err(ToolError::Failed(
                 "refusing to patch a directory".to_string(),
@@ -463,6 +565,11 @@ impl Tool for EditTool {
         }
         let updated =
             apply_hunk(&original, &args.search, &args.replace).map_err(ToolError::Failed)?;
+        if let Some(argv) = self.policy.syntax_cmd.clone() {
+            if !argv.is_empty() {
+                check_syntax(&self.policy, &updated).await?;
+            }
+        }
         std::fs::write(&p, updated).map_err(|e| ToolError::Failed(e.to_string()))?;
         Ok(ToolOutcome {
             content: format!("patched {}", args.path),
@@ -503,6 +610,30 @@ async fn run_allowed(policy: &Policy, cmd: &str) -> Result<(bool, String), ToolE
     let ok = out.status.success();
     let (content, _) = cap_chars(s.chars().take(OUT_CAP).collect(), OUT_CAP);
     Ok((ok, content))
+}
+
+static SYNTAX_N: AtomicUsize = AtomicUsize::new(0);
+
+/// Edit-gate syntax check: candidate bytes go to a tempfile OUTSIDE the
+/// tree, `syntax_cmd + tempfile` runs through the existing `run_allowed`
+/// gate (so the checker itself must be allowlisted), tempfile deleted
+/// best-effort. A failing check vetoes the write; the file is untouched.
+async fn check_syntax(policy: &Policy, candidate: &str) -> Result<(), ToolError> {
+    let argv = policy.syntax_cmd.clone().unwrap_or_default();
+    let tmp = std::env::temp_dir().join(format!(
+        "tools-std-syntax-{}-{}",
+        std::process::id(),
+        SYNTAX_N.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::write(&tmp, candidate).map_err(|e| ToolError::Failed(e.to_string()))?;
+    let cmdline = format!("{} {}", argv.join(" "), tmp.display());
+    let res = run_allowed(policy, &cmdline).await;
+    let _ = std::fs::remove_file(&tmp);
+    match res {
+        Ok((true, _)) => Ok(()),
+        Ok((false, out)) => Err(ToolError::Failed(format!("syntax check failed: {out}"))),
+        Err(e) => Err(e),
+    }
 }
 
 pub struct ExecTool {
@@ -632,6 +763,21 @@ mod tests {
             root: root.to_path_buf(),
             allowed_commands: vec!["true".to_string(), "false".to_string()],
             allowed_prefixes: vec!["echo".to_string(), "cargo test".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+        })
+    }
+
+    fn syntax_policy(root: &Path, argv: &[&str]) -> Arc<Policy> {
+        // The checker runs as `argv + tempfile` through `run_allowed`, so
+        // the checker binary must be prefix-allowlisted.
+        let prefix = argv.join(" ");
+        Arc::new(Policy {
+            root: root.to_path_buf(),
+            allowed_commands: vec!["true".to_string(), "false".to_string()],
+            allowed_prefixes: vec!["echo".to_string(), prefix],
+            syntax_cmd: Some(argv.iter().map(|s| s.to_string()).collect()),
+            denied_globs: default_denied_globs(),
         })
     }
 
@@ -678,24 +824,33 @@ mod tests {
     // --- containment matrix ---
 
     #[test]
-    fn git_denied_at_any_depth() {
+    fn git_write_denied_read_allowed() {
         let root = tmp_root();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         for rel in [".git/config", "a/.git/x", "a/.git", ".git"] {
-            match resolve_under(&root, rel) {
+            match resolve_under(&root, rel, true, &[]) {
                 Err(ToolPathError::Denied(_)) => {}
-                other => panic!("{rel} must be denied, got {other:?}"),
+                other => panic!("{rel} write must be denied, got {other:?}"),
             }
         }
+        // Reads may traverse .git (still root-anchored + symlink-safe).
+        assert!(resolve_under(&root, ".git/HEAD", false, &[]).is_ok());
     }
 
     #[test]
     fn escape_denied() {
         let root = tmp_root();
         for rel in ["../evil", "/etc/passwd", "a/../../evil"] {
-            assert!(
-                matches!(resolve_under(&root, rel), Err(ToolPathError::Denied(_))),
-                "{rel} must be denied"
-            );
+            for write in [true, false] {
+                assert!(
+                    matches!(
+                        resolve_under(&root, rel, write, &[]),
+                        Err(ToolPathError::Denied(_))
+                    ),
+                    "{rel} must be denied"
+                );
+            }
         }
     }
 
@@ -706,13 +861,13 @@ mod tests {
         std::fs::write(outside.join("secret"), "x").unwrap();
         std::os::unix::fs::symlink(outside.join("secret"), root.join("link")).unwrap();
         assert!(matches!(
-            resolve_under(&root, "link"),
+            resolve_under(&root, "link", true, &[]),
             Err(ToolPathError::Denied(_))
         ));
         std::os::unix::fs::symlink(&outside, root.join("dirlink")).unwrap();
         std::fs::create_dir_all(root.join("real")).unwrap();
         assert!(matches!(
-            resolve_under(&root, "dirlink/secret"),
+            resolve_under(&root, "dirlink/secret", true, &[]),
             Err(ToolPathError::Denied(_))
         ));
     }
@@ -720,7 +875,7 @@ mod tests {
     #[test]
     fn missing_parent_is_recoverable_never_denial() {
         let root = tmp_root();
-        match resolve_under(&root, "no/such/file.txt") {
+        match resolve_under(&root, "no/such/file.txt", true, &[]) {
             Err(ToolPathError::MissingParent(m)) => assert!(m.contains("create"), "{m}"),
             other => panic!("must be MissingParent, got {other:?}"),
         }
@@ -779,6 +934,103 @@ mod tests {
     }
 
     // --- exec ---
+
+    #[tokio::test]
+    async fn edit_syntax_veto_leaves_file_untouched() {
+        let root = tmp_root();
+        std::fs::write(root.join("f.txt"), "hello\n").unwrap();
+        let r = reg(syntax_policy(&root, &["false"]));
+        let err = run(
+            &r,
+            "edit",
+            json!({"path": "f.txt", "search": "hello", "replace": "bye"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("syntax check failed"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "hello\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_syntax_pass_on_true_writes() {
+        let root = tmp_root();
+        std::fs::write(root.join("f.txt"), "hello\n").unwrap();
+        let r = reg(syntax_policy(&root, &["true"]));
+        let out = run(
+            &r,
+            "edit",
+            json!({"path": "f.txt", "search": "hello", "replace": "bye"}),
+        )
+        .await
+        .unwrap();
+        assert!(out.content.contains("patched"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "bye\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_unconfigured_syntax_skips_with_zero_behavior_change() {
+        let root = tmp_root();
+        std::fs::write(root.join("f.txt"), "hello\n").unwrap();
+        assert!(policy(&root).syntax_cmd.is_none());
+        let r = reg(policy(&root));
+        run(
+            &r,
+            "edit",
+            json!({"path": "f.txt", "search": "hello", "replace": "bye"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "bye\n"
+        );
+    }
+
+    #[test]
+    fn denied_glob_blocks_env_allows_example() {
+        assert!(glob_match("**/*.env", ".env"));
+        assert!(glob_match("**/*.env", "a/.env"));
+        assert!(!glob_match("**/*.env", ".env.example"));
+        assert!(!glob_match("**/*.env", "a/.env.example"));
+        let root = tmp_root();
+        let globs = default_denied_globs();
+        for rel in [".env", "a/.env"] {
+            match resolve_under(&root, rel, false, &globs) {
+                Err(ToolPathError::Denied(_)) => {}
+                other => panic!("{rel} must be denied, got {other:?}"),
+            }
+            match resolve_under(&root, rel, true, &globs) {
+                Err(ToolPathError::Denied(_)) => {}
+                other => panic!("{rel} write must be denied, got {other:?}"),
+            }
+        }
+        assert!(resolve_under(&root, ".env.example", false, &globs).is_ok());
+    }
+
+    #[tokio::test]
+    async fn git_view_allowed_write_denied_via_registry() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(root.join("f.txt"), "hello\n").unwrap();
+        let r = reg(policy(&root));
+        let out = run(&r, "view", json!({"path": ".git/HEAD"})).await.unwrap();
+        assert!(out.content.contains("ref:"), "{}", out.content);
+        let err = run(
+            &r,
+            "edit",
+            json!({"path": ".git/HEAD", "search": "ref:", "replace": "x"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("denied"), "{err}");
+    }
 
     #[test]
     fn prefix_boundary() {

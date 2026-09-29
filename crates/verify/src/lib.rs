@@ -1,7 +1,9 @@
 //! Honesty kit: checks run before any verdict. Salvage of
 //! ~/rof-harness/src/engine/session.rs (run_checks/render/checks_pass/condense).
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Check {
@@ -28,21 +30,83 @@ pub trait CommandRunner: Send + Sync {
     fn run(&self, cmd: &str, args: &[String], workdir: &Path) -> std::io::Result<CheckOutput>;
 }
 
-pub struct StdRunner;
+pub struct StdRunner {
+    pub deadline: Duration,
+}
 
-// ponytail: no timeout in v1; add deadline/kill on first real hang.
+impl Default for StdRunner {
+    fn default() -> Self {
+        Self {
+            deadline: Duration::from_secs(300),
+        }
+    }
+}
+
+impl StdRunner {
+    pub fn new(deadline: Duration) -> Self {
+        Self { deadline }
+    }
+}
+
 impl CommandRunner for StdRunner {
     fn run(&self, cmd: &str, args: &[String], workdir: &Path) -> std::io::Result<CheckOutput> {
-        let out = std::process::Command::new(cmd)
+        use std::io::Read;
+        let mut child = std::process::Command::new(cmd)
             .args(args)
             .current_dir(workdir)
-            .output()?;
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
-        Ok(CheckOutput {
-            code: out.status.code().unwrap_or(-1),
-            output: text,
-        })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        // Drain pipes on threads so a chatty child can't wedge the
+        // try_wait poll below on a full pipe buffer.
+        let out_h = std::thread::spawn({
+            let mut o = child.stdout.take();
+            move || {
+                let mut s = String::new();
+                if let Some(ref mut o) = o {
+                    let _ = o.read_to_string(&mut s);
+                }
+                s
+            }
+        });
+        let err_h = std::thread::spawn({
+            let mut e = child.stderr.take();
+            move || {
+                let mut s = String::new();
+                if let Some(ref mut e) = e {
+                    let _ = e.read_to_string(&mut s);
+                }
+                s
+            }
+        });
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait()? {
+                Some(status) => {
+                    let mut text = out_h.join().unwrap_or_default();
+                    text.push_str(&err_h.join().unwrap_or_default());
+                    return Ok(CheckOutput {
+                        code: status.code().unwrap_or(-1),
+                        output: text,
+                    });
+                }
+                None if start.elapsed() >= self.deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let mut text = format!(
+                        "timeout after {}s: deadline exceeded",
+                        self.deadline.as_secs()
+                    );
+                    text.push_str(&out_h.join().unwrap_or_default());
+                    text.push_str(&err_h.join().unwrap_or_default());
+                    return Ok(CheckOutput {
+                        code: -1,
+                        output: text,
+                    });
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
     }
 }
 
@@ -75,7 +139,7 @@ pub fn run_checks(
                             "$ {cmd}\nSTATUS: {} (exit {})\n{}\n",
                             if passed { "PASSED" } else { "FAILED" },
                             o.code,
-                            condense_output(&o.output)
+                            condense_output(&o.output, None)
                         ),
                     }
                 }
@@ -95,8 +159,10 @@ pub fn checks_pass(results: &[CheckResult]) -> bool {
     results.iter().all(|c| c.passed)
 }
 
-/// Drop build noise, keep signal substrings, cap line count.
-pub fn condense_output(s: &str) -> String {
+/// Drop build noise, keep signal substrings, cap line count. With a
+/// baseline (`Some` pre-existing output), kept lines already present in
+/// the baseline are dropped as noise so only new signal surfaces.
+pub fn condense_output(s: &str, baseline: Option<&str>) -> String {
     const KEEP: [&str; 9] = [
         "FAILED",
         "error",
@@ -108,6 +174,7 @@ pub fn condense_output(s: &str) -> String {
         "left:",
         "right:",
     ];
+    let base: Option<HashSet<&str>> = baseline.map(|b| b.lines().collect());
     let mut kept: Vec<&str> = Vec::new();
     let mut dropped = 0usize;
     for line in s.lines() {
@@ -124,6 +191,10 @@ pub fn condense_output(s: &str) -> String {
             continue;
         }
         if KEEP.iter().any(|k| t.contains(k)) {
+            if base.as_ref().is_some_and(|bs| bs.contains(line)) {
+                dropped += 1;
+                continue;
+            }
             kept.push(line);
         } else {
             dropped += 1;
@@ -241,7 +312,7 @@ mod tests {
         for i in 0..100 {
             raw.push_str(&format!("error line {i}\n"));
         }
-        let out = condense_output(&raw);
+        let out = condense_output(&raw, None);
         assert!(out.contains("test b ... FAILED"));
         assert!(!out.contains("test a ... ok"));
         assert!(out.contains("over cap omitted"));
@@ -249,7 +320,33 @@ mod tests {
             out.lines().filter(|l| l.contains("error line")).count(),
             80 - 2
         );
-        let green = condense_output("   Compiling rof v0.1.0\n    Finished dev profile\n");
+        let green = condense_output("   Compiling rof v0.1.0\n    Finished dev profile\n", None);
         assert!(green.contains("no actionable lines"));
+    }
+
+    #[test]
+    fn condense_baseline_reports_only_new_lines() {
+        let raw = "error old\nerror new\ntest result: FAILED\n";
+        let without = condense_output(raw, None);
+        assert!(without.contains("error old"));
+        assert!(without.contains("error new"));
+        let with = condense_output(raw, Some("error old\n"));
+        assert!(!with.contains("error old"), "{with}");
+        assert!(with.contains("error new"), "{with}");
+        let all_old = condense_output("error old\n", Some("error old\n"));
+        assert!(all_old.contains("no actionable lines"), "{all_old}");
+    }
+
+    #[test]
+    fn std_runner_deadline_kills_sleep() {
+        let runner = StdRunner::new(Duration::from_millis(300));
+        let start = std::time::Instant::now();
+        let out = runner
+            .run("sleep", &["10".to_string()], Path::new("/tmp"))
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_ne!(out.code, 0);
+        assert!(out.output.contains("deadline"), "{}", out.output);
+        assert_eq!(StdRunner::default().deadline, Duration::from_secs(300));
     }
 }
