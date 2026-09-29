@@ -1,0 +1,1 @@
+{"dataset":"SWE-bench/SWE-bench_Verified","ids":["django__django-11099"],"note":"Calibration-only seed (zero Rust). Rare stratified runs for comparability against published numbers.","tag":"verified"}
