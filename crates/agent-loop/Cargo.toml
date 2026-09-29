@@ -1,0 +1,17 @@
+[package]
+name = "agent-loop"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+agent-log = { path = "../agent-log" }
+agent-event = { path = "../agent-event" }
+tool-core = { path = "../tool-core" }
+provider-core = { path = "../provider-core" }
+agent-budget = { path = "../agent-budget" }
