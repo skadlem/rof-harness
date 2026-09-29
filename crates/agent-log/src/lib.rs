@@ -243,22 +243,55 @@ fn validate_log(items: &[Item]) -> std::io::Result<()> {
 pub fn open_turn_closers(items: &[Item]) -> Vec<Item> {
     let mut open: Option<&Item> = None;
     let mut pending: Vec<&CallId> = Vec::new();
+    // Assistant-requested ids that never reached a recorded ToolCall start
+    // (dsh ToolCallRecovery: assistant/message registers, tool/call records,
+    // tool/result discharges; closed boundaries discard all three).
+    let mut requested: Vec<CallId> = Vec::new();
+    let mut called: Vec<CallId> = Vec::new();
+    let mut answered: Vec<CallId> = Vec::new();
     for item in items {
         match &item.kind {
             ItemKind::TurnStart { .. } => {
                 open = Some(item);
                 pending.clear();
+                requested.clear();
+                called.clear();
+                answered.clear();
             }
             ItemKind::TurnEnd { .. } => {
                 open = None;
                 pending.clear();
+                requested.clear();
+                called.clear();
+                answered.clear();
+            }
+            ItemKind::Assistant { message, .. } => {
+                if open.is_some() {
+                    if let Some(arr) = message.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc in arr {
+                            if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                if !requested.iter().any(|r| r == id) {
+                                    requested.push(id.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
             }
             ItemKind::ToolCall { call_id, .. } => {
-                if open.is_some() && !pending.contains(&call_id) {
-                    pending.push(call_id);
+                if open.is_some() {
+                    if !called.iter().any(|c| c == call_id) {
+                        called.push(call_id.clone());
+                    }
+                    if !pending.contains(&call_id) {
+                        pending.push(call_id);
+                    }
                 }
             }
             ItemKind::ToolResult { call_id, .. } => {
+                if !answered.iter().any(|a| a == call_id) {
+                    answered.push(call_id.clone());
+                }
                 pending.retain(|id| *id != call_id);
             }
             _ => {}
@@ -276,7 +309,26 @@ pub fn open_turn_closers(items: &[Item]) -> Vec<Item> {
         .last()
         .map(|i| i.recorded_at)
         .unwrap_or_else(SystemTime::now);
-    let mut out = Vec::with_capacity(pending.len() + 1);
+    let mut out = Vec::with_capacity(requested.len() + pending.len() + 1);
+    for call_id in &requested {
+        if called.iter().any(|c| c == call_id) || answered.iter().any(|a| a == call_id) {
+            continue;
+        }
+        out.push(Item {
+            seq,
+            id: new_id(),
+            parent_id: None,
+            recorded_at,
+            kind: ItemKind::ToolResult {
+                call_id: call_id.clone(),
+                content: "The assistant requested this tool call, but it was never started, so it had no side effects. Re-issue it only if still needed; do not assume it ran."
+                    .to_string(),
+                is_error: true,
+                recovery: Some(RecoveryCode::ToolNotStarted),
+            },
+        });
+        seq += 1;
+    }
     for call_id in pending {
         out.push(Item {
             seq,
@@ -561,6 +613,67 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn closers_mark_never_started_requests_tool_not_started() {
+        let requested = item(
+            3,
+            ItemKind::Assistant {
+                message: serde_json::json!({"content": "t", "tool_calls": [{"id": "r1", "name": "write", "args": {}}]}),
+                stop_reason: "tool_use".into(),
+                interrupted: false,
+            },
+        );
+        let items = vec![
+            header(1),
+            turn_start(2, "t1"),
+            requested,
+            tool_call(4, "c1"),
+        ];
+        let closers = open_turn_closers(&items);
+        assert_eq!(closers.len(), 3); // not-started r1, unknown-outcome c1, turn end
+        match &closers[0].kind {
+            ItemKind::ToolResult {
+                call_id,
+                recovery: Some(RecoveryCode::ToolNotStarted),
+                is_error: true,
+                ..
+            } => assert_eq!(call_id, "r1"),
+            other => panic!("expected ToolNotStarted, got {other:?}"),
+        }
+        match &closers[1].kind {
+            ItemKind::ToolResult {
+                call_id,
+                recovery: Some(RecoveryCode::ToolOutcomeUnknown),
+                ..
+            } => assert_eq!(call_id, "c1"),
+            other => panic!("expected ToolOutcomeUnknown, got {other:?}"),
+        }
+        assert!(matches!(
+            &closers[2].kind,
+            ItemKind::TurnEnd {
+                reason: TurnEndReason::Interrupted,
+                ..
+            }
+        ));
+        // A result without a call discharges the request: no double closer.
+        let items = vec![
+            header(1),
+            turn_start(2, "t1"),
+            item(
+                3,
+                ItemKind::Assistant {
+                    message: serde_json::json!({"content": "t", "tool_calls": [{"id": "r1", "name": "w", "args": {}}]}),
+                    stop_reason: "tool_use".into(),
+                    interrupted: false,
+                },
+            ),
+            tool_result(4, "r1"),
+        ];
+        let closers = open_turn_closers(&items);
+        assert_eq!(closers.len(), 1);
+        assert!(matches!(&closers[0].kind, ItemKind::TurnEnd { .. }));
     }
 
     #[test]
