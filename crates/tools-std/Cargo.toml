@@ -1,0 +1,12 @@
+[package]
+name = "tools-std"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tool-core = { path = "../tool-core" }

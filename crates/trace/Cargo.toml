@@ -1,0 +1,10 @@
+[package]
+name = "trace"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+agent-event = { path = "../agent-event" }
