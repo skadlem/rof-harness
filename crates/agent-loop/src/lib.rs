@@ -1,14 +1,15 @@
 //! Turn/step driver. See research/crate-agent-loop.md.
 //!
-//! NOTE (follow-up): full multi-tick run() wiring against the snapshot /
-//! context / bets crates does not exist yet. This crate ships the state
-//! machine + step + termination, tested standalone; provider and tool
-//! traffic enter as scripted [`ProviderMsg`] / [`ToolMsg`] fakes sent over
-//! channels into [`drive_tick`].
+//! [`run`] is the headless multi-tick assembly: sequential `complete` +
+//! inline tool execute over the same step-head and termination order as
+//! [`drive_tick`]. Channel-driven traffic still enters as scripted
+//! [`ProviderMsg`] / [`ToolMsg`] fakes into [`drive_tick`] for select!-shape
+//! tests.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -18,10 +19,12 @@ use tokio_util::sync::CancellationToken;
 use agent_budget::{config_for, BudgetGuard, BudgetHalt, Capability, Nudge};
 use agent_event::{
     AgentError, AgentEvent, ControlAck, ControlKind, ControlStatus, DeltaKind, Emitter, Message,
-    MessageDelta, Role, TurnEndReason as EventTurnEndReason,
+    MessageDelta, Role, RunOutcome as EventRunOutcome, TurnEndReason as EventTurnEndReason,
 };
-use agent_log::{InputSource, Item, ItemKind, RecoveryCode, TurnEndReason};
-use provider_core::{AssistantMessage, ProviderMessage, StopReason, Usage};
+use agent_log::{InputSource, Item, ItemKind, LogWriter, RecoveryCode, TurnEndReason, LOG_VERSION};
+use provider_core::{
+    AssistantMessage, LlmClient, ProviderMessage, Request, StopReason, Thinking, Usage,
+};
 use serde_json::Value;
 use tool_core::{TerminatePolicy, ToolCall, ToolResult};
 
@@ -271,7 +274,7 @@ impl LoopState {
             last_sig: String::new(),
             last_obs: 0,
             lessons: VecDeque::new(),
-            drain_timeout: Duration::from_secs(10),
+            drain_timeout: Duration::from_secs(30),
             drain_until: None,
             prompt_sections: HashMap::new(),
         }
@@ -733,8 +736,18 @@ impl LoopState {
             return PhaseVerdict::Return(Outcome::Done);
         }
         // 5. Semantic termination: drained turn, empty queues, follow-up poll.
+        // The old turn closes here (sticky reason or Completed) so the log
+        // never holds two open turns; the new turn opens right after.
         if self.in_flight.is_none() && self.open_tools() == 0 && self.steering.is_empty() {
             if let Some(text) = self.followups.pop_front() {
+                let reason = self.turn_reason.take().unwrap_or(TurnEndReason::Completed);
+                append_to(
+                    &mut self.items,
+                    ItemKind::TurnEnd {
+                        turn_id: turn_id(self.turn),
+                        reason,
+                    },
+                );
                 self.open_turn();
                 self.steering.push_back(QueuedInput::from(text));
                 return PhaseVerdict::Continue;
@@ -847,7 +860,8 @@ fn turn_id(turn: u64) -> String {
 }
 
 fn append_to(items: &mut Vec<Item>, kind: ItemKind) {
-    let seq = items.len() as u64;
+    // 1-based: the file-backed run log validates gapless-from-1 under a Header.
+    let seq = items.len() as u64 + 1;
     items.push(Item {
         seq,
         id: format!("item-{seq}"),
@@ -1057,7 +1071,13 @@ pub async fn drive_tick(
         else => {}
     }
     let verdict = state.terminate();
-    if state.turn != turn_before && matches!(verdict, PhaseVerdict::Continue) {
+    // turn_before > 0: the 0 -> 1 opening has no prior turn to close.
+    if state.turn != turn_before && turn_before > 0 && matches!(verdict, PhaseVerdict::Continue) {
+        // Same hop as run(): closer is durable already, frames follow in order.
+        emitter.emit(AgentEvent::TurnEnd {
+            turn: turn_before,
+            reason: hopped_turn_reason(state, turn_before),
+        });
         emitter.emit(AgentEvent::TurnStart { turn: state.turn });
     }
     if let PhaseVerdict::Return(ref outcome) = verdict {
@@ -1089,6 +1109,658 @@ pub trait BetsHook: Send + Sync {
 pub struct NoBets;
 
 impl BetsHook for NoBets {}
+
+// --- multi-tick run() assembly (headless; sequential, no channels) ---
+
+/// Headless run knobs. `drain_timeout` defaults to 30s (unattended runs must
+/// not wedge on a stuck tool); the context budget reuses v1's 24k evidence
+/// window until the histogram retunes it.
+#[derive(Debug, Clone)]
+pub struct RunConfig {
+    pub goal: String,
+    pub model: String,
+    pub max_tokens: usize,
+    pub context_budget_chars: usize,
+    pub context_files: Vec<String>,
+    pub drain_timeout: Duration,
+    pub log_path: Option<PathBuf>,
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            goal: "run".into(),
+            model: "run-model".into(),
+            max_tokens: 2000,
+            context_budget_chars: 24_000,
+            context_files: Vec::new(),
+            drain_timeout: Duration::from_secs(30),
+            log_path: None,
+        }
+    }
+}
+
+/// Everything `run` borrows: real siblings except the provider (generic over
+/// [`LlmClient` so tests use scripted fakes) and bets (local [`BetsHook`]
+/// with [`NoBets`] as the green default).
+pub struct Run<'a, P> {
+    pub provider: &'a P,
+    pub registry: &'a tool_core::Registry,
+    pub agent: &'a str,
+    pub workdir: &'a Path,
+    pub emitter: &'a mut Emitter,
+    pub bets: &'a dyn BetsHook,
+    pub cfg: RunConfig,
+}
+
+/// Append-only tail sync: the vec is the mirror, the file is the record.
+/// A failed pre-effect append is a hard failure (never run from
+/// process-only state).
+fn sync_log(
+    items: &[Item],
+    writer: Option<&mut LogWriter>,
+    synced: &mut usize,
+) -> std::io::Result<()> {
+    let Some(w) = writer else { return Ok(()) };
+    while *synced < items.len() {
+        w.append(&items[*synced])?;
+        *synced += 1;
+    }
+    Ok(())
+}
+
+fn event_outcome(outcome: &Outcome) -> EventRunOutcome {
+    match outcome {
+        Outcome::Done => EventRunOutcome::Passed,
+        Outcome::Halted(s) | Outcome::Failed(s) => EventRunOutcome::Failed(s.clone()),
+        Outcome::Cancelled => EventRunOutcome::Aborted,
+    }
+}
+
+/// Durable TurnEnd first, terminal frames second — never inverted. The emit
+/// still runs when the sync fails so live always sees a terminal frame.
+fn finish_run(
+    state: &mut LoopState,
+    writer: Option<&mut LogWriter>,
+    emitter: &mut Emitter,
+    run_id: u64,
+    synced: &mut usize,
+    outcome: Outcome,
+) -> Outcome {
+    let reason = outcome_log_reason(&outcome, state.turn_reason.as_ref());
+    state.stick_turn_reason(reason.clone());
+    append_to(
+        &mut state.items,
+        ItemKind::TurnEnd {
+            turn_id: turn_id(state.turn),
+            reason: reason.clone(),
+        },
+    );
+    let _ = sync_log(&state.items, writer, synced);
+    emitter.emit(AgentEvent::TurnEnd {
+        turn: state.turn,
+        reason: turn_end_reason_to_event(&reason),
+    });
+    emitter.emit(AgentEvent::RunEnd {
+        outcome: event_outcome(&outcome),
+        messages: Vec::new(),
+    });
+    let _ = run_id;
+    outcome
+}
+
+/// The durable closer for a hopped turn, read back from the log so live and
+/// replay agree exactly.
+fn hopped_turn_reason(state: &LoopState, before: u64) -> EventTurnEndReason {
+    state
+        .items
+        .iter()
+        .rev()
+        .find_map(|i| match &i.kind {
+            ItemKind::TurnEnd {
+                turn_id: tid,
+                reason,
+            } if tid == &turn_id(before) => Some(turn_end_reason_to_event(reason)),
+            _ => None,
+        })
+        .unwrap_or(EventTurnEndReason::Completed)
+}
+
+/// Follow-up opened a new turn mid-`terminate` (closer already appended
+/// there): sync it, then emit its frame before the new TurnStart. False
+/// means the durable append failed and the caller must fail closed.
+fn close_hopped_turn(
+    state: &mut LoopState,
+    writer: Option<&mut LogWriter>,
+    emitter: &mut Emitter,
+    synced: &mut usize,
+    before: u64,
+) -> bool {
+    if state.turn == before || before == 0 {
+        return true;
+    }
+    if sync_log(&state.items, writer, synced).is_err() {
+        return false;
+    }
+    emitter.emit(AgentEvent::TurnEnd {
+        turn: before,
+        reason: hopped_turn_reason(state, before),
+    });
+    emitter.emit(AgentEvent::TurnStart { turn: state.turn });
+    true
+}
+
+/// Prompt build: file map (cached-prefix head) + named files as volatiles
+/// (delivered last) + derived history fitted to one budget. Never summarizes.
+fn build_request(
+    state: &mut LoopState,
+    registry: &tool_core::Registry,
+    workdir: &Path,
+    cfg: &RunConfig,
+) -> Request {
+    state.replay_sections();
+    let mut asm = context::ContextAssembler::new(cfg.context_budget_chars);
+    let map_text = context::file_map(workdir, 200).join("\n");
+    asm.add(context::ContextItem {
+        key: context::ItemKey {
+            path: "file-map".into(),
+            region: "map".into(),
+            role: "system".into(),
+        },
+        fidelity: context::Fidelity::Exact,
+        must_include: true,
+        est_chars: map_text.chars().count(),
+        text: map_text,
+    });
+    for f in &cfg.context_files {
+        if let Ok(c) = context::named_file_contents(workdir, f, 8000) {
+            let n = c.chars().count();
+            asm.add_volatile(context::ContextItem {
+                key: context::ItemKey {
+                    path: f.clone(),
+                    region: "named".into(),
+                    role: "system".into(),
+                },
+                fidelity: context::Fidelity::Exact,
+                must_include: true,
+                est_chars: n,
+                text: c,
+            });
+        }
+    }
+    for (i, m) in state.derived_messages().iter().enumerate() {
+        let n = m.content.chars().count();
+        asm.add(context::ContextItem {
+            key: context::ItemKey {
+                path: format!("history-{i}"),
+                region: m.role.clone(),
+                role: m.role.clone(),
+            },
+            fidelity: context::Fidelity::Exact,
+            must_include: false,
+            est_chars: n,
+            text: m.content.clone(),
+        });
+    }
+    let mut messages = vec![ProviderMessage {
+        role: "system".into(),
+        content: asm.assemble(),
+    }];
+    messages.extend(state.derived_messages());
+    Request {
+        messages,
+        tools: registry.definitions(),
+        max_tokens: cfg.max_tokens,
+        thinking: Thinking::Auto,
+        extras: Value::Null,
+    }
+}
+
+/// Headless multi-tick run on real siblings: [`LlmClient`] provider,
+/// [`tool_core::Registry`] tools, [`BudgetGuard`] step head,
+/// [`snapshot::TreeService`] baseline-per-batch with batch-scope rollback
+/// (proven prefix survives: the baseline commits it first), context prompt,
+/// [`BetsHook`] step + post-batch sites, [`Emitter`] frames, [`LogWriter`]
+/// file record. Termination order is [`LoopState::terminate`] (§10); the
+/// grace step runs inside `start_provider_call`, the halt lands after.
+/// Inputs seed here (Crash queues like User, recorded with Crash source);
+/// followups ride `state.followups`. Parked-idle with empty queues is Done.
+pub async fn run<P: LlmClient>(
+    state: &mut LoopState,
+    r: Run<'_, P>,
+    inputs: Vec<Input>,
+    cancel: &CancellationToken,
+) -> Outcome {
+    let Run {
+        provider,
+        registry,
+        agent,
+        workdir,
+        emitter,
+        bets,
+        cfg,
+    } = r;
+    state.drain_timeout = cfg.drain_timeout;
+    let root = CancellationToken::new();
+    let run_id = state.next_emit_id();
+    emitter.emit(AgentEvent::RunStart {
+        run_id,
+        goal: cfg.goal.clone(),
+    });
+    let mut synced = 0usize;
+    let mut writer: Option<LogWriter> = None;
+    if let Some(p) = cfg.log_path.clone() {
+        match LogWriter::open(&p) {
+            Ok(w) => writer = Some(w),
+            Err(e) => {
+                let o = Outcome::Failed(format!("log open: {e}"));
+                emitter.emit(AgentEvent::RunEnd {
+                    outcome: event_outcome(&o),
+                    messages: Vec::new(),
+                });
+                return o;
+            }
+        }
+    }
+    if state.items.is_empty() {
+        append_to(
+            &mut state.items,
+            ItemKind::Header {
+                version: LOG_VERSION,
+                session_id: format!("run-{run_id}"),
+                cwd: workdir.to_string_lossy().into_owned(),
+                model: cfg.model.clone(),
+            },
+        );
+    }
+    let tree = snapshot::TreeService::new(workdir);
+    if let Err(e) = tree.ensure() {
+        return finish_run(
+            state,
+            writer.as_mut(),
+            emitter,
+            run_id,
+            &mut synced,
+            Outcome::Failed(format!("snapshot ensure: {e}")),
+        );
+    }
+    if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
+        return finish_run(
+            state,
+            None,
+            emitter,
+            run_id,
+            &mut synced,
+            Outcome::Failed("log append failed".into()),
+        );
+    }
+    for input in inputs {
+        let before = state.turn;
+        state.apply_input(input);
+        if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
+            return finish_run(
+                state,
+                None,
+                emitter,
+                run_id,
+                &mut synced,
+                Outcome::Failed("log append failed".into()),
+            );
+        }
+        if state.turn != before {
+            emitter.emit(AgentEvent::TurnStart { turn: state.turn });
+        }
+    }
+    if state.turn == 0 {
+        let o = Outcome::Failed("run needs at least one input".into());
+        emitter.emit(AgentEvent::RunEnd {
+            outcome: event_outcome(&o),
+            messages: Vec::new(),
+        });
+        return o;
+    }
+    loop {
+        if cancel.is_cancelled() {
+            state.stop_hard = true;
+            state.gate.begin_abort();
+        }
+        state.admit_steering();
+        if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
+            return finish_run(
+                state,
+                None,
+                emitter,
+                run_id,
+                &mut synced,
+                Outcome::Failed("log append failed".into()),
+            );
+        }
+        // Bets site 1: step head.
+        if let PhaseVerdict::Return(o) = bets.on_step() {
+            return finish_run(state, writer.as_mut(), emitter, run_id, &mut synced, o);
+        }
+        // Grace runs here (may_step inside); terminate halts after.
+        let turn_token = match state.start_provider_call(&root) {
+            Some(t) => t,
+            None => match state.terminate() {
+                PhaseVerdict::Return(o) => {
+                    return finish_run(state, writer.as_mut(), emitter, run_id, &mut synced, o);
+                }
+                PhaseVerdict::Break => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                PhaseVerdict::Continue => {
+                    if state.phase == Phase::Idle && state.is_idle() {
+                        return finish_run(
+                            state,
+                            writer.as_mut(),
+                            emitter,
+                            run_id,
+                            &mut synced,
+                            Outcome::Done,
+                        );
+                    }
+                    continue;
+                }
+            },
+        };
+        let req = build_request(state, registry, workdir, &cfg);
+        match provider.complete(&cfg.model, &req).await {
+            Err(e) => {
+                let cancelled = cancel.is_cancelled() || root.is_cancelled();
+                let msg = format!("{e:?}");
+                let turn = state.turn;
+                state.finish_provider_msg(ProviderMsg::Failed {
+                    turn,
+                    err: msg.clone(),
+                    cancelled,
+                });
+                if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
+                    return finish_run(
+                        state,
+                        None,
+                        emitter,
+                        run_id,
+                        &mut synced,
+                        Outcome::Failed("log append failed".into()),
+                    );
+                }
+                emitter.emit(AgentEvent::Error {
+                    error: AgentError {
+                        code: "provider-failed".into(),
+                        message: msg,
+                    },
+                });
+                if state.call_model {
+                    continue; // in-step retry reuses the same assembly
+                }
+                match state.terminate() {
+                    PhaseVerdict::Return(o) => {
+                        return finish_run(state, writer.as_mut(), emitter, run_id, &mut synced, o);
+                    }
+                    _ => {
+                        // Never spin: parked-idle without input is Done.
+                        if state.phase == Phase::Idle && state.is_idle() {
+                            return finish_run(
+                                state,
+                                writer.as_mut(),
+                                emitter,
+                                run_id,
+                                &mut synced,
+                                Outcome::Done,
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
+            Ok(resp) => {
+                let turn = state.turn;
+                state.finish_provider_msg(ProviderMsg::Settled {
+                    turn,
+                    message: resp.message.clone(),
+                    stop: resp.stop,
+                    usage: Some(resp.usage.clone()),
+                });
+                let outcome = state.step_claim(resp.message.clone(), resp.stop);
+                if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
+                    return finish_run(
+                        state,
+                        None,
+                        emitter,
+                        run_id,
+                        &mut synced,
+                        Outcome::Failed("log append failed".into()),
+                    );
+                }
+                emit_message_frames(state, &resp.message, emitter);
+                match outcome {
+                    ClaimOutcome::Done | ClaimOutcome::Truncated(_) | ClaimOutcome::Refused => {
+                        let before = state.turn;
+                        match state.terminate() {
+                            PhaseVerdict::Return(o) => {
+                                return finish_run(
+                                    state,
+                                    writer.as_mut(),
+                                    emitter,
+                                    run_id,
+                                    &mut synced,
+                                    o,
+                                );
+                            }
+                            _ => {
+                                if !close_hopped_turn(
+                                    state,
+                                    writer.as_mut(),
+                                    emitter,
+                                    &mut synced,
+                                    before,
+                                ) {
+                                    return finish_run(
+                                        state,
+                                        None,
+                                        emitter,
+                                        run_id,
+                                        &mut synced,
+                                        Outcome::Failed("log append failed".into()),
+                                    );
+                                }
+                                if state.phase == Phase::Idle && state.is_idle() {
+                                    return finish_run(
+                                        state,
+                                        writer.as_mut(),
+                                        emitter,
+                                        run_id,
+                                        &mut synced,
+                                        Outcome::Done,
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    ClaimOutcome::HardExit(label) => {
+                        state.fatal_error = Some(label.clone());
+                        state.gate.close(label);
+                        match state.terminate() {
+                            PhaseVerdict::Return(o) => {
+                                return finish_run(
+                                    state,
+                                    writer.as_mut(),
+                                    emitter,
+                                    run_id,
+                                    &mut synced,
+                                    o,
+                                );
+                            }
+                            _ => continue,
+                        }
+                    }
+                    ClaimOutcome::Dispatch(calls) => {
+                        for c in &calls {
+                            emitter.emit(AgentEvent::ToolStart {
+                                id: c.call_id.clone(),
+                                name: c.name.clone(),
+                                args: c.args.clone(),
+                            });
+                        }
+                        if let Err(e) = tree.baseline() {
+                            return finish_run(
+                                state,
+                                writer.as_mut(),
+                                emitter,
+                                run_id,
+                                &mut synced,
+                                Outcome::Failed(format!("snapshot baseline: {e}")),
+                            );
+                        }
+                        let mut batch_failed = false;
+                        for c in &calls {
+                            if cancel.is_cancelled() {
+                                let content = "aborted before dispatch".to_owned();
+                                state.record_tool_result(ToolMsg {
+                                    call_id: c.call_id.clone(),
+                                    result: ToolResult {
+                                        content: content.clone(),
+                                        is_error: true,
+                                        terminate: false,
+                                    },
+                                });
+                                batch_failed = true;
+                            } else {
+                                let inv = match registry.prepare(agent, c.clone()) {
+                                    tool_core::CallStatus::Dispatch(inv) => Some(inv),
+                                    tool_core::CallStatus::Result(res) => {
+                                        batch_failed |= res.is_error;
+                                        state.record_tool_result(ToolMsg {
+                                            call_id: c.call_id.clone(),
+                                            result: res,
+                                        });
+                                        None
+                                    }
+                                };
+                                if let Some(inv) = inv {
+                                    let name = inv.name.clone();
+                                    let args = inv.args.to_string();
+                                    let res = match registry.resolve(&inv.name) {
+                                        Some(tool) => {
+                                            match tool.execute(inv, turn_token.child_token()).await
+                                            {
+                                                Ok(o) => ToolResult {
+                                                    content: if o.truncated {
+                                                        format!("{}\n[truncated]", o.content)
+                                                    } else {
+                                                        o.content
+                                                    },
+                                                    is_error: false,
+                                                    terminate: false,
+                                                },
+                                                Err(e) => ToolResult::from(e),
+                                            }
+                                        }
+                                        None => ToolResult {
+                                            content: format!("unknown tool: {name}"),
+                                            is_error: true,
+                                            terminate: false,
+                                        },
+                                    };
+                                    batch_failed |= res.is_error;
+                                    state.observe_action(&format!("{name}:{args}"), &res.content);
+                                    state.record_tool_result(ToolMsg {
+                                        call_id: c.call_id.clone(),
+                                        result: res.clone(),
+                                    });
+                                }
+                            }
+                            // Nudge lands on the fresh tail BEFORE the sync, so
+                            // the file never holds a stale tail.
+                            state.apply_budget_nudge();
+                            if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
+                                return finish_run(
+                                    state,
+                                    None,
+                                    emitter,
+                                    run_id,
+                                    &mut synced,
+                                    Outcome::Failed("log append failed".into()),
+                                );
+                            }
+                            if let Some(done) = state
+                                .tool_calls
+                                .get(&c.call_id)
+                                .and_then(|s| s.result.clone())
+                            {
+                                emitter.emit(AgentEvent::ToolEnd {
+                                    id: c.call_id.clone(),
+                                    result: Value::String(done.content),
+                                    is_error: done.is_error,
+                                });
+                            }
+                        }
+                        // Batch scope: only the failed batch rolls back; the
+                        // baseline already committed the proven prefix.
+                        if batch_failed {
+                            if let Err(e) = tree.rollback() {
+                                return finish_run(
+                                    state,
+                                    writer.as_mut(),
+                                    emitter,
+                                    run_id,
+                                    &mut synced,
+                                    Outcome::Failed(format!("snapshot rollback: {e}")),
+                                );
+                            }
+                        }
+                        // Bets site 2: post-batch.
+                        if let PhaseVerdict::Return(o) = bets.on_step() {
+                            return finish_run(
+                                state,
+                                writer.as_mut(),
+                                emitter,
+                                run_id,
+                                &mut synced,
+                                o,
+                            );
+                        }
+                        let before = state.turn;
+                        match state.terminate() {
+                            PhaseVerdict::Return(o) => {
+                                return finish_run(
+                                    state,
+                                    writer.as_mut(),
+                                    emitter,
+                                    run_id,
+                                    &mut synced,
+                                    o,
+                                );
+                            }
+                            _ => {
+                                if !close_hopped_turn(
+                                    state,
+                                    writer.as_mut(),
+                                    emitter,
+                                    &mut synced,
+                                    before,
+                                ) {
+                                    return finish_run(
+                                        state,
+                                        None,
+                                        emitter,
+                                        run_id,
+                                        &mut synced,
+                                        Outcome::Failed("log append failed".into()),
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1858,6 +2530,566 @@ mod tests {
             other => panic!("expected TurnEnd, got {other:?}"),
         }
         assert_eq!(s.turn_reason, Some(TurnEndReason::MaxTokens));
+    }
+
+    // --- multi-tick run() assembly: fakes + tempdir git repo ---
+
+    use futures::stream::BoxStream;
+    use provider_core::{
+        Capabilities, Credentials, LlmClient, LlmError, Request, Response, StreamEvent,
+    };
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use tool_core::{
+        CallStatus as CoreCallStatus, GrantGate, Invocation as CoreInvocation,
+        Registry as CoreRegistry, Tool as CoreTool, ToolCall as CoreToolCall,
+        ToolDefinition as CoreToolDef, ToolError as CoreToolError, ToolOutcome as CoreToolOutcome,
+    };
+
+    static RUN_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn run_tmp(name: &str) -> std::path::PathBuf {
+        let n = RUN_N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("rof-run-{name}-{n}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    struct ScriptClient {
+        order: Arc<Mutex<Vec<String>>>,
+        queue: Mutex<VecDeque<Response>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for ScriptClient {
+        async fn complete(&self, _model: &str, _req: &Request) -> Result<Response, LlmError> {
+            self.order.lock().unwrap().push("model".into());
+            self.queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(LlmError::Transport("script empty".into()))
+        }
+        async fn stream(
+            &self,
+            _model: &str,
+            _req: &Request,
+        ) -> Result<BoxStream<'static, StreamEvent>, LlmError> {
+            Err(LlmError::Transport("no stream in script".into()))
+        }
+        fn capabilities(&self, _model: &str) -> Capabilities {
+            Capabilities {
+                sends_finish_reason: true,
+            }
+        }
+        async fn resolve_key(&self, _provider: &str) -> Result<Credentials, LlmError> {
+            Ok(Credentials {
+                api_key: String::new(),
+            })
+        }
+    }
+
+    fn script_resp(calls: Vec<(&str, &str, serde_json::Value)>, stop: StopReason) -> Response {
+        Response {
+            message: AssistantMessage {
+                content: "step".into(),
+                tool_calls: calls
+                    .into_iter()
+                    .map(|(id, name, args)| provider_core::ToolCallRef {
+                        id: id.into(),
+                        name: name.into(),
+                        args,
+                    })
+                    .collect(),
+                thinking: None,
+            },
+            stop,
+            usage: Usage {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: None,
+                cost_usd: Some(0.01),
+            },
+            latency_ms: 0,
+            attempts: 1,
+            raw_stop_reason: None,
+        }
+    }
+
+    fn text_resp(text: &str) -> Response {
+        Response {
+            message: AssistantMessage {
+                content: text.into(),
+                tool_calls: vec![],
+                thinking: None,
+            },
+            stop: StopReason::Stop,
+            usage: Usage {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: None,
+                cost_usd: Some(0.01),
+            },
+            latency_ms: 0,
+            attempts: 1,
+            raw_stop_reason: None,
+        }
+    }
+
+    struct WriteFile {
+        root: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreTool for WriteFile {
+        fn definition(&self) -> CoreToolDef {
+            CoreToolDef {
+                name: "write".into(),
+                description: "write a file under the temp root".into(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["path", "content"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    }
+                }),
+            }
+        }
+        fn prepare(&self, call: &CoreToolCall) -> CoreCallStatus {
+            CoreCallStatus::Dispatch(CoreInvocation {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                args: call.args.clone(),
+            })
+        }
+        async fn execute(
+            &self,
+            inv: CoreInvocation,
+            _cancel: CancellationToken,
+        ) -> Result<CoreToolOutcome, CoreToolError> {
+            let path = inv.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let content = inv
+                .args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if path.is_empty() {
+                return Err(CoreToolError::Failed("bad args".into()));
+            }
+            std::fs::write(self.root.join(path), content)
+                .map_err(|e| CoreToolError::Failed(e.to_string()))?;
+            Ok(CoreToolOutcome {
+                content: format!("wrote {path}"),
+                truncated: false,
+            })
+        }
+    }
+
+    struct Boom;
+
+    #[async_trait::async_trait]
+    impl CoreTool for Boom {
+        fn definition(&self) -> CoreToolDef {
+            CoreToolDef {
+                name: "boom".into(),
+                description: "always fails".into(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {}
+                }),
+            }
+        }
+        fn prepare(&self, call: &CoreToolCall) -> CoreCallStatus {
+            CoreCallStatus::Dispatch(CoreInvocation {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                args: call.args.clone(),
+            })
+        }
+        async fn execute(
+            &self,
+            _inv: CoreInvocation,
+            _cancel: CancellationToken,
+        ) -> Result<CoreToolOutcome, CoreToolError> {
+            Err(CoreToolError::Failed("boom went off".into()))
+        }
+    }
+
+    fn run_registry(root: &std::path::Path) -> CoreRegistry {
+        let mut r = CoreRegistry::new(Arc::new(GrantGate::new(
+            [(
+                "agent".to_string(),
+                vec!["write".to_string(), "boom".to_string()],
+            )]
+            .into(),
+        )));
+        r.register(Arc::new(WriteFile {
+            root: root.to_path_buf(),
+        }));
+        r.register(Arc::new(Boom));
+        r
+    }
+
+    fn run_kinds(items: &[Item]) -> Vec<&'static str> {
+        items
+            .iter()
+            .map(|i| match &i.kind {
+                ItemKind::Header { .. } => "Header",
+                ItemKind::TurnStart { .. } => "TurnStart",
+                ItemKind::Input { .. } => "Input",
+                ItemKind::Assistant { .. } => "Assistant",
+                ItemKind::ToolCall { .. } => "ToolCall",
+                ItemKind::ToolResult { .. } => "ToolResult",
+                ItemKind::TurnEnd { .. } => "TurnEnd",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    struct RecBets {
+        order: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl BetsHook for RecBets {
+        fn on_step(&self) -> PhaseVerdict {
+            self.order.lock().unwrap().push("bets".into());
+            PhaseVerdict::Continue
+        }
+    }
+
+    #[tokio::test]
+    async fn run_e2e_multi_turn_proven_prefix_kept_failed_batch_rolled_back() {
+        use agent_event::check_pairing;
+        use agent_log::{open_turn_closers, read_log};
+        let root = run_tmp("e2e");
+        std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+        std::fs::write(root.join("goal.md"), "ship it\n").unwrap();
+        let log_path = std::env::temp_dir().join(format!(
+            "rof-run-e2e-log-{}-{}.jsonl",
+            std::process::id(),
+            RUN_N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let client = ScriptClient {
+            order: order.clone(),
+            queue: Mutex::new(VecDeque::from([
+                script_resp(
+                    vec![(
+                        "c1",
+                        "write",
+                        serde_json::json!({"path": "a.rs", "content": "v2\n"}),
+                    )],
+                    StopReason::ToolUse,
+                ),
+                script_resp(
+                    vec![
+                        (
+                            "c2",
+                            "write",
+                            serde_json::json!({"path": "b.rs", "content": "new\n"}),
+                        ),
+                        ("c3", "boom", serde_json::json!({})),
+                    ],
+                    StopReason::ToolUse,
+                ),
+                text_resp("batch rounds done"),
+                text_resp("second done"),
+            ])),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        state.followups.push_back("second task".into());
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let cfg = RunConfig {
+            log_path: Some(log_path.clone()),
+            context_files: vec!["goal.md".into()],
+            ..RunConfig::default()
+        };
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg,
+            },
+            vec![Input::User("build it".into())],
+            &cancel,
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        // Proven prefix kept on disk, failed batch rolled back.
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "v2\n");
+        assert!(!root.join("b.rs").exists());
+        // Budget consumed: one step per model call, tokens + spend metered.
+        assert_eq!(state.budget.counters().steps, 4);
+        assert_eq!(state.budget.counters().tokens, 60);
+        assert_eq!(state.budget.counters().spent_cents, 4);
+        assert!(!state.budget.grace_used());
+        // Events ordered and paired across two turns plus the run pair.
+        let history = emitter.history();
+        assert!(check_pairing(history), "unpaired: {history:?}");
+        let kinds = event_order(history);
+        assert!(matches!(
+            history.first().unwrap(),
+            AgentEvent::RunStart { .. }
+        ));
+        assert!(matches!(history.last().unwrap(), AgentEvent::RunEnd { .. }));
+        assert_eq!(kinds.iter().filter(|k| **k == "TurnStart").count(), 2);
+        assert_eq!(kinds.iter().filter(|k| **k == "TurnEnd").count(), 2);
+        assert_eq!(kinds.iter().filter(|k| **k == "MessageStart").count(), 4);
+        assert_eq!(kinds.iter().filter(|k| **k == "MessageEnd").count(), 4);
+        assert_eq!(kinds.iter().filter(|k| **k == "ToolStart").count(), 3);
+        assert_eq!(kinds.iter().filter(|k| **k == "ToolEnd").count(), 3);
+        // File log validates and is balanced: header first, closers empty.
+        let file_items = read_log(&log_path).unwrap();
+        assert!(matches!(file_items[0].kind, ItemKind::Header { .. }));
+        assert_eq!(file_items.len(), state.items.len());
+        assert!(open_turn_closers(&file_items).is_empty());
+        let log_kinds = run_kinds(&file_items);
+        assert_eq!(
+            log_kinds,
+            vec![
+                "Header",
+                "TurnStart",
+                "Input",
+                "Assistant",
+                "ToolCall",
+                "ToolResult",
+                "Assistant",
+                "ToolCall",
+                "ToolCall",
+                "ToolResult",
+                "ToolResult",
+                "Assistant",
+                "TurnEnd",
+                "TurnStart",
+                "Input",
+                "Assistant",
+                "TurnEnd",
+            ]
+        );
+        // The failed call is a durable error result, not a throw.
+        let boom = file_items
+            .iter()
+            .find(|i| matches!(&i.kind, ItemKind::ToolResult { call_id, .. } if call_id == "c3"))
+            .unwrap();
+        assert!(matches!(
+            &boom.kind,
+            ItemKind::ToolResult { is_error: true, .. }
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    #[tokio::test]
+    async fn run_bets_hook_fires_at_step_head_and_post_batch_in_order() {
+        let root = run_tmp("bets");
+        std::fs::write(root.join("f.txt"), "old\n").unwrap();
+        let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let client = ScriptClient {
+            order: order.clone(),
+            queue: Mutex::new(VecDeque::from([
+                script_resp(
+                    vec![(
+                        "c1",
+                        "write",
+                        serde_json::json!({"path": "f.txt", "content": "new\n"}),
+                    )],
+                    StopReason::ToolUse,
+                ),
+                text_resp("done"),
+            ])),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &RecBets {
+                    order: order.clone(),
+                },
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("go".into())],
+            &cancel,
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        // Step-head, post-batch, step-head interleave with the two model calls.
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["bets", "model", "bets", "bets", "model"],
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "new\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn run_halt_budget_steps_after_grace_with_budget_frame() {
+        assert_eq!(RunConfig::default().drain_timeout, Duration::from_secs(30));
+        assert_eq!(LoopState::new().drain_timeout, Duration::from_secs(30));
+        let root = run_tmp("halt");
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let client = ScriptClient {
+            order,
+            queue: Mutex::new(VecDeque::new()),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let max = state.budget.config().max_steps.get();
+        state.budget.counters_mut().steps = max;
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        // Configurable drain: 5s here proves the knob, 30s is the default.
+        let cfg = RunConfig {
+            drain_timeout: Duration::from_secs(5),
+            ..RunConfig::default()
+        };
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg,
+            },
+            vec![Input::User("too late".into())],
+            &cancel,
+        )
+        .await;
+        assert!(
+            matches!(outcome, Outcome::Halted(ref s) if s == "steps"),
+            "got {outcome:?}"
+        );
+        assert!(state.budget.grace_used()); // grace ran first, halt after
+        assert_eq!(state.drain_timeout, Duration::from_secs(5));
+        match emitter.history().last().unwrap() {
+            AgentEvent::RunEnd { outcome, .. } => {
+                assert!(matches!(outcome, agent_event::RunOutcome::Failed(_)))
+            }
+            other => panic!("expected RunEnd, got {other:?}"),
+        }
+        let turn_end = emitter
+            .history()
+            .iter()
+            .find(|e| matches!(e, AgentEvent::TurnEnd { .. }))
+            .unwrap();
+        assert!(matches!(
+            turn_end,
+            AgentEvent::TurnEnd {
+                reason: agent_event::TurnEndReason::BudgetExceeded,
+                ..
+            }
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn run_halt_same_action_and_crash_input_source() {
+        // Same action + same observation x4 trips the tripwire; lessons stay capped.
+        let root = run_tmp("trip");
+        std::fs::write(root.join("f.txt"), "x\n").unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let same = || {
+            script_resp(
+                vec![(
+                    "c",
+                    "write",
+                    serde_json::json!({"path": "f.txt", "content": "x\n"}),
+                )],
+                StopReason::ToolUse,
+            )
+        };
+        let client = ScriptClient {
+            order,
+            queue: Mutex::new(VecDeque::from([same(), same(), same(), same()])),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("again".into())],
+            &cancel,
+        )
+        .await;
+        assert!(
+            matches!(outcome, Outcome::Halted(ref s) if s == "same-action"),
+            "got {outcome:?}"
+        );
+        assert!(state.lessons.len() <= 3);
+        let _ = std::fs::remove_dir_all(&root);
+        // Crash queues like User but keeps the Crash source in the log.
+        let root = run_tmp("crash");
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let client = ScriptClient {
+            order,
+            queue: Mutex::new(VecDeque::from([text_resp("recovered")])),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::Crash("boom state".into())],
+            &cancel,
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        // items[0] is the run Header, [1] the TurnStart, [2] the admitted Crash.
+        match &state.items[2].kind {
+            ItemKind::Input { source, text, .. } => {
+                assert_eq!(*source, InputSource::Crash);
+                assert_eq!(text, "boom state");
+            }
+            other => panic!("expected Crash Input, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

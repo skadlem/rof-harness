@@ -15,3 +15,5 @@ agent-event = { path = "../agent-event" }
 tool-core = { path = "../tool-core" }
 provider-core = { path = "../provider-core" }
 agent-budget = { path = "../agent-budget" }
+snapshot = { path = "../snapshot" }
+context = { path = "../context" }
