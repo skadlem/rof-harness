@@ -1,6 +1,6 @@
 # NEXT.md — resume here (ordered, gated)
 
-Baseline: `cargo test --workspace` → 176 green, clippy clean. Tree clean. Read AGENTS.md + research/DECISIONS.md first.
+Baseline: `cargo test --workspace` → 176 green, clippy clean. Tree clean. Read AGENTS.md + research/DECISIONS.md first. V1 baseline frozen as tag `v1-frozen` on `master`; this rewrite lives on branch `v2-core`.
 
 1. **Live smoke leg** — `LIVE_SMOKE=1 ROF_TEST_BASE_URL=<base> cargo test -p provider-openai --test live_smoke -- --ignored`. Needs endpoint + key in env. Zero CI spend. Gate: 3/3 live pass.
 2. **Freeze Slice A** — task ids + tags + digests into `crates/eval/slices/` (TB session-window-debug + Multi-SWE Rust 40–60 ids, still unenumerated). Gate: byte-identical re-freeze.
