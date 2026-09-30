@@ -1,0 +1,23 @@
+[package]
+name = "rof"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rof"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+agent-loop = { path = "../agent-loop" }
+agent-event = { path = "../agent-event" }
+agent-budget = { path = "../agent-budget" }
+tool-core = { path = "../tool-core" }
+tools-std = { path = "../tools-std" }
+provider-core = { path = "../provider-core" }
+provider-openai = { path = "../provider-openai" }
+snapshot = { path = "../snapshot" }
