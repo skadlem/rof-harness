@@ -1,5 +1,7 @@
 # rof — a local agent harness with a meta-harness
 
+> Status: v1 baseline, frozen as tag `v1-frozen`. Rewrite lives on branch `v2-core` (external gate pending — see that branch's `NEXT.md`).
+
 A self-contained Rust agent runtime. It owns its orchestration, context handling, tools and
 evaluation; only model inference goes to an external API. One model does everything by
 default (an explicit `ROF_CTX_MODEL` still buys a two-tier A/B) — the arms never showed
