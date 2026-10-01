@@ -762,6 +762,9 @@ impl LoopState {
     }
 
     /// Transcript fold: the request is derived from the log, not held.
+    /// Collapse-5 over tool observations (context economics): the last
+    /// `COLLAPSE_KEEP` tool results go verbatim, older ones shrink to their
+    /// first line. Stable order preserved, so prefix caches survive.
     pub fn derived_messages(&self) -> Vec<ProviderMessage> {
         let mut out = Vec::new();
         for item in &self.items {
@@ -769,16 +772,45 @@ impl LoopState {
                 ItemKind::Input { text, .. } => out.push(ProviderMessage {
                     role: "user".into(),
                     content: text.clone(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
                 }),
-                ItemKind::Assistant { message, .. } => out.push(ProviderMessage {
-                    role: "assistant".into(),
-                    content: message_content(message),
-                }),
-                ItemKind::ToolResult { content, .. } => out.push(ProviderMessage {
+                ItemKind::Assistant { message, .. } => {
+                    // Stored as JSON: recover structured calls for strict providers.
+                    let am: AssistantMessage =
+                        serde_json::from_value(message.clone()).unwrap_or(AssistantMessage {
+                            content: message_content(message),
+                            tool_calls: Vec::new(),
+                            thinking: None,
+                        });
+                    out.push(ProviderMessage {
+                        role: "assistant".into(),
+                        content: am.content,
+                        tool_calls: am.tool_calls,
+                        tool_call_id: None,
+                    })
+                }
+                ItemKind::ToolResult {
+                    call_id, content, ..
+                } => out.push(ProviderMessage {
                     role: "tool".into(),
                     content: content.clone(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(call_id.clone()),
                 }),
                 _ => {}
+            }
+        }
+        let tool_idx: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "tool")
+            .map(|(i, _)| i)
+            .collect();
+        if tool_idx.len() > context::COLLAPSE_KEEP {
+            for &i in &tool_idx[..tool_idx.len() - context::COLLAPSE_KEEP] {
+                let first = out[i].content.lines().next().unwrap_or("").to_string();
+                out[i].content = format!("[collapsed] {first}");
             }
         }
         out
@@ -1305,6 +1337,8 @@ fn build_request(
     let mut messages = vec![ProviderMessage {
         role: "system".into(),
         content: asm.assemble(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
     }];
     messages.extend(state.derived_messages());
     Request {
@@ -2159,6 +2193,31 @@ mod tests {
             (msgs[0].role.as_str(), msgs[0].content.as_str()),
             ("user", "build it")
         );
+    }
+
+    #[test]
+    fn derived_messages_collapse_5_and_ids() {
+        let mut s = LoopState::new();
+        for i in 0..7 {
+            s.items.push(Item {
+                seq: s.items.len() as u64,
+                id: format!("t{i}"),
+                parent_id: None,
+                recorded_at: SystemTime::now(),
+                kind: ItemKind::ToolResult {
+                    call_id: format!("c{i}"),
+                    content: format!("line{i}-head\nline{i}-tail"),
+                    is_error: false,
+                    recovery: None,
+                },
+            });
+        }
+        let msgs = s.derived_messages();
+        assert_eq!(msgs.len(), 7);
+        assert_eq!(msgs[0].content, "[collapsed] line0-head");
+        assert_eq!(msgs[1].content, "[collapsed] line1-head");
+        assert_eq!(msgs[2].content, "line2-head\nline2-tail");
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("c2"));
     }
 
     #[tokio::test]

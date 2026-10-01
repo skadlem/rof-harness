@@ -60,15 +60,22 @@ impl OpenAiCompat {
 impl LlmClient for OpenAiCompat {
     async fn complete(&self, model: &str, req: &Request) -> Result<Response, LlmError> {
         let t = Instant::now();
-        // ponytail: retry lives here, not in every caller. Free tiers 429 often.
         let mut knobs = WireKnobs::from_req(req);
+        // ponytail: retry lives here, not in every caller. Free tiers 429 often.
+        // Cold-start extension: 503s get up to 8 attempts with 60s sleeps
+        // (~4 min, covers Modal scale-from-zero); everything else keeps 5.
         let mut last_err = "no attempts".to_string();
         let mut last_after: Option<Duration> = None;
-        for attempt in 0..5 {
+        let mut attempt = 0u32;
+        loop {
             if attempt > 0 {
-                let d = last_after
-                    .take()
-                    .unwrap_or_else(|| Duration::from_secs(2u64.pow(attempt.min(10))));
+                let d = last_after.take().unwrap_or_else(|| {
+                    if is_cold_start(&last_err) {
+                        Duration::from_secs(60)
+                    } else {
+                        Duration::from_secs(2u64.pow(attempt.min(10)))
+                    }
+                });
                 tokio::time::sleep(d).await;
             }
             match self.once(model, req, &knobs).await {
@@ -82,10 +89,11 @@ impl LlmClient for OpenAiCompat {
                     if !f.retryable {
                         break;
                     }
+                    let cap = if is_cold_start(&f.msg) { 7 } else { 4 };
+                    if attempt >= cap {
+                        break;
+                    }
                     if f.truncated {
-                        if attempt >= 4 {
-                            break;
-                        }
                         if !apply_ladder(&mut knobs, f.content_chars) {
                             break;
                         }
@@ -95,7 +103,10 @@ impl LlmClient for OpenAiCompat {
                     }
                 }
             }
+            attempt += 1;
         }
+        // unreachable-looking tail kept for structure; loop always breaks to err
+        #[allow(unreachable_code)]
         Err(LlmError::Transport(last_err))
     }
 
@@ -236,7 +247,30 @@ fn wire_body(model: &str, req: &Request, k: &WireKnobs) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = req
         .messages
         .iter()
-        .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+        .map(|m| {
+            let mut o = serde_json::json!({"role": m.role, "content": m.content});
+            if !m.tool_calls.is_empty() {
+                o["tool_calls"] = m
+                    .tool_calls
+                    .iter()
+                    .map(|tc| {
+                        let args = match &tc.args {
+                            serde_json::Value::String(s) => s.clone(),
+                            v => v.to_string(),
+                        };
+                        serde_json::json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.name, "arguments": args},
+                        })
+                    })
+                    .collect();
+            }
+            if let Some(id) = &m.tool_call_id {
+                o["tool_call_id"] = serde_json::Value::String(id.clone());
+            }
+            o
+        })
         .collect();
     let mut b = serde_json::json!({
         "model": model,
@@ -371,6 +405,13 @@ impl OpenAiCompat {
     }
 }
 
+/// 503 from serverless GPU endpoints usually means cold start (scale-from-zero
+/// takes minutes for big models), not rejection. Worth out-waiting; other
+/// errors keep the short ladder.
+fn is_cold_start(msg: &str) -> bool {
+    msg.contains("503")
+}
+
 fn truncated_content_chars(text: &str) -> usize {
     let Some(i) = text.find("content=") else {
         return 0;
@@ -403,12 +444,18 @@ struct ChoiceMsg {
     content: String,
     #[serde(default, deserialize_with = "null_as_empty")]
     reasoning_content: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     tool_calls: Vec<WireToolCall>,
 }
 
 fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
+fn null_as_empty_vec<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<WireToolCall>, D::Error> {
+    Ok(Option::<Vec<WireToolCall>>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -657,10 +704,14 @@ mod tests {
                 ProviderMessage {
                     role: "system".into(),
                     content: "sys".into(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
                 },
                 ProviderMessage {
                     role: "user".into(),
                     content: "hi".into(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
                 },
             ],
             tools: vec![tool_core::ToolDeclaration {
@@ -677,6 +728,39 @@ mod tests {
             thinking: Thinking::Auto,
             extras: serde_json::Value::Null,
         }
+    }
+
+    #[test]
+    fn wire_body_threads_tool_ids_for_strict_providers() {
+        use provider_core::ToolCallRef;
+        let req = Request {
+            messages: vec![
+                ProviderMessage {
+                    role: "assistant".into(),
+                    content: String::new(),
+                    tool_calls: vec![ToolCallRef {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        args: serde_json::json!({"path": "a"}),
+                    }],
+                    tool_call_id: None,
+                },
+                ProviderMessage {
+                    role: "tool".into(),
+                    content: "ok".into(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some("c1".into()),
+                },
+            ],
+            tools: vec![],
+            max_tokens: 64,
+            thinking: Thinking::Auto,
+            extras: serde_json::Value::Null,
+        };
+        let b = wire_body("m", &req, &WireKnobs::from_req(&req));
+        assert_eq!(b["messages"][0]["tool_calls"][0]["id"], "c1");
+        assert_eq!(b["messages"][0]["tool_calls"][0]["type"], "function");
+        assert_eq!(b["messages"][1]["tool_call_id"], "c1");
     }
 
     #[test]
@@ -729,6 +813,25 @@ mod tests {
         assert_eq!(r.usage.reasoning, Some(30));
         assert_eq!(r.usage.total_tokens(), 110);
         assert_eq!(r.usage.content_tokens(), 70);
+    }
+
+    #[test]
+    fn cold_start_is_503_only() {
+        assert!(is_cold_start("503 Service Unavailable: "));
+        assert!(!is_cold_start("429 Too Many Requests"));
+        assert!(!is_cold_start("502 Bad Gateway"));
+    }
+
+    #[test]
+    fn null_tool_calls_decode_to_empty() {
+        let v = serde_json::json!({
+            "choices": [{"message": {"content": "ok", "tool_calls": null},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        });
+        let r = parse_body(&v, "m", 64).unwrap();
+        assert_eq!(r.message.content, "ok");
+        assert!(r.message.tool_calls.is_empty());
     }
 
     #[test]

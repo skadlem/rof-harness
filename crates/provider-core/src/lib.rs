@@ -20,6 +20,12 @@ pub enum Thinking {
 pub struct ProviderMessage {
     pub role: String,
     pub content: String,
+    /// Assistant tool calls to echo back (strict providers 422 without them).
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallRef>,
+    /// Tool-result linkage id (strict providers 422 without it).
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

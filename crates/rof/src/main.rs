@@ -17,7 +17,7 @@ use snapshot::TreeService;
 use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
-const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--allow-cmd CMD...] [--budget-steps N]";
+const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--allow-cmd CMD...] [--budget-steps N] [--dump-events PATH]";
 
 #[derive(Debug, PartialEq)]
 struct Args {
@@ -27,6 +27,7 @@ struct Args {
     endpoint: Option<String>,
     allow_cmd: Vec<String>,
     budget_steps: Option<u32>,
+    dump_events: Option<String>,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -34,8 +35,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     if a.len() < 2 || a[1] != "run" {
         return Err(USAGE.into());
     }
-    let (mut goal, mut workdir, mut model, mut endpoint, mut steps) =
-        (None, None, None, None, None);
+    let (mut goal, mut workdir, mut model, mut endpoint, mut steps, mut dump) =
+        (None, None, None, None, None, None);
     let mut allow = Vec::new();
     let mut i = 2;
     while i < a.len() {
@@ -58,6 +59,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--workdir" => workdir = Some(take(&mut i, inline)?),
             "--model" => model = Some(take(&mut i, inline)?),
             "--endpoint" => endpoint = Some(take(&mut i, inline)?),
+            "--dump-events" => dump = Some(take(&mut i, inline)?),
             "--allow-cmd" => allow.push(take(&mut i, inline)?),
             "--budget-steps" => {
                 let s = take(&mut i, inline)?;
@@ -80,6 +82,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         endpoint,
         allow_cmd: allow,
         budget_steps: steps,
+        dump_events: dump,
     })
 }
 
@@ -142,19 +145,22 @@ fn summarize(events: &[AgentEvent]) -> String {
 struct RunResult {
     outcome: Outcome,
     patch: String,
+    events: Vec<AgentEvent>,
 }
 
 async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     let policy = Arc::new(tools_std::Policy {
         root: args.workdir.clone(),
-        allowed_commands: args.allow_cmd.clone(),
-        allowed_prefixes: Vec::new(),
+        // --allow-cmd entries are binary prefixes (no shell: `&&`/`|` are
+        // literal args, so exact-string matching would allow nothing useful).
+        allowed_commands: Vec::new(),
+        allowed_prefixes: args.allow_cmd.clone(),
         syntax_cmd: None,
         denied_globs: tools_std::default_denied_globs(),
     });
     let mut reg = tool_core::Registry::new(Arc::new(GrantGate::new(HashMap::from([(
         "agent".to_string(),
-        ["view", "search", "edit", "exec", "test"]
+        ["view", "search", "edit", "write", "exec", "test"]
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
@@ -162,6 +168,7 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     reg.register(Arc::new(tools_std::view_tool(policy.clone())));
     reg.register(Arc::new(tools_std::search_tool(policy.clone())));
     reg.register(Arc::new(tools_std::edit_tool(policy.clone())));
+    reg.register(Arc::new(tools_std::write_tool(policy.clone())));
     reg.register(Arc::new(tools_std::exec_tool(policy.clone())));
     reg.register(Arc::new(tools_std::test_tool(policy)));
     let mut state = LoopState::new();
@@ -203,7 +210,11 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
         .map(|p| p.text)
         .unwrap_or_default();
     eprintln!("events {}", summarize(emitter.history()));
-    RunResult { outcome, patch }
+    RunResult {
+        outcome,
+        patch,
+        events: emitter.history().to_vec(),
+    }
 }
 
 #[tokio::main]
@@ -232,6 +243,20 @@ async fn main() {
     };
     let provider = OpenAiCompat::new(&endpoint, EndpointProfile::default());
     let r = execute(&provider, &args).await;
+    if let Some(path) = args.dump_events.as_deref() {
+        match serde_json::to_string_pretty(&r.events) {
+            Ok(js) => {
+                if let Err(e) = std::fs::write(path, js) {
+                    eprintln!("cannot write {path}: {e}");
+                    std::process::exit(2);
+                }
+            }
+            Err(e) => {
+                eprintln!("cannot encode events: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
     if !r.patch.is_empty() {
         println!("{}", r.patch);
     }
@@ -268,6 +293,8 @@ mod tests {
             "true",
             "--budget-steps",
             "7",
+            "--dump-events",
+            "/tmp/ev.json",
         ]))
         .unwrap();
         assert_eq!(
@@ -279,6 +306,7 @@ mod tests {
                 endpoint: Some("http://x".into()),
                 allow_cmd: vec!["cargo test".into(), "true".into()],
                 budget_steps: Some(7),
+                dump_events: Some("/tmp/ev.json".into()),
             }
         );
         let b = parse_args(&argv(&[
@@ -290,7 +318,10 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(b.allow_cmd, Vec::<String>::new());
-        assert_eq!((b.endpoint, b.budget_steps), (None, None));
+        assert_eq!(
+            (b.endpoint, b.budget_steps, b.dump_events),
+            (None, None, None)
+        );
     }
 
     #[test]
@@ -500,6 +531,7 @@ mod tests {
             endpoint: None,
             allow_cmd: vec![],
             budget_steps: steps,
+            dump_events: None,
         }
     }
 

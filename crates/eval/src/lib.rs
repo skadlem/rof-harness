@@ -456,6 +456,64 @@ pub fn slice_path(name: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
+/// Freeze-time winnability: every artifact the verifier reads must be
+/// producible by the agent's toolset. $0 check that fails the freeze loud
+/// (would have caught layout's missing write tool before any spend).
+#[derive(Debug, Clone)]
+pub struct ToolCaps {
+    pub can_create: bool,
+    pub can_patch: bool,
+    pub exec_prefixes: Vec<String>,
+}
+
+fn task_artifacts(toml: &str) -> Vec<String> {
+    for line in toml.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() == "artifacts" {
+            return v
+                .trim()
+                .trim_matches(['[', ']'])
+                .split(',')
+                .map(|p| p.trim().trim_matches(['"', '\'']).to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+/// Returns violation strings; empty means the task is winnable with `caps`.
+/// Agent seed = `task_dir/environment` (starting files); `/app/X` maps there.
+/// Absent artifacts need create; present ones need patch; missing tests or
+/// oracle are always violations.
+pub fn check_winnability(task_dir: &Path, caps: &ToolCaps) -> Vec<String> {
+    let mut bad = Vec::new();
+    let toml = std::fs::read_to_string(task_dir.join("task.toml")).unwrap_or_default();
+    let tests_empty = std::fs::read_dir(task_dir.join("tests"))
+        .map(|rd| rd.count() == 0)
+        .unwrap_or(true);
+    if tests_empty {
+        bad.push("no verifier tests".to_string());
+    }
+    if !task_dir.join("solution").join("solve.sh").exists() {
+        bad.push("no oracle solve.sh".to_string());
+    }
+    for a in task_artifacts(&toml) {
+        let rel = a.strip_prefix("/app/").unwrap_or(&a);
+        let seed = task_dir.join("environment").join(rel.trim_end_matches('/'));
+        let present = seed.exists();
+        if present && !caps.can_patch {
+            bad.push(format!("{a}: present in seed but no patch tool"));
+        }
+        if !present && !caps.can_create {
+            bad.push(format!("{a}: absent from seed and no write tool"));
+        }
+    }
+    bad
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,5 +736,85 @@ mod tests {
         let raw = std::fs::read_to_string(&p).expect("frozen slice file must exist");
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(v.get("ids").and_then(|x| x.as_array()).is_some());
+    }
+
+    fn win_task(root: &Path, artifacts: &str, seed_files: &[&str]) -> PathBuf {
+        let t = root.join("task");
+        std::fs::create_dir_all(t.join("tests")).unwrap();
+        std::fs::create_dir_all(t.join("solution")).unwrap();
+        std::fs::write(t.join("tests").join("test.sh"), "exit 0\n").unwrap();
+        std::fs::write(t.join("solution").join("solve.sh"), "echo ok\n").unwrap();
+        std::fs::write(t.join("task.toml"), format!("artifacts = [{artifacts}]\n")).unwrap();
+        for f in seed_files {
+            let p = t.join("environment").join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "seed\n").unwrap();
+        }
+        t
+    }
+
+    fn full_caps() -> ToolCaps {
+        ToolCaps {
+            can_create: true,
+            can_patch: true,
+            exec_prefixes: vec!["python3".into()],
+        }
+    }
+
+    #[test]
+    fn winnability_pass_and_missing_write() {
+        let root = tmp();
+        // Present artifact needs patch; absent needs create.
+        let t = win_task(
+            &root,
+            "\"/app/data\", \"/app/output/config.json\"",
+            &["data/x"],
+        );
+        assert!(check_winnability(&t, &full_caps()).is_empty());
+        let no_write = ToolCaps {
+            can_create: false,
+            ..full_caps()
+        };
+        let bad = check_winnability(&t, &no_write);
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].contains("no write tool"), "{bad:?}");
+    }
+
+    #[test]
+    fn winnability_missing_tests_or_oracle() {
+        let root = tmp();
+        let t = win_task(&root, "\"/app/data\"", &["data/x"]);
+        std::fs::remove_dir_all(t.join("tests")).unwrap();
+        let bad = check_winnability(&t, &full_caps());
+        assert!(
+            bad.iter().any(|b| b.contains("no verifier tests")),
+            "{bad:?}"
+        );
+    }
+
+    #[ignore]
+    #[test]
+    fn winnability_frozen_tasks_live() {
+        // Env-gated like live_smoke: ROF_TB_TASKS or default share path; skip if absent.
+        let base = std::env::var("ROF_TB_TASKS").unwrap_or_else(|_| {
+            format!(
+                "{}/.local/share/rof-tb/tasks",
+                std::env::var("HOME").unwrap_or_default()
+            )
+        });
+        let base = PathBuf::from(base);
+        if !base.is_dir() {
+            return;
+        }
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&base).unwrap().filter_map(|e| e.ok()) {
+            if !entry.file_type().map(|f| f.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let bad = check_winnability(&entry.path(), &full_caps());
+            assert!(bad.is_empty(), "{:?}: {bad:?}", entry.file_name());
+            checked += 1;
+        }
+        assert!(checked > 0, "no task dirs under {}", base.display());
     }
 }

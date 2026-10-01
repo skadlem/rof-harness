@@ -1,6 +1,6 @@
 //! Live smoke for the OpenAI-compatible adapter. Never runs in CI:
 //! every live test is `#[ignore]`d and skips (never fails) unless
-//! `LIVE_SMOKE=1` AND a key (`ASTRIA_API_KEY` or `OPENAI_API_KEY`) is set.
+//! `LIVE_SMOKE=1` AND `OPENAI_API_KEY` is set.
 //! Run: `LIVE_SMOKE=1 ROF_TEST_BASE_URL=<base> cargo test -p provider-openai
 //! --test live_smoke -- --ignored --nocapture`. Key names only below, values
 //! are never printed.
@@ -14,12 +14,11 @@ struct LiveConfig {
     model: String,
 }
 
-const SETUP_MSG: &str = "LIVE_SMOKE=1 with a key (ASTRIA_API_KEY or OPENAI_API_KEY) but no endpoint: set ROF_TEST_BASE_URL (preferred) or OPENAI_BASE_URL to your OpenAI-compatible base URL; no default is assumed";
+const SETUP_MSG: &str = "LIVE_SMOKE=1 with OPENAI_API_KEY but no endpoint: set ROF_TEST_BASE_URL (preferred) or OPENAI_BASE_URL to your OpenAI-compatible base URL; no default is assumed";
 
 // Pure picker so the gate is unit-testable without touching env.
 fn pick(
     live: &str,
-    astria: &str,
     openai: &str,
     base1: &str,
     base2: &str,
@@ -27,9 +26,7 @@ fn pick(
     if live != "1" {
         return Ok(None);
     }
-    let key = if !astria.trim().is_empty() {
-        "ASTRIA_API_KEY"
-    } else if !openai.trim().is_empty() {
+    let key = if !openai.trim().is_empty() {
         "OPENAI_API_KEY"
     } else {
         return Ok(None);
@@ -43,11 +40,10 @@ fn pick(
 
 fn live_config() -> Result<Option<LiveConfig>, String> {
     let live = std::env::var("LIVE_SMOKE").unwrap_or_default();
-    let astria = std::env::var("ASTRIA_API_KEY").unwrap_or_default();
     let openai = std::env::var("OPENAI_API_KEY").unwrap_or_default();
     let base1 = std::env::var("ROF_TEST_BASE_URL").unwrap_or_default();
     let base2 = std::env::var("OPENAI_BASE_URL").unwrap_or_default();
-    match pick(&live, &astria, &openai, &base1, &base2) {
+    match pick(&live, &openai, &base1, &base2) {
         Ok(None) => Ok(None),
         Err(msg) => Err(msg.to_string()),
         Ok(Some(key_env)) => {
@@ -72,6 +68,8 @@ fn tiny_req(prompt: &str, max_tokens: usize) -> Request {
         messages: vec![ProviderMessage {
             role: "user".into(),
             content: prompt.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }],
         tools: vec![],
         max_tokens,
@@ -148,16 +146,16 @@ async fn live_streaming_smoke() {
 
 #[test]
 fn gate_picker_skips_fails_loudly() {
-    assert!(pick("0", "k", "", "http://x", "").unwrap().is_none());
-    assert!(pick("", "", "", "http://x", "").unwrap().is_none());
-    assert!(pick("1", "", "", "http://x", "").unwrap().is_none());
+    assert!(pick("0", "k", "http://x", "").unwrap().is_none());
+    assert!(pick("", "", "http://x", "").unwrap().is_none());
+    assert!(pick("1", "", "http://x", "").unwrap().is_none());
     assert_eq!(
-        pick("1", "k", "", "http://x", "").unwrap(),
-        Some("ASTRIA_API_KEY")
-    );
-    assert_eq!(
-        pick("1", "", "k", "", "http://y").unwrap(),
+        pick("1", "k", "http://x", "").unwrap(),
         Some("OPENAI_API_KEY")
     );
-    assert!(pick("1", "k", "", "", "").is_err());
+    assert_eq!(
+        pick("1", "k", "", "http://y").unwrap(),
+        Some("OPENAI_API_KEY")
+    );
+    assert!(pick("1", "k", "", "").is_err());
 }
