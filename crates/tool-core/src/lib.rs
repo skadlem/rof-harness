@@ -18,7 +18,7 @@ pub struct ToolDefinition {
     pub schema: Value,
 }
 
-/// Declaration-only view: no executables, derived PartialEq for diffing.
+/// Declaration-only view: no executables, derived PartialEq for comparisons.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDeclaration {
     pub name: String,
@@ -74,7 +74,6 @@ impl From<ToolError> for ToolResult {
 pub struct ToolResult {
     pub content: String,
     pub is_error: bool,
-    pub terminate: bool,
 }
 
 /// Decision-step outcome: always an answer for the model, never a throw.
@@ -82,18 +81,6 @@ pub struct ToolResult {
 pub enum CallStatus {
     Dispatch(Invocation),
     Result(ToolResult),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
-    Parallel,
-    Exclusive,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminatePolicy {
-    Unanimous,
-    Any,
 }
 
 #[derive(Debug, Clone)]
@@ -145,9 +132,6 @@ pub trait Tool: Send + Sync {
         inv: Invocation,
         cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError>;
-    fn execution_mode(&self) -> ExecutionMode {
-        ExecutionMode::Parallel
-    }
 }
 
 pub struct Registry {
@@ -168,7 +152,7 @@ impl Registry {
     pub fn resolve(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
     }
-    /// Model-facing declarations, name-sorted for a stable diff.
+    /// Model-facing declarations, name-sorted for a stable wire order.
     pub fn definitions(&self) -> Vec<ToolDeclaration> {
         let mut out: Vec<ToolDeclaration> = self
             .tools
@@ -214,62 +198,6 @@ impl Registry {
             }),
         }
     }
-    pub fn diff_against(&self, prev: &[ToolDeclaration]) -> ToolSetDiff {
-        let cur = self.definitions();
-        ToolSetDiff {
-            added: cur.iter().filter(|d| !prev.contains(d)).cloned().collect(),
-            removed: prev
-                .iter()
-                .filter(|p| !cur.iter().any(|d| d.name == p.name))
-                .map(|p| p.name.clone())
-                .collect(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ToolSetDiff {
-    pub added: Vec<ToolDeclaration>,
-    pub removed: Vec<String>,
-}
-
-/// True when the batch may stop under the policy.
-pub fn batch_concluded(results: &[ToolResult], policy: TerminatePolicy) -> bool {
-    match policy {
-        TerminatePolicy::Unanimous => !results.is_empty() && results.iter().all(|r| r.terminate),
-        TerminatePolicy::Any => results.iter().any(|r| r.terminate),
-    }
-}
-
-/// Split model-ordered calls into sequential segments. Each `Exclusive` call
-/// and each call whose args are not an object (unparseable: unreadable, so
-/// never interleaved) becomes a one-element barrier; the rest accumulate in
-/// source order.
-pub fn plan_segments(
-    calls: &[ToolCall],
-    modes: &HashMap<String, ExecutionMode>,
-) -> Vec<Vec<usize>> {
-    let mut segs: Vec<Vec<usize>> = Vec::new();
-    let mut cur: Vec<usize> = Vec::new();
-    for (i, c) in calls.iter().enumerate() {
-        let exclusive = modes
-            .get(&c.name)
-            .copied()
-            .unwrap_or(ExecutionMode::Parallel)
-            == ExecutionMode::Exclusive;
-        if exclusive || !c.args.is_object() {
-            if !cur.is_empty() {
-                segs.push(std::mem::take(&mut cur));
-            }
-            segs.push(vec![i]);
-        } else {
-            cur.push(i);
-        }
-    }
-    if !cur.is_empty() {
-        segs.push(cur);
-    }
-    segs
 }
 
 /// Head+tail bound with omission marker; total never exceeds `max` (chars).
@@ -295,7 +223,6 @@ fn error_result(content: String) -> ToolResult {
     ToolResult {
         content: bound_text(&content, MAX_MODEL_CHARS),
         is_error: true,
-        terminate: false,
     }
 }
 
@@ -369,7 +296,6 @@ mod tests {
 
     struct FakeTool {
         def: ToolDefinition,
-        mode: ExecutionMode,
         log: Option<Arc<Mutex<Vec<String>>>>,
     }
 
@@ -381,7 +307,6 @@ mod tests {
                     description: format!("{name} tool"),
                     schema,
                 },
-                mode: ExecutionMode::Parallel,
                 log: None,
             }
         }
@@ -415,9 +340,6 @@ mod tests {
                 content: inv.call_id,
                 truncated: false,
             })
-        }
-        fn execution_mode(&self) -> ExecutionMode {
-            self.mode
         }
     }
 
@@ -466,79 +388,12 @@ mod tests {
         }
     }
 
-    fn res(terminate: bool) -> ToolResult {
-        ToolResult {
-            content: "x".into(),
-            is_error: false,
-            terminate,
-        }
-    }
-
     fn reg(gate: Arc<dyn PermissionGate>, tools: Vec<FakeTool>) -> Registry {
         let mut r = Registry::new(gate);
         for t in tools {
             r.register(Arc::new(t));
         }
         r
-    }
-
-    #[test]
-    fn unanimous_needs_every_result() {
-        assert!(batch_concluded(
-            &[res(true), res(true)],
-            TerminatePolicy::Unanimous
-        ));
-        assert!(!batch_concluded(
-            &[res(true), res(false)],
-            TerminatePolicy::Unanimous
-        ));
-        assert!(!batch_concluded(&[], TerminatePolicy::Unanimous));
-    }
-
-    #[test]
-    fn any_needs_one_result() {
-        assert!(batch_concluded(
-            &[res(true), res(false)],
-            TerminatePolicy::Any
-        ));
-        assert!(!batch_concluded(&[res(false)], TerminatePolicy::Any));
-        assert!(!batch_concluded(&[], TerminatePolicy::Any));
-    }
-
-    #[test]
-    fn exclusive_calls_are_barriers_in_source_order() {
-        let calls = vec![
-            call("a", "read", json!({})),
-            call("b", "write", json!({})),
-            call("c", "read", json!({})),
-        ];
-        let modes: HashMap<String, ExecutionMode> =
-            [("write".to_string(), ExecutionMode::Exclusive)].into();
-        assert_eq!(
-            plan_segments(&calls, &modes),
-            vec![vec![0], vec![1], vec![2]]
-        );
-    }
-
-    #[test]
-    fn unparseable_args_are_barriers() {
-        let calls = vec![
-            call("a", "read", json!({"x": 1})),
-            call("b", "read", json!("[1,2")),
-            call("c", "read", json!({"x": 1})),
-        ];
-        let modes = HashMap::new();
-        // the raw-text arg is not an object, so it is isolated mid-batch
-        assert_eq!(
-            plan_segments(&calls, &modes),
-            vec![vec![0], vec![1], vec![2]]
-        );
-    }
-
-    #[test]
-    fn parallel_calls_share_one_segment() {
-        let calls = vec![call("a", "read", json!({})), call("b", "read", json!({}))];
-        assert_eq!(plan_segments(&calls, &HashMap::new()), vec![vec![0, 1]]);
     }
 
     #[test]
@@ -635,27 +490,6 @@ mod tests {
     }
 
     #[test]
-    fn diff_reports_added_and_removed() {
-        let r = reg(Arc::new(AllowAll), vec![FakeTool::new("a", json!({}))]);
-        let d = r.diff_against(&[]);
-        assert_eq!(d.added.len(), 1);
-        assert!(d.removed.is_empty());
-        let cur = r.definitions();
-        let d2 = r.diff_against(&cur);
-        assert!(d2.added.is_empty() && d2.removed.is_empty());
-        let prev = vec![
-            cur[0].clone(),
-            ToolDeclaration {
-                name: "gone".into(),
-                description: "g".into(),
-                schema: json!({}),
-            },
-        ];
-        let d3 = r.diff_against(&prev);
-        assert_eq!(d3.removed, vec!["gone".to_string()]);
-    }
-
-    #[test]
     fn grant_gate_denies_unknown_agent_and_tool() {
         let g = GrantGate::new([("coder".to_string(), vec!["a".to_string()])].into());
         assert!(matches!(
@@ -675,7 +509,7 @@ mod tests {
     #[test]
     fn tool_error_converts_to_bounded_error_result() {
         let r = ToolResult::from(ToolError::Denied("x".into()));
-        assert!(r.is_error && !r.terminate && r.content.contains("denied"));
+        assert!(r.is_error && r.content.contains("denied"));
         let big = "y".repeat(MAX_MODEL_CHARS + 10);
         let r2 = ToolResult::from(ToolError::Failed(big));
         assert!(r2.content.chars().count() <= MAX_MODEL_CHARS);

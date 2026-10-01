@@ -70,40 +70,8 @@ pub struct BudgetExceeded {
     pub limit: u64,
 }
 
-impl BudgetExceeded {
-    /// Terminal verdict text. An aborted task never appeals.
-    pub fn verdict(&self) -> BudgetVerdict {
-        BudgetVerdict {
-            pass: false,
-            feedback: format!(
-                "aborted: {} budget exceeded ({} > {})",
-                halt_name(&self.halt),
-                self.spent,
-                self.limit
-            ),
-        }
-    }
-    /// Aborted tasks never appeal: the budget, not the judge, decided.
-    pub fn may_appeal(&self) -> bool {
-        false
-    }
-}
-
-/// Terminal verdict for a budget halt. `pass` is always false.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BudgetVerdict {
-    pub pass: bool,
-    pub feedback: String,
-}
-
-impl BudgetVerdict {
-    /// Aborted tasks never appeal.
-    pub fn may_appeal(&self) -> bool {
-        false
-    }
-}
-
-fn halt_name(h: &BudgetHalt) -> &'static str {
+/// Name of the tripped counter, verbatim in halt labels.
+pub fn halt_name(h: &BudgetHalt) -> &'static str {
     match h {
         BudgetHalt::Steps => "steps",
         BudgetHalt::Trials => "trials",
@@ -153,22 +121,6 @@ impl BudgetGuard {
 
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
-    }
-
-    pub fn grace_used(&self) -> bool {
-        self.grace_used.get()
-    }
-
-    /// Nested scope with child isolation: fresh counters and latches, so
-    /// child totals may exceed the parent cap by design.
-    pub fn child_scope(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            counters: BudgetCounters::default(),
-            started: Instant::now(),
-            grace_used: Cell::new(false),
-            nudge_fired: Cell::new(false),
-        }
     }
 
     /// Peek the first tripped counter without touching the grace latch.
@@ -412,9 +364,7 @@ mod tests {
     fn grace_fires_exactly_once() {
         let mut g = unattended();
         g.counters_mut().steps = g.config().max_steps.get();
-        assert!(!g.grace_used());
         assert!(g.may_step().is_ok()); // the one goodbye step
-        assert!(g.grace_used());
         assert_eq!(g.may_step(), Err(BudgetHalt::Steps));
         assert_eq!(g.may_step(), Err(BudgetHalt::Steps)); // stays halted
     }
@@ -491,29 +441,5 @@ mod tests {
         assert_eq!(config_for(Capability::Interactive).max_spend_cents, None);
         assert_eq!(config_for(Capability::Subagent).max_spend_cents, None);
         assert_eq!(config_for(Capability::Subagent).max_steps.get(), 50);
-    }
-
-    #[test]
-    fn verdict_is_terminal_and_never_appeals() {
-        let mut g = unattended();
-        g.counters_mut().steps = g.config().max_steps.get();
-        let ex = g.exceeded().expect("halt detail");
-        assert_eq!(ex.halt, BudgetHalt::Steps);
-        let v = ex.verdict();
-        assert!(!v.pass);
-        assert!(v.feedback.contains("aborted: steps budget exceeded"));
-        assert!(!v.may_appeal());
-        assert!(!ex.may_appeal());
-    }
-
-    #[test]
-    fn child_scope_is_isolated() {
-        let mut parent = unattended();
-        for _ in 0..20 {
-            parent.record_step();
-        }
-        let child = parent.child_scope();
-        assert_eq!(child.counters().steps, 0);
-        assert!(child.may_step().is_ok()); // totals may exceed parent
     }
 }

@@ -2,11 +2,9 @@
 //! provider_core::LlmClient. Covers DeepSeek/Atria/OpenRouter/Ollama through
 //! config (endpoint + key + model id). See research/crate-provider-core.md.
 use async_trait::async_trait;
-use futures::stream::BoxStream;
-use futures::StreamExt as _;
 use provider_core::{
     infer_stop, parse_retry_after, parse_streaming_json, Capabilities, Credentials, LlmClient,
-    LlmError, Request, Response, StopReason, StreamEvent, StreamReducer, ToolCallRef, Usage,
+    LlmError, Request, Response, StopReason, ToolCallRef, Usage,
 };
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -110,60 +108,8 @@ impl LlmClient for OpenAiCompat {
         Err(LlmError::Transport(last_err))
     }
 
-    async fn stream(
-        &self,
-        model: &str,
-        req: &Request,
-    ) -> Result<BoxStream<'static, StreamEvent>, LlmError> {
-        let key = self.resolve_key("openai").await?.api_key;
-        let knobs = WireKnobs::from_req(req);
-        let mut body = wire_body(model, req, &knobs);
-        body["stream"] = serde_json::Value::Bool(true);
-        let mut call = self
-            .http
-            .post(format!("{}/chat/completions", self.endpoint))
-            .header("Accept", "text/event-stream");
-        if !key.trim().is_empty() {
-            call = call.bearer_auth(key);
-        }
-        let resp = call
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Transport(e.to_string()))?;
-        if !resp.status().is_success() {
-            let code = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            let short: String = text.chars().take(300).collect();
-            return Err(LlmError::Transport(format!("{code}: {short}")));
-        }
-        // Collect with per-chunk idle timeout + per-frame cap, then project to
-        // events. The reducer still owns the cumulative message downstream.
-        let mut raw = String::new();
-        let mut stream = resp.bytes_stream();
-        loop {
-            match tokio::time::timeout(
-                Duration::from_secs(MODEL_RESPONSE_IDLE_TIMEOUT_SECS),
-                stream.next(),
-            )
-            .await
-            {
-                Err(_) => return Err(LlmError::Transport("sse idle timeout".into())),
-                Ok(None) => break,
-                Ok(Some(Err(e))) => return Err(LlmError::Transport(e.to_string())),
-                Ok(Some(Ok(chunk))) => {
-                    raw.push_str(&String::from_utf8_lossy(&chunk));
-                }
-            }
-        }
-        let events = sse_to_events(&raw)?;
-        Ok(futures::stream::iter(events).boxed())
-    }
-
     fn capabilities(&self, _model: &str) -> Capabilities {
-        Capabilities {
-            sends_finish_reason: true,
-        }
+        Capabilities {}
     }
 
     async fn resolve_key(&self, _provider: &str) -> Result<Credentials, LlmError> {
@@ -173,11 +119,6 @@ impl LlmClient for OpenAiCompat {
         })
     }
 }
-
-/// SSE caps: reasoning models go minutes between events; tool-arg deltas can
-/// be huge. Both are load-bearing (Unreal adapter.go:129-130).
-pub const MODEL_RESPONSE_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
-pub const MAX_SSE_FRAME_BYTES: usize = 256 << 20;
 
 #[derive(Debug, Clone)]
 struct WireKnobs {
@@ -572,122 +513,6 @@ fn parse_body(v: &serde_json::Value, model: &str, max_tokens: usize) -> Result<R
     })
 }
 
-/// Project one SSE transcript into Start/Delta/Done. One frame over the cap
-/// fails the stream; deltas accumulate content, tool-arg fragments join at Done.
-fn sse_to_events(raw: &str) -> Result<Vec<StreamEvent>, LlmError> {
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut ids: Vec<String> = Vec::new();
-    let mut names: Vec<String> = Vec::new();
-    let mut arg_frags: Vec<String> = Vec::new();
-    let mut finish: Option<String> = None;
-    for line in raw.lines() {
-        let t = line.trim();
-        let Some(payload) = t.strip_prefix("data:") else {
-            continue;
-        };
-        let payload = payload.trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
-        }
-        if payload.len() > MAX_SSE_FRAME_BYTES {
-            return Err(LlmError::Transport("sse frame too large".into()));
-        }
-        let v: serde_json::Value =
-            serde_json::from_str(payload).map_err(|e| LlmError::Transport(e.to_string()))?;
-        let choice = v
-            .pointer("/choices/0")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        if let Some(fr) = choice
-            .pointer("/finish_reason")
-            .and_then(|x| x.as_str())
-            .filter(|s| !s.is_empty() && *s != "null")
-        {
-            finish = Some(fr.to_string());
-        }
-        if let Some(c) = choice.pointer("/delta/content").and_then(|x| x.as_str()) {
-            content.push_str(c);
-        }
-        if let Some(c) = choice
-            .pointer("/delta/reasoning_content")
-            .and_then(|x| x.as_str())
-        {
-            reasoning.push_str(c);
-        }
-        if let Some(arr) = choice
-            .pointer("/delta/tool_calls")
-            .and_then(|x| x.as_array())
-            .cloned()
-        {
-            for tc in arr {
-                let idx = tc.pointer("/index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-                while ids.len() <= idx {
-                    ids.push(String::new());
-                    names.push(String::new());
-                    arg_frags.push(String::new());
-                }
-                if let Some(id) = tc.pointer("/id").and_then(|x| x.as_str()) {
-                    if !id.is_empty() {
-                        ids[idx] = id.to_string();
-                    }
-                }
-                if let Some(n) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
-                    if !n.is_empty() {
-                        names[idx] = n.to_string();
-                    }
-                }
-                if let Some(a) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
-                    arg_frags[idx].push_str(a);
-                }
-            }
-        }
-    }
-    let mut calls = Vec::new();
-    for i in 0..ids.len() {
-        let raw_args = if arg_frags[i].trim().is_empty() {
-            "{}".to_string()
-        } else {
-            arg_frags[i].clone()
-        };
-        calls.push(ToolCallRef {
-            id: if ids[i].is_empty() {
-                format!("call-{i}")
-            } else {
-                ids[i].clone()
-            },
-            name: names[i].clone(),
-            args: parse_streaming_json(&raw_args),
-        });
-    }
-    let message = provider_core::AssistantMessage {
-        content: content.clone(),
-        tool_calls: calls,
-        thinking: (!reasoning.trim().is_empty()).then_some(reasoning),
-    };
-    let mut events = vec![StreamEvent::Start {
-        partial: provider_core::AssistantMessage {
-            content: String::new(),
-            tool_calls: Vec::new(),
-            thinking: None,
-        },
-    }];
-    if !content.is_empty() {
-        events.push(StreamEvent::Delta {
-            index: 0,
-            text: content,
-        });
-    }
-    let _ = StreamReducer::new(); // reducer owns cumulative downstream; see tests
-    events.push(StreamEvent::Done {
-        message: {
-            let _ = &finish;
-            message
-        },
-    });
-    Ok(events)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,47 +860,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn sse_multi_chunk_reduces() {
-        std::env::set_var("TEST_OAI_KEY_R3", "k");
-        let sse = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"a.rs\\\"}\" }}]},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
-            "data: [DONE]\n\n",
-        );
-        let (ep, _) = serve(vec![Canned {
-            status: 200,
-            headers: vec![("Content-Type".into(), "text/event-stream".into())],
-            body: sse.into(),
-        }]);
-        let c = client_on(&ep, "TEST_OAI_KEY_R3");
-        let mut req = req_with_tool();
-        req.tools.clear();
-        let stream = c.stream("m", &req).await.unwrap();
-        let events: Vec<StreamEvent> = stream.collect().await;
-        let mut red = StreamReducer::new();
-        let mut deltas = 0;
-        for ev in events {
-            if matches!(ev, StreamEvent::Delta { .. }) {
-                deltas += 1;
-            }
-            red.apply(ev).unwrap();
-        }
-        assert!(deltas >= 1, "content must arrive as deltas");
-        let msg = red.into_message().unwrap();
-        assert_eq!(msg.content, "hello");
-        assert_eq!(msg.tool_calls.len(), 1);
-        assert_eq!(msg.tool_calls[0].args["path"], "a.rs");
-        assert!(red_error_free(&msg));
-    }
-
-    fn red_error_free(msg: &provider_core::AssistantMessage) -> bool {
-        !msg.content.is_empty() || !msg.tool_calls.is_empty()
-    }
-
     #[test]
     fn retry_after_both_encodings() {
         assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
@@ -1117,18 +901,6 @@ mod tests {
         assert!(apply_ladder(&mut z, 0));
         assert!(z.shrunk && z.max_tokens == 4000);
         assert!(!z.roomier);
-    }
-
-    #[test]
-    fn capabilities_send_finish_reason() {
-        let c = OpenAiCompat::new("http://x", EndpointProfile::default());
-        assert!(c.capabilities("m").sends_finish_reason);
-    }
-
-    #[test]
-    fn sse_caps_are_the_stub_values() {
-        assert_eq!(MODEL_RESPONSE_IDLE_TIMEOUT_SECS, 30 * 60);
-        assert_eq!(MAX_SSE_FRAME_BYTES, 256 << 20);
     }
 
     #[test]

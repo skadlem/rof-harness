@@ -34,8 +34,8 @@ dependencies = [
  "agent-event",
  "agent-log",
  "async-trait",
+ "bets",
  "context",
- "futures",
  "provider-core",
  "serde",
  "serde_json",
@@ -661,7 +661,6 @@ name = "provider-openai"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "futures",
  "provider-core",
  "reqwest",
  "serde",
@@ -839,7 +838,6 @@ dependencies = [
  "agent-event",
  "agent-loop",
  "async-trait",
- "futures",
  "provider-core",
  "provider-openai",
  "serde_json",
@@ -848,6 +846,7 @@ dependencies = [
  "tokio-util",
  "tool-core",
  "tools-std",
+ "trace",
 ]
 
 [[package]]
@@ -1160,6 +1159,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tool-core",
+ "verify",
 ]
 
 [[package]]

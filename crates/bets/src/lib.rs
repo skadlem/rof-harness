@@ -168,6 +168,8 @@ pub fn gate_batch_commit(claim: &Claim, hunks: &[(String, bool)]) -> CommitVerdi
 /// termination of under-performing branches (ACID-Agent) keep the race inside
 /// the ≤1.3× tokens-per-solved-task guardrail; cumulative spend accounting is
 /// the loop's job via [`AblationMetrics::branch_spend_cents`].
+///
+/// Unwired in `agent-loop` (with [`AblationMetrics`]) until the later B→+A→+C ablation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RaceConfig {
     pub max_branches: u32,
@@ -200,10 +202,14 @@ pub fn pick_winner(outcomes: &[BranchOutcome], config: &RaceConfig) -> Option<u3
         .iter()
         .take(config.max_branches as usize)
         .filter(|o| o.spend_cents <= config.max_extra_spend_cents)
-        .max_by(|a, b| {
-            a.verifier_score
-                .partial_cmp(&b.verifier_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+        // Strict win only: ties keep the earliest branch (max_by would
+        // return the last of several maxima, contradicting the doc).
+        .reduce(|best, o| {
+            if o.verifier_score > best.verifier_score {
+                o
+            } else {
+                best
+            }
         })
         .map(|o| o.branch_id)
 }
@@ -402,6 +408,27 @@ mod tests {
             },
         ];
         assert_eq!(pick_winner(&outcomes, &cfg), Some(1));
+    }
+
+    #[test]
+    fn pick_winner_tie_keeps_earliest_branch() {
+        let cfg = RaceConfig {
+            max_branches: 4,
+            max_extra_spend_cents: 100,
+        };
+        let outcomes = vec![
+            BranchOutcome {
+                branch_id: 0,
+                verifier_score: 0.9,
+                spend_cents: 10,
+            },
+            BranchOutcome {
+                branch_id: 1,
+                verifier_score: 0.9,
+                spend_cents: 20,
+            },
+        ];
+        assert_eq!(pick_winner(&outcomes, &cfg), Some(0));
     }
 
     #[test]

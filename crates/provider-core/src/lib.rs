@@ -1,14 +1,8 @@
 //! LLM boundary vocabulary. See research/crate-provider-core.md.
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-/// How long a stream may go quiet (reasoning models pause for minutes).
-pub const MODEL_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-/// Largest single SSE frame accepted before the stream is cut.
-pub const MAX_SSE_FRAME_BYTES: usize = 256 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Thinking {
@@ -50,7 +44,7 @@ pub enum StopReason {
 }
 
 impl StopReason {
-    /// Everything but the mid-stream accumulator state is terminal.
+    /// Everything but `Pending` is terminal.
     pub fn is_terminal(&self) -> bool {
         !matches!(self, StopReason::Pending)
     }
@@ -113,91 +107,7 @@ pub struct Response {
 }
 
 #[derive(Debug, Clone)]
-pub enum StreamEvent {
-    Start { partial: AssistantMessage },
-    Delta { index: usize, text: String },
-    Done { message: AssistantMessage },
-    Error { message: String },
-}
-
-/// The reducer owns the cumulative message; producers never snapshot it.
-/// `Start` must precede all updates and `Done`; `Error` may arrive any time,
-/// even before `Start` when setup fails pre-generation.
-#[derive(Debug, Default, Clone)]
-pub struct StreamReducer {
-    partial: Option<AssistantMessage>,
-    error: Option<String>,
-    started: bool,
-    finished: bool,
-}
-
-impl StreamReducer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn apply(&mut self, ev: StreamEvent) -> Result<(), String> {
-        match ev {
-            StreamEvent::Start { partial } => {
-                if self.started {
-                    return Err("duplicate stream start".into());
-                }
-                if self.finished {
-                    return Err("start after terminal event".into());
-                }
-                self.started = true;
-                self.partial = Some(partial);
-                Ok(())
-            }
-            StreamEvent::Delta { index: _, text } => {
-                if self.finished {
-                    return Err("delta after terminal event".into());
-                }
-                match (&mut self.partial, self.started) {
-                    (Some(p), true) => {
-                        p.content.push_str(&text);
-                        Ok(())
-                    }
-                    _ => Err("delta before start".into()),
-                }
-            }
-            StreamEvent::Done { message } => {
-                if !self.started {
-                    return Err("done before start".into());
-                }
-                if self.finished {
-                    return Err("done after terminal event".into());
-                }
-                self.finished = true;
-                self.partial = Some(message);
-                Ok(())
-            }
-            StreamEvent::Error { message } => {
-                self.finished = true;
-                if self.error.is_none() {
-                    self.error = Some(message);
-                }
-                Ok(())
-            }
-        }
-    }
-    pub fn message(&self) -> Option<&AssistantMessage> {
-        self.partial.as_ref()
-    }
-    pub fn into_message(self) -> Option<AssistantMessage> {
-        self.partial
-    }
-    pub fn error_message(&self) -> Option<&str> {
-        self.error.as_deref()
-    }
-    pub fn is_finished(&self) -> bool {
-        self.finished
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Capabilities {
-    pub sends_finish_reason: bool,
-}
+pub struct Capabilities {}
 
 #[derive(Debug, Clone)]
 pub struct Credentials {
@@ -213,20 +123,6 @@ pub enum ErrorClass {
     Fatal,
 }
 
-/// Per-provider config row. One adapter + config rows, not a compat moat.
-#[derive(Debug, Clone)]
-pub struct EndpointProfile {
-    pub emission_threshold_chars: usize,
-}
-
-impl Default for EndpointProfile {
-    fn default() -> Self {
-        Self {
-            emission_threshold_chars: 12_000,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum LlmError {
     Transport(String),
@@ -236,20 +132,14 @@ pub enum LlmError {
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     /// One logical request. Retry, backoff, and reshaping live in the
-    /// implementor. `StreamEvent` carries no usage/latency numbers, so the
-    /// default fails loudly instead of fabricating zeros (the budget meters
-    /// from `Usage`; zeros would be unlimited free tokens). Adapters must
-    /// override with a metered implementation.
+    /// implementor. The default fails loudly instead of fabricating zeros
+    /// (the budget meters from `Usage`; zeros would be unlimited free
+    /// tokens). Adapters must override with a metered implementation.
     async fn complete(&self, _model: &str, _req: &Request) -> Result<Response, LlmError> {
         Err(LlmError::Transport(
             "default LlmClient::complete cannot report usage: override it with a metered implementation".into(),
         ))
     }
-    async fn stream(
-        &self,
-        model: &str,
-        req: &Request,
-    ) -> Result<BoxStream<'static, StreamEvent>, LlmError>;
     /// Capabilities negotiated per call; shapes the request from the answer.
     fn capabilities(&self, model: &str) -> Capabilities;
     /// Per-call credential resolve, not once-at-startup: tokens expire mid-run.
@@ -294,13 +184,6 @@ pub fn infer_stop(raw: Option<&str>, message: &AssistantMessage) -> StopReason {
         }
         _ => infer(),
     }
-}
-
-/// Truncation guard: on `MaxTokens` with tool calls present, execute nothing —
-/// the salvage parser can produce valid-looking but incomplete JSON. Every
-/// call becomes an error telling the model to re-issue complete arguments.
-pub fn must_reissue_tools(stop: &StopReason, tool_call_count: usize) -> bool {
-    matches!(stop, StopReason::MaxTokens) && tool_call_count > 0
 }
 
 /// Fails-open classification (blacklist, not allowlist): unknown errors retry.
@@ -643,9 +526,6 @@ mod tests {
             infer_stop(Some("length"), &msg_with_tools()),
             StopReason::MaxTokens
         );
-        assert!(must_reissue_tools(&StopReason::MaxTokens, 1));
-        assert!(!must_reissue_tools(&StopReason::Stop, 0));
-        assert!(!must_reissue_tools(&StopReason::ToolUse, 2));
     }
     #[test]
     fn reasoning_is_subset_never_double_counted() {
@@ -686,90 +566,13 @@ mod tests {
         assert!(!StopReason::Pending.is_terminal());
     }
 
-    fn start_msg() -> AssistantMessage {
-        AssistantMessage {
-            content: String::new(),
-            tool_calls: vec![],
-            thinking: None,
-        }
-    }
-    #[test]
-    fn reducer_accumulates_and_done_replaces() {
-        let mut r = StreamReducer::new();
-        r.apply(StreamEvent::Start {
-            partial: start_msg(),
-        })
-        .unwrap();
-        r.apply(StreamEvent::Delta {
-            index: 0,
-            text: "ab".into(),
-        })
-        .unwrap();
-        r.apply(StreamEvent::Delta {
-            index: 0,
-            text: "cd".into(),
-        })
-        .unwrap();
-        assert_eq!(r.message().unwrap().content, "abcd");
-        r.apply(StreamEvent::Done {
-            message: msg_plain(),
-        })
-        .unwrap();
-        assert_eq!(r.message().unwrap().content, "hi");
-        assert!(r.is_finished());
-    }
-    #[test]
-    fn reducer_rejects_updates_before_start() {
-        let mut r = StreamReducer::new();
-        assert!(r
-            .apply(StreamEvent::Delta {
-                index: 0,
-                text: "x".into()
-            })
-            .is_err());
-        assert!(r
-            .apply(StreamEvent::Done {
-                message: msg_plain()
-            })
-            .is_err());
-    }
-    #[test]
-    fn reducer_allows_direct_error() {
-        let mut r = StreamReducer::new();
-        r.apply(StreamEvent::Error {
-            message: "setup blew up".into(),
-        })
-        .unwrap();
-        assert!(r.is_finished());
-        assert!(r.message().is_none());
-        assert_eq!(r.error_message(), Some("setup blew up"));
-    }
-
-    /// Adapter that only implements `stream`: exactly who would inherit the
-    /// default `complete`. Its stream is perfectly good (Start + Done).
-    struct StreamOnlyClient;
+    /// Adapter that implements no methods but the keys: exactly who would
+    /// inherit the default `complete`.
+    struct KeyOnlyClient;
     #[async_trait]
-    impl LlmClient for StreamOnlyClient {
-        async fn stream(
-            &self,
-            _model: &str,
-            _req: &Request,
-        ) -> Result<BoxStream<'static, StreamEvent>, LlmError> {
-            use futures::StreamExt as _;
-            Ok(futures::stream::iter([
-                StreamEvent::Start {
-                    partial: start_msg(),
-                },
-                StreamEvent::Done {
-                    message: msg_plain(),
-                },
-            ])
-            .boxed())
-        }
+    impl LlmClient for KeyOnlyClient {
         fn capabilities(&self, _model: &str) -> Capabilities {
-            Capabilities {
-                sends_finish_reason: false,
-            }
+            Capabilities {}
         }
         async fn resolve_key(&self, _provider: &str) -> Result<Credentials, LlmError> {
             Err(LlmError::Transport("no key in test".into()))
@@ -785,7 +588,7 @@ mod tests {
             thinking: Thinking::Off,
             extras: json!({}),
         };
-        let got = futures::executor::block_on(StreamOnlyClient.complete("m", &req));
+        let got = futures::executor::block_on(KeyOnlyClient.complete("m", &req));
         match got {
             Err(LlmError::Transport(m)) => assert!(m.contains("usage"), "msg: {m}"),
             Err(other) => panic!("wrong error variant: {other:?}"),
@@ -808,11 +611,5 @@ mod tests {
             parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"),
             Some(Duration::ZERO)
         );
-    }
-
-    #[test]
-    fn sse_caps_named_values() {
-        assert_eq!(MODEL_RESPONSE_IDLE_TIMEOUT, Duration::from_secs(30 * 60));
-        assert_eq!(MAX_SSE_FRAME_BYTES, 256 << 20);
     }
 }
