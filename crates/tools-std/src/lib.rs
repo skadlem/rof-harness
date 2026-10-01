@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tool_core::{CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome};
+use verify::condense_output;
 
 const VIEW_CAP: usize = 16_384;
 const OUT_CAP: usize = 8_000;
@@ -718,6 +719,7 @@ fn split_cmd(cmd: &str) -> Vec<String> {
     parts
 }
 
+/// Tool-output bound: `verify::condense_output` keeps signal lines anywhere in the full output (noise dropped, ≤80 kept lines), then `OUT_CAP` chars is the outer cap; the `ok` verdict is exit-status on the raw output, decided before condensing.
 async fn run_allowed(
     policy: &Policy,
     cmd: &str,
@@ -753,7 +755,7 @@ async fn run_allowed(
         s.push_str(&err);
     }
     let ok = out.status.success();
-    let (content, _) = cap_chars(s.chars().take(OUT_CAP).collect(), OUT_CAP);
+    let (content, _) = cap_chars(condense_output(&s, None), OUT_CAP);
     Ok((ok, content))
 }
 
@@ -1324,14 +1326,15 @@ mod tests {
 
     #[tokio::test]
     async fn exec_no_shell_proof() {
-        // Under a shell `echo hello; echo PWNED` prints two lines; with argv
-        // exec the `;` is a literal argument to echo.
+        // Under a shell `echo hello; echo PWNED error` prints two lines; with
+        // argv exec the `;` is a literal argument to echo. The `error` word
+        // keeps the echoed line in the condensed tool output.
         let root = tmp_root();
         let r = reg(policy(&root));
-        let out = run(&r, "exec", json!({"cmd": "echo hello; echo PWNED"}))
+        let out = run(&r, "exec", json!({"cmd": "echo hello; echo PWNED error"}))
             .await
             .unwrap();
-        assert_eq!(out.content, "hello; echo PWNED\n");
+        assert_eq!(out.content, "hello; echo PWNED error");
     }
 
     #[tokio::test]
@@ -1382,6 +1385,46 @@ mod tests {
         assert!(pass.content.starts_with("PASS: true"), "{}", pass.content);
         let fail = run(&r, "test", json!({"cmd": "false"})).await.unwrap();
         assert!(fail.content.starts_with("FAIL: false"), "{}", fail.content);
+    }
+
+    #[tokio::test]
+    async fn test_noisy_output_condensed_verdict_still_pass() {
+        // Early PASS marker + noise storm: the marker survives condensing,
+        // filler does not, the verdict (exit status, decided on raw output)
+        // stays PASS, and the evidence stays within the output bound.
+        let root = tmp_root();
+        let mut noisy = String::from("test result: ok. 1 passed; 0 failed\n");
+        for i in 0..20_000 {
+            noisy.push_str(&format!("Compiling noise v0.1.0\nfiller line {i}\n"));
+        }
+        assert!(noisy.len() > OUT_CAP);
+        std::fs::write(root.join("noisy.txt"), &noisy).unwrap();
+        let pol = Arc::new(Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["cat".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+        });
+        let out = run(&reg(pol), "test", json!({"cmd": "cat noisy.txt"}))
+            .await
+            .unwrap();
+        assert!(
+            out.content.starts_with("PASS: cat noisy.txt"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("test result: ok. 1 passed; 0 failed"),
+            "{}",
+            out.content
+        );
+        assert!(!out.content.contains("filler line"), "{}", out.content);
+        assert!(
+            out.content.chars().count() <= OUT_CAP,
+            "{}",
+            out.content.chars().count()
+        );
     }
 
     // --- search ---

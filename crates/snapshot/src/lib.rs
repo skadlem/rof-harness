@@ -124,6 +124,68 @@ impl TreeService {
         Ok(bound_patch(&text))
     }
 
+    /// Restore only the kept hunks: roll back to baseline, then re-apply
+    /// each kept hunk's patch text in order. Any hunk that fails to apply
+    /// is an error (do not silently skip); that path rolls back again, so
+    /// `Err` always means the tree sits at baseline.
+    ///
+    /// Hunk-text format (restorable): one `git diff --patch` fragment per
+    /// string — the file header that names the target (`--- a/<path>` /
+    /// `+++ b/<path>`, optionally preceded by `diff --git`/`index` lines)
+    /// directly followed by exactly one `@@` hunk. That header is the
+    /// envelope `git apply` requires: a bare `@@` fragment names no file
+    /// and git rejects it ("patch fragment without header"), which surfaces
+    /// as `Err` here. A missing final newline is appended (git otherwise
+    /// reports "corrupt patch").
+    pub fn restore_hunks(&self, kept_hunks: &[String]) -> Result<DiffSummary> {
+        self.rollback()?;
+        for hunk in kept_hunks {
+            if let Err(e) = self.apply_patch(hunk) {
+                let _ = self.rollback(); // failed restore leaves the tree at baseline
+                return Err(e);
+            }
+        }
+        self.diff()
+    }
+
+    /// One fragment in via stdin: a patch file written into the tree would
+    /// itself show up as untracked diff evidence.
+    fn apply_patch(&self, hunk: &str) -> Result<()> {
+        let mut patch = hunk.to_string();
+        if !patch.ends_with('\n') {
+            patch.push('\n');
+        }
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C")
+            .arg(&self.root)
+            .args(["apply", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| other(format!("spawn git: {e}")))?;
+        {
+            use std::io::Write;
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| other("git apply: no stdin".into()))?;
+            stdin
+                .write_all(patch.as_bytes())
+                .map_err(|e| other(format!("git apply stdin: {e}")))?;
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|e| other(format!("wait git: {e}")))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        Err(other(format!(
+            "git apply: {} | {}",
+            String::from_utf8_lossy(&out.stdout).trim_end(),
+            String::from_utf8_lossy(&out.stderr).trim_end()
+        )))
+    }
+
     fn is_repo(&self) -> bool {
         self.root.join(".git").exists()
     }
@@ -337,5 +399,112 @@ mod tests {
         tree.baseline().unwrap();
         tree.baseline().unwrap(); // nothing to commit: benign, not an error
         assert!(tree.diff().unwrap().is_empty());
+    }
+
+    /// One `git diff --patch` fragment per hunk: each file's header lines
+    /// (`diff --git`/`index`/`---`/`+++`) lead its first `@@`, later `@@`
+    /// lines repeat that header. Fragments end without a trailing newline —
+    /// the shape a line-splitting caller hands over.
+    fn split_patch(patch: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut header = String::new();
+        let mut cur: Option<String> = None;
+        for line in patch.lines() {
+            if line.starts_with("diff --git") {
+                if let Some(done) = cur.take() {
+                    out.push(done);
+                }
+                header = line.to_string();
+            } else if line.starts_with("@@") {
+                if let Some(done) = cur.take() {
+                    out.push(done);
+                }
+                cur = Some(format!("{header}\n{line}"));
+            } else if let Some(hunk) = cur.as_mut() {
+                hunk.push('\n');
+                hunk.push_str(line);
+            } else {
+                header.push('\n');
+                header.push_str(line);
+            }
+        }
+        if let Some(done) = cur {
+            out.push(done);
+        }
+        out
+    }
+
+    #[test]
+    fn restore_hunks_keeps_only_the_prefix_hunk() {
+        let dir = scratch("restore-prefix");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "x\ny\nz\n").unwrap();
+        tree.ensure().unwrap();
+        tree.baseline().unwrap();
+
+        // Both hunks uncommitted, as after a failed batch.
+        std::fs::write(dir.join("a.rs"), "ONE\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "x\ny\nZ\n").unwrap();
+        let full = tree.patch(&tree.diff().unwrap()).unwrap();
+        let hunks = split_patch(&full.text);
+        assert_eq!(hunks.len(), 2);
+
+        let d = tree.restore_hunks(&hunks[..1]).unwrap();
+        assert!(!d.is_empty());
+        assert_eq!(d.changed, vec!["a.rs"]); // hunk 2's file reverted
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "ONE\ntwo\nthree\nfour\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.rs")).unwrap(),
+            "x\ny\nz\n"
+        );
+    }
+
+    #[test]
+    fn restore_hunks_empty_equals_plain_rollback() {
+        let dir = scratch("restore-empty");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        tree.ensure().unwrap();
+        tree.baseline().unwrap();
+
+        std::fs::write(dir.join("a.rs"), "two\n").unwrap();
+        std::fs::write(dir.join("made.rs"), "new\n").unwrap();
+        let d = tree.restore_hunks(&[]).unwrap();
+        assert!(d.is_empty());
+        assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), "one\n");
+        assert!(!dir.join("made.rs").exists());
+    }
+
+    #[test]
+    fn restore_hunks_malformed_hunk_errors_and_restores_baseline() {
+        let dir = scratch("restore-malformed");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "x\ny\nz\n").unwrap();
+        tree.ensure().unwrap();
+        tree.baseline().unwrap();
+
+        std::fs::write(dir.join("a.rs"), "ONE\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "x\ny\nZ\n").unwrap();
+        let full = tree.patch(&tree.diff().unwrap()).unwrap();
+        let mut hunks = split_patch(&full.text);
+        hunks.push("garbage, not a patch\n".to_string());
+
+        let e = tree.restore_hunks(&hunks).unwrap_err();
+        assert!(e.to_string().contains("git apply"), "{e}");
+        // Chosen error state: rolled back to baseline, nothing half-restored.
+        assert!(tree.diff().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "one\ntwo\nthree\nfour\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b.rs")).unwrap(),
+            "x\ny\nz\n"
+        );
     }
 }

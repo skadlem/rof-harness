@@ -4,8 +4,7 @@
 //! Run: `LIVE_SMOKE=1 ROF_TEST_BASE_URL=<base> cargo test -p provider-openai
 //! --test live_smoke -- --ignored --nocapture`. Key names only below, values
 //! are never printed.
-use futures::StreamExt as _;
-use provider_core::{LlmClient, ProviderMessage, Request, StopReason, StreamEvent, Thinking};
+use provider_core::{LlmClient, ProviderMessage, Request, StopReason, Thinking};
 use provider_openai::{EndpointProfile, OpenAiCompat};
 
 struct LiveConfig {
@@ -115,33 +114,6 @@ async fn live_truncation_probe() {
             );
         }
     }
-}
-
-#[ignore]
-#[tokio::test]
-async fn live_streaming_smoke() {
-    let Some(cfg) = live_config().expect(SETUP_MSG) else {
-        return;
-    };
-    let c = OpenAiCompat::new(&cfg.endpoint, EndpointProfile::default()).with_key_env(cfg.key_env);
-    let events: Vec<StreamEvent> = c
-        .stream(&cfg.model, &tiny_req("reply with exactly: ok", 32))
-        .await
-        .expect("live stream setup failed")
-        .collect()
-        .await;
-    assert!(!events.is_empty(), "stream must emit at least Start");
-    assert!(
-        matches!(events[0], StreamEvent::Start { .. }),
-        "first frame must be Start"
-    );
-    assert!(
-        matches!(
-            events.last(),
-            Some(StreamEvent::Done { .. } | StreamEvent::Error { .. })
-        ),
-        "stream must end with Done or Error"
-    );
 }
 
 #[test]

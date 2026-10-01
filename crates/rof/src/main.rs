@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,7 +17,8 @@ use snapshot::TreeService;
 use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
-const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--allow-cmd CMD...] [--budget-steps N] [--dump-events PATH]";
+const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--allow-cmd CMD...] [--budget-steps N] [--dump-events PATH]
+--dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH";
 
 #[derive(Debug, PartialEq)]
 struct Args {
@@ -100,7 +101,7 @@ fn exit_code(outcome: &Outcome) -> i32 {
     }
 }
 
-const NAMES: [&str; 12] = [
+const NAMES: [&str; 11] = [
     "RunStart",
     "RunEnd",
     "TurnStart",
@@ -109,14 +110,13 @@ const NAMES: [&str; 12] = [
     "MessageUpdate",
     "MessageEnd",
     "ToolStart",
-    "ToolUpdate",
     "ToolEnd",
     "Control",
     "Error",
 ];
 
 fn summarize(events: &[AgentEvent]) -> String {
-    let mut counts = [0usize; 12];
+    let mut counts = [0usize; 11];
     for e in events {
         counts[match e {
             AgentEvent::RunStart { .. } => 0,
@@ -127,10 +127,9 @@ fn summarize(events: &[AgentEvent]) -> String {
             AgentEvent::MessageUpdate { .. } => 5,
             AgentEvent::MessageEnd { .. } => 6,
             AgentEvent::ToolStart { .. } => 7,
-            AgentEvent::ToolUpdate { .. } => 8,
-            AgentEvent::ToolEnd { .. } => 9,
-            AgentEvent::Control(_) => 10,
-            AgentEvent::Error { .. } => 11,
+            AgentEvent::ToolEnd { .. } => 8,
+            AgentEvent::Control(_) => 9,
+            AgentEvent::Error { .. } => 10,
         }] += 1;
     }
     NAMES
@@ -183,6 +182,15 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     }
     let mut emitter = Emitter::new();
     let cancel = CancellationToken::new();
+    // First Ctrl-C cancels the run; the loop reports Outcome::Cancelled.
+    tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                cancel.cancel();
+            }
+        }
+    });
     let outcome = agent_loop::run(
         &mut state,
         Run {
@@ -217,6 +225,17 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     }
 }
 
+/// One run's events as JSONL (one object per line, LF) via `trace::TraceSink`.
+/// The sink only appends, so a dump replaces the previous file: one run, one dump.
+fn write_dump(path: &str, events: &[AgentEvent]) -> Result<(), String> {
+    let _ = std::fs::remove_file(path);
+    let sink = trace::TraceSink::with_file(Path::new(path)).map_err(|e| e.to_string())?;
+    for e in events {
+        sink.emit(e.clone());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().collect();
@@ -244,17 +263,9 @@ async fn main() {
     let provider = OpenAiCompat::new(&endpoint, EndpointProfile::default());
     let r = execute(&provider, &args).await;
     if let Some(path) = args.dump_events.as_deref() {
-        match serde_json::to_string_pretty(&r.events) {
-            Ok(js) => {
-                if let Err(e) = std::fs::write(path, js) {
-                    eprintln!("cannot write {path}: {e}");
-                    std::process::exit(2);
-                }
-            }
-            Err(e) => {
-                eprintln!("cannot encode events: {e}");
-                std::process::exit(2);
-            }
+        if let Err(e) = write_dump(path, &r.events) {
+            eprintln!("cannot write {path}: {e}");
+            std::process::exit(2);
         }
     }
     if !r.patch.is_empty() {
@@ -440,20 +451,8 @@ mod tests {
                 .pop_front()
                 .ok_or(provider_core::LlmError::Transport("script empty".into()))
         }
-        async fn stream(
-            &self,
-            _model: &str,
-            _req: &provider_core::Request,
-        ) -> Result<
-            futures::stream::BoxStream<'static, provider_core::StreamEvent>,
-            provider_core::LlmError,
-        > {
-            Err(provider_core::LlmError::Transport("no stream".into()))
-        }
         fn capabilities(&self, _model: &str) -> provider_core::Capabilities {
-            provider_core::Capabilities {
-                sends_finish_reason: true,
-            }
+            provider_core::Capabilities {}
         }
         async fn resolve_key(
             &self,
@@ -548,6 +547,29 @@ mod tests {
             "bye\n"
         );
         assert!(r.patch.contains("note.txt"), "final patch must name it");
+    }
+
+    #[tokio::test]
+    async fn dump_events_is_one_json_object_per_line() {
+        let dir = tmp();
+        std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
+        let client = ScriptClient::new(vec![tool_resp(), text_resp()]);
+        let r = execute(&client, &args_for(&dir, None)).await;
+        assert!(!r.events.is_empty(), "fake run must produce events");
+        let path = dir.join("dump.jsonl");
+        let p = path.to_str().unwrap();
+        write_dump(p, &r.events).unwrap();
+        // Second dump to the same path replaces, never appends.
+        write_dump(p, &r.events).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with('\n'), "file ends with LF");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), r.events.len(), "N events, N lines");
+        for line in &lines {
+            let v: serde_json::Value =
+                serde_json::from_str(line).expect("every line incl. the last parses alone");
+            assert!(v.is_object(), "line is a JSON object: {line}");
+        }
     }
 
     #[tokio::test]

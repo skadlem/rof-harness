@@ -10,3 +10,4 @@ async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tool-core = { path = "../tool-core" }
+verify = { path = "../verify" }

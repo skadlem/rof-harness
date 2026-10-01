@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use agent_budget::{config_for, BudgetGuard, BudgetHalt, Capability, Nudge};
+use agent_budget::{config_for, halt_name, BudgetGuard, BudgetHalt, Capability, Nudge};
 use agent_event::{
     AgentError, AgentEvent, ControlAck, ControlKind, ControlStatus, DeltaKind, Emitter, Message,
     MessageDelta, Role, RunOutcome as EventRunOutcome, TurnEndReason as EventTurnEndReason,
@@ -26,7 +26,7 @@ use provider_core::{
     AssistantMessage, LlmClient, ProviderMessage, Request, StopReason, Thinking, Usage,
 };
 use serde_json::Value;
-use tool_core::{TerminatePolicy, ToolCall, ToolResult};
+use tool_core::{ToolCall, ToolResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateStatus {
@@ -231,18 +231,13 @@ pub struct LoopState {
     pub budget: BudgetGuard,
     pub emit_next: u64,
     pub open_msg: Option<u64>,
-    pub overflow_recovery_pending: bool,
-    pub restart_count: u32,
-    pub truncation_retries: u32,
     pub step_retries: u32,
     pub fatal_error: Option<String>,
-    pub needs_reflect: bool,
     pub last_sig: String,
     pub last_obs: u64,
     pub lessons: VecDeque<String>,
     pub drain_timeout: Duration,
     pub drain_until: Option<Instant>,
-    pub prompt_sections: HashMap<String, String>,
 }
 
 impl LoopState {
@@ -265,18 +260,13 @@ impl LoopState {
             budget: BudgetGuard::new(config_for(Capability::UnattendedBatch), Instant::now()),
             emit_next: 0,
             open_msg: None,
-            overflow_recovery_pending: false,
-            restart_count: 0,
-            truncation_retries: 0,
             step_retries: 2,
             fatal_error: None,
-            needs_reflect: false,
             last_sig: String::new(),
             last_obs: 0,
             lessons: VecDeque::new(),
             drain_timeout: Duration::from_secs(30),
             drain_until: None,
-            prompt_sections: HashMap::new(),
         }
     }
 
@@ -289,19 +279,6 @@ impl LoopState {
 
     pub fn batch_complete(&self) -> bool {
         !self.tool_calls.is_empty() && self.open_tools() == 0
-    }
-
-    /// Unanimous batch rule (Pi agent-loop.js:463-464), via tool-core.
-    pub fn batch_concluded(&self) -> bool {
-        if !self.batch_complete() {
-            return false;
-        }
-        let results: Vec<ToolResult> = self
-            .tool_calls
-            .values()
-            .filter_map(|c| c.result.clone())
-            .collect();
-        tool_core::batch_concluded(&results, TerminatePolicy::Unanimous)
     }
 
     /// The one boolean: do we talk to the model now?
@@ -414,8 +391,8 @@ impl LoopState {
         self.step += 1;
         self.budget.record_step();
         self.call_model = false;
-        // Prior batch results belong to older turns; drop them so the
-        // unanimity check only ever sees the current batch.
+        // Prior batch results belong to older turns; drop them so the batch
+        // shape only ever sees the current batch.
         self.tool_calls.retain(|_, c| c.result.is_none());
         Some(token)
     }
@@ -514,13 +491,11 @@ impl LoopState {
                             result: Some(ToolResult {
                                 content,
                                 is_error: true,
-                                terminate: false,
                             }),
                         },
                     );
                 }
                 let n = message.tool_calls.len();
-                self.truncation_retries += 1;
                 self.stick_turn_reason(TurnEndReason::MaxTokens);
                 self.push_assistant(&message, &stop_label);
                 ClaimOutcome::Truncated(n)
@@ -592,7 +567,7 @@ impl LoopState {
         if let Some(c) = self.tool_calls.get_mut(&msg.call_id) {
             c.result = Some(msg.result);
         }
-        if self.batch_complete() && !self.batch_concluded() {
+        if self.batch_complete() {
             self.call_model = true;
         }
         true
@@ -649,7 +624,6 @@ impl LoopState {
                 c.result = Some(ToolResult {
                     content,
                     is_error: true,
-                    terminate: false,
                 });
                 repaired += 1;
             }
@@ -709,7 +683,7 @@ impl LoopState {
         // 3. Budget exhausted: the guard AND-gate owns every cap; the loop
         // holds no shadow caps and halts the moment any counter trips.
         if let Some(exceeded) = self.budget.exceeded() {
-            return PhaseVerdict::Return(Outcome::Halted(budget_halt_label(&exceeded.halt).into()));
+            return PhaseVerdict::Return(Outcome::Halted(halt_name(&exceeded.halt).into()));
         }
         // 4. Refusal is terminal-with-error; sticky max-tokens halts once drained.
         if let Some(TurnEndReason::Error(reason)) = self.turn_reason.clone() {
@@ -725,15 +699,8 @@ impl LoopState {
         if self.call_model {
             return PhaseVerdict::Continue;
         }
-        if self.needs_reflect
-            || self.budget.counters().same_action_streak >= self.budget.config().same_action_cycles
-        {
-            self.needs_reflect = false;
+        if self.budget.counters().same_action_streak >= self.budget.config().same_action_cycles {
             self.push_lesson("same action repeated without progress; vary the approach".into());
-        }
-        // 6. Tool-driven stop is unanimous; pending steering keeps the run alive.
-        if self.batch_concluded() && self.steering.is_empty() {
-            return PhaseVerdict::Return(Outcome::Done);
         }
         // 5. Semantic termination: drained turn, empty queues, follow-up poll.
         // The old turn closes here (sticky reason or Completed) so the log
@@ -815,24 +782,6 @@ impl LoopState {
         }
         out
     }
-
-    /// Replay system sections into the prompt patch map (Pi transcript fold).
-    pub fn replay_sections(&mut self) {
-        for item in &self.items {
-            if let ItemKind::System { sections, .. } = &item.kind {
-                for (name, value) in sections {
-                    match value {
-                        Some(text) => {
-                            self.prompt_sections.insert(name.clone(), text.clone());
-                        }
-                        None => {
-                            self.prompt_sections.remove(name);
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 impl Default for LoopState {
@@ -847,19 +796,6 @@ fn message_content(message: &Value) -> String {
         .and_then(|c| c.as_str())
         .map(str::to_owned)
         .unwrap_or_else(|| message.to_string())
-}
-
-fn budget_halt_label(halt: &BudgetHalt) -> &'static str {
-    match halt {
-        BudgetHalt::Steps => "steps",
-        BudgetHalt::Trials => "trials",
-        BudgetHalt::Refines => "refines",
-        BudgetHalt::Tokens => "tokens",
-        BudgetHalt::Wallclock => "wallclock",
-        BudgetHalt::Spend => "spend",
-        BudgetHalt::SameAction => "same-action",
-        BudgetHalt::TrialActions => "trial-actions",
-    }
 }
 
 /// One tested mapping: durable log vocabulary to live event vocabulary.
@@ -1132,9 +1068,32 @@ pub async fn drive_tick(
 }
 
 /// Bets hook with a no-op default: loop compiles and ships with bets disabled.
+///
+/// Receivers are `&self` (the contract's `&mut self` does not fit `Run::bets`
+/// staying `&dyn`, which the frozen `rof` call site requires); hooks that need
+/// mutable state use interior mutability, as the test hook `RecBets` does.
 pub trait BetsHook: Send + Sync {
     fn on_step(&self) -> PhaseVerdict {
         PhaseVerdict::Continue
+    }
+    /// Site 1 (step head): `step` is `LoopState::step` as the head is reached
+    /// (steps started so far). Defaults to [`on_step`](Self::on_step), so hooks
+    /// implementing only `on_step` keep firing at both sites.
+    fn on_step_head(&self, _step: u64) -> PhaseVerdict {
+        self.on_step()
+    }
+    /// Site 2 (post-batch): proof-gated commit over the batch's patch fragments
+    /// (`(hunk, proof_passed)`; the proof flag is uniform today — the batch's
+    /// tool results all passed — per-hunk incremental proof is the later
+    /// ablation). Permissive default = feature off unless a hook opts in:
+    /// `Committed` leaves the batch as the existing path left it, `Partial`
+    /// restores `savepoint.kept_hunks`, `Aborted` rolls the batch back.
+    fn on_post_batch(
+        &self,
+        _claim: &bets::Claim,
+        _hunks: &[(String, bool)],
+    ) -> bets::CommitVerdict {
+        bets::CommitVerdict::Committed
     }
 }
 
@@ -1293,7 +1252,6 @@ fn build_request(
     workdir: &Path,
     cfg: &RunConfig,
 ) -> Request {
-    state.replay_sections();
     let mut asm = context::ContextAssembler::new(cfg.context_budget_chars);
     let map_text = context::file_map(workdir, 200).join("\n");
     asm.add(context::ContextItem {
@@ -1304,12 +1262,10 @@ fn build_request(
         },
         fidelity: context::Fidelity::Exact,
         must_include: true,
-        est_chars: map_text.chars().count(),
         text: map_text,
     });
     for f in &cfg.context_files {
         if let Ok(c) = context::named_file_contents(workdir, f, 8000) {
-            let n = c.chars().count();
             asm.add_volatile(context::ContextItem {
                 key: context::ItemKey {
                     path: f.clone(),
@@ -1318,7 +1274,6 @@ fn build_request(
                 },
                 fidelity: context::Fidelity::Exact,
                 must_include: true,
-                est_chars: n,
                 text: c,
             });
         }
@@ -1339,11 +1294,67 @@ fn build_request(
     }
 }
 
+/// Split `TreeService::patch` text into the fragments
+/// `TreeService::restore_hunks` accepts: one file header (`diff --git` /
+/// `index` / `---` / `+++`) directly followed by exactly one `@@` hunk — the
+/// same companion splitter the snapshot tests exercise. Untracked-file
+/// evidence (appended without an `@@`) rides the trailing fragment's tail; a
+/// restore that hits it fails closed to baseline. On a truncated patch the
+/// final fragment may be incomplete, so it is dropped.
+fn split_patch(patch: &snapshot::PatchText) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut header = String::new();
+    let mut cur: Option<String> = None;
+    for line in patch.text.lines() {
+        if line.starts_with("diff --git") {
+            if let Some(done) = cur.take() {
+                out.push(done);
+            }
+            header = line.to_string();
+        } else if line.starts_with("@@") {
+            if let Some(done) = cur.take() {
+                out.push(done);
+            }
+            cur = Some(format!("{header}\n{line}"));
+        } else if let Some(hunk) = cur.as_mut() {
+            hunk.push('\n');
+            hunk.push_str(line);
+        } else {
+            header.push('\n');
+            header.push_str(line);
+        }
+    }
+    if let Some(done) = cur {
+        out.push(done);
+    }
+    if patch.truncated {
+        out.pop(); // the marker landed in the last fragment: never restore it
+    }
+    out
+}
+
+/// The batch's patch fragments with the uniform proof flag attached to each.
+fn batch_hunks(
+    tree: &snapshot::TreeService,
+    proof_passed: bool,
+) -> Result<Vec<(String, bool)>, String> {
+    let diff = tree.diff().map_err(|e| format!("snapshot diff: {e}"))?;
+    let patch = tree
+        .patch(&diff)
+        .map_err(|e| format!("snapshot patch: {e}"))?;
+    Ok(split_patch(&patch)
+        .into_iter()
+        .map(|h| (h, proof_passed))
+        .collect())
+}
+
 /// Headless multi-tick run on real siblings: [`LlmClient`] provider,
 /// [`tool_core::Registry`] tools, [`BudgetGuard`] step head,
 /// [`snapshot::TreeService`] baseline-per-batch with batch-scope rollback
 /// (proven prefix survives: the baseline commits it first), context prompt,
-/// [`BetsHook`] step + post-batch sites, [`Emitter`] frames, [`LogWriter`]
+/// [`BetsHook`] step-head gate (`on_step_head`) + proof-gated post-batch gate
+/// (`on_post_batch`: Committed stands, Partial restores the kept hunks,
+/// Aborted rolls the batch back), [`Emitter`] frames, [`LogWriter`]
 /// file record. Termination order is [`LoopState::terminate`] (§10); the
 /// grace step runs inside `start_provider_call`, the halt lands after.
 /// Inputs seed here (Crash queues like User, recorded with Crash source);
@@ -1459,7 +1470,7 @@ pub async fn run<P: LlmClient>(
             );
         }
         // Bets site 1: step head.
-        if let PhaseVerdict::Return(o) = bets.on_step() {
+        if let PhaseVerdict::Return(o) = bets.on_step_head(state.step as u64) {
             return finish_run(state, writer.as_mut(), emitter, run_id, &mut synced, o);
         }
         // Grace runs here (may_step inside); terminate halts after.
@@ -1647,7 +1658,6 @@ pub async fn run<P: LlmClient>(
                                     result: ToolResult {
                                         content: content.clone(),
                                         is_error: true,
-                                        terminate: false,
                                     },
                                 });
                                 batch_failed = true;
@@ -1677,7 +1687,6 @@ pub async fn run<P: LlmClient>(
                                                         o.content
                                                     },
                                                     is_error: false,
-                                                    terminate: false,
                                                 },
                                                 Err(e) => ToolResult::from(e),
                                             }
@@ -1685,7 +1694,6 @@ pub async fn run<P: LlmClient>(
                                         None => ToolResult {
                                             content: format!("unknown tool: {name}"),
                                             is_error: true,
-                                            terminate: false,
                                         },
                                     };
                                     batch_failed |= res.is_error;
@@ -1721,6 +1729,32 @@ pub async fn run<P: LlmClient>(
                                 });
                             }
                         }
+                        // Bets site 2: post-batch. The claim is built before
+                        // the hunks are read (prediction precedes observation);
+                        // no step-stored verdict exists yet, so the claim states
+                        // the verifier verdict the gate checks. The batch's
+                        // hunks are extracted BEFORE the tool-error rollback
+                        // below — a failed batch would destroy its own evidence.
+                        // Uniform proof flag: the batch's tool results all
+                        // passed (test/check rides as any other result);
+                        // per-hunk incremental proof is the later ablation.
+                        let claim = bets::Claim {
+                            predicted_verdict: "tool batch results all passed".to_owned(),
+                            on_mismatch: "roll back the batch; keep only proven hunks".to_owned(),
+                        };
+                        let hunks = match batch_hunks(&tree, !batch_failed) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                return finish_run(
+                                    state,
+                                    writer.as_mut(),
+                                    emitter,
+                                    run_id,
+                                    &mut synced,
+                                    Outcome::Failed(e),
+                                )
+                            }
+                        };
                         // Batch scope: only the failed batch rolls back; the
                         // baseline already committed the proven prefix.
                         if batch_failed {
@@ -1735,7 +1769,40 @@ pub async fn run<P: LlmClient>(
                                 );
                             }
                         }
-                        // Bets site 2: post-batch.
+                        // Verdict→tree mapping: Committed stands (the failed-
+                        // batch rollback above is the existing path either way),
+                        // Partial restores the kept prefix from baseline, Aborted
+                        // runs the existing rollback path again (idempotent).
+                        // A restore error fails closed: restore_hunks leaves the
+                        // tree at baseline when any fragment does not apply.
+                        match bets.on_post_batch(&claim, &hunks) {
+                            bets::CommitVerdict::Committed => {}
+                            bets::CommitVerdict::Partial { savepoint } => {
+                                if let Err(e) = tree.restore_hunks(&savepoint.kept_hunks) {
+                                    return finish_run(
+                                        state,
+                                        writer.as_mut(),
+                                        emitter,
+                                        run_id,
+                                        &mut synced,
+                                        Outcome::Failed(format!("snapshot restore: {e}")),
+                                    );
+                                }
+                            }
+                            bets::CommitVerdict::Aborted { .. } => {
+                                if let Err(e) = tree.rollback() {
+                                    return finish_run(
+                                        state,
+                                        writer.as_mut(),
+                                        emitter,
+                                        run_id,
+                                        &mut synced,
+                                        Outcome::Failed(format!("snapshot rollback: {e}")),
+                                    );
+                                }
+                            }
+                        }
+                        // Bets site 2 step hook (unchanged): Return ends the run.
                         if let PhaseVerdict::Return(o) = bets.on_step() {
                             return finish_run(
                                 state,
@@ -1815,11 +1882,10 @@ mod tests {
         }
     }
 
-    fn result(terminate: bool) -> ToolResult {
+    fn result() -> ToolResult {
         ToolResult {
             content: "ok".into(),
             is_error: false,
-            terminate,
         }
     }
 
@@ -1961,7 +2027,6 @@ mod tests {
             let state = &s.tool_calls[id];
             let res = state.result.as_ref().expect("answered, not dispatched");
             assert!(res.is_error);
-            assert!(!res.terminate);
         }
         assert!(s.items.len() > before);
         assert_eq!(s.turn_reason, Some(TurnEndReason::MaxTokens));
@@ -2092,7 +2157,6 @@ mod tests {
             assert!(res.is_error);
         }
         assert!(s.batch_complete());
-        assert!(!s.batch_concluded());
     }
 
     #[test]
@@ -2121,61 +2185,11 @@ mod tests {
     }
 
     #[test]
-    fn unanimous_batch_concluded() {
-        let mut s = LoopState::new();
-        assert!(!s.batch_concluded()); // empty batch concludes nothing
-        s.tool_calls.insert(
-            "a".into(),
-            ToolCallState {
-                name: "x".into(),
-                result: None,
-            },
-        );
-        assert!(!s.batch_concluded()); // pending call blocks
-        s.record_tool_result(ToolMsg {
-            call_id: "a".into(),
-            result: result(true),
-        });
-        s.tool_calls.insert(
-            "b".into(),
-            ToolCallState {
-                name: "x".into(),
-                result: Some(result(false)),
-            },
-        );
-        assert!(!s.batch_concluded()); // one holdout vetoes
-        s.tool_calls.get_mut("b").unwrap().result = Some(result(true));
-        assert!(s.batch_concluded());
-        assert!(!s.record_tool_result(ToolMsg {
-            call_id: "nope".into(),
-            result: result(true),
-        }));
-    }
-
-    #[test]
-    fn derived_messages_and_section_replay() {
+    fn derived_messages_fold_history() {
         let mut s = LoopState::new();
         s.phase = Phase::Running;
         s.apply_input(Input::User("build it".into()));
         s.admit_steering();
-        s.items.push(Item {
-            seq: s.items.len() as u64,
-            id: "sys".into(),
-            parent_id: None,
-            recorded_at: SystemTime::now(),
-            kind: ItemKind::System {
-                sections: [("goal".to_owned(), Some("ship".to_owned()))]
-                    .into_iter()
-                    .collect(),
-                tools_added: vec![],
-                tools_removed: vec![],
-            },
-        });
-        s.replay_sections();
-        assert_eq!(
-            s.prompt_sections.get("goal").map(String::as_str),
-            Some("ship")
-        );
         let msgs = s.derived_messages();
         assert_eq!(msgs.len(), 1);
         assert_eq!(
@@ -2302,7 +2316,7 @@ mod tests {
         assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
         assert!(s.record_tool_result(ToolMsg {
             call_id: "a".into(),
-            result: result(false),
+            result: result(),
         }));
         let warn = s.budget.config().warn_steps.get();
         s.budget.counters_mut().steps = warn;
@@ -2480,13 +2494,17 @@ mod tests {
             result: ToolResult {
                 content: outcome.content,
                 is_error: false,
-                terminate: true, // unanimous batch concludes the turn
             },
         })
         .await
         .unwrap();
         let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
-        assert!(matches!(v, PhaseVerdict::Return(Outcome::Done)));
+        // Batch done, results owed back to the model: the tick parks on.
+        assert!(matches!(v, PhaseVerdict::Continue));
+        // A hard stop drains the parked idle and closes the turn.
+        itx.send(Input::StopHard).await.unwrap();
+        let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+        assert!(matches!(v, PhaseVerdict::Return(Outcome::Cancelled)));
 
         // Events arrive ordered; every Start pairs with its End.
         let order = event_order(emitter.history());
@@ -2582,10 +2600,7 @@ mod tests {
 
     // --- multi-tick run() assembly: fakes + tempdir git repo ---
 
-    use futures::stream::BoxStream;
-    use provider_core::{
-        Capabilities, Credentials, LlmClient, LlmError, Request, Response, StreamEvent,
-    };
+    use provider_core::{Capabilities, Credentials, LlmClient, LlmError, Request, Response};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use tool_core::{
@@ -2622,17 +2637,8 @@ mod tests {
                 .pop_front()
                 .ok_or(LlmError::Transport("script empty".into()))
         }
-        async fn stream(
-            &self,
-            _model: &str,
-            _req: &Request,
-        ) -> Result<BoxStream<'static, StreamEvent>, LlmError> {
-            Err(LlmError::Transport("no stream in script".into()))
-        }
         fn capabilities(&self, _model: &str) -> Capabilities {
-            Capabilities {
-                sends_finish_reason: true,
-            }
+            Capabilities {}
         }
         async fn resolve_key(&self, _provider: &str) -> Result<Credentials, LlmError> {
             Ok(Credentials {
@@ -2819,7 +2825,7 @@ mod tests {
     #[tokio::test]
     async fn run_e2e_multi_turn_proven_prefix_kept_failed_batch_rolled_back() {
         use agent_event::check_pairing;
-        use agent_log::{open_turn_closers, read_log};
+        use agent_log::read_log;
         let root = run_tmp("e2e");
         std::fs::write(root.join("a.rs"), "v1\n").unwrap();
         std::fs::write(root.join("goal.md"), "ship it\n").unwrap();
@@ -2889,7 +2895,8 @@ mod tests {
         assert_eq!(state.budget.counters().steps, 4);
         assert_eq!(state.budget.counters().tokens, 60);
         assert_eq!(state.budget.counters().spent_cents, 4);
-        assert!(!state.budget.grace_used());
+        // No cap tripped: the one grace step stayed untouched.
+        assert!(state.budget.exceeded().is_none());
         // Events ordered and paired across two turns plus the run pair.
         let history = emitter.history();
         assert!(check_pairing(history), "unpaired: {history:?}");
@@ -2905,11 +2912,10 @@ mod tests {
         assert_eq!(kinds.iter().filter(|k| **k == "MessageEnd").count(), 4);
         assert_eq!(kinds.iter().filter(|k| **k == "ToolStart").count(), 3);
         assert_eq!(kinds.iter().filter(|k| **k == "ToolEnd").count(), 3);
-        // File log validates and is balanced: header first, closers empty.
+        // File log validates and is balanced: header first.
         let file_items = read_log(&log_path).unwrap();
         assert!(matches!(file_items[0].kind, ItemKind::Header { .. }));
         assert_eq!(file_items.len(), state.items.len());
-        assert!(open_turn_closers(&file_items).is_empty());
         let log_kinds = run_kinds(&file_items);
         assert_eq!(
             log_kinds,
@@ -3041,7 +3047,7 @@ mod tests {
             matches!(outcome, Outcome::Halted(ref s) if s == "steps"),
             "got {outcome:?}"
         );
-        assert!(state.budget.grace_used()); // grace ran first, halt after
+        assert!(state.budget.may_step().is_err()); // grace ran first, halt after
         assert_eq!(state.drain_timeout, Duration::from_secs(5));
         match emitter.history().last().unwrap() {
             AgentEvent::RunEnd { outcome, .. } => {
@@ -3159,9 +3165,7 @@ mod tests {
         let max = s.budget.config().max_steps.get();
         s.budget.counters_mut().steps = max;
         // Grace fires exactly once through the loop's guard.
-        assert!(!s.budget.grace_used());
         assert!(s.budget.may_step().is_ok());
-        assert!(s.budget.grace_used());
         assert!(s.budget.may_step().is_err());
         // Step head now refuses; the tick halts with a BudgetExceeded frame.
         let root = CancellationToken::new();
@@ -3334,5 +3338,360 @@ mod tests {
             other => panic!("expected failed RunEnd, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- bets site 2: proof-gated post-batch verdicts ---
+
+    /// Verdict hook: keeps only the batch's first hunk, reverts the rest.
+    struct PartialFirst;
+
+    impl BetsHook for PartialFirst {
+        fn on_post_batch(
+            &self,
+            claim: &bets::Claim,
+            hunks: &[(String, bool)],
+        ) -> bets::CommitVerdict {
+            assert!(!claim.predicted_verdict.trim().is_empty());
+            assert!(hunks.len() >= 2, "need a multi-hunk batch, got {hunks:?}");
+            // Uniform proof: this batch's tool results all passed.
+            assert!(hunks.iter().all(|(_, ok)| *ok), "{hunks:?}");
+            bets::CommitVerdict::Partial {
+                savepoint: bets::Savepoint {
+                    kept_hunks: hunks[..1].iter().map(|(h, _)| h.clone()).collect(),
+                    reverted_hunks: hunks[1..].iter().map(|(h, _)| h.clone()).collect(),
+                },
+            }
+        }
+    }
+
+    /// Verdict hook: rejects every batch outright.
+    struct AbortBatch;
+
+    impl BetsHook for AbortBatch {
+        fn on_post_batch(
+            &self,
+            _claim: &bets::Claim,
+            hunks: &[(String, bool)],
+        ) -> bets::CommitVerdict {
+            assert!(!hunks.is_empty(), "gate sees the batch's hunks");
+            bets::CommitVerdict::Aborted {
+                reason: "stub rejects the batch".into(),
+            }
+        }
+    }
+
+    #[test]
+    fn no_bets_defaults_keep_the_run_ungated_and_step_head_delegates() {
+        // Site 2 default = permissive Committed: feature off unless a hook opts in.
+        let claim = bets::Claim {
+            predicted_verdict: "all green".into(),
+            on_mismatch: "rollback".into(),
+        };
+        assert!(matches!(
+            NoBets.on_post_batch(&claim, &[]),
+            bets::CommitVerdict::Committed
+        ));
+        assert!(matches!(NoBets.on_step_head(3), PhaseVerdict::Continue));
+        // Site 1 default delegates to on_step: an on_step-only hook still gates.
+        struct StopOnStep;
+        impl BetsHook for StopOnStep {
+            fn on_step(&self) -> PhaseVerdict {
+                PhaseVerdict::Return(Outcome::Done)
+            }
+        }
+        assert!(matches!(
+            StopOnStep.on_step_head(0),
+            PhaseVerdict::Return(Outcome::Done)
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_post_batch_partial_keeps_first_hunk_only_and_continues() {
+        let root = run_tmp("partial");
+        std::fs::write(root.join("a.rs"), "one\n").unwrap();
+        std::fs::write(root.join("b.rs"), "two\n").unwrap();
+        let client = ScriptClient {
+            order: Arc::new(Mutex::new(Vec::new())),
+            requests: Default::default(),
+            queue: Mutex::new(VecDeque::from([
+                script_resp(
+                    vec![
+                        (
+                            "c1",
+                            "write",
+                            serde_json::json!({"path": "a.rs", "content": "A2\n"}),
+                        ),
+                        (
+                            "c2",
+                            "write",
+                            serde_json::json!({"path": "b.rs", "content": "B2\n"}),
+                        ),
+                    ],
+                    StopReason::ToolUse,
+                ),
+                text_resp("done"),
+            ])),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &PartialFirst,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("go".into())],
+            &cancel,
+        )
+        .await;
+        // Documented semantics: Partial rewrites the tree to the kept prefix,
+        // then the run continues to its normal Done.
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "A2\n");
+        assert_eq!(std::fs::read_to_string(root.join("b.rs")).unwrap(), "two\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn run_post_batch_aborted_rolls_back_the_whole_batch() {
+        let root = run_tmp("aborted");
+        std::fs::write(root.join("a.rs"), "one\n").unwrap();
+        let client = ScriptClient {
+            order: Arc::new(Mutex::new(Vec::new())),
+            requests: Default::default(),
+            queue: Mutex::new(VecDeque::from([
+                script_resp(
+                    vec![(
+                        "c1",
+                        "write",
+                        serde_json::json!({"path": "a.rs", "content": "A2\n"}),
+                    )],
+                    StopReason::ToolUse,
+                ),
+                text_resp("done"),
+            ])),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &AbortBatch,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("go".into())],
+            &cancel,
+        )
+        .await;
+        // Documented semantics: Aborted runs the full rollback path, the run
+        // itself continues and finishes normally.
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "one\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- shared-scenario drift guard: both drivers, one script, one ordering ---
+
+    /// Frame vocabulary in emission order (driver chrome filtered out).
+    fn frame_order(history: &[AgentEvent]) -> Vec<&'static str> {
+        history
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnStart { .. } => Some("TurnStart"),
+                AgentEvent::MessageStart { .. } => Some("MessageStart"),
+                AgentEvent::MessageUpdate { .. } => Some("MessageUpdate"),
+                AgentEvent::MessageEnd { .. } => Some("MessageEnd"),
+                AgentEvent::ToolStart { .. } => Some("ToolStart"),
+                AgentEvent::ToolEnd { .. } => Some("ToolEnd"),
+                AgentEvent::TurnEnd { .. } => Some("TurnEnd"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The frame order the durable rows demand: every terminal frame follows
+    /// the append of its fact.
+    fn project_durable(rows: &[&'static str]) -> Vec<&'static str> {
+        rows.iter()
+            .flat_map(|k| match *k {
+                "TurnStart" => vec!["TurnStart"],
+                "Assistant" => vec!["MessageStart", "MessageUpdate", "MessageEnd"],
+                "ToolCall" => vec!["ToolStart"],
+                "ToolResult" => vec!["ToolEnd"],
+                "TurnEnd" => vec!["TurnEnd"],
+                _ => vec![],
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
+        use agent_event::check_pairing;
+
+        // The shared script: user turn, one write tool call, its result, final text.
+        fn write_call(id: &str) -> (&str, &str, serde_json::Value) {
+            (
+                id,
+                "write",
+                serde_json::json!({"path": "w.txt", "content": "x\n"}),
+            )
+        }
+
+        // --- leg 1: run() on real siblings ---
+        let run_root = run_tmp("shared-run");
+        let run_client = ScriptClient {
+            order: Arc::new(Mutex::new(Vec::new())),
+            requests: Default::default(),
+            queue: Mutex::new(VecDeque::from([
+                script_resp(vec![write_call("c1")], StopReason::ToolUse),
+                text_resp("done"),
+            ])),
+        };
+        let registry = run_registry(&run_root);
+        let mut run_state = LoopState::new();
+        let mut run_emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let outcome = run(
+            &mut run_state,
+            Run {
+                provider: &run_client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &run_root,
+                emitter: &mut run_emitter,
+                bets: &NoBets,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("go".into())],
+            &cancel,
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        let _ = std::fs::remove_dir_all(&run_root);
+
+        // --- leg 2: drive_tick on the same script ---
+        let tick_root = run_tmp("shared-tick");
+        let registry = run_registry(&tick_root);
+        let mut s = LoopState::new();
+        s.stop_when_idle = true; // the scripted run is done after the final text
+        let mut emitter = Emitter::new();
+        let (itx, mut irx) = mpsc::channel(8);
+        let (ptx, mut prx) = mpsc::channel(8);
+        let (ttx, mut trx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+
+        itx.send(Input::User("go".into())).await.unwrap();
+        let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+        assert!(matches!(v, PhaseVerdict::Continue));
+        s.admit_steering(); // pre-boundary: the only place steering enters the log
+        let root = CancellationToken::new();
+        assert!(s.start_provider_call(&root).is_some());
+        ptx.send(ProviderMsg::Settled {
+            turn: 1,
+            message: script_resp(vec![write_call("c1")], StopReason::ToolUse).message,
+            stop: StopReason::ToolUse,
+            usage: None,
+        })
+        .await
+        .unwrap();
+        let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+        assert!(matches!(v, PhaseVerdict::Continue));
+        // The ToolCall row is durable (at claim) before the tool runs.
+        let prepared = registry.prepare(
+            "agent",
+            ToolCall {
+                call_id: "c1".into(),
+                name: "write".into(),
+                args: serde_json::json!({"path": "w.txt", "content": "x\n"}),
+            },
+        );
+        let inv = match prepared {
+            tool_core::CallStatus::Dispatch(inv) => inv,
+            tool_core::CallStatus::Result(r) => panic!("gate must allow the fake: {}", r.content),
+        };
+        let out = registry
+            .resolve("write")
+            .unwrap()
+            .execute(inv, CancellationToken::new())
+            .await
+            .expect("write tool runs");
+        ttx.send(ToolMsg {
+            call_id: "c1".into(),
+            result: ToolResult {
+                content: out.content,
+                is_error: false,
+            },
+        })
+        .await
+        .unwrap();
+        let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+        assert!(matches!(v, PhaseVerdict::Continue));
+        assert!(s.start_provider_call(&root).is_some());
+        ptx.send(ProviderMsg::Settled {
+            turn: 1,
+            message: text_resp("done").message,
+            stop: StopReason::Stop,
+            usage: None,
+        })
+        .await
+        .unwrap();
+        let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+        assert!(matches!(v, PhaseVerdict::Return(Outcome::Done)));
+        let _ = std::fs::remove_dir_all(&tick_root);
+
+        // --- drift guard: same durable order, same frame order, frames follow rows ---
+        let rows_of = |items: &[Item]| -> Vec<&'static str> {
+            run_kinds(items)
+                .into_iter()
+                .filter(|k| *k != "Header")
+                .collect()
+        };
+        let run_rows = rows_of(&run_state.items);
+        let tick_rows = rows_of(&s.items);
+        assert_eq!(run_rows, tick_rows, "durable rows drifted between drivers");
+        assert_eq!(
+            run_rows,
+            vec![
+                "TurnStart",
+                "Input",
+                "Assistant",
+                "ToolCall",
+                "ToolResult",
+                "Assistant",
+                "TurnEnd"
+            ]
+        );
+        let run_frames = frame_order(run_emitter.history());
+        let tick_frames = frame_order(emitter.history());
+        assert_eq!(
+            run_frames, tick_frames,
+            "frame order drifted between drivers"
+        );
+        assert_eq!(
+            project_durable(&run_rows),
+            run_frames,
+            "run(): frames must follow the durable rows"
+        );
+        assert_eq!(
+            project_durable(&tick_rows),
+            tick_frames,
+            "drive_tick(): frames must follow the durable rows"
+        );
+        assert!(check_pairing(run_emitter.history()));
+        assert!(check_pairing(emitter.history()));
     }
 }

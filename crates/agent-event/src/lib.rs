@@ -118,10 +118,6 @@ pub enum AgentEvent {
         name: String,
         args: Value,
     },
-    ToolUpdate {
-        id: ToolCallId,
-        partial_result: Value,
-    },
     ToolEnd {
         id: ToolCallId,
         result: Value,
@@ -133,60 +129,9 @@ pub enum AgentEvent {
     },
 }
 
-/// Monotone id source: ids are deterministic from emission order, so a replay
-/// driven in order reproduces live ids.
-#[derive(Debug, Default)]
-pub struct IdAlloc {
-    next: u64,
-}
-
-impl IdAlloc {
-    pub fn alloc(&mut self) -> u64 {
-        let id = self.next;
-        self.next += 1;
-        id
-    }
-}
-
-/// The live-view reducer: folds one `AgentEvent` stream into what the TUI shows.
-/// Partials are never authoritative — only terminal frames mutate state.
-/// Replay drives this same reducer over the recorded vec.
-#[derive(Debug, Default, PartialEq)]
-pub struct Transcript {
-    pub messages: Vec<Message>,
-    pub tool_results: Vec<(ToolCallId, Value, bool)>,
-}
-
-impl Transcript {
-    pub fn apply(&mut self, event: &AgentEvent) {
-        match event {
-            AgentEvent::MessageEnd { message, .. } => self.messages.push(message.clone()),
-            AgentEvent::ToolEnd {
-                id,
-                result,
-                is_error,
-            } => {
-                self.tool_results
-                    .push((id.clone(), result.clone(), *is_error));
-            }
-            // The terminal frame is authoritative for the whole transcript.
-            AgentEvent::RunEnd { messages, .. } => self.messages.clone_from(messages),
-            _ => {}
-        }
-    }
-
-    pub fn replay(events: &[AgentEvent]) -> Self {
-        let mut t = Self::default();
-        for e in events {
-            t.apply(e);
-        }
-        t
-    }
-}
-
 /// Pairing invariant: every Start is eventually paired with an End.
-/// One-directional — an End without a Start (e.g. a synthesized empty-stream
-/// close) passes; a Start without an End fails.
+/// One-directional — an End without a Start passes; a Start without an End
+/// fails.
 pub fn check_pairing(events: &[AgentEvent]) -> bool {
     use std::collections::HashSet;
     let mut run_starts = 0;
@@ -226,91 +171,6 @@ pub fn check_pairing(events: &[AgentEvent]) -> bool {
         && turn_starts.iter().all(|t| turn_ends.contains(t))
         && msg_starts.iter().all(|m| msg_ends.contains(m))
         && tool_starts.iter().all(|t| tool_ends.contains(t))
-}
-
-/// Crash-shape repair: append one synthesized terminal frame per Start that
-/// never got its End, in first-seen order. Idempotent.
-/// LOOP-OWNED RULE: the loop must durably append the crash facts before
-/// emitting these terminals — this fn repairs the live shape, not the log.
-pub fn synthesize_missing_ends(events: &mut Vec<AgentEvent>) {
-    use std::collections::HashSet;
-    let mut msg_seen: HashSet<MessageId> = HashSet::new();
-    let mut tool_seen: HashSet<ToolCallId> = HashSet::new();
-    let mut turn_seen: HashSet<TurnId> = HashSet::new();
-    let mut msg_order: Vec<(MessageId, Role)> = Vec::new();
-    let mut tool_order: Vec<ToolCallId> = Vec::new();
-    let mut turn_order: Vec<TurnId> = Vec::new();
-    let mut msg_ends: HashSet<MessageId> = HashSet::new();
-    let mut tool_ends: HashSet<ToolCallId> = HashSet::new();
-    let mut turn_ends: HashSet<TurnId> = HashSet::new();
-    let mut run_starts = 0;
-    let mut run_ends = 0;
-    for e in events.iter() {
-        match e {
-            AgentEvent::RunStart { .. } => run_starts += 1,
-            AgentEvent::RunEnd { .. } => run_ends += 1,
-            AgentEvent::TurnStart { turn } => {
-                if turn_seen.insert(*turn) {
-                    turn_order.push(*turn);
-                }
-            }
-            AgentEvent::TurnEnd { turn, .. } => {
-                turn_ends.insert(*turn);
-            }
-            AgentEvent::MessageStart { id, role, .. } => {
-                if msg_seen.insert(*id) {
-                    msg_order.push((*id, *role));
-                }
-            }
-            AgentEvent::MessageEnd { id, .. } => {
-                msg_ends.insert(*id);
-            }
-            AgentEvent::ToolStart { id, .. } => {
-                if tool_seen.insert(id.clone()) {
-                    tool_order.push(id.clone());
-                }
-            }
-            AgentEvent::ToolEnd { id, .. } => {
-                tool_ends.insert(id.clone());
-            }
-            _ => {}
-        }
-    }
-    for (id, role) in msg_order {
-        if !msg_ends.contains(&id) {
-            events.push(AgentEvent::MessageEnd {
-                id,
-                message: Message {
-                    role,
-                    content: String::new(),
-                },
-                interrupted: true,
-            });
-        }
-    }
-    for id in tool_order {
-        if !tool_ends.contains(&id) {
-            events.push(AgentEvent::ToolEnd {
-                id,
-                result: Value::Null,
-                is_error: true,
-            });
-        }
-    }
-    for turn in turn_order {
-        if !turn_ends.contains(&turn) {
-            events.push(AgentEvent::TurnEnd {
-                turn,
-                reason: TurnEndReason::Aborted,
-            });
-        }
-    }
-    if run_starts > run_ends {
-        events.push(AgentEvent::RunEnd {
-            outcome: RunOutcome::Failed("run ended without RunEnd; synthesized".to_string()),
-            messages: Vec::new(),
-        });
-    }
 }
 
 fn call_catch(listener: &dyn Fn(&AgentEvent), event: &AgentEvent) -> bool {
@@ -383,11 +243,6 @@ impl Emitter {
     pub fn history(&self) -> &[AgentEvent] {
         &self.history
     }
-
-    /// Forks never inherit subscribers: a forked run gets a fresh seam.
-    pub fn fork(&self) -> Self {
-        Self::new()
-    }
 }
 
 #[cfg(test)]
@@ -446,10 +301,6 @@ mod tests {
                 name: "read".to_string(),
                 args: json!({}),
             },
-            AgentEvent::ToolUpdate {
-                id: "c1".to_string(),
-                partial_result: json!("par"),
-            },
             AgentEvent::ToolEnd {
                 id: "c1".to_string(),
                 result: json!("ok"),
@@ -484,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn pairing_invariant_and_synthesis() {
+    fn pairing_invariant() {
         let mut good = vec![
             AgentEvent::RunStart {
                 run_id: 0,
@@ -539,7 +390,7 @@ mod tests {
             },
         ];
         assert!(check_pairing(&good));
-        // One-directional: an End without a Start (synthesized empty-stream close) passes.
+        // One-directional: an End without a Start passes.
         assert!(check_pairing(&[AgentEvent::MessageEnd {
             id: 9,
             message: Message {
@@ -550,118 +401,6 @@ mod tests {
         }]));
         good.remove(7);
         assert!(!check_pairing(&good));
-        let mut broken = vec![
-            AgentEvent::RunStart {
-                run_id: 0,
-                goal: "g".to_string(),
-            },
-            AgentEvent::TurnStart { turn: 3 },
-            AgentEvent::MessageStart {
-                id: 7,
-                role: Role::Assistant,
-                partial: Message {
-                    role: Role::Assistant,
-                    content: "part".to_string(),
-                },
-            },
-            AgentEvent::ToolStart {
-                id: "c9".to_string(),
-                name: "sh".to_string(),
-                args: json!(null),
-            },
-        ];
-        assert!(!check_pairing(&broken));
-        synthesize_missing_ends(&mut broken);
-        assert!(check_pairing(&broken));
-        assert!(broken.iter().any(|e| matches!(
-            e,
-            AgentEvent::MessageEnd {
-                id: 7,
-                interrupted: true,
-                ..
-            }
-        )));
-        let len = broken.len();
-        synthesize_missing_ends(&mut broken);
-        assert_eq!(broken.len(), len);
-    }
-
-    #[test]
-    fn replay_equals_live() {
-        let live = vec![
-            AgentEvent::RunStart {
-                run_id: 0,
-                goal: "g".to_string(),
-            },
-            AgentEvent::MessageStart {
-                id: 0,
-                role: Role::Assistant,
-                partial: Message {
-                    role: Role::Assistant,
-                    content: String::new(),
-                },
-            },
-            AgentEvent::MessageUpdate {
-                id: 0,
-                delta: MessageDelta {
-                    kind: DeltaKind::Text,
-                    text: Some("hello ".to_string()),
-                },
-                partial: Message {
-                    role: Role::Assistant,
-                    content: "hello ".to_string(),
-                },
-            },
-            AgentEvent::MessageUpdate {
-                id: 0,
-                delta: MessageDelta {
-                    kind: DeltaKind::Text,
-                    text: Some("world".to_string()),
-                },
-                partial: Message {
-                    role: Role::Assistant,
-                    content: "hello world".to_string(),
-                },
-            },
-            AgentEvent::MessageEnd {
-                id: 0,
-                message: Message {
-                    role: Role::Assistant,
-                    content: "hello world".to_string(),
-                },
-                interrupted: false,
-            },
-            AgentEvent::ToolStart {
-                id: "c1".to_string(),
-                name: "read".to_string(),
-                args: json!({"p": "f"}),
-            },
-            AgentEvent::ToolUpdate {
-                id: "c1".to_string(),
-                partial_result: json!("par"),
-            },
-            AgentEvent::ToolEnd {
-                id: "c1".to_string(),
-                result: json!("full"),
-                is_error: false,
-            },
-            AgentEvent::RunEnd {
-                outcome: RunOutcome::Passed,
-                messages: vec![Message {
-                    role: Role::Assistant,
-                    content: "hello world".to_string(),
-                }],
-            },
-        ];
-        let live_state = Transcript::replay(&live);
-        let replayed: Vec<AgentEvent> = live
-            .iter()
-            .map(|e| serde_json::from_str(&serde_json::to_string(e).unwrap()).unwrap())
-            .collect();
-        assert_eq!(live_state, Transcript::replay(&replayed));
-        assert_eq!(live_state.messages.len(), 1);
-        assert_eq!(live_state.messages[0].content, "hello world");
-        assert_eq!(live_state.tool_results.len(), 1);
     }
 
     #[test]
@@ -684,17 +423,13 @@ mod tests {
             AgentEvent::TurnStart { .. }
         ));
         assert!(matches!(rx.try_recv().unwrap(), AgentEvent::Error { .. }));
-        // A dead tap never errors the loop; a fork inherits no subscribers.
+        // A dead tap never errors the loop.
         drop(rx);
         bus.emit(AgentEvent::TurnEnd {
             turn: 1,
             reason: TurnEndReason::Aborted,
         });
         assert_eq!(bus.history().len(), 4);
-        assert_eq!(*seen.lock().unwrap(), 4);
-        let mut fork = bus.fork();
-        assert!(fork.history().is_empty());
-        fork.emit(AgentEvent::TurnStart { turn: 9 });
         assert_eq!(*seen.lock().unwrap(), 4);
     }
 }

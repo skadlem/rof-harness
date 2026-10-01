@@ -40,7 +40,6 @@ pub struct ContextItem {
     pub key: ItemKey,
     pub fidelity: Fidelity,
     pub must_include: bool,
-    pub est_chars: usize,
     pub text: String,
 }
 
@@ -49,7 +48,6 @@ pub struct ContextAssembler {
     items: Vec<ContextItem>,
     volatile_items: Vec<ContextItem>,
     seen: HashSet<ItemKey>,
-    eliminated: usize,
 }
 
 impl ContextAssembler {
@@ -59,11 +57,10 @@ impl ContextAssembler {
             items: Vec::new(),
             volatile_items: Vec::new(),
             seen: HashSet::new(),
-            eliminated: 0,
         }
     }
 
-    /// Dedupe by key; counts eliminated chars. Volatile items bypass the mid layer.
+    /// Dedupe by key. Volatile items bypass the mid layer.
     pub fn add(&mut self, _item: ContextItem) {
         self.place(_item, false);
     }
@@ -77,7 +74,6 @@ impl ContextAssembler {
 
     fn place(&mut self, item: ContextItem, volatile: bool) {
         if self.seen.contains(&item.key) {
-            self.eliminated += item.text.chars().count();
             return;
         }
         self.seen.insert(item.key.clone());
@@ -90,18 +86,7 @@ impl ContextAssembler {
 
     /// Halving-to-floor fit; oversized must_include narrows, never silently cuts.
     pub fn assemble(&self) -> String {
-        self.assemble_inner(self.budget, false)
-    }
-
-    /// Diet-first reask split for the retry turn: volatiles are fitted first so a
-    /// tight budget starves background before evidence. Delivery order is
-    /// unchanged, so bytes equal `assemble` whenever everything fits.
-    pub fn assemble_reask(&self, _budget_chars: usize) -> String {
-        self.assemble_inner(_budget_chars, true)
-    }
-
-    pub fn eliminated_chars(&self) -> usize {
-        self.eliminated
+        self.assemble_inner(self.budget)
     }
 
     fn shape(&self, item: &ContextItem, remaining: usize) -> Option<String> {
@@ -145,17 +130,12 @@ impl ContextAssembler {
         }
     }
 
-    fn assemble_inner(&self, budget: usize, volatiles_first: bool) -> String {
+    fn assemble_inner(&self, budget: usize) -> String {
         let mut used = 0usize;
         let mut stable = vec![None; self.items.len()];
         let mut vol = vec![None; self.volatile_items.len()];
-        if volatiles_first {
-            self.fit_list(&self.volatile_items, &mut vol, &mut used, budget);
-            self.fit_list(&self.items, &mut stable, &mut used, budget);
-        } else {
-            self.fit_list(&self.items, &mut stable, &mut used, budget);
-            self.fit_list(&self.volatile_items, &mut vol, &mut used, budget);
-        }
+        self.fit_list(&self.items, &mut stable, &mut used, budget);
+        self.fit_list(&self.volatile_items, &mut vol, &mut used, budget);
         let mut sections = Vec::new();
         for (item, text) in self
             .items
@@ -254,35 +234,6 @@ pub fn cut_chars(_text: &str, _max_chars: usize) -> &str {
     }
 }
 
-/// Collapse-5: all but the last `COLLAPSE_KEEP` observations collapse to one
-/// line each; the tail stays verbatim.
-pub fn collapse_history(observations: &[String]) -> String {
-    if observations.len() <= COLLAPSE_KEEP {
-        return observations.join("\n");
-    }
-    let split = observations.len() - COLLAPSE_KEEP;
-    let mut s = String::new();
-    for o in &observations[..split] {
-        s.push_str("[collapsed] ");
-        s.push_str(o.lines().next().unwrap_or(""));
-        s.push('\n');
-    }
-    s.push_str(&observations[split..].join("\n"));
-    s
-}
-
-/// 100-line file window centred on `center_line` (0-indexed).
-pub fn file_window(text: &str, center_line: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() <= WINDOW_LINES {
-        return text.to_string();
-    }
-    let start = center_line
-        .saturating_sub(WINDOW_LINES / 2)
-        .min(lines.len() - WINDOW_LINES);
-    lines[start..start + WINDOW_LINES].join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,17 +247,15 @@ mod tests {
             },
             fidelity,
             must_include: must,
-            est_chars: text.chars().count(),
             text: text.into(),
         }
     }
 
     #[test]
-    fn dedupe_by_key_counts_eliminated() {
+    fn dedupe_by_key() {
         let mut a = ContextAssembler::new(100_000);
         a.add(mk("s/a.rs", "cur", "impl A {}", Fidelity::Exact, true));
         a.add(mk("s/a.rs", "cur", "impl A {}", Fidelity::Exact, true));
-        assert_eq!(a.eliminated_chars(), "impl A {}".chars().count());
         assert_eq!(a.assemble().matches("impl A {}").count(), 1);
     }
 
@@ -377,16 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn reask_fits_volatiles_first_but_delivers_stable_order() {
-        let mut a = ContextAssembler::new(100_000);
-        a.add(mk("bg.rs", "cur", "background", Fidelity::Drop, false));
-        a.add_volatile(mk("ev.rs", "cur", "evidence", Fidelity::Exact, true));
-        assert_eq!(a.assemble(), a.assemble_reask(100_000));
-        let diet = a.assemble_reask("--- ev.rs\nevidence".chars().count() + 4);
-        assert!(diet.contains("evidence") && !diet.contains("background"));
-    }
-
-    #[test]
     fn window_anchored_on_symbol() {
         let text = "a\n".repeat(3000) + "fn target_sym() {}\n" + &"b\n".repeat(3000);
         let w = window_anchored(&text, "target_sym", 2000);
@@ -417,24 +356,5 @@ mod tests {
         let big = named_file_contents(&dir, "big.rs", 2000).unwrap();
         assert_eq!(big.chars().count(), 2000);
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn collapse_keeps_last_five_verbatim() {
-        let obs: Vec<String> = (0..7).map(|i| format!("obs{i}\nsecond line {i}")).collect();
-        let out = collapse_history(&obs);
-        assert!(out.contains("[collapsed] obs0") && out.contains("[collapsed] obs1"));
-        assert!(out.contains("second line 6") && !out.contains("second line 0"));
-    }
-
-    #[test]
-    fn file_window_is_100_lines_centred() {
-        let text = (0..250)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let w = file_window(&text, 200);
-        assert_eq!(w.lines().count(), WINDOW_LINES);
-        assert!(w.contains("line 200") && !w.contains("line 0\n"));
     }
 }
