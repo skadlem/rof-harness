@@ -466,31 +466,95 @@ pub struct ToolCaps {
     pub exec_prefixes: Vec<String>,
 }
 
-fn task_artifacts(toml: &str) -> Vec<String> {
-    for line in toml.lines() {
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
+/// Parse `artifacts = [...]` from task.toml: single- or multi-line arrays,
+/// `#` comments tolerated. `Err` on malformed input — an empty list must
+/// never mean "the parser gave up quietly".
+fn task_artifacts(toml: &str) -> Result<Vec<String>, String> {
+    let mut buf = String::new();
+    let mut open = false;
+    let mut done = false;
+    for raw in toml.lines() {
+        if done {
+            break;
+        }
+        let line = raw.trim();
+        let line = match line.find(" #") {
+            Some(i) => line[..i].trim_end(),
+            None => line,
         };
-        if k.trim() == "artifacts" {
-            return v
-                .trim()
-                .trim_matches(['[', ']'])
-                .split(',')
-                .map(|p| p.trim().trim_matches(['"', '\'']).to_string())
-                .filter(|p| !p.is_empty())
-                .collect();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if open {
+            buf.push(' ');
+            buf.push_str(line);
+            if line.contains(']') {
+                done = true;
+            }
+        } else if let Some((k, v)) = line.split_once('=') {
+            if k.trim() != "artifacts" {
+                continue;
+            }
+            buf.push_str(v.trim());
+            if buf.contains(']') {
+                done = true;
+            } else {
+                open = true;
+            }
         }
     }
-    Vec::new()
+    if open && !done {
+        return Err("task.toml: artifacts array never closed with ']'".into());
+    }
+    if buf.is_empty() {
+        return Ok(Vec::new());
+    }
+    let end = buf.find(']').map(|i| i + 1).unwrap_or(buf.len());
+    let mut out = Vec::new();
+    for e in buf[..end].trim().trim_matches(['[', ']']).split(',') {
+        let e = e.trim();
+        if e.is_empty() {
+            continue;
+        }
+        let inner = e
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| e.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+            .ok_or_else(|| format!("task.toml: unparseable artifacts entry {e:?}"))?;
+        if inner.contains('"') || inner.contains('\'') {
+            return Err(format!("task.toml: unparseable artifacts entry {e:?}"));
+        }
+        out.push(inner.to_string());
+    }
+    Ok(out)
 }
 
 /// Returns violation strings; empty means the task is winnable with `caps`.
 /// Agent seed = `task_dir/environment` (starting files); `/app/X` maps there.
-/// Absent artifacts need create; present ones need patch; missing tests or
-/// oracle are always violations.
+/// Absent artifacts need create; present ones need patch; missing tests,
+/// oracle, or an unreadable/malformed task.toml are always violations —
+/// no task.toml can never mean winnable.
 pub fn check_winnability(task_dir: &Path, caps: &ToolCaps) -> Vec<String> {
     let mut bad = Vec::new();
-    let toml = std::fs::read_to_string(task_dir.join("task.toml")).unwrap_or_default();
+    match std::fs::read_to_string(task_dir.join("task.toml")) {
+        Err(e) => bad.push(format!("task.toml missing or unreadable: {e}")),
+        Ok(toml) => match task_artifacts(&toml) {
+            Err(e) => bad.push(e),
+            Ok(artifacts) => {
+                for a in artifacts {
+                    let rel = a.strip_prefix("/app/").unwrap_or(&a);
+                    let seed = task_dir.join("environment").join(rel.trim_end_matches('/'));
+                    let present = seed.exists();
+                    if present && !caps.can_patch {
+                        bad.push(format!("{a}: present in seed but no patch tool"));
+                    }
+                    if !present && !caps.can_create {
+                        bad.push(format!("{a}: absent from seed and no write tool"));
+                    }
+                }
+            }
+        },
+    }
     let tests_empty = std::fs::read_dir(task_dir.join("tests"))
         .map(|rd| rd.count() == 0)
         .unwrap_or(true);
@@ -499,17 +563,6 @@ pub fn check_winnability(task_dir: &Path, caps: &ToolCaps) -> Vec<String> {
     }
     if !task_dir.join("solution").join("solve.sh").exists() {
         bad.push("no oracle solve.sh".to_string());
-    }
-    for a in task_artifacts(&toml) {
-        let rel = a.strip_prefix("/app/").unwrap_or(&a);
-        let seed = task_dir.join("environment").join(rel.trim_end_matches('/'));
-        let present = seed.exists();
-        if present && !caps.can_patch {
-            bad.push(format!("{a}: present in seed but no patch tool"));
-        }
-        if !present && !caps.can_create {
-            bad.push(format!("{a}: absent from seed and no write tool"));
-        }
     }
     bad
 }
@@ -790,6 +843,98 @@ mod tests {
             bad.iter().any(|b| b.contains("no verifier tests")),
             "{bad:?}"
         );
+        assert!(!bad.iter().any(|b| b.contains("no oracle")), "{bad:?}");
+
+        // missing-oracle branch: tests restored, solve.sh gone.
+        std::fs::create_dir_all(t.join("tests")).unwrap();
+        std::fs::write(t.join("tests").join("test.sh"), "exit 0\n").unwrap();
+        std::fs::remove_file(t.join("solution").join("solve.sh")).unwrap();
+        let bad = check_winnability(&t, &full_caps());
+        assert!(
+            bad.iter().any(|b| b.contains("no oracle solve.sh")),
+            "{bad:?}"
+        );
+        assert!(
+            !bad.iter().any(|b| b.contains("no verifier tests")),
+            "{bad:?}"
+        );
+    }
+
+    #[test]
+    fn artifacts_multiline_array_parses() {
+        let root = tmp();
+        let t = win_task(&root, "\"/app/data\"", &["data/x"]);
+        std::fs::write(
+            t.join("task.toml"),
+            "image = \"img\"\nartifacts = [\n  \"/app/data\",\n  \"/app/output\",\n]\n",
+        )
+        .unwrap();
+        assert!(check_winnability(&t, &full_caps()).is_empty());
+        let no_write = ToolCaps {
+            can_create: false,
+            ..full_caps()
+        };
+        let bad = check_winnability(&t, &no_write);
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert!(bad[0].contains("no write tool"), "{bad:?}");
+    }
+
+    #[test]
+    fn artifacts_comment_lines_tolerated() {
+        let toml = "# task metadata\nimage = \"img\"\n\nartifacts = [\n  # what the verifier reads\n  \"/app/data\", # seed present\n]\ntimeout = 60\n";
+        assert_eq!(task_artifacts(toml).unwrap(), vec!["/app/data".to_string()]);
+        assert!(task_artifacts("# nothing here\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn artifacts_malformed_is_loud_error() {
+        // unquoted entry
+        assert!(task_artifacts("artifacts = [\n  /app/data,\n]").is_err());
+        // array never closed
+        assert!(task_artifacts("artifacts = [\"/app/data\"\n").is_err());
+        // through check_winnability: never an empty ("winnable") pass
+        let root = tmp();
+        let t = win_task(&root, "\"/app/data\"", &["data/x"]);
+        std::fs::write(t.join("task.toml"), "artifacts = [/app/data]\n").unwrap();
+        let bad = check_winnability(&t, &full_caps());
+        assert!(bad.iter().any(|b| b.contains("unparseable")), "{bad:?}");
+    }
+
+    #[test]
+    fn winnability_missing_task_toml_is_violation() {
+        let root = tmp();
+        let t = win_task(&root, "\"/app/data\"", &["data/x"]);
+        std::fs::remove_file(t.join("task.toml")).unwrap();
+        let bad = check_winnability(&t, &full_caps());
+        assert!(bad.iter().any(|b| b.contains("task.toml")), "{bad:?}");
+    }
+
+    #[test]
+    fn frozen_slices_pinned_by_digest_and_ids() {
+        // Re-freezing either slice must break `cargo test` before any run.
+        for (name, sha, ids) in [
+            (
+                "tb-slice-a",
+                "a460a97aff950f2dc1041fd2207b6f5751c73bd207df7b361bf190ae3dde3525",
+                2usize,
+            ),
+            (
+                "multiswe-rust",
+                "badd9685eb31cd5675465e29294c321e168a1678321613ed028b30fbadd07b36",
+                50usize,
+            ),
+        ] {
+            let p = slice_path(name); // CARGO_MANIFEST_DIR/slices/<name>.json
+            let out = std::process::Command::new("sha256sum")
+                .arg(&p)
+                .output()
+                .expect("sha256sum must run");
+            let got = String::from_utf8(out.stdout).unwrap();
+            assert!(got.starts_with(sha), "{name}: slice re-frozen? got {got}");
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            assert_eq!(v["ids"].as_array().unwrap().len(), ids, "{name} ids");
+        }
     }
 
     #[ignore]

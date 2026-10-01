@@ -236,39 +236,14 @@ pub enum LlmError {
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     /// One logical request. Retry, backoff, and reshaping live in the
-    /// implementor. The default aggregates `stream`; adapters with real
-    /// usage/latency numbers override it.
-    async fn complete(&self, model: &str, req: &Request) -> Result<Response, LlmError> {
-        use futures::StreamExt as _;
-        let mut stream = self.stream(model, req).await?;
-        let mut red = StreamReducer::new();
-        while let Some(ev) = stream.next().await {
-            red.apply(ev).map_err(LlmError::Transport)?;
-        }
-        let err = red.error_message().map(str::to_string);
-        match red.into_message() {
-            Some(message) => {
-                let stop = infer_stop(None, &message);
-                Ok(Response {
-                    message,
-                    stop,
-                    usage: Usage {
-                        input: 0,
-                        output: 0,
-                        cache_read: 0,
-                        cache_write: 0,
-                        reasoning: None,
-                        cost_usd: None,
-                    },
-                    latency_ms: 0,
-                    attempts: 1,
-                    raw_stop_reason: None,
-                })
-            }
-            None => Err(LlmError::Transport(
-                err.unwrap_or_else(|| "empty stream: no Start or Done".into()),
-            )),
-        }
+    /// implementor. `StreamEvent` carries no usage/latency numbers, so the
+    /// default fails loudly instead of fabricating zeros (the budget meters
+    /// from `Usage`; zeros would be unlimited free tokens). Adapters must
+    /// override with a metered implementation.
+    async fn complete(&self, _model: &str, _req: &Request) -> Result<Response, LlmError> {
+        Err(LlmError::Transport(
+            "default LlmClient::complete cannot report usage: override it with a metered implementation".into(),
+        ))
     }
     async fn stream(
         &self,
@@ -768,6 +743,54 @@ mod tests {
         assert!(r.is_finished());
         assert!(r.message().is_none());
         assert_eq!(r.error_message(), Some("setup blew up"));
+    }
+
+    /// Adapter that only implements `stream`: exactly who would inherit the
+    /// default `complete`. Its stream is perfectly good (Start + Done).
+    struct StreamOnlyClient;
+    #[async_trait]
+    impl LlmClient for StreamOnlyClient {
+        async fn stream(
+            &self,
+            _model: &str,
+            _req: &Request,
+        ) -> Result<BoxStream<'static, StreamEvent>, LlmError> {
+            use futures::StreamExt as _;
+            Ok(futures::stream::iter([
+                StreamEvent::Start {
+                    partial: start_msg(),
+                },
+                StreamEvent::Done {
+                    message: msg_plain(),
+                },
+            ])
+            .boxed())
+        }
+        fn capabilities(&self, _model: &str) -> Capabilities {
+            Capabilities {
+                sends_finish_reason: false,
+            }
+        }
+        async fn resolve_key(&self, _provider: &str) -> Result<Credentials, LlmError> {
+            Err(LlmError::Transport("no key in test".into()))
+        }
+    }
+
+    #[test]
+    fn default_complete_fails_loud_instead_of_zero_usage_success() {
+        let req = Request {
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 32,
+            thinking: Thinking::Off,
+            extras: json!({}),
+        };
+        let got = futures::executor::block_on(StreamOnlyClient.complete("m", &req));
+        match got {
+            Err(LlmError::Transport(m)) => assert!(m.contains("usage"), "msg: {m}"),
+            Err(other) => panic!("wrong error variant: {other:?}"),
+            Ok(r) => panic!("fabricated success with zero usage: {:?}", r.usage),
+        }
     }
 
     #[test]

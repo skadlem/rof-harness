@@ -1283,7 +1283,10 @@ fn close_hopped_turn(
 }
 
 /// Prompt build: file map (cached-prefix head) + named files as volatiles
-/// (delivered last) + derived history fitted to one budget. Never summarizes.
+/// (delivered last), fitted to `context_budget_chars` in the system string.
+/// History is delivered exactly once, raw, as messages (collapse-5 rides
+/// [`LoopState::derived_messages`]) — never fitted into the system copy.
+/// Never summarizes.
 fn build_request(
     state: &mut LoopState,
     registry: &tool_core::Registry,
@@ -1320,27 +1323,13 @@ fn build_request(
             });
         }
     }
-    for (i, m) in state.derived_messages().iter().enumerate() {
-        let n = m.content.chars().count();
-        asm.add(context::ContextItem {
-            key: context::ItemKey {
-                path: format!("history-{i}"),
-                region: m.role.clone(),
-                role: m.role.clone(),
-            },
-            fidelity: context::Fidelity::Exact,
-            must_include: false,
-            est_chars: n,
-            text: m.content.clone(),
-        });
-    }
     let mut messages = vec![ProviderMessage {
         role: "system".into(),
         content: asm.assemble(),
         tool_calls: Vec::new(),
         tool_call_id: None,
     }];
-    messages.extend(state.derived_messages());
+    messages.extend(state.derived_messages()); // once: raw history, collapse-5 intact
     Request {
         messages,
         tools: registry.definitions(),
@@ -2618,12 +2607,15 @@ mod tests {
     struct ScriptClient {
         order: Arc<Mutex<Vec<String>>>,
         queue: Mutex<VecDeque<Response>>,
+        /// Every outgoing request, for shape assertions.
+        requests: Arc<Mutex<Vec<Request>>>,
     }
 
     #[async_trait::async_trait]
     impl LlmClient for ScriptClient {
-        async fn complete(&self, _model: &str, _req: &Request) -> Result<Response, LlmError> {
+        async fn complete(&self, _model: &str, req: &Request) -> Result<Response, LlmError> {
             self.order.lock().unwrap().push("model".into());
+            self.requests.lock().unwrap().push(req.clone());
             self.queue
                 .lock()
                 .unwrap()
@@ -2839,6 +2831,7 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let client = ScriptClient {
             order: order.clone(),
+            requests: Default::default(),
             queue: Mutex::new(VecDeque::from([
                 script_resp(
                     vec![(
@@ -2960,6 +2953,7 @@ mod tests {
         let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let client = ScriptClient {
             order: order.clone(),
+            requests: Default::default(),
             queue: Mutex::new(VecDeque::from([
                 script_resp(
                     vec![(
@@ -3014,6 +3008,7 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let client = ScriptClient {
             order,
+            requests: Default::default(),
             queue: Mutex::new(VecDeque::new()),
         };
         let registry = run_registry(&root);
@@ -3087,6 +3082,7 @@ mod tests {
         };
         let client = ScriptClient {
             order,
+            requests: Default::default(),
             queue: Mutex::new(VecDeque::from([same(), same(), same(), same()])),
         };
         let registry = run_registry(&root);
@@ -3119,6 +3115,7 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let client = ScriptClient {
             order,
+            requests: Default::default(),
             queue: Mutex::new(VecDeque::from([text_resp("recovered")])),
         };
         let registry = run_registry(&root);
@@ -3179,5 +3176,163 @@ mod tests {
             }
             other => panic!("expected TurnEnd, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_request_shape_history_delivered_once_collapse_5() {
+        use agent_event::check_pairing;
+        let root = run_tmp("shape");
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        // 7 write rounds, then a finishing text: the 8th request carries 7 tool
+        // results, so collapse-5 has older material to shrink.
+        let mut queue: VecDeque<Response> = VecDeque::new();
+        for i in 1..=7 {
+            let id = format!("c{i}");
+            let path = format!("f{i}.txt");
+            queue.push_back(script_resp(
+                vec![(
+                    id.as_str(),
+                    "write",
+                    serde_json::json!({"path": path, "content": "x\n"}),
+                )],
+                StopReason::ToolUse,
+            ));
+        }
+        queue.push_back(text_resp("all done"));
+        let client = ScriptClient {
+            order,
+            requests: requests.clone(),
+            queue: Mutex::new(queue),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("shape-pin-goal".into())],
+            &cancel,
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 8); // 7 tool rounds + the finishing text call
+        for (i, req) in reqs.iter().enumerate() {
+            assert_eq!(req.messages[0].role, "system");
+            let wire = serde_json::to_string(req).unwrap();
+            // Unique input appears exactly once in the whole wire request:
+            // a fitted system copy would make it twice.
+            assert_eq!(
+                wire.matches("shape-pin-goal").count(),
+                1,
+                "history duplicated in request {i}"
+            );
+            // No history message is echoed into the system string.
+            let sys = &req.messages[0].content;
+            for m in &req.messages[1..] {
+                assert!(
+                    m.content.is_empty() || !sys.contains(&m.content),
+                    "request {i}: {:?} also fitted into system",
+                    m.content
+                );
+            }
+        }
+        // Collapse-5 rides the raw path: oldest 2 of 7 tool results arrive
+        // collapsed, each result delivered exactly once overall.
+        let wire_last = serde_json::to_string(&reqs[7]).unwrap();
+        for n in 1..=7 {
+            assert_eq!(
+                wire_last.matches(&format!("wrote f{n}.txt")).count(),
+                1,
+                "tool result f{n} must appear exactly once"
+            );
+        }
+        let content_of = |id: &str| {
+            reqs[7]
+                .messages
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("missing tool message {id}"))
+                .content
+                .clone()
+        };
+        assert_eq!(content_of("c1"), "[collapsed] wrote f1.txt");
+        assert_eq!(content_of("c2"), "[collapsed] wrote f2.txt");
+        assert_eq!(content_of("c3"), "wrote f3.txt");
+        assert_eq!(content_of("c7"), "wrote f7.txt");
+        assert!(check_pairing(emitter.history()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn run_provider_failure_emits_provider_failed_then_fails() {
+        use agent_event::check_pairing;
+        let root = run_tmp("provfail");
+        // Empty script: every complete() call returns Err(Transport(...)).
+        let client = ScriptClient {
+            order: Arc::new(Mutex::new(Vec::new())),
+            requests: Default::default(),
+            queue: Mutex::new(VecDeque::new()),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("go".into())],
+            &cancel,
+        )
+        .await;
+        // Production outcome path: retries exhaust, the gate closes, the
+        // fatal error surfaces as Outcome::Failed.
+        match &outcome {
+            Outcome::Failed(msg) => assert!(msg.contains("script empty"), "got {msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let history = emitter.history();
+        let errors = history
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Error { error } if error.code == "provider-failed"))
+            .count();
+        assert_eq!(errors, 3, "1 initial + 2 in-step retries: {history:?}");
+        // Durable attempt trail: will_retry, will_retry, exhausted.
+        let attempts: Vec<bool> = state
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Attempt { will_retry, .. } => Some(*will_retry),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attempts, vec![true, true, false]);
+        assert!(check_pairing(history));
+        match history.last().unwrap() {
+            AgentEvent::RunEnd {
+                outcome: agent_event::RunOutcome::Failed(msg),
+                ..
+            } => assert!(msg.contains("script empty"), "got {msg}"),
+            other => panic!("expected failed RunEnd, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
