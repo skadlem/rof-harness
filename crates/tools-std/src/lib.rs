@@ -431,20 +431,28 @@ fn search_dir(dir: &Path, root: &Path, pat: &str, hits: &mut Vec<String>, limit:
         if ft.is_dir() {
             search_dir(&p, root, pat, hits, limit);
         } else if ft.is_file() {
-            let Ok(data) = std::fs::read(&p) else {
-                continue;
-            };
-            let rel = p
-                .strip_prefix(root)
-                .map(|r| r.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| p.to_string_lossy().into_owned());
-            for (i, line) in String::from_utf8_lossy(&data).lines().enumerate() {
-                if line.contains(pat) {
-                    hits.push(format!("{}:{}: {}", rel, i + 1, line));
-                    if hits.len() >= limit {
-                        break;
-                    }
-                }
+            search_file(&p, root, pat, hits, limit);
+        }
+    }
+}
+
+/// Collect `pat` hits from one file as `rel:line: text`, stopping at `limit`.
+/// A direct file search must not share `search_dir`'s sibling scan: siblings
+/// would fill `limit` first and silently drop this file's lines.
+/// ponytail: literal contains only, no regex; add regex when a task needs it.
+fn search_file(p: &Path, root: &Path, pat: &str, hits: &mut Vec<String>, limit: usize) {
+    let Ok(data) = std::fs::read(p) else {
+        return;
+    };
+    let rel = p
+        .strip_prefix(root)
+        .map(|r| r.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| p.to_string_lossy().into_owned());
+    for (i, line) in String::from_utf8_lossy(&data).lines().enumerate() {
+        if line.contains(pat) {
+            hits.push(format!("{}:{}: {}", rel, i + 1, line));
+            if hits.len() >= limit {
+                break;
             }
         }
     }
@@ -478,19 +486,7 @@ impl Tool for SearchTool {
         let limit = args.max_results.unwrap_or(50).clamp(1, 200) as usize;
         let mut hits = Vec::new();
         if base.is_file() {
-            search_dir(
-                base.parent().unwrap_or(&self.policy.root),
-                &self.policy.root,
-                &args.pattern,
-                &mut hits,
-                limit,
-            );
-            let rel = base
-                .strip_prefix(&self.policy.root)
-                .map(|r| r.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            hits.retain(|h| h.starts_with(rel.as_str()));
-            // ponytail: literal contains only, no regex; add regex when a task needs it.
+            search_file(&base, &self.policy.root, &args.pattern, &mut hits, limit);
         } else {
             search_dir(&base, &self.policy.root, &args.pattern, &mut hits, limit);
         }
@@ -722,7 +718,11 @@ fn split_cmd(cmd: &str) -> Vec<String> {
     parts
 }
 
-async fn run_allowed(policy: &Policy, cmd: &str) -> Result<(bool, String), ToolError> {
+async fn run_allowed(
+    policy: &Policy,
+    cmd: &str,
+    timeout: Duration,
+) -> Result<(bool, String), ToolError> {
     if !policy.allowed_commands.iter().any(|a| a == cmd)
         && !prefix_allowed(&policy.allowed_prefixes, cmd)
     {
@@ -734,14 +734,17 @@ async fn run_allowed(policy: &Policy, cmd: &str) -> Result<(bool, String), ToolE
         .ok_or_else(|| ToolError::Failed("empty cmd".to_string()))?;
     // No shell: argv exec only, so `;`, `$()`, `&&` are literal arguments.
     let out = tokio::time::timeout(
-        EXEC_TIMEOUT,
+        timeout,
         tokio::process::Command::new(bin)
             .args(rest)
             .current_dir(&policy.root)
+            // kill_on_drop (tokio default false): a timed-out child must not
+            // keep running and mutating the workdir after we report timeout.
+            .kill_on_drop(true)
             .output(),
     )
     .await
-    .map_err(|_| ToolError::Failed("timeout after 300s".to_string()))?
+    .map_err(|_| ToolError::Failed(format!("timeout after {timeout:?}")))?
     .map_err(|e| ToolError::Failed(e.to_string()))?;
     let mut s = String::from_utf8_lossy(&out.stdout).to_string();
     let err = String::from_utf8_lossy(&out.stderr);
@@ -769,7 +772,7 @@ async fn check_syntax(policy: &Policy, candidate: &str) -> Result<(), ToolError>
     ));
     std::fs::write(&tmp, candidate).map_err(|e| ToolError::Failed(e.to_string()))?;
     let cmdline = format!("{} {}", argv.join(" "), tmp.display());
-    let res = run_allowed(policy, &cmdline).await;
+    let res = run_allowed(policy, &cmdline, EXEC_TIMEOUT).await;
     let _ = std::fs::remove_file(&tmp);
     match res {
         Ok((true, _)) => Ok(()),
@@ -817,7 +820,7 @@ impl Tool for ExecTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: CmdArgs = parse_args(&inv.args)?;
-        let (_ok, content) = run_allowed(&self.policy, &args.cmd).await?;
+        let (_ok, content) = run_allowed(&self.policy, &args.cmd, EXEC_TIMEOUT).await?;
         Ok(ToolOutcome {
             content,
             truncated: false,
@@ -849,7 +852,7 @@ impl Tool for TestTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: CmdArgs = parse_args(&inv.args)?;
-        let (ok, out) = run_allowed(&self.policy, &args.cmd).await?;
+        let (ok, out) = run_allowed(&self.policy, &args.cmd, EXEC_TIMEOUT).await?;
         // Cascade policy (what FAIL does to the loop) lives in loop/bets, not here.
         let content = if ok {
             format!("PASS: {}\n{out}", args.cmd)
@@ -1331,6 +1334,33 @@ mod tests {
         assert_eq!(out.content, "hello; echo PWNED\n");
     }
 
+    #[tokio::test]
+    async fn exec_timeout_kills_child() {
+        // Child would touch the marker at t=1s; the 100ms timeout must kill
+        // it first (kill_on_drop) or the timed-out exec keeps mutating root.
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["sh".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+        };
+        let err = run_allowed(
+            &pol,
+            "sh -c 'sleep 1; touch late-marker'",
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            !root.join("late-marker").exists(),
+            "child survived the timeout"
+        );
+    }
+
     #[test]
     fn split_cmd_honors_quotes() {
         assert_eq!(split_cmd("ls -la"), vec!["ls", "-la"]);
@@ -1368,6 +1398,25 @@ mod tests {
             .unwrap();
         assert!(out.content.contains("a.txt:1:"), "{}", out.content);
         assert!(!out.content.contains(".git"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn search_single_file_not_starved_by_sibling_limit() {
+        let root = tmp_root();
+        // a.txt sorts first and alone exceeds the limit, so a sibling scan
+        // would cut z.txt's lines; the direct file search must still find them.
+        std::fs::write(root.join("a.txt"), "needle sibling\n".repeat(60)).unwrap();
+        std::fs::write(root.join("z.txt"), "needle target\n").unwrap();
+        let r = reg(policy(&root));
+        let out = run(&r, "search", json!({"path": "z.txt", "pattern": "needle"}))
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("z.txt:1: needle target"),
+            "{}",
+            out.content
+        );
+        assert!(!out.content.contains("a.txt"), "{}", out.content);
     }
 
     // --- schema strictness incl no-coercion ---
