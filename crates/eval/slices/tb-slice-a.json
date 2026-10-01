@@ -1,1 +1,29 @@
-{"dataset":"terminal-bench/terminal-bench-2-1","ids":["polyglot-rust-c"],"note":"Slice A v1 seed (primary loop-quality gate, Harbor oracle pre-flight). Expand to the frozen task list per research/bench-landscape.md Next step 1.","tag":"harbor-hub-latest"}
+{
+ "dataset": "terminal-bench/terminal-bench-2-1",
+ "dataset_tag": "github 7131e4375048a0e408a8fb404b5f499d726b695b (HEAD 2026-09-30; re-pin via Harbor Hub on oracle pre-flight)",
+ "entries": {
+  "layout-config-recreation2": {
+   "environment_image": "harborframework/terminal-bench:layout-config-recreation2-environment-9caa9d6614e4ae31@sha256:c08989cd9fc6858e7ec7488acf65b2840ece53581fb4327b3e667ff15da23724",
+   "provenance": "measured-local task.toml + sha256 tests/ solution/",
+   "solution_hash": "sha256:d79e91839b0f1081beb84edf6c76222be77f62f46218251ac1162af22643e9a4",
+   "tests_hash": "sha256:80b1119bd061e05cc87d6206523726be70424244e98e7f43e40338294b21a2a0",
+   "timeout_secs": 28800,
+   "verifier_image": "harborframework/terminal-bench:layout-config-recreation2-verifier-5f249ec0c47d9285@sha256:6f428236b1ffbef143a9f8c70d732155796c45b4ab4a7e80ab8dced97b4cfaaa"
+  },
+  "session-window-debug": {
+   "environment_image": "harborframework/terminal-bench:session-window-debug-environment-a05048a37a8c0198@sha256:b5fb99c6a88ba1274fea1abeb3209f23869e5d8a483d50f8f3d925bdbdbe5f8f",
+   "provenance": "measured-local task.toml + sha256 tests/ solution/",
+   "solution_hash": "sha256:35aed395a3d976808ac5a500ce207fd1625b3cf6d7447f93c697e2c56a36cfcb",
+   "tests_hash": "sha256:40eaa121c92a5b65d4a4ac6418f070c44bcfc406c7fa0a5452d471f43e40338294b21a2a0",
+   "timeout_secs": 28800,
+   "verifier_image": "harborframework/terminal-bench:session-window-debug-verifier-5f15b536bd15c598@sha256:8ee1a52619501d6b7e40dfc56f0307d6f476afce4b6d45fd980c5dd6f5a7c592"
+  }
+ },
+ "ids": [
+  "layout-config-recreation2",
+  "session-window-debug"
+ ],
+ "note": "v1 seed: 2 measured-local tasks with full digests. 21-expansion BLOCKED: v1 21-id list unrecoverable (crossbench=10py, tbench=production-planning, rof-tb=swd-only); needs session-store lookup. Rival-reuse attestation blocked until then.",
+ "reps": 3,
+ "seed_rule": "rep-index 0,1,2"
+}

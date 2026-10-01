@@ -1,4 +1,4 @@
-//! The 5 built-in tools + containment. Implements [`tool_core::Tool`].
+//! The 6 built-in tools + containment. Implements [`tool_core::Tool`].
 //!
 //! Schemas are hand-built `serde_json` values kept inside tool-core's strict
 //! subset (`required`, `type`, `additionalProperties: false`, `maxLength`);
@@ -578,7 +578,149 @@ impl Tool for EditTool {
     }
 }
 
+// --- write ---
+
+pub struct WriteTool {
+    policy: Arc<Policy>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteArgs {
+    path: String,
+    content: String,
+}
+
+fn write_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["path", "content"],
+        "additionalProperties": false,
+        "properties": {
+            "path": {"type": "string", "maxLength": 4096},
+            "content": {"type": "string", "maxLength": 262144}
+        }
+    })
+}
+
+/// Create missing parents one level at a time, re-jailing each level before
+/// descending: `create_dir_all` would happily mkdir through a symlink that
+/// points out of the root.
+fn create_parent_dirs(root: &Path, path: &str) -> Result<(), ToolError> {
+    let mut cur = root.to_path_buf();
+    for c in Path::new(path)
+        .parent()
+        .unwrap_or(Path::new(""))
+        .components()
+    {
+        cur.push(c);
+        if cur.symlink_metadata().is_err() {
+            std::fs::create_dir(&cur)
+                .map_err(|e| ToolError::Failed(format!("cannot create {}: {e}", cur.display())))?;
+        }
+        symlink_safe(root, &cur).map_err(path_err)?;
+    }
+    Ok(())
+}
+
+fn resolve_for_write(policy: &Policy, path: &str) -> Result<PathBuf, ToolError> {
+    match resolve_under(&policy.root, path, true, &policy.denied_globs) {
+        Err(ToolPathError::MissingParent(_)) => {
+            create_parent_dirs(&policy.root, path)?;
+            resolve_under(&policy.root, path, true, &policy.denied_globs).map_err(path_err)
+        }
+        other => other.map_err(path_err),
+    }
+}
+
+#[async_trait]
+impl Tool for WriteTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "write".to_string(),
+            description: "create or overwrite a whole file".to_string(),
+            schema: write_schema(),
+        }
+    }
+    fn prepare(&self, call: &ToolCall) -> CallStatus {
+        dispatch(call)
+    }
+    async fn execute(
+        &self,
+        inv: Invocation,
+        _cancel: CancellationToken,
+    ) -> Result<ToolOutcome, ToolError> {
+        let args: WriteArgs = parse_args(&inv.args)?;
+        if args.content.len() > EDIT_REPLACE_CAP {
+            return Err(ToolError::Failed("content over 256KB cap".to_string()));
+        }
+        let p = resolve_for_write(&self.policy, &args.path)?;
+        if p.is_dir() {
+            return Err(ToolError::Failed(
+                "refusing to write a directory".to_string(),
+            ));
+        }
+        // Same guard as edit: never clobber a big file with a small stub.
+        if std::fs::metadata(&p)
+            .map(|m| m.len() > EDIT_FILE_CAP as u64)
+            .unwrap_or(false)
+        {
+            return Err(ToolError::Failed("file over 512KB cap".to_string()));
+        }
+        if let Some(argv) = self.policy.syntax_cmd.clone() {
+            if !argv.is_empty() {
+                check_syntax(&self.policy, &args.content).await?;
+            }
+        }
+        std::fs::write(&p, &args.content).map_err(|e| ToolError::Failed(e.to_string()))?;
+        Ok(ToolOutcome {
+            content: format!("wrote {}", args.path),
+            truncated: false,
+        })
+    }
+}
+
 // --- exec / test share the runner: exact-or-prefix allowlist, no shell ---
+
+/// Split a command into argv honoring single/double quotes and backslash
+/// escapes (no shell: `;`, `$()`, `&&`, `|` stay literal characters). Naive
+/// whitespace splitting mangles quoted args (`python3 -c "print(x)"` broke).
+fn split_cmd(cmd: &str) -> Vec<String> {
+    let (mut parts, mut cur, mut quote) = (Vec::new(), String::new(), None);
+    let mut chars = cmd.chars().peekable();
+    let mut pushed = false;
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, '\'') => quote = Some('\''),
+            (None, '"') => quote = Some('"'),
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), '\\') => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            (None, '\\') => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            (None, c) if c.is_whitespace() => {
+                if !cur.is_empty() || pushed {
+                    parts.push(std::mem::take(&mut cur));
+                    pushed = false;
+                }
+            }
+            (_, c) => {
+                cur.push(c);
+                pushed = true;
+            }
+        }
+    }
+    if !cur.is_empty() || pushed {
+        parts.push(cur);
+    }
+    parts
+}
 
 async fn run_allowed(policy: &Policy, cmd: &str) -> Result<(bool, String), ToolError> {
     if !policy.allowed_commands.iter().any(|a| a == cmd)
@@ -586,15 +728,15 @@ async fn run_allowed(policy: &Policy, cmd: &str) -> Result<(bool, String), ToolE
     {
         return Err(ToolError::Denied(format!("command not allowlisted: {cmd}")));
     }
-    let mut parts = cmd.split_whitespace();
-    let bin = parts
-        .next()
+    let argv = split_cmd(cmd);
+    let (bin, rest) = argv
+        .split_first()
         .ok_or_else(|| ToolError::Failed("empty cmd".to_string()))?;
     // No shell: argv exec only, so `;`, `$()`, `&&` are literal arguments.
     let out = tokio::time::timeout(
         EXEC_TIMEOUT,
         tokio::process::Command::new(bin)
-            .args(parts)
+            .args(rest)
             .current_dir(&policy.root)
             .output(),
     )
@@ -731,6 +873,9 @@ pub fn search_tool(policy: Arc<Policy>) -> SearchTool {
 pub fn edit_tool(policy: Arc<Policy>) -> EditTool {
     EditTool { policy }
 }
+pub fn write_tool(policy: Arc<Policy>) -> WriteTool {
+    WriteTool { policy }
+}
 pub fn exec_tool(policy: Arc<Policy>) -> ExecTool {
     ExecTool { policy }
 }
@@ -785,7 +930,7 @@ mod tests {
         let mut r = Registry::new(Arc::new(GrantGate::new(
             [(
                 "agent".to_string(),
-                vec!["view", "search", "edit", "exec", "test"]
+                vec!["view", "search", "edit", "write", "exec", "test"]
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
@@ -796,6 +941,7 @@ mod tests {
         r.register(Arc::new(view_tool(p.clone())));
         r.register(Arc::new(search_tool(p.clone())));
         r.register(Arc::new(edit_tool(p.clone())));
+        r.register(Arc::new(write_tool(p.clone())));
         r.register(Arc::new(exec_tool(p.clone())));
         r.register(Arc::new(test_tool(p)));
         r
@@ -930,6 +1076,122 @@ mod tests {
                 .unwrap()
                 .content
                 == "bye\n"
+        );
+    }
+
+    // --- write ---
+
+    #[tokio::test]
+    async fn write_creates_new_with_parents_then_overwrites() {
+        let root = tmp_root();
+        let r = reg(policy(&root));
+        let out = run(
+            &r,
+            "write",
+            json!({"path": "a/b/new.txt", "content": "first\n"}),
+        )
+        .await
+        .unwrap();
+        assert!(out.content.contains("wrote a/b/new.txt"), "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a/b/new.txt")).unwrap(),
+            "first\n"
+        );
+        // Overwrite is the whole point: no search hunk, no read-modify-write.
+        run(
+            &r,
+            "write",
+            json!({"path": "a/b/new.txt", "content": "second\n"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a/b/new.txt")).unwrap(),
+            "second\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_jail_escape_and_glob_denied() {
+        let root = tmp_root();
+        let outside = tmp_root();
+        let r = reg(policy(&root));
+        for rel in ["../evil.txt", "/etc/passwd"] {
+            let err = run(&r, "write", json!({"path": rel, "content": "x"}))
+                .await
+                .unwrap_err();
+            assert!(err.contains("denied"), "{rel}: {err}");
+        }
+        let err = run(&r, "write", json!({"path": ".env", "content": "SECRET=1"}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("denied"), "{err}");
+        assert!(!outside.join("evil.txt").exists());
+        assert!(!root.join(".env").exists());
+        // A symlinked dir must not be used as a mkdir tunnel out of the root.
+        std::os::unix::fs::symlink(&outside, root.join("out")).unwrap();
+        let err = run(
+            &r,
+            "write",
+            json!({"path": "out/tunneled.txt", "content": "x"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("denied"), "{err}");
+        assert!(!outside.join("tunneled.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn write_refuses_directory() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        let r = reg(policy(&root));
+        let err = run(&r, "write", json!({"path": "d", "content": "x"}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("directory"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn write_caps_enforced() {
+        let root = tmp_root();
+        let r = reg(policy(&root));
+        let big = "x".repeat(EDIT_REPLACE_CAP + 1);
+        let err = run(&r, "write", json!({"path": "big.txt", "content": big}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("256KB cap"), "{err}");
+        assert!(!root.join("big.txt").exists());
+
+        std::fs::write(root.join("huge.txt"), "y".repeat(EDIT_FILE_CAP + 1)).unwrap();
+        let err = run(
+            &r,
+            "write",
+            json!({"path": "huge.txt", "content": "small\n"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("512KB cap"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("huge.txt"))
+                .unwrap()
+                .len(),
+            EDIT_FILE_CAP + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn write_syntax_veto_leaves_file_untouched() {
+        let root = tmp_root();
+        std::fs::write(root.join("f.txt"), "hello\n").unwrap();
+        let r = reg(syntax_policy(&root, &["false"]));
+        let err = run(&r, "write", json!({"path": "f.txt", "content": "bye\n"}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("syntax check failed"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "hello\n"
         );
     }
 
@@ -1069,6 +1331,17 @@ mod tests {
         assert_eq!(out.content, "hello; echo PWNED\n");
     }
 
+    #[test]
+    fn split_cmd_honors_quotes() {
+        assert_eq!(split_cmd("ls -la"), vec!["ls", "-la"]);
+        assert_eq!(
+            split_cmd("python3 -c \"print(open('f').read())\""),
+            vec!["python3", "-c", "print(open('f').read())"]
+        );
+        assert_eq!(split_cmd("echo 'a b' c"), vec!["echo", "a b", "c"]);
+        assert!(split_cmd("").is_empty());
+    }
+
     // --- test tool verdict ---
 
     #[tokio::test]
@@ -1107,6 +1380,7 @@ mod tests {
             ("view", json!({"path": "f"})),
             ("search", json!({"pattern": "x"})),
             ("edit", json!({"path": "f", "search": "a", "replace": "b"})),
+            ("write", json!({"path": "f", "content": "b"})),
             ("exec", json!({"cmd": "true"})),
             ("test", json!({"cmd": "true"})),
         ] {
@@ -1119,11 +1393,12 @@ mod tests {
             );
         }
         // Extra property rejected on every tool.
-        for name in ["view", "search", "edit", "exec", "test"] {
+        for name in ["view", "search", "edit", "write", "exec", "test"] {
             let args = match name {
                 "view" => json!({"path": "f", "zzz": 1}),
                 "search" => json!({"pattern": "x", "zzz": 1}),
                 "edit" => json!({"path": "f", "search": "a", "replace": "b", "zzz": 1}),
+                "write" => json!({"path": "f", "content": "b", "zzz": 1}),
                 _ => json!({"cmd": "true", "zzz": 1}),
             };
             match r.prepare("agent", call("x", name, args)) {
@@ -1154,7 +1429,10 @@ mod tests {
         let root = tmp_root();
         let r = reg(policy(&root));
         let defs: Vec<String> = r.definitions().iter().map(|d| d.name.clone()).collect();
-        assert_eq!(defs, vec!["edit", "exec", "search", "test", "view"]);
+        assert_eq!(
+            defs,
+            vec!["edit", "exec", "search", "test", "view", "write"]
+        );
         for d in r.definitions() {
             assert_eq!(
                 d.schema.get("additionalProperties"),
