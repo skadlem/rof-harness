@@ -17,6 +17,8 @@ pub struct BudgetConfig {
     pub max_wallclock: Duration,
     pub max_spend_cents: Option<u64>,
     pub same_action_cycles: u32,
+    /// Effectively per-RUN today: the counter never resets, so this cap fires
+    /// once per run despite the per-trial name.
     pub actions_per_trial: u32,
     pub max_refunds: u32,
 }

@@ -318,6 +318,12 @@ fn dispatch(call: &ToolCall) -> CallStatus {
 
 // --- view ---
 
+/// `max_bytes` narrows the read, never widens it: the output bound is
+/// `min(max_bytes, VIEW_CAP)`.
+fn view_read_cap(max_bytes: Option<u64>) -> usize {
+    max_bytes.unwrap_or(VIEW_CAP as u64).min(VIEW_CAP as u64) as usize
+}
+
 pub struct ViewTool {
     policy: Arc<Policy>,
 }
@@ -368,10 +374,7 @@ impl Tool for ViewTool {
         )
         .map_err(path_err)?;
         let data = std::fs::read(&p).map_err(|e| ToolError::Failed(e.to_string()))?;
-        let cap = args
-            .max_bytes
-            .unwrap_or(VIEW_CAP as u64)
-            .min(usize::MAX as u64) as usize;
+        let cap = view_read_cap(args.max_bytes);
         let n = data.len().min(cap);
         let (content, truncated) =
             cap_chars(String::from_utf8_lossy(&data[..n]).to_string(), OUT_CAP);
@@ -1297,6 +1300,27 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("denied"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn view_max_bytes_beyond_view_cap_still_truncates() {
+        let root = tmp_root();
+        std::fs::write(root.join("big.txt"), "a".repeat(VIEW_CAP + 100)).unwrap();
+        let r = reg(policy(&root));
+        let out = run(
+            &r,
+            "view",
+            json!({"path": "big.txt", "max_bytes": 10_000_000u64}),
+        )
+        .await
+        .unwrap();
+        assert!(out.truncated);
+        assert!(out.content.chars().count() <= OUT_CAP);
+        // Honesty bound: max_bytes narrows the read, never widens it.
+        assert_eq!(view_read_cap(None), VIEW_CAP);
+        assert_eq!(view_read_cap(Some(u64::MAX)), VIEW_CAP);
+        assert_eq!(view_read_cap(Some(VIEW_CAP as u64 + 1)), VIEW_CAP);
+        assert_eq!(view_read_cap(Some(42)), 42);
     }
 
     #[test]
