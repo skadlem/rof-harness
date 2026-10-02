@@ -28,6 +28,13 @@ use provider_core::{
 use serde_json::Value;
 use tool_core::{ToolCall, ToolResult};
 
+/// Queued directives kept before the oldest is dropped (drop-oldest: the
+/// newest counter warning outranks stale advice, mirroring the lessons cap).
+const DIRECTIVE_CAP: usize = 3;
+
+/// Model-facing notice when one failed tool reverts the whole batch.
+const ROLLBACK_NOTICE: &str = "a tool in your last batch failed and the whole batch was reverted — your successful changes in it are gone; re-apply them";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateStatus {
     Open,
@@ -236,6 +243,14 @@ pub struct LoopState {
     pub last_sig: String,
     pub last_obs: u64,
     pub lessons: VecDeque<String>,
+    /// Model-facing directives from the action counters, delivered onto the
+    /// newest ToolResult tail; nothing is consumed until a tail exists.
+    pub pending_directives: VecDeque<String>,
+    /// Successful `edit`|`write` tool results so far (the zero-edit trigger).
+    pub edits: u32,
+    /// One-shot latches: the half-cap and near-cap directives fire once each.
+    pub half_directive_sent: bool,
+    pub late_directive_sent: bool,
     pub drain_timeout: Duration,
     pub drain_until: Option<Instant>,
 }
@@ -265,6 +280,10 @@ impl LoopState {
             last_sig: String::new(),
             last_obs: 0,
             lessons: VecDeque::new(),
+            pending_directives: VecDeque::new(),
+            edits: 0,
+            half_directive_sent: false,
+            late_directive_sent: false,
             drain_timeout: Duration::from_secs(30),
             drain_until: None,
         }
@@ -638,6 +657,84 @@ impl LoopState {
         self.lessons.push_back(lesson);
     }
 
+    /// One queued directive, capped at [`DIRECTIVE_CAP`] (drop-oldest).
+    pub fn push_directive(&mut self, text: String) {
+        if self.pending_directives.len() >= DIRECTIVE_CAP {
+            self.pending_directives.pop_front();
+        }
+        self.pending_directives.push_back(text);
+    }
+
+    /// Action-counter directives, checked after every recorded action so the
+    /// text rides that action's own not-yet-synced row. One-shot per run.
+    pub fn queue_directives(&mut self) {
+        let cap = self.budget.config().actions_per_trial;
+        let actions = self.budget.counters().actions_this_trial;
+        if cap == 0 {
+            return;
+        }
+        if !self.half_directive_sent && actions >= cap / 2 && self.edits == 0 {
+            self.half_directive_sent = true;
+            self.push_directive(format!(
+                "0 edits so far after {actions} actions. Stop reading. Apply your first edit with the edit tool NOW."
+            ));
+        }
+        if !self.late_directive_sent && actions >= cap * 4 / 5 {
+            self.late_directive_sent = true;
+            self.push_directive(format!(
+                "only {} actions remain before the run is stopped. Finish and submit your patch now.",
+                cap - actions
+            ));
+        }
+    }
+
+    /// Deliver queued directives and each undelivered lesson onto the newest
+    /// ToolResult tail, one text per line; nothing is consumed while no tail
+    /// exists, so the next batch retries. The carried texts become part of
+    /// that durable ToolResult row — no synthetic row, no new `ItemKind`.
+    /// Returns how many texts landed.
+    pub fn deliver_directives(&mut self) -> usize {
+        if !self.has_tool_tail() {
+            return 0;
+        }
+        let mut delivered = 0;
+        while let Some(text) = self.pending_directives.pop_front() {
+            self.append_to_tail(&text);
+            delivered += 1;
+        }
+        while let Some(lesson) = self.lessons.pop_front() {
+            self.append_to_tail(&lesson);
+            delivered += 1;
+        }
+        delivered
+    }
+
+    /// Newest ToolResult row: the one mutable delivery surface. Appends must
+    /// happen before that row is synced, so the durable log carries exactly
+    /// the text the model saw and replay from the file stays faithful.
+    fn has_tool_tail(&self) -> bool {
+        self.items
+            .iter()
+            .rev()
+            .any(|i| matches!(i.kind, ItemKind::ToolResult { .. }))
+    }
+
+    fn append_to_tail(&mut self, text: &str) {
+        let tail = self
+            .items
+            .iter_mut()
+            .rev()
+            .find(|i| matches!(i.kind, ItemKind::ToolResult { .. }));
+        if let Some(Item {
+            kind: ItemKind::ToolResult { content, .. },
+            ..
+        }) = tail
+        {
+            content.push('\n');
+            content.push_str(text);
+        }
+    }
+
     fn next_emit_id(&mut self) -> u64 {
         let id = self.emit_next;
         self.emit_next += 1;
@@ -645,22 +742,15 @@ impl LoopState {
     }
 
     /// One-shot wrap-up notice. Caller-append contract: the text lands on the
-    /// newest ToolResult tail in place, never as a synthetic user/system row;
-    /// with no ToolResult tail the text is returned unappended and the caller
-    /// skips it (keeps a provider-cached prefix intact).
+    /// newest ToolResult tail in place, never as a synthetic user/system row.
+    /// With no tail the nudge stays latched (not burned) and returns `None`,
+    /// so a later batch can still deliver it.
     pub fn apply_budget_nudge(&mut self) -> Option<String> {
-        let Nudge::WrapUp(text) = self.budget.nudge_due()?;
-        if let Some(item) = self
-            .items
-            .iter_mut()
-            .rev()
-            .find(|i| matches!(i.kind, ItemKind::ToolResult { .. }))
-        {
-            if let ItemKind::ToolResult { content, .. } = &mut item.kind {
-                content.push('\n');
-                content.push_str(&text);
-            }
+        if !self.has_tool_tail() {
+            return None;
         }
+        let Nudge::WrapUp(text) = self.budget.nudge_due()?;
+        self.append_to_tail(&text);
         Some(text)
     }
 
@@ -730,8 +820,9 @@ impl LoopState {
 
     /// Transcript fold: the request is derived from the log, not held.
     /// Collapse-5 over tool observations (context economics): the last
-    /// `COLLAPSE_KEEP` tool results go verbatim, older ones shrink to their
-    /// first line. Stable order preserved, so prefix caches survive.
+    /// `COLLAPSE_KEEP` tool results go verbatim, older ones shrink to a
+    /// `[collapsed: Nb — re-open to edit]` stub plus their first 120 chars as
+    /// folded. Stable order preserved, so prefix caches survive.
     pub fn derived_messages(&self) -> Vec<ProviderMessage> {
         let mut out = Vec::new();
         for item in &self.items {
@@ -776,8 +867,11 @@ impl LoopState {
             .collect();
         if tool_idx.len() > context::COLLAPSE_KEEP {
             for &i in &tool_idx[..tool_idx.len() - context::COLLAPSE_KEEP] {
-                let first = out[i].content.lines().next().unwrap_or("").to_string();
-                out[i].content = format!("[collapsed] {first}");
+                // Bytes at fold time + a 120-char head: enough to tell the
+                // observation apart from a re-read of the file.
+                let bytes = out[i].content.len();
+                let head: String = out[i].content.chars().take(120).collect();
+                out[i].content = format!("[collapsed: {bytes}b — re-open to edit] {head}");
             }
         }
         out
@@ -1241,11 +1335,32 @@ fn close_hopped_turn(
     true
 }
 
-/// Prompt build: file map (cached-prefix head) + named files as volatiles
-/// (delivered last), fitted to `context_budget_chars` in the system string.
-/// History is delivered exactly once, raw, as messages (collapse-5 rides
-/// [`LoopState::derived_messages`]) — never fitted into the system copy.
-/// Never summarizes.
+/// Static workflow contract: budgets remaining plus the read→edit→finish
+/// obligations the transcript alone does not state. Rides ahead of the file
+/// map so the contract never rotates out and the map keeps a stable tail.
+fn workflow_contract(state: &LoopState) -> String {
+    let cfg = state.budget.config();
+    let counters = state.budget.counters();
+    format!(
+        "WORKFLOW CONTRACT\n\
+         budgets remaining: steps {}/{}; actions {}/{}; tokens {}/{}\n\
+         tool results older than the last 5 are collapsed to one line; re-open a file immediately before editing it.\n\
+         work file-by-file: view -> edit immediately -> next file. `edit` and `write` are the ONLY patch mechanisms — never write files via exec; exec/test are for checks only.\n\
+         when your patch is complete, reply with a text message and NO tool calls — that finishes the run.",
+        cfg.max_steps.get().saturating_sub(counters.steps),
+        cfg.max_steps,
+        cfg.actions_per_trial.saturating_sub(counters.actions_this_trial),
+        cfg.actions_per_trial,
+        cfg.max_tokens.saturating_sub(counters.tokens),
+        cfg.max_tokens,
+    )
+}
+
+/// Prompt build: workflow contract + file map (cached-prefix head) + named
+/// files as volatiles (delivered last), fitted to `context_budget_chars` in
+/// the system string. History is delivered exactly once, raw, as messages
+/// (collapse-5 rides [`LoopState::derived_messages`]) — never fitted into the
+/// system copy. Never summarizes.
 fn build_request(
     state: &mut LoopState,
     registry: &tool_core::Registry,
@@ -1253,6 +1368,16 @@ fn build_request(
     cfg: &RunConfig,
 ) -> Request {
     let mut asm = context::ContextAssembler::new(cfg.context_budget_chars);
+    asm.add(context::ContextItem {
+        key: context::ItemKey {
+            path: "workflow-contract".into(),
+            region: "contract".into(),
+            role: "system".into(),
+        },
+        fidelity: context::Fidelity::Exact,
+        must_include: true,
+        text: workflow_contract(state),
+    });
     let map_text = context::file_map(workdir, 200).join("\n");
     asm.add(context::ContextItem {
         key: context::ItemKey {
@@ -1698,15 +1823,21 @@ pub async fn run<P: LlmClient>(
                                     };
                                     batch_failed |= res.is_error;
                                     state.observe_action(&format!("{name}:{args}"), &res.content);
+                                    if !res.is_error && matches!(name.as_str(), "edit" | "write") {
+                                        state.edits += 1;
+                                    }
                                     state.record_tool_result(ToolMsg {
                                         call_id: c.call_id.clone(),
                                         result: res.clone(),
                                     });
                                 }
                             }
-                            // Nudge lands on the fresh tail BEFORE the sync, so
-                            // the file never holds a stale tail.
+                            // Directives and the nudge land on the fresh tail
+                            // BEFORE the sync, so the file never holds a stale
+                            // tail and the row keeps the exact model text.
+                            state.queue_directives();
                             state.apply_budget_nudge();
+                            state.deliver_directives();
                             if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
                                 return finish_run(
                                     state,
@@ -1758,6 +1889,30 @@ pub async fn run<P: LlmClient>(
                         // Batch scope: only the failed batch rolls back; the
                         // baseline already committed the proven prefix.
                         if batch_failed {
+                            // Pre-effect record: the rollback destroys the
+                            // batch's successful edits, so the notice is
+                            // durable before the tree moves. `Attempt` is the
+                            // existing log-only vocabulary (no model row, no
+                            // new event); the model-visible copy rides the
+                            // directive channel on the next tool tail.
+                            append_to(
+                                &mut state.items,
+                                ItemKind::Attempt {
+                                    error: ROLLBACK_NOTICE.into(),
+                                    will_retry: true,
+                                },
+                            );
+                            state.push_directive(ROLLBACK_NOTICE.into());
+                            if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
+                                return finish_run(
+                                    state,
+                                    None,
+                                    emitter,
+                                    run_id,
+                                    &mut synced,
+                                    Outcome::Failed("log append failed".into()),
+                                );
+                            }
                             if let Err(e) = tree.rollback() {
                                 return finish_run(
                                     state,
@@ -2217,8 +2372,14 @@ mod tests {
         }
         let msgs = s.derived_messages();
         assert_eq!(msgs.len(), 7);
-        assert_eq!(msgs[0].content, "[collapsed] line0-head");
-        assert_eq!(msgs[1].content, "[collapsed] line1-head");
+        assert_eq!(
+            msgs[0].content,
+            "[collapsed: 21b — re-open to edit] line0-head\nline0-tail"
+        );
+        assert_eq!(
+            msgs[1].content,
+            "[collapsed: 21b — re-open to edit] line1-head\nline1-tail"
+        );
         assert_eq!(msgs[2].content, "line2-head\nline2-tail");
         assert_eq!(msgs[2].tool_call_id.as_deref(), Some("c2"));
     }
@@ -2327,6 +2488,144 @@ mod tests {
             other => panic!("nudge must land on the ToolResult tail, got {other:?}"),
         }
         assert!(s.apply_budget_nudge().is_none()); // latched
+    }
+
+    #[test]
+    fn no_tail_keeps_directive_queued_and_nudge_latch_unburned() {
+        let mut s = LoopState::new();
+        // Nudge due at warn steps, but tailless: the latch is not consumed.
+        s.budget.counters_mut().steps = s.budget.config().warn_steps.get();
+        assert!(s.apply_budget_nudge().is_none());
+        // A queued directive with no tail stays queued (retry, not drop).
+        s.budget.counters_mut().actions_this_trial = s.budget.config().actions_per_trial / 2;
+        s.queue_directives();
+        assert_eq!(s.pending_directives.len(), 1);
+        assert_eq!(s.deliver_directives(), 0);
+        assert_eq!(s.pending_directives.len(), 1);
+        // First recorded result creates the tail: both land, once each.
+        s.turn = 1;
+        assert!(matches!(
+            s.step_claim(assistant(vec![call("a")]), StopReason::ToolUse),
+            ClaimOutcome::Dispatch(_)
+        ));
+        assert!(s.record_tool_result(ToolMsg {
+            call_id: "a".into(),
+            result: result(),
+        }));
+        assert_eq!(s.deliver_directives(), 1);
+        let nudge = s
+            .apply_budget_nudge()
+            .expect("latch survived the tailless attempt");
+        assert!(nudge.contains("wrap up"));
+        match s.items.last().map(|i| &i.kind) {
+            Some(ItemKind::ToolResult { content, .. }) => {
+                assert!(content.contains("0 edits so far after 15 actions"));
+                assert!(content.contains(&nudge));
+            }
+            other => panic!("expected ToolResult tail, got {other:?}"),
+        }
+        assert!(s.pending_directives.is_empty());
+        assert_eq!(s.deliver_directives(), 0); // delivered once, never twice
+    }
+
+    #[test]
+    fn directive_triggers_fire_once_at_half_and_late_cap() {
+        let mut s = LoopState::new();
+        let cap = s.budget.config().actions_per_trial;
+        s.budget.counters_mut().actions_this_trial = cap / 2;
+        s.queue_directives();
+        assert_eq!(
+            s.pending_directives.front().unwrap(),
+            "0 edits so far after 15 actions. Stop reading. Apply your first edit with the edit tool NOW."
+        );
+        s.queue_directives();
+        assert_eq!(s.pending_directives.len(), 1); // half-cap latch holds
+        s.edits = 1; // an edit silences only the zero-edit rule
+        s.budget.counters_mut().actions_this_trial = cap * 4 / 5;
+        s.queue_directives();
+        assert_eq!(
+            s.pending_directives.back().unwrap(),
+            "only 6 actions remain before the run is stopped. Finish and submit your patch now."
+        );
+        s.queue_directives();
+        assert_eq!(s.pending_directives.len(), 2); // both one-shot
+    }
+
+    #[test]
+    fn lessons_ride_the_tail_once_each() {
+        let mut s = LoopState::new();
+        s.push_lesson("vary the approach".into());
+        s.turn = 1;
+        assert!(matches!(
+            s.step_claim(assistant(vec![call("a")]), StopReason::ToolUse),
+            ClaimOutcome::Dispatch(_)
+        ));
+        assert!(s.record_tool_result(ToolMsg {
+            call_id: "a".into(),
+            result: result(),
+        }));
+        assert_eq!(s.deliver_directives(), 1);
+        match s.items.last().map(|i| &i.kind) {
+            Some(ItemKind::ToolResult { content, .. }) => {
+                assert!(content.contains("vary the approach"))
+            }
+            other => panic!("expected ToolResult tail, got {other:?}"),
+        }
+        assert!(s.lessons.is_empty());
+        assert_eq!(s.deliver_directives(), 0); // each lesson delivered once
+    }
+
+    #[test]
+    fn collapse_stub_preview_caps_at_120_chars() {
+        let mut s = LoopState::new();
+        for i in 0..6 {
+            s.items.push(Item {
+                seq: s.items.len() as u64,
+                id: format!("t{i}"),
+                parent_id: None,
+                recorded_at: SystemTime::now(),
+                kind: ItemKind::ToolResult {
+                    call_id: format!("c{i}"),
+                    content: format!("{}-{i}", "x".repeat(200)),
+                    is_error: false,
+                    recovery: None,
+                },
+            });
+        }
+        let msgs = s.derived_messages();
+        let head = &msgs[0].content;
+        let prefix = "[collapsed: 202b — re-open to edit] ";
+        assert!(head.starts_with(prefix), "{head}");
+        assert_eq!(head.chars().count(), prefix.chars().count() + 120);
+    }
+
+    #[test]
+    fn build_request_contract_precedes_map_with_live_budgets() {
+        let root = run_tmp("contract");
+        std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        state.budget.counters_mut().steps = 3;
+        state.budget.counters_mut().actions_this_trial = 5;
+        state.budget.counters_mut().tokens = 100;
+        let req = build_request(&mut state, &registry, &root, &RunConfig::default());
+        assert_eq!(req.messages[0].role, "system");
+        let sys = &req.messages[0].content;
+        assert!(sys.starts_with("--- workflow-contract"), "{sys}");
+        for needle in [
+            "budgets remaining: steps 17/20; actions 25/30; tokens 49900/50000",
+            "tool results older than the last 5 are collapsed to one line; re-open a file immediately before editing it.",
+            "work file-by-file: view -> edit immediately -> next file.",
+            "`edit` and `write` are the ONLY patch mechanisms — never write files via exec; exec/test are for checks only.",
+            "when your patch is complete, reply with a text message and NO tool calls — that finishes the run.",
+        ] {
+            assert!(sys.contains(needle), "missing {needle:?} in {sys}");
+        }
+        assert!(
+            sys.contains("--- file-map") && sys.contains("a.rs"),
+            "{sys}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2780,11 +3079,47 @@ mod tests {
         }
     }
 
+    struct FakeRead;
+
+    #[async_trait::async_trait]
+    impl CoreTool for FakeRead {
+        fn definition(&self) -> CoreToolDef {
+            CoreToolDef {
+                name: "read".into(),
+                description: "read-only probe with a fresh observation each call".into(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["n"],
+                    "additionalProperties": false,
+                    "properties": {"n": {"type": "integer"}}
+                }),
+            }
+        }
+        fn prepare(&self, call: &CoreToolCall) -> CoreCallStatus {
+            CoreCallStatus::Dispatch(CoreInvocation {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                args: call.args.clone(),
+            })
+        }
+        async fn execute(
+            &self,
+            inv: CoreInvocation,
+            _cancel: CancellationToken,
+        ) -> Result<CoreToolOutcome, CoreToolError> {
+            let n = inv.args.get("n").and_then(|v| v.as_i64()).unwrap_or(-1);
+            Ok(CoreToolOutcome {
+                content: format!("read {n}"),
+                truncated: false,
+            })
+        }
+    }
+
     fn run_registry(root: &std::path::Path) -> CoreRegistry {
         let mut r = CoreRegistry::new(Arc::new(GrantGate::new(
             [(
                 "agent".to_string(),
-                vec!["write".to_string(), "boom".to_string()],
+                vec!["write".to_string(), "boom".to_string(), "read".to_string()],
             )]
             .into(),
         )));
@@ -2792,6 +3127,7 @@ mod tests {
             root: root.to_path_buf(),
         }));
         r.register(Arc::new(Boom));
+        r.register(Arc::new(FakeRead));
         r
     }
 
@@ -2803,10 +3139,10 @@ mod tests {
                 ItemKind::TurnStart { .. } => "TurnStart",
                 ItemKind::Input { .. } => "Input",
                 ItemKind::Assistant { .. } => "Assistant",
+                ItemKind::Attempt { .. } => "Attempt",
                 ItemKind::ToolCall { .. } => "ToolCall",
                 ItemKind::ToolResult { .. } => "ToolResult",
                 ItemKind::TurnEnd { .. } => "TurnEnd",
-                _ => "other",
             })
             .collect()
     }
@@ -2931,6 +3267,7 @@ mod tests {
                 "ToolCall",
                 "ToolResult",
                 "ToolResult",
+                "Attempt",
                 "Assistant",
                 "TurnEnd",
                 "TurnStart",
@@ -2948,6 +3285,194 @@ mod tests {
             &boom.kind,
             ItemKind::ToolResult { is_error: true, .. }
         ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    #[tokio::test]
+    async fn run_half_cap_zero_edits_directive_lands_on_a_tool_tail() {
+        use agent_log::read_log;
+        let root = run_tmp("directive");
+        let log_path = std::env::temp_dir().join(format!(
+            "rof-directive-log-{}-{}.jsonl",
+            std::process::id(),
+            RUN_N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        // 15 read-only actions (= cap/2) with zero edits: the directive fires.
+        let mut queue: VecDeque<Response> = VecDeque::new();
+        for i in 1..=15 {
+            let id = format!("r{i}");
+            queue.push_back(script_resp(
+                vec![(id.as_str(), "read", serde_json::json!({"n": i}))],
+                StopReason::ToolUse,
+            ));
+        }
+        queue.push_back(text_resp("done"));
+        let client = ScriptClient {
+            order: Arc::new(Mutex::new(Vec::new())),
+            requests: requests.clone(),
+            queue: Mutex::new(queue),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: RunConfig {
+                    log_path: Some(log_path.clone()),
+                    ..RunConfig::default()
+                },
+            },
+            vec![Input::User("probe it".into())],
+            &cancel,
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        assert_eq!(state.edits, 0);
+        assert_eq!(state.budget.counters().actions_this_trial, 15);
+        let hits: Vec<&str> = state
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::ToolResult { content, .. }
+                    if content.contains("0 edits so far after 15 actions") =>
+                {
+                    Some(content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].contains("Stop reading. Apply your first edit with the edit tool NOW."));
+        assert!(state.pending_directives.is_empty());
+        // The next model call sees it, on the 15th action's own tail.
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 16);
+        assert!(
+            reqs[15]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("0 edits so far after 15 actions")),
+            "{:?}",
+            reqs[15].messages
+        );
+        // Durability: the file row is exactly the row the model saw.
+        let file_items = read_log(&log_path).unwrap();
+        assert!(file_items.iter().any(|i| matches!(
+            &i.kind,
+            ItemKind::ToolResult { content, .. }
+                if content.contains("0 edits so far after 15 actions")
+        )));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    #[tokio::test]
+    async fn run_failed_batch_records_rollback_notice_and_queues_it_for_the_model() {
+        use agent_log::read_log;
+        let root = run_tmp("rollback-notice");
+        let log_path = std::env::temp_dir().join(format!(
+            "rof-rollback-log-{}-{}.jsonl",
+            std::process::id(),
+            RUN_N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = ScriptClient {
+            order: Arc::new(Mutex::new(Vec::new())),
+            requests: requests.clone(),
+            queue: Mutex::new(VecDeque::from([
+                script_resp(
+                    vec![
+                        (
+                            "c1",
+                            "write",
+                            serde_json::json!({"path": "a.rs", "content": "v2\n"}),
+                        ),
+                        ("c2", "boom", serde_json::json!({})),
+                    ],
+                    StopReason::ToolUse,
+                ),
+                script_resp(
+                    vec![(
+                        "c3",
+                        "write",
+                        serde_json::json!({"path": "a.rs", "content": "v3\n"}),
+                    )],
+                    StopReason::ToolUse,
+                ),
+                text_resp("done"),
+            ])),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: RunConfig {
+                    log_path: Some(log_path.clone()),
+                    ..RunConfig::default()
+                },
+            },
+            vec![Input::User("go".into())],
+            &cancel,
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        // The successful edit counted, was rolled back, then re-applied.
+        assert_eq!(state.edits, 2);
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "v3\n");
+        // Durable log-only row, never a model-message row.
+        let notices: Vec<&str> = state
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Attempt {
+                    error,
+                    will_retry: true,
+                } if error.contains("whole batch was reverted") => Some(error.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        // Durable: the rollback record is in the log file before the model's
+        // next request, and only once.
+        let file_items = read_log(&log_path).unwrap();
+        let durable = file_items
+            .iter()
+            .filter(|i| {
+                matches!(&i.kind, ItemKind::Attempt { error, .. } if error.contains("whole batch was reverted"))
+            })
+            .count();
+        assert_eq!(durable, 1, "{file_items:?}");
+        // The model sees it on the next tool tail, one batch later.
+        let reqs = requests.lock().unwrap();
+        let seen = |i: usize| {
+            reqs[i]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("whole batch was reverted"))
+        };
+        assert!(!seen(1), "not with the failed batch's own results");
+        assert!(seen(2), "next tool tail must carry the notice");
+        assert!(state.pending_directives.is_empty());
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&log_path);
     }
@@ -3194,14 +3719,18 @@ mod tests {
         for i in 1..=7 {
             let id = format!("c{i}");
             let path = format!("f{i}.txt");
-            queue.push_back(script_resp(
+            // Unique marker: the generic "step" would substring-match the
+            // contract's "steps remaining" budget line.
+            let mut resp = script_resp(
                 vec![(
                     id.as_str(),
                     "write",
                     serde_json::json!({"path": path, "content": "x\n"}),
                 )],
                 StopReason::ToolUse,
-            ));
+            );
+            resp.message.content = format!("script-step-{i}");
+            queue.push_back(resp);
         }
         queue.push_back(text_resp("all done"));
         let client = ScriptClient {
@@ -3270,8 +3799,14 @@ mod tests {
                 .content
                 .clone()
         };
-        assert_eq!(content_of("c1"), "[collapsed] wrote f1.txt");
-        assert_eq!(content_of("c2"), "[collapsed] wrote f2.txt");
+        assert_eq!(
+            content_of("c1"),
+            "[collapsed: 12b — re-open to edit] wrote f1.txt"
+        );
+        assert_eq!(
+            content_of("c2"),
+            "[collapsed: 12b — re-open to edit] wrote f2.txt"
+        );
         assert_eq!(content_of("c3"), "wrote f3.txt");
         assert_eq!(content_of("c7"), "wrote f7.txt");
         assert!(check_pairing(emitter.history()));
