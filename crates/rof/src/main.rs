@@ -17,7 +17,7 @@ use snapshot::TreeService;
 use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
-const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--allow-cmd CMD...] [--budget-steps N] [--dump-events PATH]
+const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--allow-cmd CMD...] [--budget-steps N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--dump-events PATH]
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH";
 
 #[derive(Debug, PartialEq)]
@@ -28,6 +28,9 @@ struct Args {
     endpoint: Option<String>,
     allow_cmd: Vec<String>,
     budget_steps: Option<u32>,
+    budget_tokens: Option<u64>,
+    max_tokens: Option<usize>,
+    context_files: Vec<String>,
     dump_events: Option<String>,
 }
 
@@ -39,6 +42,9 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let (mut goal, mut workdir, mut model, mut endpoint, mut steps, mut dump) =
         (None, None, None, None, None, None);
     let mut allow = Vec::new();
+    let mut context_files = Vec::new();
+    let mut max_tokens: Option<usize> = None;
+    let mut budget_tokens: Option<u64> = None;
     let mut i = 2;
     while i < a.len() {
         let flag = a[i];
@@ -62,6 +68,21 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--endpoint" => endpoint = Some(take(&mut i, inline)?),
             "--dump-events" => dump = Some(take(&mut i, inline)?),
             "--allow-cmd" => allow.push(take(&mut i, inline)?),
+            "--context-file" => context_files.push(take(&mut i, inline)?),
+            "--max-tokens" => {
+                let s = take(&mut i, inline)?;
+                max_tokens =
+                    Some(s.parse().map_err(|_| {
+                        format!("--max-tokens needs a positive integer, got {s:?}")
+                    })?);
+            }
+            "--budget-tokens" => {
+                let s = take(&mut i, inline)?;
+                budget_tokens =
+                    Some(s.parse().map_err(|_| {
+                        format!("--budget-tokens needs a positive integer, got {s:?}")
+                    })?);
+            }
             "--budget-steps" => {
                 let s = take(&mut i, inline)?;
                 let n: u32 = s
@@ -78,11 +99,14 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     }
     Ok(Args {
         goal: goal.ok_or("missing --goal")?,
+        context_files,
+        max_tokens,
         workdir: PathBuf::from(workdir.ok_or("missing --workdir")?),
         model: model.ok_or("missing --model")?,
         endpoint,
         allow_cmd: allow,
         budget_steps: steps,
+        budget_tokens,
         dump_events: dump,
     })
 }
@@ -171,13 +195,18 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     reg.register(Arc::new(tools_std::exec_tool(policy.clone())));
     reg.register(Arc::new(tools_std::test_tool(policy)));
     let mut state = LoopState::new();
-    if let Some(n) = args.budget_steps {
+    if args.budget_steps.is_some() || args.budget_tokens.is_some() {
         let mut b = config_for(Capability::UnattendedBatch);
-        b.max_steps = NonZeroU32::new(n).expect("parse rejects 0");
-        b.warn_steps = b
-            .warn_steps
-            .min(NonZeroU32::new(n.saturating_sub(1).max(1)).expect("max(1) is non-zero"));
-        b.max_refunds = n / 4;
+        if let Some(n) = args.budget_steps {
+            b.max_steps = NonZeroU32::new(n).expect("parse rejects 0");
+            b.warn_steps = b
+                .warn_steps
+                .min(NonZeroU32::new(n.saturating_sub(1).max(1)).expect("max(1) is non-zero"));
+            b.max_refunds = n / 4;
+        }
+        if let Some(t) = args.budget_tokens {
+            b.max_tokens = t;
+        }
         state.budget = BudgetGuard::new(b, Instant::now());
     }
     let mut emitter = Emitter::new();
@@ -203,6 +232,8 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
             cfg: RunConfig {
                 goal: args.goal.clone(),
                 model: args.model.clone(),
+                context_files: args.context_files.clone(),
+                max_tokens: args.max_tokens.unwrap_or(8_000),
                 ..RunConfig::default()
             },
         },
@@ -304,6 +335,8 @@ mod tests {
             "true",
             "--budget-steps",
             "7",
+            "--context-file",
+            "app/a.py",
             "--dump-events",
             "/tmp/ev.json",
         ]))
@@ -317,6 +350,9 @@ mod tests {
                 endpoint: Some("http://x".into()),
                 allow_cmd: vec!["cargo test".into(), "true".into()],
                 budget_steps: Some(7),
+                budget_tokens: None,
+                context_files: vec!["app/a.py".into()],
+                max_tokens: None,
                 dump_events: Some("/tmp/ev.json".into()),
             }
         );
@@ -530,6 +566,9 @@ mod tests {
             endpoint: None,
             allow_cmd: vec![],
             budget_steps: steps,
+            budget_tokens: None,
+            context_files: Vec::new(),
+            max_tokens: None,
             dump_events: None,
         }
     }
