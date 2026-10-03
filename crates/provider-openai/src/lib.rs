@@ -186,6 +186,16 @@ fn apply_ladder(k: &mut WireKnobs, content_chars: usize, reasoning_chars: usize)
 }
 
 fn wire_body(model: &str, req: &Request, k: &WireKnobs) -> serde_json::Value {
+    // Thinking-mode conversation: any assistant message carried real
+    // reasoning. Measured (api.deepseek.com): a request ending on tool
+    // messages 400s "reasoning_content ... must be passed back" if ANY
+    // assistant message OMITS the key; empty string is accepted. So in
+    // thinking-mode conversations every assistant message carries the
+    // key — real echo or empty string; non-thinking conversations stay
+    // untouched (no unknown fields for strict endpoints).
+    let thinking_mode = req.messages.iter().any(|m| {
+        m.role == "assistant" && m.thinking.as_deref().is_some_and(|t| !t.trim().is_empty())
+    });
     let messages: Vec<serde_json::Value> = req
         .messages
         .iter()
@@ -210,6 +220,14 @@ fn wire_body(model: &str, req: &Request, k: &WireKnobs) -> serde_json::Value {
             }
             if let Some(id) = &m.tool_call_id {
                 o["tool_call_id"] = serde_json::Value::String(id.clone());
+            }
+            // DeepSeek thinking mode: key presence is mandatory (see above).
+            if m.role == "assistant" && thinking_mode {
+                o["reasoning_content"] =
+                    match m.thinking.as_deref().filter(|t| !t.trim().is_empty()) {
+                        Some(t) => serde_json::Value::String(t.to_string()),
+                        None => serde_json::Value::String(String::new()),
+                    };
             }
             o
         })
@@ -597,12 +615,14 @@ mod tests {
                     content: "sys".into(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    thinking: None,
                 },
                 ProviderMessage {
                     role: "user".into(),
                     content: "hi".into(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    thinking: None,
                 },
             ],
             tools: vec![tool_core::ToolDeclaration {
@@ -635,12 +655,14 @@ mod tests {
                         args: serde_json::json!({"path": "a"}),
                     }],
                     tool_call_id: None,
+                    thinking: None,
                 },
                 ProviderMessage {
                     role: "tool".into(),
                     content: "ok".into(),
                     tool_calls: Vec::new(),
                     tool_call_id: Some("c1".into()),
+                    thinking: None,
                 },
             ],
             tools: vec![],
@@ -656,6 +678,59 @@ mod tests {
         assert_eq!(b["messages"][0]["tool_calls"][0]["id"], "c1");
         assert_eq!(b["messages"][0]["tool_calls"][0]["type"], "function");
         assert_eq!(b["messages"][1]["tool_call_id"], "c1");
+    }
+
+    #[test]
+    fn wire_body_echoes_reasoning_content_in_thinking_mode_conversations() {
+        let mk = |role: &str, thinking: Option<&str>| ProviderMessage {
+            role: role.into(),
+            content: "x".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            thinking: thinking.map(str::to_owned),
+        };
+        let req = Request {
+            messages: vec![
+                mk("assistant", Some("chain of thought")),
+                mk("assistant", None),
+                mk("assistant", Some("   ")),
+                mk("user", Some("not assistant reasoning")),
+            ],
+            tools: vec![],
+            max_tokens: 64,
+            thinking: Thinking::Auto,
+            extras: serde_json::Value::Null,
+        };
+        let b = wire_body(
+            "m",
+            &req,
+            &WireKnobs::from_req(&req, &EndpointProfile::default()),
+        );
+        assert_eq!(b["messages"][0]["reasoning_content"], "chain of thought");
+        // Thinking-mode conversation (msg 0 carries real reasoning): every
+        // assistant message carries the KEY — empty string when absent.
+        // Measured: an omitted key on any assistant message 400s
+        // "reasoning_content ... must be passed back" on tool-terminated
+        // requests (api.deepseek.com); empty string is accepted.
+        assert_eq!(b["messages"][1]["reasoning_content"], "");
+        assert_eq!(b["messages"][2]["reasoning_content"], "");
+        // Non-assistant messages never carry it.
+        assert!(b["messages"][3].get("reasoning_content").is_none());
+        // Non-thinking conversation: key stays absent everywhere.
+        let plain = Request {
+            messages: vec![mk("assistant", None), mk("assistant", None)],
+            tools: vec![],
+            max_tokens: 64,
+            thinking: Thinking::Auto,
+            extras: serde_json::Value::Null,
+        };
+        let pb = wire_body(
+            "m",
+            &plain,
+            &WireKnobs::from_req(&plain, &EndpointProfile::default()),
+        );
+        assert!(pb["messages"][0].get("reasoning_content").is_none());
+        assert!(pb["messages"][1].get("reasoning_content").is_none());
     }
 
     #[test]
@@ -935,6 +1010,50 @@ mod tests {
         let r = c.complete("m", &req).await.unwrap();
         assert_eq!(r.message.content, "back");
         assert_eq!(r.attempts, 3);
+    }
+
+    /// DeepSeek thinking-mode protocol: the reasoning a response carries must
+    /// ride the next turn's assistant message back as `reasoning_content`.
+    #[tokio::test]
+    async fn complete_echoes_prior_turn_reasoning_content_on_the_next_request() {
+        std::env::set_var("TEST_OAI_KEY_THINK", "k");
+        let (ep, bodies) = serve(vec![
+            Canned {
+                status: 200,
+                headers: vec![],
+                body: serde_json::json!({
+                    "choices": [{
+                        "message": {"content": "first", "reasoning_content": "chain of thought"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+                })
+                .to_string(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![],
+                body: ok_body("second"),
+            },
+        ]);
+        let c = client_on(&ep, "TEST_OAI_KEY_THINK");
+        let r1 = c.complete("m", &req_with_tool()).await.unwrap();
+        assert_eq!(r1.message.thinking.as_deref(), Some("chain of thought"));
+        // Turn 2's history, as agent-loop derives it from the stored item.
+        let mut req2 = req_with_tool();
+        req2.messages.push(ProviderMessage {
+            role: "assistant".into(),
+            content: r1.message.content.clone(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            thinking: r1.message.thinking.clone(),
+        });
+        c.complete("m", &req2).await.unwrap();
+        let sent = bodies.lock().unwrap();
+        let b: serde_json::Value = serde_json::from_str(&sent[1]).unwrap();
+        assert_eq!(b["messages"][2]["reasoning_content"], "chain of thought");
+        // Messages that captured no reasoning stay clean on the wire.
+        assert!(b["messages"][0].get("reasoning_content").is_none());
     }
 
     #[tokio::test]
