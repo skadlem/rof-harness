@@ -33,6 +33,10 @@ use tool_core::{ToolCall, ToolResult};
 /// newest counter warning outranks stale advice, mirroring the lessons cap).
 const DIRECTIVE_CAP: usize = 3;
 
+/// Assistant rows whose echoed reasoning survives folding into the derived
+/// transcript.
+const THINKING_KEEP: usize = 2;
+
 /// Model-facing notice when one failed tool reverts the whole batch.
 const ROLLBACK_NOTICE: &str = "a tool in your last batch failed and the whole batch was reverted — your successful changes in it are gone; re-apply them";
 
@@ -859,6 +863,14 @@ impl LoopState {
     /// `COLLAPSE_KEEP` tool results go verbatim, older ones shrink to a
     /// `[collapsed: Nb — re-open to edit]` stub plus their first 120 chars as
     /// folded. Stable order preserved, so prefix caches survive.
+    ///
+    /// Echoed reasoning is trimmed to the last [`THINKING_KEEP`] assistant
+    /// rows: on a thinking-heavy trace it was 64% of input (measured: 128k of
+    /// 224k tokens), and keeping the last two cuts that ~68%. Wire key
+    /// presence is unaffected — the wire layer still emits
+    /// `reasoning_content: ""` for these rows in a thinking-mode
+    /// conversation. chosen-not-measured: dropping older reasoning may
+    /// degrade cross-turn reasoning continuity; the A/B is pending.
     pub fn derived_messages(&self) -> Vec<ProviderMessage> {
         let mut out = Vec::new();
         for item in &self.items {
@@ -883,8 +895,9 @@ impl LoopState {
                         content: am.content,
                         tool_calls: am.tool_calls,
                         tool_call_id: None,
-                        // Thinking rides the stored JSON; DeepSeek rejects a
-                        // follow-up turn that omits it.
+                        // Thinking rides the stored JSON; the trim below
+                        // blanks all but the last 2, and the wire layer
+                        // keeps the mandatory `reasoning_content` key present.
                         thinking: am.thinking,
                     })
                 }
@@ -898,6 +911,18 @@ impl LoopState {
                     thinking: None,
                 }),
                 _ => {}
+            }
+        }
+        // Echoed reasoning is trimmed here, before the wire layer sees it:
+        // keep the last THINKING_KEEP assistant rows, blank the older ones.
+        let keep_from = out
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .count()
+            .saturating_sub(THINKING_KEEP);
+        for (n, m) in out.iter_mut().filter(|m| m.role == "assistant").enumerate() {
+            if n < keep_from {
+                m.thinking = None;
             }
         }
         let tool_idx: Vec<usize> = out
@@ -2524,6 +2549,32 @@ mod tests {
         assert_eq!(msgs[2].tool_call_id.as_deref(), Some("c2"));
     }
 
+    #[test]
+    fn derived_messages_keeps_thinking_on_last_two_assistants() {
+        let mut s = LoopState::new();
+        for i in 0..4 {
+            s.push_assistant(
+                &AssistantMessage {
+                    content: format!("step-{i}"),
+                    tool_calls: Vec::new(),
+                    thinking: Some(format!("reason-{i}")),
+                },
+                "Stop",
+            );
+        }
+        let msgs = s.derived_messages();
+        let thinking: Vec<Option<&str>> = msgs
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .map(|m| m.thinking.as_deref())
+            .collect();
+        assert_eq!(
+            thinking,
+            vec![None, None, Some("reason-2"), Some("reason-3")],
+            "thinking survives on exactly the last 2 assistant rows"
+        );
+    }
+
     #[tokio::test]
     async fn drive_tick_select_spine() {
         let mut s = LoopState::new();
@@ -4095,8 +4146,9 @@ mod tests {
             "{:?}",
             content_of("c7")
         );
-        // Collapse-5 collapses tool observations only: every assistant turn
-        // still carries its reasoning into the 8th request.
+        // Collapse-5 collapses tool observations only; assistant reasoning
+        // follows the keep-last-2 policy, so only steps 6-7 still carry it
+        // into the 8th request.
         for i in 1..=7 {
             let want = format!("reason-{i}");
             let step = format!("script-step-{i}");
@@ -4105,7 +4157,8 @@ mod tests {
                 .iter()
                 .find(|m| m.role == "assistant" && m.content == step)
                 .and_then(|m| m.thinking.as_deref());
-            assert_eq!(got, Some(want.as_str()), "reasoning lost for step {i}");
+            let expect = if i >= 6 { Some(want.as_str()) } else { None };
+            assert_eq!(got, expect, "reasoning for step {i}");
         }
         assert!(check_pairing(emitter.history()));
         let _ = std::fs::remove_dir_all(&root);

@@ -17,7 +17,7 @@ use snapshot::TreeService;
 use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
-const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--allow-cmd CMD...] [--budget-steps N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--dump-events PATH]
+const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--dump-events PATH]
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget";
 
@@ -29,6 +29,7 @@ struct Args {
     endpoint: Option<String>,
     allow_cmd: Vec<String>,
     budget_steps: Option<u32>,
+    budget_actions: Option<u32>,
     budget_tokens: Option<u64>,
     max_tokens: Option<usize>,
     context_files: Vec<String>,
@@ -42,6 +43,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     }
     let (mut goal, mut workdir, mut model, mut endpoint, mut steps, mut dump) =
         (None, None, None, None, None, None);
+    let mut actions: Option<u32> = None;
     let mut allow = Vec::new();
     let mut context_files = Vec::new();
     let mut max_tokens: Option<usize> = None;
@@ -94,6 +96,16 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 }
                 steps = Some(n);
             }
+            "--budget-actions" => {
+                let s = take(&mut i, inline)?;
+                let n: u32 = s
+                    .parse()
+                    .map_err(|_| format!("--budget-actions needs a positive integer, got {s:?}"))?;
+                if n == 0 {
+                    return Err("--budget-actions must be > 0".into());
+                }
+                actions = Some(n);
+            }
             other => return Err(format!("unknown flag {other:?}\n{USAGE}")),
         }
         i += 1;
@@ -107,6 +119,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         endpoint,
         allow_cmd: allow,
         budget_steps: steps,
+        budget_actions: actions,
         budget_tokens,
         dump_events: dump,
     })
@@ -123,6 +136,9 @@ fn budget_for(args: &Args) -> BudgetGuard {
             .warn_steps
             .min(NonZeroU32::new(n.saturating_sub(1).max(1)).expect("max(1) is non-zero"));
         b.max_refunds = n / 4;
+    }
+    if let Some(n) = args.budget_actions {
+        b.actions_per_trial = n;
     }
     match args.budget_tokens {
         Some(t) => b.max_tokens = t,
@@ -347,6 +363,8 @@ mod tests {
             "true",
             "--budget-steps",
             "7",
+            "--budget-actions",
+            "9",
             "--context-file",
             "app/a.py",
             "--dump-events",
@@ -362,6 +380,7 @@ mod tests {
                 endpoint: Some("http://x".into()),
                 allow_cmd: vec!["cargo test".into(), "true".into()],
                 budget_steps: Some(7),
+                budget_actions: Some(9),
                 budget_tokens: None,
                 context_files: vec!["app/a.py".into()],
                 max_tokens: None,
@@ -378,8 +397,8 @@ mod tests {
         .unwrap();
         assert_eq!(b.allow_cmd, Vec::<String>::new());
         assert_eq!(
-            (b.endpoint, b.budget_steps, b.dump_events),
-            (None, None, None)
+            (b.endpoint, b.budget_steps, b.budget_actions, b.dump_events),
+            (None, None, None, None)
         );
     }
 
@@ -424,6 +443,30 @@ mod tests {
                 "--model",
                 "m",
                 "--budget-steps",
+                "many",
+            ],
+            vec![
+                "rof",
+                "run",
+                "--goal",
+                "g",
+                "--workdir",
+                "/w",
+                "--model",
+                "m",
+                "--budget-actions",
+                "0",
+            ],
+            vec![
+                "rof",
+                "run",
+                "--goal",
+                "g",
+                "--workdir",
+                "/w",
+                "--model",
+                "m",
+                "--budget-actions",
                 "many",
             ],
             vec!["rof", "run", "--goal"],
@@ -578,6 +621,7 @@ mod tests {
             endpoint: None,
             allow_cmd: vec![],
             budget_steps: steps,
+            budget_actions: None,
             budget_tokens: None,
             context_files: Vec::new(),
             max_tokens: None,
@@ -600,6 +644,13 @@ mod tests {
         pinned.budget_steps = Some(5);
         assert_eq!(budget_for(&pinned).config().max_tokens, 50_000);
         assert_eq!(budget_for(&pinned).config().max_steps.get(), 5);
+        // --budget-actions overrides the trial action cap.
+        pinned.budget_actions = Some(9);
+        assert_eq!(budget_for(&pinned).config().actions_per_trial, 9);
+        assert_eq!(
+            budget_for(&args_for(dir, None)).config().actions_per_trial,
+            30
+        );
     }
 
     #[tokio::test]
