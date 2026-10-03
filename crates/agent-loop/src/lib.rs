@@ -474,8 +474,9 @@ impl LoopState {
             ..
         } = msg
         {
-            // Failed attempts are billed too: meter before the refund/retry
-            // fork so an exhausted ladder's re-sends are never invisible.
+            // Attempts that returned usage are billed: meter before the
+            // refund/retry fork so an exhausted ladder's re-sends are never
+            // invisible (pre-generation failures carry no usage to meter).
             if let Some(u) = &usage {
                 self.record_usage(u);
             }

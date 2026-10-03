@@ -73,8 +73,11 @@ impl LlmClient for OpenAiCompat {
         // 5; truncated attempts follow the ladder until it has no rung left.
         let mut last_err = "no attempts".to_string();
         let mut last_after: Option<Duration> = None;
-        // Failed attempts are billed too: sum what each carried so the error
-        // path can meter every re-send of the ladder.
+        // Billed attempts are metered: sum what each carried so the error
+        // path never loses a re-send's usage. Only attempts that RETURNED
+        // usage are billed (completed, or truncated then rejected);
+        // pre-generation HTTP failures carry no usage and are not charged
+        // (research/decision-audit-provider-economics.md C10).
         let mut usage_acc: Option<Usage> = None;
         let mut attempt = 0u32;
         loop {
@@ -190,12 +193,15 @@ fn apply_ladder(k: &mut WireKnobs, content_chars: usize, reasoning_chars: usize)
 
 fn wire_body(model: &str, req: &Request, k: &WireKnobs) -> serde_json::Value {
     // Thinking-mode conversation: any assistant message carried real
-    // reasoning. Measured (api.deepseek.com): a request ending on tool
-    // messages 400s "reasoning_content ... must be passed back" if ANY
-    // assistant message OMITS the key; empty string is accepted. So in
-    // thinking-mode conversations every assistant message carries the
-    // key — real echo or empty string; non-thinking conversations stay
-    // untouched (no unknown fields for strict endpoints).
+    // reasoning. The passback requirement ("reasoning_content ... must be
+    // passed back"; 400 otherwise) is OFFICIALLY documented on DeepSeek's
+    // Thinking Mode page. Two behaviors below are EMPIRICAL workarounds,
+    // absent from the docs (research/decision-audit-provider-economics.md
+    // C11): empty string is accepted, and a request ending on tool messages
+    // 400s if ANY assistant message OMITS the key. So in thinking-mode
+    // conversations every assistant message carries the key — real echo or
+    // empty string; non-thinking conversations stay untouched (no unknown
+    // fields for strict endpoints).
     let thinking_mode = req.messages.iter().any(|m| {
         m.role == "assistant" && m.thinking.as_deref().is_some_and(|t| !t.trim().is_empty())
     });

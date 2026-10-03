@@ -129,6 +129,7 @@ pub struct Response {
     pub raw_stop_reason: Option<String>,
     /// Usage the FAILED attempts of this same call were billed (retry-ladder
     /// re-sends a recovered final attempt does not carry). `None` = none.
+    /// Internal field — NOT an OpenAI wire field (our accounting seam).
     /// `#[serde(default)]` keeps stored responses parsing.
     #[serde(default)]
     pub retry_usage: Option<Box<Usage>>,
