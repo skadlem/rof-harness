@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::process::Output;
+use std::sync::OnceLock;
 
 /// Same change set as [`TreeService::diff`]: changed paths, stat evidence,
 /// plus the untracked subset (status alone would miss created files).
@@ -38,12 +39,17 @@ pub struct PatchText {
 
 pub struct TreeService {
     root: PathBuf,
+    /// HEAD at [`TreeService::ensure`]: the ref [`TreeService::patch_since_start`]
+    /// diffs from. Recorded once because `baseline()` moves HEAD per batch, so a
+    /// diff against it forgets every earlier batch.
+    start: OnceLock<String>,
 }
 
 impl TreeService {
     pub fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
+            start: OnceLock::new(),
         }
     }
 
@@ -53,13 +59,48 @@ impl TreeService {
 
     /// Idempotent: `init` when no repo, one commit when HEAD is unborn
     /// (`checkout` refuses an unborn HEAD, so rollback needs that commit).
+    /// Seeds the bytecode exclude before that commit and records the start
+    /// HEAD for [`TreeService::patch_since_start`].
     pub fn ensure(&self) -> Result<()> {
         if !self.is_repo() {
             self.git(["init", "--quiet"])?;
         }
+        self.exclude_bytecode()?;
         if self.head_unborn()? {
             self.commit_all("rof: initial tree state")?;
         }
+        // Unborn HEAD (empty tree, nothing to commit) records no start:
+        // there is no revision to diff from yet.
+        let head = self.git_status(["rev-parse", "HEAD"])?;
+        if head.status.success() {
+            let _ = self
+                .start
+                .set(String::from_utf8_lossy(&head.stdout).trim().to_string());
+        }
+        Ok(())
+    }
+
+    /// `__pycache__/` + `*.pyc` in the copy-local `.git/info/exclude`:
+    /// measured, baseline commits (`commit_all` = `git add -A`) were absorbing
+    /// bytecode. Local to the copy — never tracked, never a global git setting.
+    fn exclude_bytecode(&self) -> Result<()> {
+        if !self.root.join(".git").is_dir() {
+            return Ok(()); // gitfile (worktree/submodule): not this copy's repo dir
+        }
+        let info = self.root.join(".git/info");
+        std::fs::create_dir_all(&info)?;
+        let path = info.join("exclude");
+        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        for pat in ["__pycache__/", "*.pyc"] {
+            if !text.lines().any(|l| l == pat) {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(pat);
+                text.push('\n');
+            }
+        }
+        std::fs::write(&path, text)?;
         Ok(())
     }
 
@@ -80,14 +121,46 @@ impl TreeService {
     /// reports a moved oracle test under its new (clean) name; off, the same
     /// move reads as delete + new file and the delete is caught.
     pub fn diff(&self) -> Result<DiffSummary> {
+        self.diff_at(None)
+    }
+
+    /// The whole run's patch, not the last batch's: `diff`/`patch` semantics
+    /// against the start HEAD recorded at [`TreeService::ensure`]. A per-batch
+    /// `baseline()` commits what landed, so the index-based [`TreeService::diff`]
+    /// reports an empty patch once a later batch follows.
+    pub fn patch_since_start(&self) -> Result<(DiffSummary, PatchText)> {
+        let start = self.start.get().ok_or_else(|| {
+            other("patch_since_start: ensure() has not recorded a start HEAD".into())
+        })?;
+        let diff = self.diff_at(Some(start))?;
+        let patch = self.patch_at(&diff, Some(start))?;
+        Ok((diff, patch))
+    }
+
+    /// `rev = Some(start)`: commit-to-worktree diff; `None`: index-to-worktree
+    /// (the per-batch baseline shape).
+    fn diff_at(&self, rev: Option<&str>) -> Result<DiffSummary> {
+        let mut changed: Vec<String> = Vec::new();
+        if rev.is_some() {
+            let out = self.git(["diff", "--name-only"].into_iter().chain(rev))?;
+            changed.extend(
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::to_string),
+            );
+        }
         let porcelain = self.git(["status", "--porcelain", "--no-renames"])?;
         let text = String::from_utf8_lossy(&porcelain.stdout);
-        let mut changed: Vec<String> = Vec::new();
         let mut untracked: Vec<String> = Vec::new();
         for line in text.lines() {
             let Some((code, path)) = porcelain_pair(line) else {
                 continue;
             };
+            // Against a start rev the rev diff above owns tracked changes;
+            // `?` rows are untracked in both modes.
+            if rev.is_some() && !code.starts_with('?') {
+                continue;
+            }
             if !changed.contains(&path) {
                 changed.push(path.clone());
             }
@@ -96,7 +169,7 @@ impl TreeService {
             }
         }
         changed.sort();
-        let stat = self.git(["diff", "--stat"])?;
+        let stat = self.git(["diff", "--stat"].into_iter().chain(rev))?;
         let mut stat = String::from_utf8_lossy(&stat.stdout).into_owned();
         for path in &untracked {
             stat.push_str(&format!(" {path} | new file\n"));
@@ -112,7 +185,11 @@ impl TreeService {
     /// The ONLY diff text produced: `diff --patch` plus one evidence line
     /// per untracked path (empty in `git diff`), cut to both caps.
     pub fn patch(&self, diff: &DiffSummary) -> Result<PatchText> {
-        let raw = self.git(["diff", "--patch"])?;
+        self.patch_at(diff, None)
+    }
+
+    fn patch_at(&self, diff: &DiffSummary, rev: Option<&str>) -> Result<PatchText> {
+        let raw = self.git(["diff", "--patch"].into_iter().chain(rev))?;
         let mut text = String::from_utf8_lossy(&raw.stdout).into_owned();
         for path in &diff.untracked {
             let shown = match std::fs::metadata(self.root.join(path)).map(|m| m.len()) {
@@ -399,6 +476,58 @@ mod tests {
         tree.baseline().unwrap();
         tree.baseline().unwrap(); // nothing to commit: benign, not an error
         assert!(tree.diff().unwrap().is_empty());
+    }
+
+    #[test]
+    fn patch_since_start_spans_every_baseline() {
+        let dir = scratch("since-start");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        tree.ensure().unwrap();
+
+        // Two dispatched batches, each absorbed by its own baseline commit
+        // (the per-Dispatch `tree.baseline()` shape).
+        std::fs::write(dir.join("a.rs"), "two\n").unwrap();
+        tree.baseline().unwrap();
+        std::fs::write(dir.join("b.rs"), "new\n").unwrap();
+        tree.baseline().unwrap();
+        assert!(
+            tree.diff().unwrap().is_empty(),
+            "last baseline absorbed both batches"
+        );
+
+        let (d, p) = tree.patch_since_start().unwrap();
+        assert_eq!(d.changed, vec!["a.rs", "b.rs"]);
+        assert!(
+            p.text.contains("-one") && p.text.contains("+two"),
+            "{}",
+            p.text
+        );
+        assert!(p.text.contains("b/b.rs"), "{}", p.text);
+    }
+
+    #[test]
+    fn ensure_excludes_bytecode_from_commits() {
+        let dir = scratch("bytecode");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.py"), "print(1)\n").unwrap();
+        std::fs::create_dir(dir.join("__pycache__")).unwrap();
+        std::fs::write(dir.join("__pycache__/a.cpython-311.pyc"), "junk\n").unwrap();
+        std::fs::write(dir.join("b.pyc"), "junk\n").unwrap();
+        tree.ensure().unwrap();
+        tree.baseline().unwrap();
+
+        let ls = tree.git(["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        let committed = String::from_utf8_lossy(&ls.stdout).into_owned();
+        assert!(committed.contains("a.py"), "{committed}");
+        assert!(
+            !committed.contains(".pyc") && !committed.contains("__pycache__"),
+            "bytecode reached the commit: {committed}"
+        );
+        assert!(
+            tree.diff().unwrap().is_empty(),
+            "junk stays out of evidence"
+        );
     }
 
     /// One `git diff --patch` fragment per hunk: each file's header lines
