@@ -17,7 +17,7 @@ use snapshot::TreeService;
 use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
-const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--dump-events PATH]
+const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--dump-events PATH]
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget";
 
@@ -34,6 +34,9 @@ struct Args {
     max_tokens: Option<usize>,
     context_files: Vec<String>,
     dump_events: Option<String>,
+    proof_cmd: Option<String>,
+    incentives: agent_loop::IncentivesLevel,
+    bets: bool,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -48,6 +51,9 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut context_files = Vec::new();
     let mut max_tokens: Option<usize> = None;
     let mut budget_tokens: Option<u64> = None;
+    let mut proof_cmd: Option<String> = None;
+    let mut incentives = agent_loop::IncentivesLevel::Full;
+    let mut bets = false;
     let mut i = 2;
     while i < a.len() {
         let flag = a[i];
@@ -106,6 +112,24 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 }
                 actions = Some(n);
             }
+            "--proof-cmd" => {
+                proof_cmd = Some(take(&mut i, inline)?);
+            }
+            "--incentives" => {
+                incentives = match take(&mut i, inline)?.as_str() {
+                    "base" => agent_loop::IncentivesLevel::Base,
+                    "contract" => agent_loop::IncentivesLevel::Contract,
+                    "full" => agent_loop::IncentivesLevel::Full,
+                    other => {
+                        return Err(format!(
+                            "--incentives needs base|contract|full, got {other:?}"
+                        ))
+                    }
+                };
+            }
+            "--bets" => {
+                bets = true;
+            }
             other => return Err(format!("unknown flag {other:?}\n{USAGE}")),
         }
         i += 1;
@@ -122,6 +146,9 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         budget_actions: actions,
         budget_tokens,
         dump_events: dump,
+        proof_cmd,
+        incentives,
+        bets,
     })
 }
 
@@ -212,6 +239,28 @@ struct RunResult {
     events: Vec<AgentEvent>,
 }
 
+/// Opt-in Bet B/A gate (`--bets`): uniform all-or-nothing verdict on the
+/// batch's proof flags (Bet B); with `--proof-cmd` the flags are per-hunk
+/// incremental proofs and [`bets::gate_batch_commit`] keeps the proven
+/// leading prefix (Bet A). Read-only batches carry no hunks — nothing to
+/// gate, so they commit. Bet C (candidate racing) stays flagged: unbuilt.
+struct Gate {
+    incremental: bool,
+}
+
+impl agent_loop::BetsHook for Gate {
+    fn on_post_batch(&self, claim: &bets::Claim, hunks: &[(String, bool)]) -> bets::CommitVerdict {
+        if hunks.is_empty() {
+            return bets::CommitVerdict::Committed;
+        }
+        if self.incremental {
+            bets::gate_batch_commit(claim, hunks)
+        } else {
+            bets::gate_commit(claim, hunks.iter().all(|(_, ok)| *ok))
+        }
+    }
+}
+
 async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     let policy = Arc::new(tools_std::Policy {
         root: args.workdir.clone(),
@@ -237,6 +286,10 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     reg.register(Arc::new(tools_std::test_tool(policy)));
     let mut state = LoopState::new();
     state.budget = budget_for(args);
+    let gate = Gate {
+        incremental: args.proof_cmd.is_some(),
+    };
+    let bets_hook: &dyn agent_loop::BetsHook = if args.bets { &gate } else { &NoBets };
     let mut emitter = Emitter::new();
     let cancel = CancellationToken::new();
     // First Ctrl-C cancels the run; the loop reports Outcome::Cancelled.
@@ -260,12 +313,14 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
             agent: "agent",
             workdir: &args.workdir,
             emitter: &mut emitter,
-            bets: &NoBets as &dyn agent_loop::BetsHook,
+            bets: bets_hook,
             cfg: RunConfig {
                 goal: args.goal.clone(),
                 model: args.model.clone(),
                 context_files: args.context_files.clone(),
                 max_tokens: args.max_tokens.unwrap_or(8_000),
+                incentives: args.incentives,
+                proof_cmd: args.proof_cmd.clone(),
                 ..RunConfig::default()
             },
         },
@@ -280,6 +335,7 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
         .ok()
         .map(|(_, p)| p.text)
         .unwrap_or_default();
+    eprintln!("ablation {:?}", state.ablation);
     eprintln!("events {}", summarize(emitter.history()));
     RunResult {
         outcome,
@@ -389,6 +445,9 @@ mod tests {
                 context_files: vec!["app/a.py".into()],
                 max_tokens: None,
                 dump_events: Some("/tmp/ev.json".into()),
+                bets: false,
+                incentives: agent_loop::IncentivesLevel::Full,
+                proof_cmd: None,
             }
         );
         let b = parse_args(&argv(&[
@@ -632,6 +691,9 @@ mod tests {
             context_files: Vec::new(),
             max_tokens: None,
             dump_events: None,
+            bets: false,
+            incentives: agent_loop::IncentivesLevel::Full,
+            proof_cmd: None,
         }
     }
 

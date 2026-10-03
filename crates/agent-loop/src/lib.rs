@@ -284,6 +284,12 @@ pub struct LoopState {
     /// One-shot latches: the half-cap and near-cap directives fire once each.
     pub half_directive_sent: bool,
     pub late_directive_sent: bool,
+    /// Ablation observability (Bet B→+A→+C): verdict/assessment counters for
+    /// the run-end report. Never drives behavior.
+    pub ablation: bets::AblationMetrics,
+    /// Incentive scaffold level (B→+A→+C ablation): gates the workflow
+    /// contract and the directive channel. Default Full = current behavior.
+    pub incentives: IncentivesLevel,
     pub drain_timeout: Duration,
     pub drain_until: Option<Instant>,
 }
@@ -320,6 +326,8 @@ impl LoopState {
             edits: 0,
             half_directive_sent: false,
             late_directive_sent: false,
+            ablation: bets::AblationMetrics::default(),
+            incentives: IncentivesLevel::Full,
             drain_timeout: Duration::from_secs(30),
             drain_until: None,
         }
@@ -720,6 +728,9 @@ impl LoopState {
 
     /// One queued directive, capped at [`DIRECTIVE_CAP`] (drop-oldest).
     pub fn push_directive(&mut self, text: String) {
+        if self.incentives < IncentivesLevel::Full {
+            return; // ablation arm: the directive channel is off entirely
+        }
         if self.pending_directives.len() >= DIRECTIVE_CAP {
             self.pending_directives.pop_front();
         }
@@ -1309,6 +1320,18 @@ impl BetsHook for NoBets {}
 
 // --- multi-tick run() assembly (headless; sequential, no channels) ---
 
+/// Incentive scaffold level for the B→+A→+C ablation. `Base` ships no
+/// workflow contract and drops the directive channel; `Contract` adds the
+/// static workflow contract; `Full` (default = current behavior) adds the
+/// model-facing directives (cap notices, lessons, rollback notices).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum IncentivesLevel {
+    Base,
+    Contract,
+    #[default]
+    Full,
+}
+
 /// Headless run knobs. `drain_timeout` defaults to 30s (unattended runs must
 /// not wedge on a stuck tool); the context budget reuses v1's 24k evidence
 /// window until the histogram retunes it.
@@ -1321,6 +1344,12 @@ pub struct RunConfig {
     pub context_files: Vec<String>,
     pub drain_timeout: Duration,
     pub log_path: Option<PathBuf>,
+    /// Ablation knob: incentive scaffold level (default [`IncentivesLevel::Full`]).
+    pub incentives: IncentivesLevel,
+    /// Per-hunk incremental proof probe (Bet A): whitespace-argv, no shell,
+    /// run against each leading-prefix tree in `workdir`. `None` = the uniform
+    /// proof flag (the batch's tool results all passed).
+    pub proof_cmd: Option<String>,
 }
 
 impl Default for RunConfig {
@@ -1333,6 +1362,8 @@ impl Default for RunConfig {
             context_files: Vec::new(),
             drain_timeout: Duration::from_secs(30),
             log_path: None,
+            incentives: IncentivesLevel::Full,
+            proof_cmd: None,
         }
     }
 }
@@ -1512,16 +1543,18 @@ fn build_request(
     cfg: &RunConfig,
 ) -> Request {
     let mut asm = context::ContextAssembler::new(cfg.context_budget_chars);
-    asm.add(context::ContextItem {
-        key: context::ItemKey {
-            path: "workflow-contract".into(),
-            region: "contract".into(),
-            role: "system".into(),
-        },
-        fidelity: context::Fidelity::Exact,
-        must_include: true,
-        text: WORKFLOW_CONTRACT.into(),
-    });
+    if cfg.incentives >= IncentivesLevel::Contract {
+        asm.add(context::ContextItem {
+            key: context::ItemKey {
+                path: "workflow-contract".into(),
+                region: "contract".into(),
+                role: "system".into(),
+            },
+            fidelity: context::Fidelity::Exact,
+            must_include: true,
+            text: WORKFLOW_CONTRACT.into(),
+        });
+    }
     // Frozen by `run` at start; the lazy fallback keeps direct callers honest.
     let map_text = state
         .file_map
@@ -1636,6 +1669,48 @@ fn batch_hunks(
         .collect())
 }
 
+/// Per-hunk incremental proof (Bet A): probe every leading prefix against the
+/// tree it actually produces — restore baseline + hunks[0..=k], run `proof_cmd`
+/// (whitespace argv, no shell, 60s kill; timeout/failure = unproven), record
+/// ok_k. The bet gate keeps the proven LEADING prefix
+/// ([`bets::split_savepoint`]); a later hunk that passes after a failing
+/// prefix is not proven against committed state and reverts with the rest.
+/// Leaves the tree at baseline + all hunks (the last prefix); the verdict
+/// mapping below performs the final restore.
+async fn incremental_hunks(
+    tree: &snapshot::TreeService,
+    workdir: &Path,
+    proof_cmd: &str,
+) -> Result<Vec<(String, bool)>, String> {
+    let diff = tree.diff().map_err(|e| format!("snapshot diff: {e}"))?;
+    let patch = tree
+        .patch(&diff)
+        .map_err(|e| format!("snapshot patch: {e}"))?;
+    let hunks = split_patch(&patch);
+    let mut flags = Vec::with_capacity(hunks.len());
+    for k in 0..hunks.len() {
+        tree.restore_hunks(&hunks[..=k])
+            .map_err(|e| format!("snapshot restore: {e}"))?;
+        let mut argv = proof_cmd.split_whitespace();
+        let bin = argv.next().ok_or_else(|| "proof-cmd empty".to_string())?;
+        let ok = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new(bin)
+                .args(argv)
+                .current_dir(workdir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status(),
+        )
+        .await
+        .map(|s| s.is_ok_and(|s| s.success()))
+        .unwrap_or(false);
+        flags.push((hunks[k].clone(), ok));
+    }
+    Ok(flags)
+}
+
 /// Headless multi-tick run on real siblings: [`LlmClient`] provider,
 /// [`tool_core::Registry`] tools, [`BudgetGuard`] step head,
 /// [`snapshot::TreeService`] baseline-per-batch with batch-scope rollback
@@ -1663,6 +1738,7 @@ pub async fn run<P: LlmClient>(
         cfg,
     } = r;
     state.drain_timeout = cfg.drain_timeout;
+    state.incentives = cfg.incentives;
     let root = CancellationToken::new();
     let run_id = state.next_emit_id();
     emitter.emit(AgentEvent::RunStart {
@@ -2050,17 +2126,23 @@ pub async fn run<P: LlmClient>(
                             predicted_verdict: "tool batch results all passed".to_owned(),
                             on_mismatch: "roll back the batch; keep only proven hunks".to_owned(),
                         };
-                        let hunks = match batch_hunks(&tree, !batch_failed) {
-                            Ok(h) => h,
-                            Err(e) => {
-                                return finish_run(
-                                    state,
-                                    writer.as_mut(),
-                                    emitter,
-                                    run_id,
-                                    &mut synced,
-                                    Outcome::Failed(e),
-                                )
+                        let hunks = {
+                            let probe = match &cfg.proof_cmd {
+                                Some(cmd) => incremental_hunks(&tree, workdir, cmd).await,
+                                None => batch_hunks(&tree, !batch_failed),
+                            };
+                            match probe {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    return finish_run(
+                                        state,
+                                        writer.as_mut(),
+                                        emitter,
+                                        run_id,
+                                        &mut synced,
+                                        Outcome::Failed(e),
+                                    )
+                                }
                             }
                         };
                         // Batch scope: only the failed batch rolls back; the
@@ -2107,7 +2189,17 @@ pub async fn run<P: LlmClient>(
                         // runs the existing rollback path again (idempotent).
                         // A restore error fails closed: restore_hunks leaves the
                         // tree at baseline when any fragment does not apply.
-                        match bets.on_post_batch(&claim, &hunks) {
+                        let observation = if batch_failed {
+                            "tool batch results not all passed"
+                        } else {
+                            "tool batch results all passed"
+                        };
+                        state
+                            .ablation
+                            .note_assessment(bets::assess_claim(&claim, observation));
+                        let verdict = bets.on_post_batch(&claim, &hunks);
+                        state.ablation.note_commit(&verdict);
+                        match verdict {
                             bets::CommitVerdict::Committed => {}
                             bets::CommitVerdict::Partial { savepoint } => {
                                 if let Err(e) = tree.restore_hunks(&savepoint.kept_hunks) {
@@ -4550,6 +4642,126 @@ mod tests {
     }
 
     // --- bets site 2: proof-gated post-batch verdicts ---
+
+    #[test]
+    fn incentives_levels_gate_contract_and_directive_channel() {
+        let root = run_tmp("incentives");
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        // Base: no workflow contract in the system string, directives dropped.
+        let cfg = RunConfig {
+            incentives: IncentivesLevel::Base,
+            ..RunConfig::default()
+        };
+        let r = build_request(&mut state, &registry, &root, &cfg);
+        assert!(!r.messages[0].content.contains("WORKFLOW CONTRACT"));
+        state.incentives = IncentivesLevel::Base;
+        state.push_directive("go".into());
+        assert!(state.pending_directives.is_empty(), "Base drops directives");
+        // Contract: contract on, directives still off.
+        let cfg = RunConfig {
+            incentives: IncentivesLevel::Contract,
+            ..RunConfig::default()
+        };
+        let r = build_request(&mut state, &registry, &root, &cfg);
+        assert!(r.messages[0].content.contains("WORKFLOW CONTRACT"));
+        state.incentives = IncentivesLevel::Contract;
+        state.push_directive("go".into());
+        assert!(
+            state.pending_directives.is_empty(),
+            "Contract drops directives"
+        );
+        // Full (default = current behavior): both live.
+        state.incentives = IncentivesLevel::Full;
+        state.push_directive("go".into());
+        assert_eq!(state.pending_directives.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Bet A gate (mirror of rof's `Gate`): keep the proven leading prefix.
+    struct GateBatch;
+
+    impl BetsHook for GateBatch {
+        fn on_post_batch(
+            &self,
+            claim: &bets::Claim,
+            hunks: &[(String, bool)],
+        ) -> bets::CommitVerdict {
+            bets::gate_batch_commit(claim, hunks)
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_proof_keeps_the_proven_leading_prefix() {
+        let root = run_tmp("incremental");
+        std::fs::write(root.join("a.rs"), "one\n").unwrap();
+        std::fs::write(root.join("b.rs"), "two\n").unwrap();
+        // Probe: a b.rs containing "BAD" fails. Prefix 1 (a.rs only) passes,
+        // prefix 2 (both) fails -> flags [true, false] -> Partial keeps a.rs.
+        std::fs::write(
+            root.join("probe.py"),
+            "import pathlib, sys\nsys.exit(1 if 'BAD' in pathlib.Path('b.rs').read_text() else 0)\n",
+        )
+        .unwrap();
+        let client = ScriptClient {
+            order: Arc::new(Mutex::new(Vec::new())),
+            requests: Default::default(),
+            queue: Mutex::new(VecDeque::from([
+                script_resp(
+                    vec![
+                        (
+                            "c1",
+                            "write",
+                            serde_json::json!({"path": "a.rs", "content": "A2\n"}),
+                        ),
+                        (
+                            "c2",
+                            "write",
+                            serde_json::json!({"path": "b.rs", "content": "BAD\n"}),
+                        ),
+                    ],
+                    StopReason::ToolUse,
+                ),
+                text_resp("done"),
+            ])),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &GateBatch,
+                cfg: RunConfig {
+                    proof_cmd: Some("python3 probe.py".into()),
+                    ..RunConfig::default()
+                },
+            },
+            vec![Input::User("go".into())],
+            &cancel,
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "A2\n",
+            "proven hunk stays"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.rs")).unwrap(),
+            "two\n",
+            "refuted hunk reverts"
+        );
+        assert_eq!(state.ablation.proven_hunks, 1);
+        assert_eq!(state.ablation.rollbacks, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// Verdict hook: keeps only the batch's first hunk, reverts the rest.
     struct PartialFirst;
