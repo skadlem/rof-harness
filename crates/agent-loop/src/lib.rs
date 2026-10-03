@@ -229,6 +229,9 @@ pub struct LoopState {
     pub step: u32,
     pub phase: Phase,
     pub items: Vec<Item>,
+    /// File map frozen at run start (prefix-cache head): mid-run edits must
+    /// not rotate the system-message bytes, so `build_request` never re-walks.
+    pub file_map: Option<String>,
     pub steering: VecDeque<QueuedInput>,
     pub followups: VecDeque<String>,
     pub wake_requested: bool,
@@ -269,6 +272,7 @@ impl LoopState {
             step: 0,
             phase: Phase::Idle,
             items: Vec::new(),
+            file_map: None,
             steering: VecDeque::new(),
             followups: VecDeque::new(),
             wake_requested: false,
@@ -1399,32 +1403,44 @@ fn close_hopped_turn(
     true
 }
 
-/// Static workflow contract: budgets remaining plus the read→edit→finish
-/// obligations the transcript alone does not state. Rides ahead of the file
-/// map so the contract never rotates out and the map keeps a stable tail.
-fn workflow_contract(state: &LoopState) -> String {
+/// Static workflow contract: the read→edit→finish obligations the transcript
+/// alone does not state. Byte-identical for the whole run. Live budget digits
+/// must not appear here: the system message is the cached-prefix head, and a
+/// changing head invalidates the provider's prefix cache every request. The
+/// counters ride the request tail instead (see [`build_request`]).
+const WORKFLOW_CONTRACT: &str = "WORKFLOW CONTRACT\n\
+    budgets remaining are printed on the last line of the newest message; read them there.\n\
+    tool results older than the last 5 are collapsed to one line; re-open a file immediately before editing it.\n\
+    work file-by-file: view -> edit immediately -> next file. `edit` and `write` are the ONLY patch mechanisms — never write files via exec; exec/test are for checks only.\n\
+    when your patch is complete, reply with a text message and NO tool calls — that finishes the run.";
+
+/// Live counters, request-scoped: appended to the final outgoing message after
+/// the transcript is derived, so they are never persisted.
+fn budget_line(state: &LoopState) -> String {
     let cfg = state.budget.config();
     let counters = state.budget.counters();
     format!(
-        "WORKFLOW CONTRACT\n\
-         budgets remaining: steps {}/{}; actions {}/{}; tokens {}/{}\n\
-         tool results older than the last 5 are collapsed to one line; re-open a file immediately before editing it.\n\
-         work file-by-file: view -> edit immediately -> next file. `edit` and `write` are the ONLY patch mechanisms — never write files via exec; exec/test are for checks only.\n\
-         when your patch is complete, reply with a text message and NO tool calls — that finishes the run.",
+        "budgets remaining: steps {}/{}; actions {}/{}; tokens {}/{}",
         cfg.max_steps.get().saturating_sub(counters.steps),
         cfg.max_steps,
-        cfg.actions_per_trial.saturating_sub(counters.actions_this_trial),
+        cfg.actions_per_trial
+            .saturating_sub(counters.actions_this_trial),
         cfg.actions_per_trial,
         cfg.max_tokens.saturating_sub(counters.tokens),
         cfg.max_tokens,
     )
 }
 
-/// Prompt build: workflow contract + file map (cached-prefix head) + named
-/// files as volatiles (delivered last), fitted to `context_budget_chars` in
-/// the system string. History is delivered exactly once, raw, as messages
-/// (collapse-5 rides [`LoopState::derived_messages`]) — never fitted into the
-/// system copy. Never summarizes.
+/// Prompt build: static workflow contract + run-start file map (cached-prefix
+/// head) + named files as volatiles (delivered last), fitted to
+/// `context_budget_chars` in the system string. Every byte of that head is
+/// frozen for the run — DeepSeek-style prefix caching only fires on
+/// byte-identical prefixes. The live budget line is the sole per-request
+/// variation: it is appended to the last outgoing message only and never to
+/// the transcript, so the durable log stays exactly what was recorded. History
+/// is delivered exactly once, raw, as messages (collapse-5 rides
+/// [`LoopState::derived_messages`]) — never fitted into the system copy. Never
+/// summarizes.
 fn build_request(
     state: &mut LoopState,
     registry: &tool_core::Registry,
@@ -1440,9 +1456,13 @@ fn build_request(
         },
         fidelity: context::Fidelity::Exact,
         must_include: true,
-        text: workflow_contract(state),
+        text: WORKFLOW_CONTRACT.into(),
     });
-    let map_text = context::file_map(workdir, 200).join("\n");
+    // Frozen by `run` at start; the lazy fallback keeps direct callers honest.
+    let map_text = state
+        .file_map
+        .get_or_insert_with(|| context::file_map(workdir, 200).join("\n"))
+        .clone();
     asm.add(context::ContextItem {
         key: context::ItemKey {
             path: "file-map".into(),
@@ -1475,6 +1495,12 @@ fn build_request(
         thinking: None,
     }];
     messages.extend(state.derived_messages()); // once: raw history, collapse-5 intact
+
+    // Prefix-cache tail: the only per-request bytes. Never persisted.
+    if let Some(last) = messages[1..].last_mut() {
+        last.content.push('\n');
+        last.content.push_str(&budget_line(state));
+    }
     Request {
         messages,
         tools: registry.definitions(),
@@ -1643,6 +1669,9 @@ pub async fn run<P: LlmClient>(
         });
         return o;
     }
+    // Prefix-cache head: freeze the file map once, before the first request;
+    // mid-run edits must not rotate the system message.
+    state.file_map = Some(context::file_map(workdir, 200).join("\n"));
     loop {
         if cancel.is_cancelled() {
             state.stop_hard = true;
@@ -2711,20 +2740,30 @@ mod tests {
     }
 
     #[test]
-    fn build_request_contract_precedes_map_with_live_budgets() {
+    fn build_request_system_is_static_and_budgets_ride_the_tail() {
         let root = run_tmp("contract");
         std::fs::write(root.join("a.rs"), "v1\n").unwrap();
         let registry = run_registry(&root);
         let mut state = LoopState::new();
+        state.phase = Phase::Running;
+        state.apply_input(Input::User("build it".into()));
+        state.admit_steering();
         state.budget.counters_mut().steps = 3;
         state.budget.counters_mut().actions_this_trial = 5;
         state.budget.counters_mut().tokens = 100;
-        let req = build_request(&mut state, &registry, &root, &RunConfig::default());
-        assert_eq!(req.messages[0].role, "system");
-        let sys = &req.messages[0].content;
+        let r1 = build_request(&mut state, &registry, &root, &RunConfig::default());
+        // Mid-run edit + moved counters: neither may rotate the cached head.
+        std::fs::write(root.join("b.rs"), "new\n").unwrap();
+        state.budget.counters_mut().steps = 4;
+        state.budget.counters_mut().actions_this_trial = 6;
+        state.budget.counters_mut().tokens = 300;
+        let r2 = build_request(&mut state, &registry, &root, &RunConfig::default());
+
+        assert_eq!(r1.messages[0].role, "system");
+        let sys = &r1.messages[0].content;
         assert!(sys.starts_with("--- workflow-contract"), "{sys}");
         for needle in [
-            "budgets remaining: steps 17/20; actions 25/30; tokens 49900/50000",
+            "budgets remaining are printed on the last line of the newest message; read them there.",
             "tool results older than the last 5 are collapsed to one line; re-open a file immediately before editing it.",
             "work file-by-file: view -> edit immediately -> next file.",
             "`edit` and `write` are the ONLY patch mechanisms — never write files via exec; exec/test are for checks only.",
@@ -2733,9 +2772,37 @@ mod tests {
             assert!(sys.contains(needle), "missing {needle:?} in {sys}");
         }
         assert!(
+            !sys.contains("budgets remaining:"),
+            "live digits in system: {sys}"
+        );
+        assert!(
             sys.contains("--- file-map") && sys.contains("a.rs"),
             "{sys}"
         );
+        assert!(!sys.contains("b.rs"), "map froze at run start: {sys}");
+        assert_eq!(sys, &r2.messages[0].content);
+        assert_eq!(r1.messages.len(), 2); // system + the one input
+
+        // Identical prefix up to the final (budget-carrying) message.
+        for (m1, m2) in r1.messages[..r1.messages.len() - 1]
+            .iter()
+            .zip(&r2.messages[..r2.messages.len() - 1])
+        {
+            assert_eq!(format!("{m1:?}"), format!("{m2:?}"));
+        }
+        assert_eq!(
+            r1.messages.last().unwrap().content,
+            "build it\nbudgets remaining: steps 17/20; actions 25/30; tokens 49900/50000"
+        );
+        assert_eq!(
+            r2.messages.last().unwrap().content,
+            "build it\nbudgets remaining: steps 16/20; actions 24/30; tokens 49700/50000"
+        );
+        // Request-scoped only: the durable transcript never carries counters.
+        assert!(!state
+            .items
+            .iter()
+            .any(|i| format!("{:?}", i.kind).contains("budgets remaining")));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3576,7 +3643,8 @@ mod tests {
             "{:?}",
             reqs[15].messages
         );
-        // Durability: the file row is exactly the row the model saw.
+        // Durability: the file row is exactly the durable row the model saw
+        // (the request-scoped budget line rides the wire copy only).
         let file_items = read_log(&log_path).unwrap();
         assert!(file_items.iter().any(|i| matches!(
             &i.kind,
@@ -3931,7 +3999,7 @@ mod tests {
             let id = format!("c{i}");
             let path = format!("f{i}.txt");
             // Unique marker: the generic "step" would substring-match the
-            // contract's "steps remaining" budget line.
+            // "steps N/M" budget tail on every request.
             let mut resp = script_resp(
                 vec![(
                     id.as_str(),
@@ -4020,7 +4088,13 @@ mod tests {
             "[collapsed: 12b — re-open to edit] wrote f2.txt"
         );
         assert_eq!(content_of("c3"), "wrote f3.txt");
-        assert_eq!(content_of("c7"), "wrote f7.txt");
+        // c7 is the request's final message: the request-scoped budget line
+        // rides its tail, so only the durable part matches exactly.
+        assert!(
+            content_of("c7").starts_with("wrote f7.txt\nbudgets remaining:"),
+            "{:?}",
+            content_of("c7")
+        );
         // Collapse-5 collapses tool observations only: every assistant turn
         // still carries its reasoning into the 8th request.
         for i in 1..=7 {
@@ -4034,6 +4108,82 @@ mod tests {
             assert_eq!(got, Some(want.as_str()), "reasoning lost for step {i}");
         }
         assert!(check_pairing(emitter.history()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Prefix-cache stability end to end: the system head is byte-identical
+    /// across requests and frozen at run start, and the only per-request bytes
+    /// are the live budgets on the final message.
+    #[tokio::test]
+    async fn run_system_prefix_is_static_and_file_map_frozen() {
+        let root = run_tmp("prefix");
+        std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+        let client = ScriptClient {
+            order: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            queue: Mutex::new(VecDeque::from([
+                script_resp(
+                    vec![(
+                        "w1",
+                        "write",
+                        serde_json::json!({"path": "b.rs", "content": "new\n"}),
+                    )],
+                    StopReason::ToolUse,
+                ),
+                script_resp(
+                    vec![("r1", "read", serde_json::json!({"n": 1}))],
+                    StopReason::ToolUse,
+                ),
+                text_resp("done"),
+            ])),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("go".into())],
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        assert!(root.join("b.rs").exists(), "mid-run write happened");
+        let reqs = client.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        // File map frozen at run start: b.rs was written mid-run and never
+        // shows up; the head bytes match across all requests.
+        let sys = &reqs[0].messages[0].content;
+        assert!(sys.contains("a.rs") && !sys.contains("b.rs"), "{sys}");
+        assert_eq!(sys, &reqs[1].messages[0].content);
+        assert_eq!(sys, &reqs[2].messages[0].content);
+        // Identical prefix up to each request's final message, the only one
+        // the budget line touches.
+        for pair in reqs.windows(2) {
+            let head = &pair[0].messages[..pair[0].messages.len() - 1];
+            assert!(pair[1].messages.len() > head.len(), "request lost history");
+            for (m1, m2) in head.iter().zip(&pair[1].messages) {
+                assert_eq!(format!("{m1:?}"), format!("{m2:?}"), "prefix rotated");
+            }
+        }
+        // Fresh counters on the tail of every request: one step per call, one
+        // action per executed tool, 15 tokens metered per settle.
+        for (req, tail) in reqs.iter().zip([
+            "budgets remaining: steps 19/20; actions 30/30; tokens 50000/50000",
+            "budgets remaining: steps 18/20; actions 29/30; tokens 49985/50000",
+            "budgets remaining: steps 17/20; actions 28/30; tokens 49970/50000",
+        ]) {
+            let last = &req.messages.last().unwrap().content;
+            assert!(last.ends_with(tail), "{last:?} must end with {tail:?}");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
