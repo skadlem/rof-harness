@@ -78,9 +78,25 @@ pub struct AgentError {
     pub message: String,
 }
 
+/// Live token/cost report: one settle's usage (`MessageEnd.usage`) or the run
+/// totals so far (`TurnEnd.usage_totals`). `reasoning_tokens`/`cost_usd`
+/// mirror provider-core `Usage`: `None` = the provider reported nothing,
+/// never a coerced zero. Live-event-only — the durable log vocabulary is
+/// unchanged.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct UsageReport {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub reasoning_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
+}
+
 /// The live vocabulary. Flat, tagged, serializable: one enum, one emission seam.
 /// Partials are never authoritative; the terminal frame is mandatory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is absent because `UsageReport.cost_usd` is an `f64`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AgentEvent {
     RunStart {
@@ -97,6 +113,9 @@ pub enum AgentEvent {
     TurnEnd {
         turn: TurnId,
         reason: TurnEndReason,
+        /// Cumulative over the run so far, not just this turn.
+        #[serde(default)]
+        usage_totals: UsageReport,
     },
     MessageStart {
         id: MessageId,
@@ -112,6 +131,8 @@ pub enum AgentEvent {
         id: MessageId,
         message: Message,
         interrupted: bool,
+        /// This settle's provider usage; `None` = the provider reported none.
+        usage: Option<UsageReport>,
     },
     ToolStart {
         id: ToolCallId,
@@ -251,6 +272,16 @@ mod tests {
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
+    fn report() -> UsageReport {
+        UsageReport {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 2,
+            reasoning_tokens: Some(1),
+            cost_usd: Some(0.01),
+        }
+    }
+
     fn all_variants() -> Vec<AgentEvent> {
         vec![
             AgentEvent::RunStart {
@@ -268,6 +299,7 @@ mod tests {
             AgentEvent::TurnEnd {
                 turn: 0,
                 reason: TurnEndReason::Completed,
+                usage_totals: report(),
             },
             AgentEvent::MessageStart {
                 id: 0,
@@ -295,6 +327,7 @@ mod tests {
                     content: "hi".to_string(),
                 },
                 interrupted: false,
+                usage: Some(report()),
             },
             AgentEvent::ToolStart {
                 id: "c1".to_string(),
@@ -357,6 +390,7 @@ mod tests {
                     content: "hi".to_string(),
                 },
                 interrupted: false,
+                usage: None,
             },
             AgentEvent::ToolStart {
                 id: "c1".to_string(),
@@ -371,6 +405,7 @@ mod tests {
             AgentEvent::TurnEnd {
                 turn: 0,
                 reason: TurnEndReason::Completed,
+                usage_totals: UsageReport::default(),
             },
             AgentEvent::RunEnd {
                 outcome: RunOutcome::Passed,
@@ -398,6 +433,7 @@ mod tests {
                 content: String::new()
             },
             interrupted: true,
+            usage: None,
         }]));
         good.remove(7);
         assert!(!check_pairing(&good));
@@ -428,8 +464,26 @@ mod tests {
         bus.emit(AgentEvent::TurnEnd {
             turn: 1,
             reason: TurnEndReason::Aborted,
+            usage_totals: UsageReport::default(),
         });
         assert_eq!(bus.history().len(), 4);
         assert_eq!(*seen.lock().unwrap(), 4);
+    }
+
+    #[test]
+    fn pre_usage_dump_lines_still_deserialize() {
+        // Dumps written before the usage fields keep parsing: `usage` is an
+        // Option (serde fills None) and `usage_totals` carries serde(default).
+        let end: AgentEvent = serde_json::from_str(
+            r#"{"type":"MessageEnd","id":1,"message":{"role":"Assistant","content":"hi"},"interrupted":false}"#,
+        )
+        .unwrap();
+        assert!(matches!(end, AgentEvent::MessageEnd { usage: None, .. }));
+        let turn: AgentEvent =
+            serde_json::from_str(r#"{"type":"TurnEnd","turn":1,"reason":"Completed"}"#).unwrap();
+        let AgentEvent::TurnEnd { usage_totals, .. } = turn else {
+            panic!("expected TurnEnd");
+        };
+        assert_eq!(usage_totals, UsageReport::default());
     }
 }

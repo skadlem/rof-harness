@@ -14,12 +14,20 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointProfile {
     pub emission_threshold_chars: usize,
+    /// Exact JSON fragment merged into the request body to switch thinking
+    /// off. DeepSeek's measured knob is `{"thinking":{"type":"disabled"}}`;
+    /// `enable_thinking` and `reasoning_effort` are ignored there (live probe,
+    /// api.deepseek.com deepseek-flash). None = no known knob: the ladder
+    /// skips the rung instead of sending a placebo.
+    #[serde(default)]
+    pub thinking_off: Option<serde_json::Value>,
 }
 
 impl Default for EndpointProfile {
     fn default() -> Self {
         Self {
             emission_threshold_chars: 12_000,
+            thinking_off: Some(serde_json::json!({"thinking": {"type": "disabled"}})),
         }
     }
 }
@@ -58,12 +66,16 @@ impl OpenAiCompat {
 impl LlmClient for OpenAiCompat {
     async fn complete(&self, model: &str, req: &Request) -> Result<Response, LlmError> {
         let t = Instant::now();
-        let mut knobs = WireKnobs::from_req(req);
+        let mut knobs = WireKnobs::from_req(req, &self.profile);
         // ponytail: retry lives here, not in every caller. Free tiers 429 often.
         // Cold-start extension: 503s get up to 8 attempts with 60s sleeps
-        // (~4 min, covers Modal scale-from-zero); everything else keeps 5.
+        // (~4 min, covers Modal scale-from-zero); other retryable errors keep
+        // 5; truncated attempts follow the ladder until it has no rung left.
         let mut last_err = "no attempts".to_string();
         let mut last_after: Option<Duration> = None;
+        // Failed attempts are billed too: sum what each carried so the error
+        // path can meter every re-send of the ladder.
+        let mut usage_acc: Option<Usage> = None;
         let mut attempt = 0u32;
         loop {
             if attempt > 0 {
@@ -84,28 +96,32 @@ impl LlmClient for OpenAiCompat {
                 }
                 Err(f) => {
                     last_err = f.msg.clone();
+                    usage_acc = merge_usage(usage_acc, f.usage.map(|u| *u));
                     if !f.retryable {
                         break;
                     }
-                    let cap = if is_cold_start(&f.msg) { 7 } else { 4 };
-                    if attempt >= cap {
-                        break;
-                    }
                     if f.truncated {
-                        if !apply_ladder(&mut knobs, f.content_chars) {
+                        // Ladder rung first: an exhausted ladder stops instead
+                        // of re-sending the identical shape for a 5th time.
+                        if !apply_ladder(&mut knobs, f.content_chars, f.reasoning_chars) {
                             break;
                         }
                         last_after = f.after;
                     } else {
+                        let cap = if is_cold_start(&f.msg) { 7 } else { 4 };
+                        if attempt >= cap {
+                            break;
+                        }
                         last_after = f.after;
                     }
                 }
             }
             attempt += 1;
         }
-        // unreachable-looking tail kept for structure; loop always breaks to err
-        #[allow(unreachable_code)]
-        Err(LlmError::Transport(last_err))
+        Err(LlmError::Metered {
+            source: last_err,
+            usage: usage_acc,
+        })
     }
 
     fn capabilities(&self, _model: &str) -> Capabilities {
@@ -123,62 +139,47 @@ impl LlmClient for OpenAiCompat {
 #[derive(Debug, Clone)]
 struct WireKnobs {
     max_tokens: usize,
-    reasoning_effort: Option<String>,
-    enable_thinking: Option<bool>,
-    reasoning: Option<bool>,
-    roomier: bool,
-    shrunk: bool,
+    /// Endpoint's thinking-off fragment, if it has a real one.
+    thinking_off: Option<serde_json::Value>,
+    thinking_suppressed: bool,
 }
 
 impl WireKnobs {
-    fn from_req(req: &Request) -> Self {
-        // Thinking::Off is already the strongest rung: start reasoning-off so
-        // the ladder only has roomier/shrink left. Auto starts unshaped.
-        let reasoning = matches!(req.thinking, provider_core::Thinking::Off).then_some(false);
+    fn from_req(req: &Request, profile: &EndpointProfile) -> Self {
+        // Thinking::Off applies the endpoint's real suppression knob up front;
+        // the ladder then only has token-raising left for that call.
+        let thinking_off = profile.thinking_off.clone();
+        let thinking_suppressed =
+            matches!(req.thinking, provider_core::Thinking::Off) && thinking_off.is_some();
         Self {
             max_tokens: req.max_tokens,
-            reasoning_effort: None,
-            enable_thinking: None,
-            reasoning,
-            roomier: false,
-            shrunk: false,
+            thinking_off,
+            thinking_suppressed,
         }
     }
 }
 
-/// Cheapest-quality rungs first; roomier only when content shipped, shrink
-/// terminal on the zero-content sequence. Returns whether a reshape applied.
-fn apply_ladder(k: &mut WireKnobs, content_chars: usize) -> bool {
-    if k.reasoning_effort.is_none() && k.enable_thinking.is_none() && k.reasoning.is_none() {
-        k.reasoning_effort = Some("low".to_string());
+/// Ceiling the overflow ladder may raise `max_tokens` to. Chosen (no anchor):
+/// bounds one ladder's spend; the ladder unit test pins the bound.
+const MAX_TOKENS_CEILING: usize = 32_768;
+
+/// Cheapest-first reshape for one truncated (`finish_reason=length`) attempt.
+/// Overflow needs room, never less of it: (1) thinking off — reasoning ate
+/// the whole budget (content=0, reasoning>0) and the endpoint has a real
+/// knob, applied once; (2) raise `max_tokens` — double, ceiling-bounded.
+/// Returns whether a reshape applied; false ends the ladder.
+fn apply_ladder(k: &mut WireKnobs, content_chars: usize, reasoning_chars: usize) -> bool {
+    if !k.thinking_suppressed
+        && content_chars == 0
+        && reasoning_chars > 0
+        && k.thinking_off.is_some()
+    {
+        k.thinking_suppressed = true;
         return true;
     }
-    if k.enable_thinking.is_none() && k.reasoning.is_none() {
-        k.enable_thinking = Some(false);
-        return true;
-    }
-    if k.reasoning.is_none() {
-        // Exclusive: gateways reject contradictory knob combos, so the
-        // strongest rung travels alone.
-        k.reasoning = Some(false);
-        k.reasoning_effort = None;
-        k.enable_thinking = None;
-        return true;
-    }
-    if !k.roomier && content_chars > 0 {
-        k.roomier = true;
-        k.max_tokens = k.max_tokens.saturating_mul(2);
-        k.reasoning_effort = None;
-        k.enable_thinking = None;
-        k.reasoning = None;
-        return true;
-    }
-    if content_chars == 0 && !k.shrunk && k.max_tokens > 1024 {
-        k.shrunk = true;
-        k.max_tokens = (k.max_tokens / 2).max(1024);
-        k.reasoning = Some(false);
-        k.reasoning_effort = None;
-        k.enable_thinking = None;
+    let raised = k.max_tokens.saturating_mul(2).min(MAX_TOKENS_CEILING);
+    if raised > k.max_tokens {
+        k.max_tokens = raised;
         return true;
     }
     false
@@ -218,14 +219,12 @@ fn wire_body(model: &str, req: &Request, k: &WireKnobs) -> serde_json::Value {
         "messages": messages,
         "max_tokens": k.max_tokens,
     });
-    if let Some(e) = &k.reasoning_effort {
-        b["reasoning_effort"] = serde_json::Value::String(e.clone());
-    }
-    if let Some(t) = k.enable_thinking {
-        b["enable_thinking"] = serde_json::Value::Bool(t);
-    }
-    if let Some(r) = k.reasoning {
-        b["reasoning"] = serde_json::Value::Bool(r);
+    if k.thinking_suppressed {
+        if let Some(frag) = k.thinking_off.as_ref().and_then(|f| f.as_object()) {
+            for (kk, vv) in frag {
+                b[kk.as_str()] = vv.clone();
+            }
+        }
     }
     if !req.tools.is_empty() {
         let tools: Vec<serde_json::Value> = req
@@ -258,6 +257,10 @@ struct OnceFail {
     retryable: bool,
     truncated: bool,
     content_chars: usize,
+    reasoning_chars: usize,
+    /// Usage the failed response carried; summed across attempts in `complete`.
+    /// Boxed: keeps the `Result` small (the failure path is cold).
+    usage: Option<Box<Usage>>,
 }
 
 impl OpenAiCompat {
@@ -272,6 +275,8 @@ impl OpenAiCompat {
                 retryable: false,
                 truncated: false,
                 content_chars: 0,
+                reasoning_chars: 0,
+                usage: None,
             })?
             .api_key;
         let mut call = self
@@ -290,6 +295,8 @@ impl OpenAiCompat {
                 retryable: true,
                 truncated: false,
                 content_chars: 0,
+                reasoning_chars: 0,
+                usage: None,
             })?;
         if !resp.status().is_success() {
             let code = resp.status();
@@ -307,12 +314,19 @@ impl OpenAiCompat {
                     | provider_core::ErrorClass::Overload
                     | provider_core::ErrorClass::AuthStale
             );
+            // Some gateways bill and report usage on an error body; carry it.
+            let usage = serde_json::from_str::<ChatResp>(&text)
+                .ok()
+                .and_then(|r| wire_usage(r.usage))
+                .map(Box::new);
             return Err(OnceFail {
                 msg,
                 after,
                 retryable,
                 truncated: false,
                 content_chars: 0,
+                reasoning_chars: 0,
+                usage,
             });
         }
         let v: serde_json::Value = resp.json().await.map_err(|e| OnceFail {
@@ -321,10 +335,11 @@ impl OpenAiCompat {
             retryable: true,
             truncated: false,
             content_chars: 0,
+            reasoning_chars: 0,
+            usage: None,
         })?;
-        parse_body(&v, model, k.max_tokens).map_err(|msg| {
+        parse_body(&v, model, k.max_tokens).map_err(|BodyFail { msg, usage }| {
             let truncated = msg.contains("finish_reason=length");
-            let content_chars = truncated_content_chars(&msg);
             let retryable = if truncated {
                 true
             } else {
@@ -336,14 +351,37 @@ impl OpenAiCompat {
                 )
             };
             OnceFail {
+                content_chars: chars_after(&msg, "; content="),
+                reasoning_chars: chars_after(&msg, "; reasoning_content="),
                 msg,
                 after: None,
                 retryable,
                 truncated,
-                content_chars,
+                usage: usage.map(Box::new),
             }
         })
     }
+}
+
+/// Fold a failed attempt's usage into the running total. Attempts are
+/// independent requests, so billed tokens sum; `reasoning` stays a subset of
+/// `output` because both fields are summed the same way.
+fn merge_usage(acc: Option<Usage>, next: Option<Usage>) -> Option<Usage> {
+    let Some(next) = next else { return acc };
+    let Some(mut acc) = acc else {
+        return Some(next);
+    };
+    acc.input = acc.input.saturating_add(next.input);
+    acc.output = acc.output.saturating_add(next.output);
+    acc.cache_read = acc.cache_read.saturating_add(next.cache_read);
+    acc.cache_write = acc.cache_write.saturating_add(next.cache_write);
+    if let Some(r) = next.reasoning {
+        acc.reasoning = Some(acc.reasoning.unwrap_or(0).saturating_add(r));
+    }
+    if let Some(c) = next.cost_usd {
+        acc.cost_usd = Some(acc.cost_usd.unwrap_or(0.0) + c);
+    }
+    Some(acc)
 }
 
 /// 503 from serverless GPU endpoints usually means cold start (scale-from-zero
@@ -353,11 +391,13 @@ fn is_cold_start(msg: &str) -> bool {
     msg.contains("503")
 }
 
-fn truncated_content_chars(text: &str) -> usize {
-    let Some(i) = text.find("content=") else {
+/// Digits after `marker` in a message (`"; content=4 chars"` -> 4). The
+/// ladder needs the counts to pick its rung.
+fn chars_after(text: &str, marker: &str) -> usize {
+    let Some(i) = text.find(marker) else {
         return 0;
     };
-    let rest = &text[i + "content=".len()..];
+    let rest = &text[i + marker.len()..];
     let end = rest
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
@@ -439,13 +479,44 @@ struct ReasonDetail {
     reasoning_tokens: u64,
 }
 
+/// A failed body parse: the message plus whatever usage the body carried
+/// (a truncated 200 is billed even though its answer is unusable).
+#[derive(Debug)]
+struct BodyFail {
+    msg: String,
+    usage: Option<Usage>,
+}
+
+/// Wire usage -> `Usage`; None when the body shipped no usage object at all.
+/// Never zeros: the budget must not read "unreported" as "free".
+fn wire_usage(u: Option<WireUsage>) -> Option<Usage> {
+    u.map(|u| Usage {
+        input: u.prompt_tokens,
+        output: u.completion_tokens,
+        cache_read: u
+            .prompt_tokens_details
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0),
+        cache_write: 0,
+        reasoning: u
+            .completion_tokens_details
+            .map(|d| d.reasoning_tokens)
+            .filter(|&n| n > 0),
+        cost_usd: None,
+    })
+}
+
 /// Parse one chat/completions body. Truncation and empty answers are errors
 /// (never empty answers): the retry ladder needs the counts to decide.
-fn parse_body(v: &serde_json::Value, model: &str, max_tokens: usize) -> Result<Response, String> {
-    let resp: ChatResp =
-        serde_json::from_value(v.clone()).map_err(|e| format!("bad chat body: {e}"))?;
-    let choice = resp.choices.into_iter().next().ok_or_else(|| {
-        format!("empty content from {model} (finish_reason=None; reasoning_content=0 chars); the endpoint shipped no text")
+fn parse_body(v: &serde_json::Value, model: &str, max_tokens: usize) -> Result<Response, BodyFail> {
+    let resp: ChatResp = serde_json::from_value(v.clone()).map_err(|e| BodyFail {
+        msg: format!("bad chat body: {e}"),
+        usage: None,
+    })?;
+    let wire = wire_usage(resp.usage);
+    let choice = resp.choices.into_iter().next().ok_or_else(|| BodyFail {
+        msg: format!("empty content from {model} (finish_reason=None; reasoning_content=0 chars); the endpoint shipped no text"),
+        usage: wire.clone(),
     })?;
     let finish = choice.finish_reason.clone();
     let text = choice.message.content.clone();
@@ -468,33 +539,28 @@ fn parse_body(v: &serde_json::Value, model: &str, max_tokens: usize) -> Result<R
         thinking: (!reasoning.trim().is_empty()).then_some(reasoning.clone()),
     };
     let stop = infer_stop(finish.as_deref(), &message);
-    let (input, output, cache_read, reasoning_tok) = resp
-        .usage
-        .map(|u| {
-            (
-                u.prompt_tokens,
-                u.completion_tokens,
-                u.prompt_tokens_details
-                    .map(|d| d.cached_tokens)
-                    .unwrap_or(0),
-                u.completion_tokens_details
-                    .map(|d| d.reasoning_tokens)
-                    .filter(|&n| n > 0),
-            )
-        })
+    let (input, output, cache_read, reasoning_tok) = wire
+        .as_ref()
+        .map(|u| (u.input, u.output, u.cache_read, u.reasoning))
         .unwrap_or((0, 0, 0, None));
     if stop == StopReason::MaxTokens {
-        return Err(format!(
-            "output truncated at {max_tokens} tokens (finish_reason=length; content={} chars; reasoning_content={} chars); raise max_tokens",
-            text.trim().len(),
-            reasoning.trim().len()
-        ));
+        return Err(BodyFail {
+            msg: format!(
+                "output truncated at {max_tokens} tokens (finish_reason=length; content={} chars; reasoning_content={} chars); raise max_tokens",
+                text.trim().len(),
+                reasoning.trim().len()
+            ),
+            usage: wire,
+        });
     }
     if text.trim().is_empty() && message.tool_calls.is_empty() {
-        return Err(format!(
-            "empty content from {model} (finish_reason={finish:?}; reasoning_content={} chars); the endpoint shipped no text",
-            reasoning.trim().len()
-        ));
+        return Err(BodyFail {
+            msg: format!(
+                "empty content from {model} (finish_reason={finish:?}; reasoning_content={} chars); the endpoint shipped no text",
+                reasoning.trim().len()
+            ),
+            usage: wire,
+        });
     }
     Ok(Response {
         message,
@@ -582,7 +648,11 @@ mod tests {
             thinking: Thinking::Auto,
             extras: serde_json::Value::Null,
         };
-        let b = wire_body("m", &req, &WireKnobs::from_req(&req));
+        let b = wire_body(
+            "m",
+            &req,
+            &WireKnobs::from_req(&req, &EndpointProfile::default()),
+        );
         assert_eq!(b["messages"][0]["tool_calls"][0]["id"], "c1");
         assert_eq!(b["messages"][0]["tool_calls"][0]["type"], "function");
         assert_eq!(b["messages"][1]["tool_call_id"], "c1");
@@ -591,7 +661,7 @@ mod tests {
     #[test]
     fn request_mapping_snapshot_incl_tools() {
         let req = req_with_tool();
-        let k = WireKnobs::from_req(&req);
+        let k = WireKnobs::from_req(&req, &EndpointProfile::default());
         let b = wire_body("m", &req, &k);
         assert_eq!(b["model"], "m");
         assert_eq!(b["messages"].as_array().unwrap().len(), 2);
@@ -602,12 +672,19 @@ mod tests {
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "read");
         assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
-        assert!(b.get("reasoning").is_none());
-        // Thinking::Off maps to reasoning:false, nothing else.
+        assert!(b.get("thinking").is_none());
+        // Thinking::Off applies the profile's real knob, nothing else.
         let mut off = req.clone();
         off.thinking = Thinking::Off;
-        let b2 = wire_body("m", &off, &WireKnobs::from_req(&off));
-        assert_eq!(b2["reasoning"], false);
+        let b2 = wire_body(
+            "m",
+            &off,
+            &WireKnobs::from_req(&off, &EndpointProfile::default()),
+        );
+        assert_eq!(b2["thinking"]["type"], "disabled");
+        assert!(b2.get("reasoning").is_none());
+        assert!(b2.get("enable_thinking").is_none());
+        assert!(b2.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -667,15 +744,32 @@ mod tests {
             "usage": {"prompt_tokens": 5, "completion_tokens": 64}
         });
         let e = parse_body(&v, "m", 64).unwrap_err();
-        assert!(e.contains("finish_reason=length"), "{e}");
-        assert!(e.contains("content=4 chars"), "{e}");
-        assert!(e.contains("reasoning_content=3 chars"), "{e}");
+        assert!(e.msg.contains("finish_reason=length"), "{}", e.msg);
+        assert!(e.msg.contains("content=4 chars"), "{}", e.msg);
+        assert!(e.msg.contains("reasoning_content=3 chars"), "{}", e.msg);
+        // The billed usage rides the failure, not just the message.
+        let u = e.usage.expect("truncated body carried usage");
+        assert_eq!((u.input, u.output), (5, 64));
         // Empty answer is also an error, never Ok("").
         let empty = serde_json::json!({
             "choices": [{"message": {"content": null}, "finish_reason": "stop"}]
         });
         let e2 = parse_body(&empty, "m", 64).unwrap_err();
-        assert!(e2.contains("empty content"), "{e2}");
+        assert!(e2.msg.contains("empty content"), "{}", e2.msg);
+        assert!(e2.usage.is_none(), "no usage object -> None, never zeros");
+    }
+
+    #[test]
+    fn truncation_message_parses_content_and_reasoning_counts() {
+        let v = serde_json::json!({
+            "choices": [{"message": {"content": "", "reasoning_content": "rrrr"},
+                         "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 8}
+        });
+        let f = parse_body(&v, "m", 64).unwrap_err();
+        assert_eq!(chars_after(&f.msg, "; content="), 0);
+        assert_eq!(chars_after(&f.msg, "; reasoning_content="), 4);
+        assert_eq!(chars_after("no counts here", "; content="), 0);
     }
 
     #[test]
@@ -800,6 +894,17 @@ mod tests {
         .to_string()
     }
 
+    fn trunc_body(content: &str, reasoning: &str) -> String {
+        serde_json::json!({
+            "choices": [{
+                "message": {"content": content, "reasoning_content": reasoning},
+                "finish_reason": "length"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 64}
+        })
+        .to_string()
+    }
+
     fn client_on(endpoint: &str, key_env: &str) -> OpenAiCompat {
         OpenAiCompat::new(endpoint, EndpointProfile::default()).with_key_env(key_env)
     }
@@ -860,6 +965,97 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn complete_ladder_sends_thinking_disabled_on_reasoning_only_truncation() {
+        std::env::set_var("TEST_OAI_KEY_L1", "k");
+        let (ep, bodies) = serve(vec![
+            Canned {
+                status: 200,
+                headers: vec![],
+                body: trunc_body("", "rrrr"),
+            },
+            Canned {
+                status: 200,
+                headers: vec![],
+                body: ok_body("done"),
+            },
+        ]);
+        let c = client_on(&ep, "TEST_OAI_KEY_L1");
+        let mut req = req_with_tool();
+        req.tools.clear();
+        let r = c.complete("m", &req).await.unwrap();
+        assert_eq!(r.attempts, 2);
+        let sent = bodies.lock().unwrap();
+        assert_eq!(sent.len(), 2, "one retry after the thinking-off rung");
+        let b0: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        let b1: serde_json::Value = serde_json::from_str(&sent[1]).unwrap();
+        assert!(b0.get("thinking").is_none());
+        assert_eq!(b1["thinking"]["type"], "disabled");
+        assert_eq!(b1["max_tokens"], 64, "rung 1 never shrinks or raises");
+    }
+
+    #[tokio::test]
+    async fn failed_truncation_error_carries_usage() {
+        std::env::set_var("TEST_OAI_KEY_U1", "k");
+        let (ep, _) = serve(vec![Canned {
+            status: 200,
+            headers: vec![],
+            body: trunc_body("half", ""),
+        }]);
+        let c = client_on(&ep, "TEST_OAI_KEY_U1");
+        let mut req = req_with_tool();
+        req.tools.clear();
+        // At the ceiling no rung applies, so the first failure is final: one send.
+        req.max_tokens = MAX_TOKENS_CEILING;
+        let err = c.complete("m", &req).await.unwrap_err();
+        match err {
+            LlmError::Metered {
+                source,
+                usage: Some(u),
+            } => {
+                assert!(source.contains("finish_reason=length"), "{source}");
+                assert_eq!((u.input, u.output), (5, 64));
+            }
+            other => panic!("expected Metered with usage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_2xx_parseable_usage_is_carried_and_summed_across_retries() {
+        std::env::set_var("TEST_OAI_KEY_U2", "k");
+        let body = serde_json::json!({
+            "error": {"message": "rate limited"},
+            "usage": {"prompt_tokens": 7, "completion_tokens": 0}
+        })
+        .to_string();
+        // Retry-After: 0 keeps the five attempts instant; the server repeats
+        // the last canned reply.
+        let canned: Vec<Canned> = (0..5)
+            .map(|_| Canned {
+                status: 429,
+                headers: vec![("Retry-After".into(), "0".into())],
+                body: body.clone(),
+            })
+            .collect();
+        let (ep, bodies) = serve(canned);
+        let c = client_on(&ep, "TEST_OAI_KEY_U2");
+        let mut req = req_with_tool();
+        req.tools.clear();
+        let err = c.complete("m", &req).await.unwrap_err();
+        assert_eq!(bodies.lock().unwrap().len(), 5, "1 + 4 retries");
+        match err {
+            LlmError::Metered {
+                source,
+                usage: Some(u),
+            } => {
+                assert!(source.contains("429"), "{source}");
+                // Every failed attempt was billed the prompt: the error sums them.
+                assert_eq!(u.input, 35);
+            }
+            other => panic!("expected Metered with usage, got {other:?}"),
+        }
+    }
+
     #[test]
     fn retry_after_both_encodings() {
         assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
@@ -872,43 +1068,76 @@ mod tests {
     }
 
     #[test]
-    fn ladder_climbs_then_roomier_or_shrink() {
-        let mut k = WireKnobs {
-            max_tokens: 1000,
-            reasoning_effort: None,
-            enable_thinking: None,
-            reasoning: None,
-            roomier: false,
-            shrunk: false,
+    fn ladder_thinking_off_first_then_raises_never_shrinks() {
+        let profile = EndpointProfile::default();
+        let mut req = req_with_tool();
+        req.max_tokens = 8_000;
+        let mut k = WireKnobs::from_req(&req, &profile);
+        // Zero-content reasoning overflow: thinking-off first, no token change.
+        assert!(apply_ladder(&mut k, 0, 500));
+        assert!(k.thinking_suppressed);
+        assert_eq!(k.max_tokens, 8_000);
+        // Same failure again: the one-shot rung is spent, so raise (double).
+        assert!(apply_ladder(&mut k, 0, 500));
+        assert_eq!(k.max_tokens, 16_000);
+        assert!(apply_ladder(&mut k, 0, 500));
+        assert_eq!(k.max_tokens, 32_000);
+        assert!(apply_ladder(&mut k, 0, 500));
+        assert_eq!(k.max_tokens, MAX_TOKENS_CEILING, "bounded by the ceiling");
+        assert!(!apply_ladder(&mut k, 0, 500), "no rung left at the ceiling");
+        // Content shipped: thinking is not the culprit, raise immediately.
+        let mut c = WireKnobs::from_req(&req, &profile);
+        assert!(apply_ladder(&mut c, 50, 500));
+        assert!(!c.thinking_suppressed);
+        assert_eq!(c.max_tokens, 16_000);
+        // No real knob for this endpoint: the placebo rung is skipped.
+        let knobless = EndpointProfile {
+            thinking_off: None,
+            ..profile
         };
-        assert!(apply_ladder(&mut k, 50));
-        assert_eq!(k.reasoning_effort.as_deref(), Some("low"));
-        assert!(apply_ladder(&mut k, 50));
-        assert_eq!(k.enable_thinking, Some(false));
-        assert!(apply_ladder(&mut k, 50));
-        assert_eq!(k.reasoning, Some(false));
-        assert!(apply_ladder(&mut k, 50));
-        assert!(k.roomier && k.max_tokens == 2000);
-        // Zero-content path shrinks instead of doubling.
+        let mut n = WireKnobs::from_req(&req, &knobless);
+        assert!(apply_ladder(&mut n, 0, 500));
+        assert!(!n.thinking_suppressed);
+        assert_eq!(n.max_tokens, 16_000);
+        // Degenerate zero budget: no rung may claim progress (no endless ladder).
         let mut z = WireKnobs {
-            max_tokens: 8000,
-            reasoning_effort: None,
-            enable_thinking: None,
-            reasoning: Some(false),
-            roomier: false,
-            shrunk: false,
+            max_tokens: 0,
+            thinking_off: None,
+            thinking_suppressed: true,
         };
-        assert!(apply_ladder(&mut z, 0));
-        assert!(z.shrunk && z.max_tokens == 4000);
-        assert!(!z.roomier);
+        assert!(!apply_ladder(&mut z, 50, 0));
+        assert_eq!(z.max_tokens, 0);
+    }
+
+    #[test]
+    fn ladder_rung_wire_body_sends_thinking_disabled_and_keeps_max_tokens() {
+        let profile = EndpointProfile::default();
+        let req = req_with_tool();
+        let mut k = WireKnobs::from_req(&req, &profile);
+        let before = wire_body("m", &req, &k);
+        assert!(before.get("thinking").is_none());
+        assert!(apply_ladder(&mut k, 0, 12));
+        let after = wire_body("m", &req, &k);
+        assert_eq!(after["thinking"]["type"], "disabled");
+        assert_eq!(after["max_tokens"], 64, "rung 1 spends no extra tokens");
+        // The next rung raises and leaves the knob in place.
+        assert!(apply_ladder(&mut k, 0, 12));
+        let raised = wire_body("m", &req, &k);
+        assert_eq!(raised["thinking"]["type"], "disabled");
+        assert_eq!(raised["max_tokens"], 128);
     }
 
     #[test]
     fn extras_merge_and_profile_threshold_default() {
-        assert_eq!(EndpointProfile::default().emission_threshold_chars, 12_000);
+        let profile = EndpointProfile::default();
+        assert_eq!(profile.emission_threshold_chars, 12_000);
+        assert_eq!(
+            profile.thinking_off.as_ref().unwrap()["thinking"]["type"],
+            "disabled"
+        );
         let mut req = req_with_tool();
         req.extras = serde_json::json!({"temperature": 0});
-        let k = WireKnobs::from_req(&req);
+        let k = WireKnobs::from_req(&req, &profile);
         let b = wire_body("m", &req, &k);
         assert_eq!(b["temperature"], 0);
         let _ = HashMap::<String, String>::new();
