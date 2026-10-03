@@ -37,6 +37,18 @@ const DIRECTIVE_CAP: usize = 3;
 /// transcript.
 const THINKING_KEEP: usize = 2;
 
+/// Echoed-reasoning trim knob: env `THINKING_KEEP` overrides the keep-count
+/// (A/B arm B = a large value echoes everything). Default stays
+/// [`THINKING_KEEP`] (chosen-not-measured; the K=2 A/B validates). Not unit
+/// tested for the env leg (env mutation races under parallel tests); the live
+/// A/B measures the arms directly.
+fn thinking_keep() -> usize {
+    std::env::var("THINKING_KEEP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(THINKING_KEEP)
+}
+
 /// Model-facing notice when one failed tool reverts the whole batch.
 const ROLLBACK_NOTICE: &str = "a tool in your last batch failed and the whole batch was reverted — your successful changes in it are gone; re-apply them";
 
@@ -922,12 +934,12 @@ impl LoopState {
             }
         }
         // Echoed reasoning is trimmed here, before the wire layer sees it:
-        // keep the last THINKING_KEEP assistant rows, blank the older ones.
+        // keep the last thinking_keep() assistant rows, blank the older ones.
         let keep_from = out
             .iter()
             .filter(|m| m.role == "assistant")
             .count()
-            .saturating_sub(THINKING_KEEP);
+            .saturating_sub(thinking_keep());
         for (n, m) in out.iter_mut().filter(|m| m.role == "assistant").enumerate() {
             if n < keep_from {
                 m.thinking = None;
