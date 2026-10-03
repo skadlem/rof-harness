@@ -18,7 +18,8 @@ use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
 const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--allow-cmd CMD...] [--budget-steps N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--dump-events PATH]
---dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH";
+--dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
+--context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget";
 
 #[derive(Debug, PartialEq)]
 struct Args {
@@ -111,6 +112,30 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     })
 }
 
+/// Budget for one run: explicit flags win; context-pinned runs without a
+/// token flag get the pilot default; otherwise the library UnattendedBatch
+/// config (50k tokens).
+fn budget_for(args: &Args) -> BudgetGuard {
+    let mut b = config_for(Capability::UnattendedBatch);
+    if let Some(n) = args.budget_steps {
+        b.max_steps = NonZeroU32::new(n).expect("parse rejects 0");
+        b.warn_steps = b
+            .warn_steps
+            .min(NonZeroU32::new(n.saturating_sub(1).max(1)).expect("max(1) is non-zero"));
+        b.max_refunds = n / 4;
+    }
+    match args.budget_tokens {
+        Some(t) => b.max_tokens = t,
+        // chosen-to-validate: pinned-prefix floor ~4-5k tok/req x 20-30
+        // requests + reasoning completions; validated-or-revised at next pilot.
+        None if args.budget_steps.is_none() && !args.context_files.is_empty() => {
+            b.max_tokens = 200_000
+        }
+        None => {}
+    }
+    BudgetGuard::new(b, Instant::now())
+}
+
 fn resolve_endpoint(flag: Option<&str>, env: Option<&str>) -> Result<String, String> {
     flag.or(env)
         .map(str::to_string)
@@ -195,20 +220,7 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     reg.register(Arc::new(tools_std::exec_tool(policy.clone())));
     reg.register(Arc::new(tools_std::test_tool(policy)));
     let mut state = LoopState::new();
-    if args.budget_steps.is_some() || args.budget_tokens.is_some() {
-        let mut b = config_for(Capability::UnattendedBatch);
-        if let Some(n) = args.budget_steps {
-            b.max_steps = NonZeroU32::new(n).expect("parse rejects 0");
-            b.warn_steps = b
-                .warn_steps
-                .min(NonZeroU32::new(n.saturating_sub(1).max(1)).expect("max(1) is non-zero"));
-            b.max_refunds = n / 4;
-        }
-        if let Some(t) = args.budget_tokens {
-            b.max_tokens = t;
-        }
-        state.budget = BudgetGuard::new(b, Instant::now());
-    }
+    state.budget = budget_for(args);
     let mut emitter = Emitter::new();
     let cancel = CancellationToken::new();
     // First Ctrl-C cancels the run; the loop reports Outcome::Cancelled.
@@ -571,6 +583,23 @@ mod tests {
             max_tokens: None,
             dump_events: None,
         }
+    }
+
+    #[test]
+    fn context_pins_default_budget_and_flags_override() {
+        let dir = Path::new("/tmp/w");
+        assert_eq!(budget_for(&args_for(dir, None)).config().max_tokens, 50_000);
+        let mut pinned = args_for(dir, None);
+        pinned.context_files = vec!["a.py".into()];
+        assert_eq!(budget_for(&pinned).config().max_tokens, 200_000);
+        // Explicit flags win over the pilot default.
+        pinned.budget_tokens = Some(7);
+        assert_eq!(budget_for(&pinned).config().max_tokens, 7);
+        // A step budget also suppresses the token default.
+        pinned.budget_tokens = None;
+        pinned.budget_steps = Some(5);
+        assert_eq!(budget_for(&pinned).config().max_tokens, 50_000);
+        assert_eq!(budget_for(&pinned).config().max_steps.get(), 5);
     }
 
     #[tokio::test]

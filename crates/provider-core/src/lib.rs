@@ -127,6 +127,15 @@ pub enum ErrorClass {
 pub enum LlmError {
     Transport(String),
     AllFailed(String),
+    /// A failure that still carried billed usage (truncated 200 body,
+    /// parseable non-2xx body). `source` is the message `Transport` would
+    /// carry; `usage` sums every failed attempt inside one `complete` call.
+    /// None = the failure reported nothing: never a fabricated zero, so the
+    /// metering loop can tell "unreported" from "free".
+    Metered {
+        source: String,
+        usage: Option<Usage>,
+    },
 }
 
 #[async_trait]

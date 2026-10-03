@@ -20,10 +20,11 @@ use agent_budget::{config_for, halt_name, BudgetGuard, BudgetHalt, Capability, N
 use agent_event::{
     AgentError, AgentEvent, ControlAck, ControlKind, ControlStatus, DeltaKind, Emitter, Message,
     MessageDelta, Role, RunOutcome as EventRunOutcome, TurnEndReason as EventTurnEndReason,
+    UsageReport,
 };
 use agent_log::{InputSource, Item, ItemKind, LogWriter, RecoveryCode, TurnEndReason, LOG_VERSION};
 use provider_core::{
-    AssistantMessage, LlmClient, ProviderMessage, Request, StopReason, Thinking, Usage,
+    AssistantMessage, LlmClient, LlmError, ProviderMessage, Request, StopReason, Thinking, Usage,
 };
 use serde_json::Value;
 use tool_core::{ToolCall, ToolResult};
@@ -178,6 +179,9 @@ pub enum ProviderMsg {
         turn: u64,
         err: String,
         cancelled: bool,
+        /// Usage the failed attempts carried (summed by the adapter). Metered
+        /// by `finish_provider_msg`: a failed ladder is still billed spend.
+        usage: Option<Usage>,
     },
 }
 
@@ -236,6 +240,9 @@ pub struct LoopState {
     pub stop_when_idle: bool,
     pub turn_reason: Option<TurnEndReason>,
     pub budget: BudgetGuard,
+    /// Live running totals for `TurnEnd.usage_totals`, cumulative over the
+    /// run; the durable log vocabulary is unchanged.
+    pub usage_totals: UsageReport,
     pub emit_next: u64,
     pub open_msg: Option<u64>,
     pub step_retries: u32,
@@ -273,6 +280,7 @@ impl LoopState {
             stop_when_idle: false,
             turn_reason: None,
             budget: BudgetGuard::new(config_for(Capability::UnattendedBatch), Instant::now()),
+            usage_totals: UsageReport::default(),
             emit_next: 0,
             open_msg: None,
             step_retries: 2,
@@ -418,7 +426,8 @@ impl LoopState {
 
     /// Returns false when the message is stale (wrong turn) and was dropped.
     /// Spend/tokens land here from provider Usage: steps at the step head,
-    /// tokens + spend on settle. Tokens/spend are never refunded.
+    /// tokens + spend on settle and on a metered failure. Tokens/spend are
+    /// never refunded.
     pub fn finish_provider_msg(&mut self, msg: ProviderMsg) -> bool {
         if msg.turn() != self.turn {
             return false; // STALE GUARD: late landing from an interrupted turn.
@@ -430,7 +439,18 @@ impl LoopState {
         {
             self.record_usage(usage);
         }
-        if let ProviderMsg::Failed { err, cancelled, .. } = msg {
+        if let ProviderMsg::Failed {
+            err,
+            cancelled,
+            usage,
+            ..
+        } = msg
+        {
+            // Failed attempts are billed too: meter before the refund/retry
+            // fork so an exhausted ladder's re-sends are never invisible.
+            if let Some(u) = &usage {
+                self.record_usage(u);
+            }
             if cancelled {
                 self.budget.refund_step(); // no progress: bounded inside the guard
                 return true;
@@ -456,12 +476,24 @@ impl LoopState {
         true
     }
 
-    /// Tokens meter every settle; spend converts cost_usd to cents.
+    /// Tokens meter every settle and every metered failure; spend converts
+    /// cost_usd to cents. The same reading folds into the live running totals
+    /// (`TurnEnd.usage_totals`).
     pub fn record_usage(&mut self, usage: &Usage) {
         self.budget.record_tokens(usage.total_tokens());
         if let Some(cost) = usage.cost_usd {
             self.budget
                 .record_spend_cents((cost * 100.0).round().max(0.0) as u64);
+        }
+        let totals = &mut self.usage_totals;
+        totals.input_tokens = totals.input_tokens.saturating_add(usage.input);
+        totals.output_tokens = totals.output_tokens.saturating_add(usage.output);
+        totals.cache_read_tokens = totals.cache_read_tokens.saturating_add(usage.cache_read);
+        if let Some(r) = usage.reasoning {
+            totals.reasoning_tokens = Some(totals.reasoning_tokens.unwrap_or(0).saturating_add(r));
+        }
+        if let Some(c) = usage.cost_usd {
+            totals.cost_usd = Some(totals.cost_usd.unwrap_or(0.0) + c);
         }
     }
 
@@ -975,9 +1007,26 @@ impl Drop for TurnGuard<'_> {
     }
 }
 
+/// Provider settle usage → the live-event payload. `cache_write` stays out:
+/// the live vocabulary names only what consumers read.
+fn usage_report(u: &Usage) -> UsageReport {
+    UsageReport {
+        input_tokens: u.input,
+        output_tokens: u.output,
+        cache_read_tokens: u.cache_read,
+        reasoning_tokens: u.reasoning,
+        cost_usd: u.cost_usd,
+    }
+}
+
 /// Emit one assistant message frame set: Start, one full-content Update, End.
 /// Reuses the open Partial id when a stream preceded the settle.
-fn emit_message_frames(state: &mut LoopState, message: &AssistantMessage, emitter: &mut Emitter) {
+fn emit_message_frames(
+    state: &mut LoopState,
+    message: &AssistantMessage,
+    usage: Option<&Usage>,
+    emitter: &mut Emitter,
+) {
     let partial = Message {
         role: Role::Assistant,
         content: message.content.clone(),
@@ -1009,6 +1058,7 @@ fn emit_message_frames(state: &mut LoopState, message: &AssistantMessage, emitte
         id,
         message: partial,
         interrupted: false,
+        usage: usage.map(usage_report),
     });
 }
 
@@ -1093,10 +1143,15 @@ pub async fn drive_tick(
                             },
                         });
                     }
-                    ProviderMsg::Settled { message, stop, .. } => {
+                    ProviderMsg::Settled {
+                        message,
+                        stop,
+                        usage,
+                        ..
+                    } => {
                         // ...and Assistant + ToolCall appends inside step_claim...
                         let outcome = state.step_claim(message.clone(), stop);
-                        emit_message_frames(state, &message, emitter); // ...before these frames.
+                        emit_message_frames(state, &message, usage.as_ref(), emitter); // ...before these frames.
                         if let ClaimOutcome::Dispatch(calls) = outcome {
                             for c in &calls {
                                 emitter.emit(AgentEvent::ToolStart {
@@ -1139,6 +1194,7 @@ pub async fn drive_tick(
         emitter.emit(AgentEvent::TurnEnd {
             turn: turn_before,
             reason: hopped_turn_reason(state, turn_before),
+            usage_totals: state.usage_totals.clone(),
         });
         emitter.emit(AgentEvent::TurnStart { turn: state.turn });
     }
@@ -1156,6 +1212,7 @@ pub async fn drive_tick(
         emitter.emit(AgentEvent::TurnEnd {
             turn: state.turn,
             reason: turn_end_reason_to_event(&reason),
+            usage_totals: state.usage_totals.clone(),
         });
     }
     verdict
@@ -1285,6 +1342,7 @@ fn finish_run(
     emitter.emit(AgentEvent::TurnEnd {
         turn: state.turn,
         reason: turn_end_reason_to_event(&reason),
+        usage_totals: state.usage_totals.clone(),
     });
     emitter.emit(AgentEvent::RunEnd {
         outcome: event_outcome(&outcome),
@@ -1330,6 +1388,7 @@ fn close_hopped_turn(
     emitter.emit(AgentEvent::TurnEnd {
         turn: before,
         reason: hopped_turn_reason(state, before),
+        usage_totals: state.usage_totals.clone(),
     });
     emitter.emit(AgentEvent::TurnStart { turn: state.turn });
     true
@@ -1628,12 +1687,18 @@ pub async fn run<P: LlmClient>(
         match provider.complete(&cfg.model, &req).await {
             Err(e) => {
                 let cancelled = cancel.is_cancelled() || root.is_cancelled();
-                let msg = format!("{e:?}");
+                // Metered failures carry what the attempts were billed; every
+                // other error shape has no usage to report.
+                let (msg, usage) = match e {
+                    LlmError::Metered { source, usage } => (source, usage),
+                    other => (format!("{other:?}"), None),
+                };
                 let turn = state.turn;
                 state.finish_provider_msg(ProviderMsg::Failed {
                     turn,
                     err: msg.clone(),
                     cancelled,
+                    usage,
                 });
                 if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
                     return finish_run(
@@ -1693,7 +1758,7 @@ pub async fn run<P: LlmClient>(
                         Outcome::Failed("log append failed".into()),
                     );
                 }
-                emit_message_frames(state, &resp.message, emitter);
+                emit_message_frames(state, &resp.message, Some(&resp.usage), emitter);
                 match outcome {
                     ClaimOutcome::Done | ClaimOutcome::Truncated(_) | ClaimOutcome::Refused => {
                         let before = state.turn;
@@ -2280,6 +2345,7 @@ mod tests {
             turn: 1,
             err: "flaky".into(),
             cancelled: false,
+            usage: None,
         }));
         assert!(s.call_model); // retry reuses the open step
         assert!(s.in_flight.is_none());
@@ -2290,6 +2356,7 @@ mod tests {
             turn: 1,
             err: "dead".into(),
             cancelled: false,
+            usage: None,
         }));
         assert_eq!(s.fatal_error.as_deref(), Some("dead"));
         assert!(matches!(
@@ -2297,6 +2364,44 @@ mod tests {
             PhaseVerdict::Return(Outcome::Failed(_))
         ));
         assert!(!s.should_call_model()); // closed gate says nay
+    }
+
+    #[test]
+    fn failed_attempt_usage_is_metered_and_still_retries() {
+        let mut s = LoopState::new();
+        s.turn = 1;
+        let root = CancellationToken::new();
+        assert!(s.start_provider_call(&root).is_some());
+        let u = Usage {
+            input: 100,
+            output: 20,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: Some(5),
+            cost_usd: Some(0.02),
+        };
+        assert!(s.finish_provider_msg(ProviderMsg::Failed {
+            turn: 1,
+            err: "output truncated at 64 tokens".into(),
+            cancelled: false,
+            usage: Some(u),
+        }));
+        // Budget and run totals see the failed attempt's spend.
+        assert_eq!(s.budget.counters().tokens, 120);
+        assert_eq!(s.budget.counters().spent_cents, 2);
+        assert_eq!(s.usage_totals.input_tokens, 100);
+        assert_eq!(s.usage_totals.output_tokens, 20);
+        assert_eq!(s.usage_totals.reasoning_tokens, Some(5));
+        assert_eq!(s.usage_totals.cost_usd, Some(0.02));
+        // The Attempt row still drives the in-step retry.
+        assert!(s.call_model);
+        assert!(matches!(
+            s.items.last().map(|i| &i.kind),
+            Some(ItemKind::Attempt {
+                will_retry: true,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2639,6 +2744,7 @@ mod tests {
             turn: 1,
             err: "cancelled".into(),
             cancelled: true,
+            usage: None,
         }));
         assert_eq!(s.budget.counters().steps, 0);
         assert_eq!(s.budget.counters().refunds, 1);
@@ -2860,6 +2966,17 @@ mod tests {
         assert_eq!(s.budget.counters().steps, 1);
         assert_eq!(s.budget.counters().tokens, 150);
         assert_eq!(s.budget.counters().spent_cents, 2);
+        // F1a: the settle's usage rides MessageEnd; TurnEnd carries the totals.
+        assert!(emitter.history().iter().any(|e| matches!(
+            e,
+            AgentEvent::MessageEnd { usage: Some(u), .. }
+                if u.input_tokens == 100 && u.output_tokens == 50 && u.cost_usd == Some(0.02)
+        )));
+        assert!(emitter.history().iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnEnd { usage_totals, .. }
+                if usage_totals.input_tokens == 100 && usage_totals.cost_usd == Some(0.02)
+        )));
     }
 
     #[tokio::test]
@@ -2895,6 +3012,16 @@ mod tests {
             other => panic!("expected TurnEnd, got {other:?}"),
         }
         assert_eq!(s.turn_reason, Some(TurnEndReason::MaxTokens));
+        // F1a: no provider usage = None on MessageEnd, zero totals on TurnEnd.
+        assert!(emitter
+            .history()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::MessageEnd { usage: None, .. })));
+        assert!(emitter.history().iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnEnd { usage_totals, .. }
+                if *usage_totals == UsageReport::default()
+        )));
     }
 
     // --- multi-tick run() assembly: fakes + tempdir git repo ---
@@ -3287,6 +3414,84 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&log_path);
+    }
+
+    #[tokio::test]
+    async fn settle_usage_rides_message_end_and_cumulates_on_turn_end() {
+        let root = run_tmp("usage");
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        let mut settled = text_resp("done");
+        settled.usage.reasoning = Some(3);
+        let client = ScriptClient {
+            order: Default::default(),
+            requests: Default::default(),
+            queue: Mutex::new(VecDeque::from([
+                script_resp(
+                    vec![(
+                        "c1",
+                        "write",
+                        serde_json::json!({"path": "a.txt", "content": "bye\n"}),
+                    )],
+                    StopReason::ToolUse,
+                ),
+                settled,
+            ])),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("edit the note".into())],
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        let history = emitter.history();
+        // Every settle reports its own usage on MessageEnd.
+        let ends: Vec<&UsageReport> = history
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::MessageEnd { usage, .. } => {
+                    Some(usage.as_ref().expect("settle must carry usage"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 2, "one MessageEnd per settle");
+        assert_eq!(
+            (
+                ends[0].input_tokens,
+                ends[0].output_tokens,
+                ends[0].cost_usd
+            ),
+            (10, 5, Some(0.01))
+        );
+        assert_eq!(ends[0].reasoning_tokens, None); // provider reported none
+        assert_eq!(ends[1].reasoning_tokens, Some(3));
+        // TurnEnd totals sum both settles (10+10 in, 5+5 out, 0.01+0.01).
+        let totals = history
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::TurnEnd { usage_totals, .. } => Some(usage_totals),
+                _ => None,
+            })
+            .expect("turn closes with totals");
+        assert_eq!((totals.input_tokens, totals.output_tokens), (20, 10));
+        assert_eq!(totals.reasoning_tokens, Some(3)); // reported-only sum, not erased by None
+        assert_eq!(totals.cost_usd, Some(0.02));
+        assert_eq!(state.usage_totals.input_tokens, 20);
+        assert_eq!(state.budget.counters().tokens, 30);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -3872,6 +4077,93 @@ mod tests {
             } => assert!(msg.contains("script empty"), "got {msg}"),
             other => panic!("expected failed RunEnd, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// First call fails with a metered truncation, then succeeds: F1b through
+    /// the real `run()` path (extraction + budget + retry).
+    struct MeteredFailThenOk {
+        calls: Mutex<u32>,
+        usage: Usage,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for MeteredFailThenOk {
+        async fn complete(&self, _model: &str, _req: &Request) -> Result<Response, LlmError> {
+            let mut n = self.calls.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                return Err(LlmError::Metered {
+                    source: "output truncated at 64 tokens".into(),
+                    usage: Some(self.usage.clone()),
+                });
+            }
+            drop(n);
+            Ok(text_resp("done"))
+        }
+        fn capabilities(&self, _model: &str) -> Capabilities {
+            Capabilities {}
+        }
+        async fn resolve_key(&self, _provider: &str) -> Result<Credentials, LlmError> {
+            Ok(Credentials {
+                api_key: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_meters_failed_attempt_usage_then_retries() {
+        let root = run_tmp("meteredfail");
+        let client = MeteredFailThenOk {
+            calls: Mutex::new(0),
+            usage: Usage {
+                input: 100,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: None,
+                cost_usd: Some(0.02),
+            },
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("go".into())],
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        // Failed attempt (120) + settled attempt (15) both metered.
+        assert_eq!(state.budget.counters().tokens, 135);
+        assert_eq!(state.usage_totals.input_tokens, 110);
+        assert_eq!(state.usage_totals.output_tokens, 25);
+        assert_eq!(state.usage_totals.cost_usd, Some(0.03));
+        let attempts: Vec<bool> = state
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Attempt { will_retry, .. } => Some(*will_retry),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attempts, vec![true], "one failed attempt, retried");
+        let errors = emitter
+            .history()
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Error { error } if error.code == "provider-failed"))
+            .count();
+        assert_eq!(errors, 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
