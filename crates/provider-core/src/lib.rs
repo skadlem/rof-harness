@@ -20,6 +20,11 @@ pub struct ProviderMessage {
     /// Tool-result linkage id (strict providers 422 without it).
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// Assistant thinking the endpoint demands echoed back (DeepSeek thinking
+    /// mode 400s without `reasoning_content` on prior assistant messages).
+    /// None = the provider sent none; never fabricated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,6 +467,18 @@ mod tests {
             tool_calls: vec![],
             thinking: None,
         }
+    }
+
+    #[test]
+    fn provider_message_thinking_absent_parses_and_serializes_away() {
+        // Rows written before the field existed (and None-thinking rows) must
+        // keep parsing, and None must not invent a `thinking` key.
+        let m: ProviderMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": "x", "tool_calls": [], "tool_call_id": null
+        }))
+        .unwrap();
+        assert_eq!(m.thinking, None);
+        assert!(serde_json::to_value(&m).unwrap().get("thinking").is_none());
     }
 
     #[test]

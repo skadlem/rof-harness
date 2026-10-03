@@ -69,6 +69,7 @@ fn tiny_req(prompt: &str, max_tokens: usize) -> Request {
             content: prompt.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            thinking: None,
         }],
         tools: vec![],
         max_tokens,

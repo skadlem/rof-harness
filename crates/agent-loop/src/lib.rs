@@ -864,6 +864,7 @@ impl LoopState {
                     content: text.clone(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    thinking: None,
                 }),
                 ItemKind::Assistant { message, .. } => {
                     // Stored as JSON: recover structured calls for strict providers.
@@ -878,6 +879,9 @@ impl LoopState {
                         content: am.content,
                         tool_calls: am.tool_calls,
                         tool_call_id: None,
+                        // Thinking rides the stored JSON; DeepSeek rejects a
+                        // follow-up turn that omits it.
+                        thinking: am.thinking,
                     })
                 }
                 ItemKind::ToolResult {
@@ -887,6 +891,7 @@ impl LoopState {
                     content: content.clone(),
                     tool_calls: Vec::new(),
                     tool_call_id: Some(call_id.clone()),
+                    thinking: None,
                 }),
                 _ => {}
             }
@@ -1467,6 +1472,7 @@ fn build_request(
         content: asm.assemble(),
         tool_calls: Vec::new(),
         tool_call_id: None,
+        thinking: None,
     }];
     messages.extend(state.derived_messages()); // once: raw history, collapse-5 intact
     Request {
@@ -3935,6 +3941,7 @@ mod tests {
                 StopReason::ToolUse,
             );
             resp.message.content = format!("script-step-{i}");
+            resp.message.thinking = Some(format!("reason-{i}"));
             queue.push_back(resp);
         }
         queue.push_back(text_resp("all done"));
@@ -4014,7 +4021,82 @@ mod tests {
         );
         assert_eq!(content_of("c3"), "wrote f3.txt");
         assert_eq!(content_of("c7"), "wrote f7.txt");
+        // Collapse-5 collapses tool observations only: every assistant turn
+        // still carries its reasoning into the 8th request.
+        for i in 1..=7 {
+            let want = format!("reason-{i}");
+            let step = format!("script-step-{i}");
+            let got = reqs[7]
+                .messages
+                .iter()
+                .find(|m| m.role == "assistant" && m.content == step)
+                .and_then(|m| m.thinking.as_deref());
+            assert_eq!(got, Some(want.as_str()), "reasoning lost for step {i}");
+        }
         assert!(check_pairing(emitter.history()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// DeepSeek thinking mode: turn 2's request must echo turn 1's assistant
+    /// `thinking`, or the API 400s mid-run (measured, api.deepseek.com).
+    #[tokio::test]
+    async fn run_multi_turn_request_echoes_assistant_thinking() {
+        let root = run_tmp("think");
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut first = script_resp(
+            vec![(
+                "c1",
+                "write",
+                serde_json::json!({"path": "a.txt", "content": "bye\n"}),
+            )],
+            StopReason::ToolUse,
+        );
+        first.message.thinking = Some("must edit a.txt".into());
+        let client = ScriptClient {
+            order: Arc::new(Mutex::new(Vec::new())),
+            requests: requests.clone(),
+            queue: Mutex::new(VecDeque::from([first, text_resp("done")])),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("edit the note".into())],
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        // The stored assistant row keeps the thinking for replay.
+        let stored = state
+            .items
+            .iter()
+            .find_map(|i| match &i.kind {
+                ItemKind::Assistant { message, .. } => Some(message),
+                _ => None,
+            })
+            .expect("assistant row stored");
+        assert_eq!(stored["thinking"], "must edit a.txt");
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        // Turn 1 has no assistant history: nothing to echo there.
+        assert!(reqs[0].messages.iter().all(|m| m.thinking.is_none()));
+        let echoed = reqs[1]
+            .messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant history in turn 2");
+        assert_eq!(echoed.thinking.as_deref(), Some("must edit a.txt"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
