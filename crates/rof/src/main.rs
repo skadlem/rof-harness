@@ -248,6 +248,10 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
             }
         }
     });
+    // Freeze the run-start HEAD `patch_since_start` diffs from; the loop's own
+    // ensure() is idempotent and reports the same failure as a run error.
+    let tree = TreeService::new(&args.workdir);
+    let _ = tree.ensure();
     let outcome = agent_loop::run(
         &mut state,
         Run {
@@ -269,12 +273,12 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
         &cancel,
     )
     .await;
-    let tree = TreeService::new(&args.workdir);
+    // The per-Dispatch baseline commits absorb what landed, so the index-based
+    // `tree.diff()` reports an empty patch; report the whole run instead.
     let patch = tree
-        .diff()
+        .patch_since_start()
         .ok()
-        .and_then(|d| tree.patch(&d).ok())
-        .map(|p| p.text)
+        .map(|(_, p)| p.text)
         .unwrap_or_default();
     eprintln!("events {}", summarize(emitter.history()));
     RunResult {
@@ -657,15 +661,25 @@ mod tests {
     async fn headless_run_edits_then_done() {
         let dir = tmp();
         std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
-        let client = ScriptClient::new(vec![tool_resp(), text_resp()]);
+        // Two dispatched batches: the second batch's per-Dispatch baseline
+        // absorbs the first, which is what made the old post-run diff empty.
+        let mut second = tool_resp();
+        second.message.tool_calls[0].id = "c2".into();
+        second.message.tool_calls[0].args =
+            serde_json::json!({"path": "note.txt", "search": "bye", "replace": "later"});
+        let client = ScriptClient::new(vec![tool_resp(), second, text_resp()]);
         let r = execute(&client, &args_for(&dir, None)).await;
         assert!(matches!(r.outcome, Outcome::Done), "{:?}", r.outcome);
         assert_eq!(exit_code(&r.outcome), 0);
         assert_eq!(
             std::fs::read_to_string(dir.join("note.txt")).unwrap(),
-            "bye\n"
+            "later\n"
         );
-        assert!(r.patch.contains("note.txt"), "final patch must name it");
+        assert!(
+            r.patch.contains("-hello") && r.patch.contains("+later"),
+            "patch must span every batch, not just the last: {}",
+            r.patch
+        );
     }
 
     #[tokio::test]

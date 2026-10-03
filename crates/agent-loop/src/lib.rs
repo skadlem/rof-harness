@@ -236,6 +236,13 @@ pub struct LoopState {
     /// File map frozen at run start (prefix-cache head): mid-run edits must
     /// not rotate the system-message bytes, so `build_request` never re-walks.
     pub file_map: Option<String>,
+    /// Run-start pin contents (`path`, bytes) for `cfg.context_files` —
+    /// `file_map`'s rule applied to named files. Re-reading a pin per request
+    /// re-emits its bytes: after the model edits that file the bytes differ,
+    /// rotating the cached prefix and restating a file the `edit` result
+    /// already carried. Frozen once, compared per request: unchanged -> cached
+    /// run-start bytes, changed -> dropped to the normal view/edit flow.
+    pub pins: Option<Vec<(String, String)>>,
     pub steering: VecDeque<QueuedInput>,
     pub followups: VecDeque<String>,
     pub wake_requested: bool,
@@ -277,6 +284,7 @@ impl LoopState {
             phase: Phase::Idle,
             items: Vec::new(),
             file_map: None,
+            pins: None,
             steering: VecDeque::new(),
             followups: VecDeque::new(),
             wake_requested: false,
@@ -1456,16 +1464,34 @@ fn budget_line(state: &LoopState) -> String {
     )
 }
 
+/// Named files are pinned verbatim up to this cap; snapshot and comparison
+/// must read the same window or an unchanged pin would look edited.
+const PIN_CAP_CHARS: usize = 8000;
+
+/// Run-start pin contents: one read per named file, reused for the whole run
+/// (see [`LoopState::pins`]). Unreadable files are simply not pinned.
+fn pin_snapshot(files: &[String], workdir: &Path) -> Vec<(String, String)> {
+    files
+        .iter()
+        .filter_map(|f| {
+            context::named_file_contents(workdir, f, PIN_CAP_CHARS)
+                .ok()
+                .map(|c| (f.clone(), c))
+        })
+        .collect()
+}
+
 /// Prompt build: static workflow contract + run-start file map (cached-prefix
 /// head) + named files as volatiles (delivered last), fitted to
 /// `context_budget_chars` in the system string. Every byte of that head is
 /// frozen for the run — DeepSeek-style prefix caching only fires on
-/// byte-identical prefixes. The live budget line is the sole per-request
-/// variation: it is appended to the last outgoing message only and never to
-/// the transcript, so the durable log stays exactly what was recorded. History
-/// is delivered exactly once, raw, as messages (collapse-5 rides
-/// [`LoopState::derived_messages`]) — never fitted into the system copy. Never
-/// summarizes.
+/// byte-identical prefixes. Named files freeze the same way ([`LoopState::pins`])
+/// and drop out of the request if their file changed since run start. The live
+/// budget line is the sole per-request variation: it is appended to the last
+/// outgoing message only and never to the transcript, so the durable log stays
+/// exactly what was recorded. History is delivered exactly once, raw, as
+/// messages (collapse-5 rides [`LoopState::derived_messages`]) — never fitted
+/// into the system copy. Never summarizes.
 fn build_request(
     state: &mut LoopState,
     registry: &tool_core::Registry,
@@ -1498,8 +1524,16 @@ fn build_request(
         must_include: true,
         text: map_text,
     });
-    for f in &cfg.context_files {
-        if let Ok(c) = context::named_file_contents(workdir, f, 8000) {
+    for (f, start) in state
+        .pins
+        .get_or_insert_with(|| pin_snapshot(&cfg.context_files, workdir))
+        .iter()
+    {
+        // Dropped pins are not errors: `view`/`edit` carry the current bytes.
+        let unchanged = context::named_file_contents(workdir, f, PIN_CAP_CHARS)
+            .map(|c| c == *start)
+            .unwrap_or(false);
+        if unchanged {
             asm.add_volatile(context::ContextItem {
                 key: context::ItemKey {
                     path: f.clone(),
@@ -1508,7 +1542,7 @@ fn build_request(
                 },
                 fidelity: context::Fidelity::Exact,
                 must_include: true,
-                text: c,
+                text: start.clone(),
             });
         }
     }
@@ -1695,8 +1729,10 @@ pub async fn run<P: LlmClient>(
         return o;
     }
     // Prefix-cache head: freeze the file map once, before the first request;
-    // mid-run edits must not rotate the system message.
+    // mid-run edits must not rotate the system message. Named-file pins freeze
+    // on the same beat (dropout rule in `build_request`).
     state.file_map = Some(context::file_map(workdir, 200).join("\n"));
+    state.pins = Some(pin_snapshot(&cfg.context_files, workdir));
     loop {
         if cancel.is_cancelled() {
             state.stop_hard = true;
@@ -2854,6 +2890,49 @@ mod tests {
             .items
             .iter()
             .any(|i| format!("{:?}", i.kind).contains("budgets remaining")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Pins follow the file-map rule: frozen at run start (byte-stable head)
+    /// and dropped once their file changes, so the model never sees pre-edit
+    /// bytes the `edit` result already superseded.
+    #[test]
+    fn pins_freeze_at_run_start_and_drop_when_edited() {
+        let root = run_tmp("pins");
+        std::fs::write(root.join("goal.md"), "keep me\n").unwrap();
+        std::fs::write(root.join("note.md"), "v1\n").unwrap();
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        state.phase = Phase::Running;
+        state.apply_input(Input::User("go".into()));
+        state.admit_steering();
+        let cfg = RunConfig {
+            context_files: vec!["goal.md".into(), "note.md".into()],
+            ..RunConfig::default()
+        };
+        // First request freezes the pins, as `run` does before its first call.
+        let r1 = build_request(&mut state, &registry, &root, &cfg);
+        assert!(r1.messages[0].content.contains("--- goal.md"));
+        assert!(r1.messages[0].content.contains("v1"));
+
+        // Unrelated write: pin bytes stay identical across requests.
+        std::fs::write(root.join("other.txt"), "x\n").unwrap();
+        let r2 = build_request(&mut state, &registry, &root, &cfg);
+        assert_eq!(r2.messages[0].content, r1.messages[0].content);
+
+        // Mid-run edit to one pinned file: that pin disappears, the other stays.
+        std::fs::write(root.join("note.md"), "v2\n").unwrap();
+        let r3 = build_request(&mut state, &registry, &root, &cfg);
+        let sys = &r3.messages[0].content;
+        assert!(
+            sys.contains("--- goal.md") && sys.contains("keep me"),
+            "{sys}"
+        );
+        assert!(!sys.contains("--- note.md"), "edited pin must drop: {sys}");
+        assert!(
+            !sys.contains("v1") && !sys.contains("v2"),
+            "stale or fresh pin bytes leaked: {sys}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
