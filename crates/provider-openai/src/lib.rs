@@ -92,6 +92,9 @@ impl LlmClient for OpenAiCompat {
                 Ok(mut r) => {
                     r.latency_ms = t.elapsed().as_millis() as u64;
                     r.attempts = u64::from(attempt) + 1;
+                    // Ladder-recovered attempts were billed too: carry what
+                    // the failed re-sends cost so metering can count it.
+                    r.retry_usage = usage_acc.take().map(Box::new);
                     return Ok(r);
                 }
                 Err(f) => {
@@ -335,7 +338,7 @@ impl OpenAiCompat {
             // Some gateways bill and report usage on an error body; carry it.
             let usage = serde_json::from_str::<ChatResp>(&text)
                 .ok()
-                .and_then(|r| wire_usage(r.usage))
+                .and_then(|r| wire_usage(r.usage, model))
                 .map(Box::new);
             return Err(OnceFail {
                 msg,
@@ -382,24 +385,12 @@ impl OpenAiCompat {
 }
 
 /// Fold a failed attempt's usage into the running total. Attempts are
-/// independent requests, so billed tokens sum; `reasoning` stays a subset of
-/// `output` because both fields are summed the same way.
+/// independent requests, so billed tokens sum (`Usage::plus`).
 fn merge_usage(acc: Option<Usage>, next: Option<Usage>) -> Option<Usage> {
-    let Some(next) = next else { return acc };
-    let Some(mut acc) = acc else {
-        return Some(next);
-    };
-    acc.input = acc.input.saturating_add(next.input);
-    acc.output = acc.output.saturating_add(next.output);
-    acc.cache_read = acc.cache_read.saturating_add(next.cache_read);
-    acc.cache_write = acc.cache_write.saturating_add(next.cache_write);
-    if let Some(r) = next.reasoning {
-        acc.reasoning = Some(acc.reasoning.unwrap_or(0).saturating_add(r));
+    match (acc, next) {
+        (Some(a), Some(n)) => Some(a.plus(&n)),
+        (a, n) => a.or(n),
     }
-    if let Some(c) = next.cost_usd {
-        acc.cost_usd = Some(acc.cost_usd.unwrap_or(0.0) + c);
-    }
-    Some(acc)
 }
 
 /// 503 from serverless GPU endpoints usually means cold start (scale-from-zero
@@ -507,21 +498,42 @@ struct BodyFail {
 
 /// Wire usage -> `Usage`; None when the body shipped no usage object at all.
 /// Never zeros: the budget must not read "unreported" as "free".
-fn wire_usage(u: Option<WireUsage>) -> Option<Usage> {
-    u.map(|u| Usage {
-        input: u.prompt_tokens,
-        output: u.completion_tokens,
-        cache_read: u
-            .prompt_tokens_details
-            .map(|d| d.cached_tokens)
-            .unwrap_or(0),
-        cache_write: 0,
-        reasoning: u
-            .completion_tokens_details
-            .map(|d| d.reasoning_tokens)
-            .filter(|&n| n > 0),
-        cost_usd: None,
+fn wire_usage(u: Option<WireUsage>, model: &str) -> Option<Usage> {
+    u.map(|u| {
+        let mut usage = Usage {
+            input: u.prompt_tokens,
+            output: u.completion_tokens,
+            cache_read: u
+                .prompt_tokens_details
+                .map(|d| d.cached_tokens)
+                .unwrap_or(0),
+            cache_write: 0,
+            reasoning: u
+                .completion_tokens_details
+                .map(|d| d.reasoning_tokens)
+                .filter(|&n| n > 0),
+            cost_usd: None,
+        };
+        usage.cost_usd = price_usd(model, usage.input, usage.cache_read, usage.output);
+        usage
     })
+}
+
+/// USD cost at DeepSeek's published PEAK rates ($/1Mtok, api-docs.deepseek.com
+/// "Models & Pricing", fetched 2026-10-03): flash in-hit $0.006 / in-miss
+/// $0.30 / out $1.20; v4-pro $0.044 / $1.32 / $3.96. PEAK is a conservative
+/// upper bound — DeepSeek bills off-peak at exactly half (weekends and CN
+/// holidays in full; the holiday calendar is not modeled). `input` includes
+/// cache-hit tokens (OpenAI wire semantics), so they split at the hit rate.
+/// Unknown models price `None`: never fabricate a cost.
+fn price_usd(model: &str, input: u64, cache_read: u64, output: u64) -> Option<f64> {
+    let (hit, miss, out) = match model {
+        m if m.starts_with("deepseek-flash") => (0.006, 0.30, 1.20),
+        m if m.starts_with("deepseek-v4-pro") => (0.044, 1.32, 3.96),
+        _ => return None,
+    };
+    let miss_in = input.saturating_sub(cache_read);
+    Some((cache_read as f64 * hit + miss_in as f64 * miss + output as f64 * out) / 1e6)
 }
 
 /// Parse one chat/completions body. Truncation and empty answers are errors
@@ -531,7 +543,7 @@ fn parse_body(v: &serde_json::Value, model: &str, max_tokens: usize) -> Result<R
         msg: format!("bad chat body: {e}"),
         usage: None,
     })?;
-    let wire = wire_usage(resp.usage);
+    let wire = wire_usage(resp.usage, model);
     let choice = resp.choices.into_iter().next().ok_or_else(|| BodyFail {
         msg: format!("empty content from {model} (finish_reason=None; reasoning_content=0 chars); the endpoint shipped no text"),
         usage: wire.clone(),
@@ -589,11 +601,12 @@ fn parse_body(v: &serde_json::Value, model: &str, max_tokens: usize) -> Result<R
             cache_read,
             cache_write: 0,
             reasoning: reasoning_tok,
-            cost_usd: None,
+            cost_usd: wire.as_ref().and_then(|u| u.cost_usd),
         },
         latency_ms: 0,
         attempts: 1,
         raw_stop_reason: finish,
+        retry_usage: None,
     })
 }
 
@@ -886,6 +899,66 @@ mod tests {
         });
         let r2 = parse_body(&v2, "m", 64).unwrap();
         assert_eq!(r2.message.tool_calls[0].args["content"], "    }\n");
+    }
+
+    #[test]
+    fn price_usd_splits_hit_miss_and_never_fabricates() {
+        // flash PEAK: hit $0.006/M, miss $0.30/M, out $1.20/M (api-docs 2026-10-03)
+        let c = price_usd("deepseek-flash", 1_000_000, 500_000, 250_000).unwrap();
+        assert!((c - 0.453).abs() < 1e-9, "{c}"); // 0.003 + 0.15 + 0.30
+        let all_hit = price_usd("deepseek-flash", 1_000_000, 1_000_000, 0).unwrap();
+        assert!(
+            (all_hit - 0.006).abs() < 1e-12,
+            "cache hits never pay miss rate"
+        );
+        let pro = price_usd("deepseek-v4-pro", 1_000_000, 0, 1_000_000).unwrap();
+        assert!((pro - (1.32 + 3.96)).abs() < 1e-9, "pro PEAK sum");
+        assert_eq!(
+            price_usd("gpt-4o", 10, 0, 10),
+            None,
+            "unknown models never fabricate a cost"
+        );
+    }
+
+    #[test]
+    fn parse_body_prices_usage_and_starts_without_retries() {
+        let v = serde_json::json!({
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 500}
+        });
+        let r = parse_body(&v, "deepseek-flash", 64).unwrap();
+        let cost = r.usage.cost_usd.expect("known model is priced");
+        assert!((cost - (1000.0 * 0.30 + 500.0 * 1.20) / 1e6).abs() < 1e-12);
+        assert!(r.retry_usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn recovered_ladder_carries_failed_attempt_usage() {
+        std::env::set_var("TEST_OAI_KEY_RL", "k");
+        let (ep, _) = serve(vec![
+            Canned {
+                status: 200,
+                headers: vec![],
+                body: trunc_body("half", ""),
+            },
+            Canned {
+                status: 200,
+                headers: vec![],
+                body: ok_body("done"),
+            },
+        ]);
+        let c = client_on(&ep, "TEST_OAI_KEY_RL");
+        let r = c.complete("m", &req_with_tool()).await.unwrap();
+        assert_eq!(r.attempts, 2, "truncation rung then success");
+        assert_eq!(
+            (r.usage.input, r.usage.output),
+            (1, 2),
+            "final attempt alone"
+        );
+        let ru = r.retry_usage.as_ref().expect("failed attempts carried");
+        assert_eq!((ru.input, ru.output), (5, 64), "the billed re-send");
+        let b = r.billed_usage();
+        assert_eq!((b.input, b.output), (6, 66), "metering sees the whole bill");
     }
 
     struct Canned {

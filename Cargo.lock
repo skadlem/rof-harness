@@ -175,6 +175,7 @@ dependencies = [
 name = "eval"
 version = "0.1.0"
 dependencies = [
+ "agent-event",
  "serde",
  "serde_json",
  "tokio",

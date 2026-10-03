@@ -432,6 +432,95 @@ impl RunReport {
     }
 }
 
+/// Build a per-instance report from a rof `--dump-events` JSONL dump. The
+/// LAST `TurnEnd.usage_totals` is the run's cumulative bill (each TurnEnd
+/// folds the running totals), `MessageEnd` count is the step count, and the
+/// `RunEnd` outcome becomes `halt_reason`. `wall_secs` and `patch` are
+/// caller-measured (the dump carries neither). Typed event parsing: a schema
+/// drift is a compile error here, never silently zero.
+pub fn instance_report(
+    id: &str,
+    verdict: Verdict,
+    events_jsonl: &Path,
+    wall_secs: u64,
+    patch: &str,
+) -> std::io::Result<InstanceReport> {
+    use agent_event::{AgentEvent, RunOutcome, UsageReport};
+    let text = std::fs::read_to_string(events_jsonl)?;
+    let mut totals = UsageReport::default();
+    let mut steps = 0u32;
+    let mut halt: Option<String> = None;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let ev: AgentEvent = serde_json::from_str(line)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        match ev {
+            AgentEvent::MessageEnd { .. } => steps += 1,
+            AgentEvent::TurnEnd { usage_totals, .. } => totals = usage_totals,
+            AgentEvent::RunEnd { outcome, .. } => {
+                halt = match outcome {
+                    RunOutcome::Failed(r) => Some(r),
+                    RunOutcome::Aborted => Some("aborted".into()),
+                    RunOutcome::Passed => None,
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(InstanceReport {
+        id: id.into(),
+        verdict,
+        tokens_in: totals.input_tokens,
+        tokens_out: totals.output_tokens,
+        dollars: totals.cost_usd.unwrap_or(0.0),
+        wall_secs,
+        steps,
+        halt_reason: halt,
+        patch_digest: patch_digest(patch),
+    })
+}
+
+/// Identity digest for grouping identical patches across runs. Not
+/// cryptographic (`DefaultHasher` is per-toolchain); grouping, not integrity.
+fn patch_digest(patch: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    patch.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Paired-task bootstrap (B resamples, fixed seed so the gate reproduces
+/// without a rand dep): per-task solve-fraction pairs (a, b); resample n
+/// pairs with replacement, take mean(a-b) each draw; report the observed
+/// mean and the 2.5/97.5 percentiles. `None` on empty input. Unit = task
+/// (rep fractions average inside a task first — never pool reps as draws).
+pub fn paired_bootstrap(pairs: &[(f64, f64)], iters: u64, seed: u64) -> Option<(f64, f64, f64)> {
+    let n = pairs.len();
+    if n == 0 {
+        return None;
+    }
+    let diffs: Vec<f64> = pairs.iter().map(|(a, b)| a - b).collect();
+    let mean = diffs.iter().sum::<f64>() / n as f64;
+    let mut state = seed | 1;
+    let mut draw = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as usize % n
+    };
+    let mut means: Vec<f64> = (0..iters)
+        .map(|_| {
+            let s: f64 = (0..n).map(|_| diffs[draw()]).sum();
+            s / n as f64
+        })
+        .collect();
+    means.sort_by(|a, b| a.partial_cmp(b).expect("finite means"));
+    let pct = |p: f64| {
+        let idx = ((means.len() - 1) as f64 * p).round() as usize;
+        means[idx]
+    };
+    Some((mean, pct(0.025), pct(0.975)))
+}
+
 /// Mean pass rate with Wilson 95% CI. Never report a bare percentage:
 /// 89 tasks means wide intervals.
 pub fn wilson_ci(passed: u64, total: u64) -> (f64, f64, f64) {
@@ -756,6 +845,61 @@ mod tests {
         assert!(lo < p && p < hi); // never a bare percentage
         let (_, lo89, hi89) = wilson_ci(45, 89);
         assert!(hi89 - lo89 > 0.15); // 89 tasks => wide intervals
+    }
+
+    #[test]
+    fn instance_report_reads_cumulative_usage_steps_and_halt() {
+        let dir = std::env::temp_dir().join(format!("rof-ir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("events.jsonl");
+        std::fs::write(
+            &p,
+            concat!(
+                "{\"type\":\"MessageEnd\",\"id\":1,\"message\":{\"role\":\"Assistant\",\"content\":\"\"},\"interrupted\":false,\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_tokens\":3,\"reasoning_tokens\":1,\"cost_usd\":null}}\n",
+                "{\"type\":\"TurnEnd\",\"turn\":1,\"reason\":\"BudgetExceeded\",\"usage_totals\":{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_tokens\":3,\"reasoning_tokens\":1,\"cost_usd\":null}}\n",
+                "{\"type\":\"MessageEnd\",\"id\":2,\"message\":{\"role\":\"Assistant\",\"content\":\"\"},\"interrupted\":false,\"usage\":null}\n",
+                "{\"type\":\"TurnEnd\",\"turn\":1,\"reason\":\"BudgetExceeded\",\"usage_totals\":{\"input_tokens\":25,\"output_tokens\":6,\"cache_read_tokens\":9,\"reasoning_tokens\":4,\"cost_usd\":0.5}}\n",
+                "{\"type\":\"RunEnd\",\"outcome\":{\"Failed\":\"steps\"},\"messages\":[]}\n",
+            ),
+        )
+        .unwrap();
+        let r = instance_report("t1", Verdict::Resolved, &p, 12, "diff --git a").unwrap();
+        assert_eq!(
+            (r.tokens_in, r.tokens_out),
+            (25, 6),
+            "last cumulative TurnEnd"
+        );
+        assert_eq!(r.dollars, 0.5, "cost_usd flows into dollars");
+        assert_eq!(r.steps, 2);
+        assert_eq!(r.halt_reason.as_deref(), Some("steps"));
+        assert_eq!(r.wall_secs, 12);
+        let same = instance_report("t1", Verdict::Resolved, &p, 12, "diff --git a").unwrap();
+        assert_eq!(r.patch_digest, same.patch_digest, "digest is stable");
+        let other = instance_report("t1", Verdict::Resolved, &p, 12, "diff --git b").unwrap();
+        assert_ne!(r.patch_digest, other.patch_digest);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn paired_bootstrap_hand_checkable_and_deterministic() {
+        assert!(paired_bootstrap(&[], 100, 1).is_none());
+        let one = paired_bootstrap(&[(1.0, 0.0)], 100, 7).unwrap();
+        assert_eq!(
+            one,
+            (1.0, 1.0, 1.0),
+            "single pair is degenerate but defined"
+        );
+        let pairs = [(1.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 0.0)];
+        let (m, lo, hi) = paired_bootstrap(&pairs, 10_000, 42).unwrap();
+        assert!((m - 0.5).abs() < 1e-12, "{m}");
+        assert!(lo <= m && m <= hi, "[{lo}, {hi}] brackets the mean");
+        assert_eq!(
+            paired_bootstrap(&pairs, 10_000, 42).unwrap(),
+            (m, lo, hi),
+            "same seed, same gate"
+        );
+        let (_, lo2, hi2) = paired_bootstrap(&pairs, 10_000, 43).unwrap();
+        assert!(hi2 > lo2, "interval has width on mixed pairs");
     }
 
     #[test]
