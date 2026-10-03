@@ -85,6 +85,24 @@ impl Usage {
         self.output
             .saturating_sub(self.reasoning.unwrap_or(0).min(self.output))
     }
+
+    /// Sum of two independently billed requests (retry-ladder re-sends):
+    /// token fields add, reasoning stays a subset of output, cost adds when
+    /// either side knows it. Tokens and spend are never refunded.
+    pub fn plus(&self, next: &Usage) -> Usage {
+        let mut u = self.clone();
+        u.input = u.input.saturating_add(next.input);
+        u.output = u.output.saturating_add(next.output);
+        u.cache_read = u.cache_read.saturating_add(next.cache_read);
+        u.cache_write = u.cache_write.saturating_add(next.cache_write);
+        if let Some(r) = next.reasoning {
+            u.reasoning = Some(u.reasoning.unwrap_or(0).saturating_add(r));
+        }
+        if let Some(c) = next.cost_usd {
+            u.cost_usd = Some(u.cost_usd.unwrap_or(0.0) + c);
+        }
+        u
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +127,23 @@ pub struct Response {
     pub latency_ms: u64,
     pub attempts: u64,
     pub raw_stop_reason: Option<String>,
+    /// Usage the FAILED attempts of this same call were billed (retry-ladder
+    /// re-sends a recovered final attempt does not carry). `None` = none.
+    /// `#[serde(default)]` keeps stored responses parsing.
+    #[serde(default)]
+    pub retry_usage: Option<Box<Usage>>,
+}
+
+impl Response {
+    /// What this call actually billed: final attempt plus every failed
+    /// re-send the ladder made. Metering must record THIS, not `usage`:
+    /// a recovered ladder is still billed spend.
+    pub fn billed_usage(&self) -> Usage {
+        match &self.retry_usage {
+            Some(extra) => extra.plus(&self.usage),
+            None => self.usage.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +484,56 @@ fn close_truncated(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn billed_usage_folds_failed_attempts_into_the_bill() {
+        let usage = |i: u64, o: u64, cost: Option<f64>| Usage {
+            input: i,
+            output: o,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: None,
+            cost_usd: cost,
+        };
+        let mut r = Response {
+            message: msg_with_tools(),
+            stop: StopReason::Stop,
+            usage: usage(100, 50, Some(0.01)),
+            latency_ms: 0,
+            attempts: 1,
+            raw_stop_reason: None,
+            retry_usage: None,
+        };
+        assert_eq!(r.billed_usage().input, 100, "no retries: identical");
+        r.retry_usage = Some(Box::new(usage(400, 10, Some(0.02))));
+        let b = r.billed_usage();
+        assert_eq!((b.input, b.output), (500, 60));
+        assert!((b.cost_usd.unwrap() - 0.03).abs() < 1e-12);
+    }
+
+    #[test]
+    fn plus_keeps_reasoning_subset_and_known_cost() {
+        let a = Usage {
+            input: 1,
+            output: 10,
+            cache_read: 2,
+            cache_write: 0,
+            reasoning: Some(4),
+            cost_usd: None,
+        };
+        let b = Usage {
+            input: 1,
+            output: 10,
+            cache_read: 2,
+            cache_write: 0,
+            reasoning: Some(3),
+            cost_usd: Some(0.5),
+        };
+        let s = a.plus(&b);
+        assert_eq!((s.input, s.output, s.cache_read), (2, 20, 4));
+        assert_eq!(s.reasoning, Some(7));
+        assert_eq!(s.cost_usd, Some(0.5), "known side wins over unknown");
+    }
 
     fn msg_with_tools() -> AssistantMessage {
         AssistantMessage {

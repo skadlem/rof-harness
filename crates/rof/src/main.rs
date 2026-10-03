@@ -590,6 +590,7 @@ mod tests {
             latency_ms: 0,
             attempts: 1,
             raw_stop_reason: None,
+            retry_usage: None,
         }
     }
 
@@ -605,6 +606,7 @@ mod tests {
             latency_ms: 0,
             attempts: 1,
             raw_stop_reason: None,
+            retry_usage: None,
         }
     }
 

@@ -1837,11 +1837,14 @@ pub async fn run<P: LlmClient>(
             }
             Ok(resp) => {
                 let turn = state.turn;
+                // Meter the BILL, not just the final attempt: a recovered
+                // retry ladder was billed every failed re-send too.
+                let billed = resp.billed_usage();
                 state.finish_provider_msg(ProviderMsg::Settled {
                     turn,
                     message: resp.message.clone(),
                     stop: resp.stop,
-                    usage: Some(resp.usage.clone()),
+                    usage: Some(billed.clone()),
                 });
                 let outcome = state.step_claim(resp.message.clone(), resp.stop);
                 if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
@@ -1854,7 +1857,7 @@ pub async fn run<P: LlmClient>(
                         Outcome::Failed("log append failed".into()),
                     );
                 }
-                emit_message_frames(state, &resp.message, Some(&resp.usage), emitter);
+                emit_message_frames(state, &resp.message, Some(&billed), emitter);
                 match outcome {
                     ClaimOutcome::Done | ClaimOutcome::Truncated(_) | ClaimOutcome::Refused => {
                         let before = state.turn;
@@ -3302,6 +3305,7 @@ mod tests {
             latency_ms: 0,
             attempts: 1,
             raw_stop_reason: None,
+            retry_usage: None,
         }
     }
 
@@ -3324,6 +3328,7 @@ mod tests {
             latency_ms: 0,
             attempts: 1,
             raw_stop_reason: None,
+            retry_usage: None,
         }
     }
 
