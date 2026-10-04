@@ -17,7 +17,7 @@ use snapshot::TreeService;
 use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
-const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--dump-events PATH]
+const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--dump-events PATH]
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget";
 
@@ -27,6 +27,11 @@ struct Args {
     workdir: PathBuf,
     model: String,
     endpoint: Option<String>,
+    /// Env var holding the API key (default OPENAI_API_KEY; opencode-go uses
+    /// GO_KEY). The key itself never appears in argv or logs.
+    api_key_env: String,
+    /// Extra request headers as NAME:VALUE (e.g. x-opencode-session:<id>).
+    headers: Vec<String>,
     allow_cmd: Vec<String>,
     budget_steps: Option<u32>,
     budget_actions: Option<u32>,
@@ -46,6 +51,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     }
     let (mut goal, mut workdir, mut model, mut endpoint, mut steps, mut dump) =
         (None, None, None, None, None, None);
+    let mut api_key_env = "OPENAI_API_KEY".to_string();
+    let mut headers: Vec<String> = Vec::new();
     let mut actions: Option<u32> = None;
     let mut allow = Vec::new();
     let mut context_files = Vec::new();
@@ -115,6 +122,12 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--proof-cmd" => {
                 proof_cmd = Some(take(&mut i, inline)?);
             }
+            "--api-key-env" => {
+                api_key_env = take(&mut i, inline)?;
+            }
+            "--header" => {
+                headers.push(take(&mut i, inline)?);
+            }
             "--incentives" => {
                 incentives = match take(&mut i, inline)?.as_str() {
                     "base" => agent_loop::IncentivesLevel::Base,
@@ -141,6 +154,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         workdir: PathBuf::from(workdir.ok_or("missing --workdir")?),
         model: model.ok_or("missing --model")?,
         endpoint,
+        api_key_env,
+        headers,
         allow_cmd: allow,
         budget_steps: steps,
         budget_actions: actions,
@@ -379,7 +394,16 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let provider = OpenAiCompat::new(&endpoint, EndpointProfile::default());
+    let mut provider =
+        OpenAiCompat::new(&endpoint, EndpointProfile::default()).with_key_env(&args.api_key_env);
+    for h in &args.headers {
+        if let Some((name, value)) = h.split_once(':') {
+            provider = provider.with_header(name, value);
+        } else {
+            eprintln!("--header needs NAME:VALUE, got {h:?}");
+            std::process::exit(2);
+        }
+    }
     let r = execute(&provider, &args).await;
     if let Some(path) = args.dump_events.as_deref() {
         if let Err(e) = write_dump(path, &r.events) {
@@ -438,6 +462,8 @@ mod tests {
                 workdir: PathBuf::from("/tmp/w"),
                 model: "m".into(),
                 endpoint: Some("http://x".into()),
+                api_key_env: "OPENAI_API_KEY".into(),
+                headers: Vec::new(),
                 allow_cmd: vec!["cargo test".into(), "true".into()],
                 budget_steps: Some(7),
                 budget_actions: Some(9),
@@ -684,6 +710,8 @@ mod tests {
             workdir: dir.to_path_buf(),
             model: "fake".into(),
             endpoint: None,
+            api_key_env: "OPENAI_API_KEY".into(),
+            headers: Vec::new(),
             allow_cmd: vec![],
             budget_steps: steps,
             budget_actions: None,

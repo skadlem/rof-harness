@@ -37,6 +37,9 @@ pub struct OpenAiCompat {
     profile: EndpointProfile,
     http: reqwest::Client,
     key_env: String,
+    /// Extra per-request headers (e.g. opencode-go's `x-opencode-session`:
+    /// a stable per-conversation id for routing + prompt caching).
+    headers: Vec<(String, String)>,
 }
 
 impl OpenAiCompat {
@@ -49,11 +52,17 @@ impl OpenAiCompat {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             key_env: "OPENAI_API_KEY".to_string(),
+            headers: Vec::new(),
         }
     }
 
     pub fn with_key_env(mut self, env: &str) -> Self {
         self.key_env = env.to_string();
+        self
+    }
+
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
         self
     }
 
@@ -315,6 +324,9 @@ impl OpenAiCompat {
         let mut call = self
             .http
             .post(format!("{}/chat/completions", self.endpoint));
+        for (name, value) in &self.headers {
+            call = call.header(name.as_str(), value.as_str());
+        }
         if !key.trim().is_empty() {
             call = call.bearer_auth(key);
         }
