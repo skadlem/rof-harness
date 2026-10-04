@@ -198,13 +198,19 @@ fn wire_body(model: &str, req: &Request, k: &WireKnobs) -> serde_json::Value {
     // Thinking Mode page. Two behaviors below are EMPIRICAL workarounds,
     // absent from the docs (research/decision-audit-provider-economics.md
     // C11): empty string is accepted, and a request ending on tool messages
-    // 400s if ANY assistant message OMITS the key. So in thinking-mode
-    // conversations every assistant message carries the key — real echo or
-    // empty string; non-thinking conversations stay untouched (no unknown
-    // fields for strict endpoints).
+    // 400s if ANY assistant message OMITS the key. Enforcement is
+    // INTERMITTENT when no reasoning exists anywhere in history (measured:
+    // ablation matrix, 5/12 runs died while an identical-shape 27-msg run
+    // passed), so the belt is shape-based: every assistant row carries the
+    // key — real echo or empty string — whenever the conversation is in
+    // thinking mode OR the request ends on tool messages (the only 400 shape
+    // ever observed). User-ending and assistant-ending requests and
+    // non-thinking endpoints keep their rows untouched (no unknown fields for
+    // strict endpoints).
     let thinking_mode = req.messages.iter().any(|m| {
         m.role == "assistant" && m.thinking.as_deref().is_some_and(|t| !t.trim().is_empty())
     });
+    let echo_key = thinking_mode || req.messages.last().is_some_and(|m| m.role == "tool");
     let messages: Vec<serde_json::Value> = req
         .messages
         .iter()
@@ -231,7 +237,7 @@ fn wire_body(model: &str, req: &Request, k: &WireKnobs) -> serde_json::Value {
                 o["tool_call_id"] = serde_json::Value::String(id.clone());
             }
             // DeepSeek thinking mode: key presence is mandatory (see above).
-            if m.role == "assistant" && thinking_mode {
+            if m.role == "assistant" && echo_key {
                 o["reasoning_content"] =
                     match m.thinking.as_deref().filter(|t| !t.trim().is_empty()) {
                         Some(t) => serde_json::Value::String(t.to_string()),
@@ -905,6 +911,64 @@ mod tests {
         });
         let r2 = parse_body(&v2, "m", 64).unwrap();
         assert_eq!(r2.message.tool_calls[0].args["content"], "    }\n");
+    }
+
+    #[test]
+    fn tool_ending_requests_always_carry_reasoning_content() {
+        // Regression: no reasoning anywhere in history + request ends on a
+        // tool row = the 400 shape. Every assistant row must carry the key.
+        let mut req = req_with_tool();
+        req.messages.extend([
+            ProviderMessage {
+                role: "assistant".into(),
+                content: "looking".into(),
+                tool_calls: vec![provider_core::ToolCallRef {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    args: serde_json::json!({"path": "a"}),
+                }],
+                tool_call_id: None,
+                thinking: None,
+            },
+            ProviderMessage {
+                role: "tool".into(),
+                content: "data".into(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("c1".into()),
+                thinking: None,
+            },
+        ]);
+        let k = WireKnobs::from_req(&req, &EndpointProfile::default());
+        let b = wire_body("m", &req, &k);
+        let msgs = b["messages"].as_array().unwrap();
+        let asst: Vec<&serde_json::Value> =
+            msgs.iter().filter(|m| m["role"] == "assistant").collect();
+        assert!(!asst.is_empty());
+        for m in asst {
+            assert_eq!(
+                m["reasoning_content"], "",
+                "tool-ending request needs the key"
+            );
+        }
+        // Assistant-ending, non-thinking requests keep rows untouched.
+        let mut req2 = req_with_tool();
+        req2.messages.push(ProviderMessage {
+            role: "assistant".into(),
+            content: "x".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            thinking: None,
+        });
+        let b3 = wire_body(
+            "m",
+            &req2,
+            &WireKnobs::from_req(&req2, &EndpointProfile::default()),
+        );
+        let m = b3["messages"].as_array().unwrap().last().unwrap();
+        assert!(
+            m.get("reasoning_content").is_none(),
+            "assistant-ending stays untouched"
+        );
     }
 
     #[test]
