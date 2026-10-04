@@ -1055,10 +1055,15 @@ mod tests {
 
     #[test]
     fn frozen_slices_pinned_by_digest_and_ids() {
-        // Re-freezing either slice must break `cargo test` before any run.
+        // Re-freezing any slice must break `cargo test` before any run.
         for (name, sha, ids) in [
             (
                 "tb-slice-a",
+                "a1fbef407c28d415fb29fe052fe91164fc07fd277f66f38fd17c37bd581f2813",
+                21usize,
+            ),
+            (
+                "tb-slice-v1seed",
                 "a460a97aff950f2dc1041fd2207b6f5751c73bd207df7b361bf190ae3dde3525",
                 2usize,
             ),

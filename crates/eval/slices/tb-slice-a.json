@@ -1,29 +1,220 @@
 {
  "dataset": "terminal-bench/terminal-bench-2-1",
- "dataset_tag": "github 7131e4375048a0e408a8fb404b5f499d726b695b (HEAD 2026-09-30; re-pin via Harbor Hub on oracle pre-flight)",
+ "dataset_tag": "harbor registry terminal-bench/terminal-bench-2-1@latest (89 tasks, downloaded 2026-10-04)",
  "entries": {
-  "layout-config-recreation2": {
-   "environment_image": "harborframework/terminal-bench:layout-config-recreation2-environment-9caa9d6614e4ae31@sha256:c08989cd9fc6858e7ec7488acf65b2840ece53581fb4327b3e667ff15da23724",
-   "provenance": "measured-local task.toml + sha256 tests/ solution/",
-   "solution_hash": "sha256:d79e91839b0f1081beb84edf6c76222be77f62f46218251ac1162af22643e9a4",
-   "tests_hash": "sha256:80b1119bd061e05cc87d6206523726be70424244e98e7f43e40338294b21a2a0",
-   "timeout_secs": 28800,
-   "verifier_image": "harborframework/terminal-bench:layout-config-recreation2-verifier-5f249ec0c47d9285@sha256:6f428236b1ffbef143a9f8c70d732155796c45b4ab4a7e80ab8dced97b4cfaaa"
+  "break-filter-js-from-html": {
+   "environment_image": "alexgshaw/break-filter-js-from-html:20251031",
+   "historical_pass_rate": 0.36,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:9973d32ed5f566fe7f6573c076f737025535e13d205ad9443fd5d0a803c055f2",
+   "tests_hash": "sha256:bb0b0c18ae7a1e9ddc42918716c1547a4a00ebfc5d779ff7399573dfb3f8ba3e",
+   "timeout_secs": 1200.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
   },
-  "session-window-debug": {
-   "environment_image": "harborframework/terminal-bench:session-window-debug-environment-a05048a37a8c0198@sha256:b5fb99c6a88ba1274fea1abeb3209f23869e5d8a483d50f8f3d925bdbdbe5f8f",
-   "provenance": "measured-local task.toml + sha256 tests/ solution/",
-   "solution_hash": "sha256:35aed395a3d976808ac5a500ce207fd1625b3cf6d7447f93c697e2c56a36cfcb",
-   "tests_hash": "sha256:40eaa121c92a5b65d4a4ac6418f070c44bcfc406c7fa0a5452d471f43e40338294b21a2a0",
-   "timeout_secs": 28800,
-   "verifier_image": "harborframework/terminal-bench:session-window-debug-verifier-5f15b536bd15c598@sha256:8ee1a52619501d6b7e40dfc56f0307d6f476afce4b6d45fd980c5dd6f5a7c592"
+  "build-pov-ray": {
+   "environment_image": "alexgshaw/build-pov-ray:20251031",
+   "historical_pass_rate": 0.6,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:b9b45462d68be69c41bf64fc5186ee1077781ca70b07df56b6661e459b296458",
+   "tests_hash": "sha256:eae3777eb199f2990749cc5819ceb8a9086b8a543bbb9dc58349550cad3aa358",
+   "timeout_secs": 12000.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "custom-memory-heap-crash": {
+   "environment_image": "alexgshaw/custom-memory-heap-crash:20251031",
+   "historical_pass_rate": 0.24,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:e6cca7f8cb177fb633ccfd0e33c8da28833a400444c1596da39c82db7d5b293d",
+   "tests_hash": "sha256:efc5f1bacfa8ef26f4eb2b33906a540c1e85a410030484e6be3ac13cdb16eecc",
+   "timeout_secs": 1800.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "dna-assembly": {
+   "environment_image": "alexgshaw/dna-assembly:20251031",
+   "historical_pass_rate": 0.96,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:77677a69ba13a594f7a1a8f4c3b0566f12748d1fa47554490cff660f7edf1008",
+   "tests_hash": "sha256:a44b981b7ee70c1308306642c4bfff06d4dd1c56cda23e54e6e35fec02c28257",
+   "timeout_secs": 1800.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "dna-insert": {
+   "environment_image": "alexgshaw/dna-insert:20251031",
+   "historical_pass_rate": 0.88,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:41bd21ebc98c5f343dfd0413630006ab86be6e6645efce7d79700e2d825d2016",
+   "tests_hash": "sha256:33e0a450c91da7928e1b2bcd5f878b598d77da6328888ff876645fb8a5d1172e",
+   "timeout_secs": 1800.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "headless-terminal": {
+   "environment_image": "alexgshaw/headless-terminal:20251031",
+   "historical_pass_rate": 0.28,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:3e4e3ef660bd8421861a0d704e40dcd6e168395ea2065db370567cefbc547660",
+   "tests_hash": "sha256:bdb75f34541fdc008f13085e94241a558b937f87e63e2bb05f58d2bac4b6134c",
+   "timeout_secs": 900.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "hf-model-inference": {
+   "environment_image": "alexgshaw/hf-model-inference:20260430",
+   "historical_pass_rate": 0.88,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:c515bf0b14c402448f544178e14df3ab6d180da35a5b19586f6901ec9ad87798",
+   "tests_hash": "sha256:38163a0eaee9347c5ae13438e3caf82f22650a92c3da7af291bfe01b54a76a51",
+   "timeout_secs": 900.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "install-windows-3.11": {
+   "environment_image": "alexgshaw/install-windows-3.11:20251031",
+   "historical_pass_rate": 0.6,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:7be507db544ba404179c7e6dd7783896450f68f4e172ee67e853772f4d03e4ad",
+   "tests_hash": "sha256:f649a3b60eaa0c66a4e92627a432330c8a7a6edec69bc3aa7e1043d1530154ee",
+   "timeout_secs": 3600.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "kv-store-grpc": {
+   "environment_image": "alexgshaw/kv-store-grpc:20251031",
+   "historical_pass_rate": 0.92,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:190b0c5a40851d19af4345133e7c22244b7a2843ac431a18fec361103adf4289",
+   "tests_hash": "sha256:01dcaf780bc4c49669e23daf2e30b60702c37a712d7c475f406307fa97a06ba9",
+   "timeout_secs": 900.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "log-summary-date-ranges": {
+   "environment_image": "alexgshaw/log-summary-date-ranges:20251031",
+   "historical_pass_rate": 0.96,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:437f92aa4faf9750928bfd97977742b7d88c1dc2fdfe9085f82d3cc50adb5bba",
+   "tests_hash": "sha256:b5280a3f0f353d839964ec86d3f690f7f260fd7899a7118c504038fe5b9e15ea",
+   "timeout_secs": 900.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "make-mips-interpreter": {
+   "environment_image": "alexgshaw/make-mips-interpreter:20251031",
+   "historical_pass_rate": 0.96,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:9c7a138a01776b609c7a814f570f26420cc061b075ac5aa412b3e9caad59ac2e",
+   "tests_hash": "sha256:9e64fa627babc7e00ef131e82d91ac7f0b4069328c3e011dbf6c14a15a2c49ff",
+   "timeout_secs": 1800.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "mcmc-sampling-stan": {
+   "environment_image": "alexgshaw/mcmc-sampling-stan:20251031",
+   "historical_pass_rate": 0.96,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:e0779165aedf09f0035236d1b57162af3fa9bca419aab2fcf7429280a04e044c",
+   "tests_hash": "sha256:6a823d036af84a663f3901261a2119ae362f88df458c56b4d0c528e769fc3be5",
+   "timeout_secs": 1800.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "model-extraction-relu-logits": {
+   "environment_image": "alexgshaw/model-extraction-relu-logits:20251031",
+   "historical_pass_rate": 0.64,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:b6eafd47751b04ce9094f055db3558852dce65d4d7eebeef4c12bb2c66b38fe8",
+   "tests_hash": "sha256:ade07fb26ffdd1a7fa2299fc027c120ca916274f6a591eedfd9360c1199ff4a3",
+   "timeout_secs": 900.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "mteb-retrieve": {
+   "environment_image": "alexgshaw/mteb-retrieve:20260430",
+   "historical_pass_rate": 0.32,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:8ce7a57412f70c0066228b24126ae9d80e9e0e73981e6c75bfd5d39fed985dfd",
+   "tests_hash": "sha256:0ad3e28b2beeca9ecc952f3c567f1cdc62449550b434b816774cbb1ca8d2778f",
+   "timeout_secs": 1800.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "protein-assembly": {
+   "environment_image": "alexgshaw/protein-assembly:20260403",
+   "historical_pass_rate": 0.96,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:5b3e0b74c291579ff0aeb20a42d3eee087df2b6bc3130859af3faa5ab3022f4e",
+   "tests_hash": "sha256:d43a370f5f5b41f3a0359c0843b580edb3c4df253a7912532e1f9cf72e459e26",
+   "timeout_secs": 1800.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "pypi-server": {
+   "environment_image": "alexgshaw/pypi-server:20251031",
+   "historical_pass_rate": 0.8,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:cf31b67a6d15e58698b59a16c7a4e6f77a49999e3e8b5fcbf828db3ad23acf36",
+   "tests_hash": "sha256:69078a18fba18920f02033375f8ac580fb6f40d7804614ab5daf709ee8e89741",
+   "timeout_secs": 900.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "query-optimize": {
+   "environment_image": "alexgshaw/query-optimize:20251031",
+   "historical_pass_rate": 0.8,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:4541e0fdb64ae5745e4e30733c3730802bb6002429da7851e6fca82b852a19a0",
+   "tests_hash": "sha256:f425c434536af51b85dbd7b40c90a9736a8e9f279df8504dc14a8602782c051c",
+   "timeout_secs": 900.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "raman-fitting": {
+   "environment_image": "alexgshaw/raman-fitting:20251031",
+   "historical_pass_rate": 0.56,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:dcb09be59366cfa38f6e8d8ae1d9715815e812483e41453f6af5321b7d76a1d9",
+   "tests_hash": "sha256:55820226403a86ef6628a2366da2c734a3e6ac9e7ef4775b3ff3cc2a87ac439d",
+   "timeout_secs": 900.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "sam-cell-seg": {
+   "environment_image": "alexgshaw/sam-cell-seg:20251031",
+   "historical_pass_rate": 0.92,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:d0bca42d19face8b5c6195da306b371026be418ee01c48d0bfe7a7d59ce227f1",
+   "tests_hash": "sha256:1873a6393bdd982aadd78ee1a6361b4ce7f55dee37fa916b8b056f5630a6ac37",
+   "timeout_secs": 7200.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "sanitize-git-repo": {
+   "environment_image": "alexgshaw/sanitize-git-repo:20251031",
+   "historical_pass_rate": 0.2,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:6ee6ed3d868011d00d50ebe686b95df0737995c77cc59210a30c74ff7d596231",
+   "tests_hash": "sha256:a2c569d1d80cf141815db3027e9b1c5d3f4d305c029e8deff8cee3340db3d206",
+   "timeout_secs": 900.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
+  },
+  "video-processing": {
+   "environment_image": "alexgshaw/video-processing:20251031",
+   "historical_pass_rate": 0.52,
+   "provenance": "measured hub job-tasks 2026-10-04 (14 jobs, 89 tasks, weighted by trials) + task.toml digests; tree-sha = sha256(sorted relpath\\0 content-sha256)",
+   "solution_hash": "sha256:66800e00d788db8edc931efaddb1fa07cf13cbeec4c0629197c404c48b499699",
+   "tests_hash": "sha256:25b964bc9af9894f61e0bf6a8b73f106bb96bf727b46be432da354335d917d59",
+   "timeout_secs": 3600.0,
+   "verifier_image": "dockerfile:verifier/Dockerfile"
   }
  },
  "ids": [
-  "layout-config-recreation2",
-  "session-window-debug"
+  "break-filter-js-from-html",
+  "build-pov-ray",
+  "custom-memory-heap-crash",
+  "dna-assembly",
+  "dna-insert",
+  "headless-terminal",
+  "hf-model-inference",
+  "install-windows-3.11",
+  "kv-store-grpc",
+  "log-summary-date-ranges",
+  "make-mips-interpreter",
+  "mcmc-sampling-stan",
+  "model-extraction-relu-logits",
+  "mteb-retrieve",
+  "protein-assembly",
+  "pypi-server",
+  "query-optimize",
+  "raman-fitting",
+  "sam-cell-seg",
+  "sanitize-git-repo",
+  "video-processing"
  ],
- "note": "v1 seed: 2 measured-local tasks with full digests. 21-expansion BLOCKED: v1 21-id list unrecoverable (crossbench=10py, tbench=production-planning, rof-tb=swd-only); needs session-store lookup. Rival-reuse attestation blocked until then.",
- "reps": 3,
- "seed_rule": "rep-index 0,1,2"
+ "note": "Slice A (21): top-21 by IRT Fisher information p(1-p) over historical per-task pass rates (Harbor Hub official leaderboard job-tasks, 22 rows -> 14 unique jobs). Strict 30-70% band held only 7/89 and IRT half-max band [0.146,0.854] only 12/89 (frontier saturation: 70/89 at p>=0.9, MEASURED) -> information ranking is the adaptation. Selection frozen before any rof/rival run on these ids. v1 2-task seed preserved in tb-slice-v1seed.json (NOTE: swd/layout are NOT in the TB2.1 89-task dataset).",
+ "reps": 3
 }
