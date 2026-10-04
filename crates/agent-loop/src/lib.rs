@@ -2182,6 +2182,10 @@ pub async fn run<P: LlmClient>(
                                     Outcome::Failed(format!("snapshot rollback: {e}")),
                                 );
                             }
+                            // Not counted in AblationMetrics.rollbacks: this
+                            // legacy rollback is pre-gate and identical in all
+                            // ablation arms. rollbacks = GATE interventions
+                            // (Partial/Aborted verdicts) only.
                         }
                         // Verdict→tree mapping: Committed stands (the failed-
                         // batch rollback above is the existing path either way),
@@ -2198,7 +2202,15 @@ pub async fn run<P: LlmClient>(
                             .ablation
                             .note_assessment(bets::assess_claim(&claim, observation));
                         let verdict = bets.on_post_batch(&claim, &hunks);
-                        state.ablation.note_commit(&verdict);
+                        if !hunks.is_empty() {
+                            // The gate's domain is patch batches: an empty
+                            // batch has nothing proven, so its Committed must
+                            // not inflate proven_hunks. rollbacks counts gate
+                            // interventions (Partial/Aborted) only — the
+                            // legacy failed-batch rollback above is pre-gate
+                            // and identical across ablation arms.
+                            state.ablation.note_commit(&verdict);
+                        }
                         match verdict {
                             bets::CommitVerdict::Committed => {}
                             bets::CommitVerdict::Partial { savepoint } => {
@@ -4760,6 +4772,49 @@ mod tests {
         );
         assert_eq!(state.ablation.proven_hunks, 1);
         assert_eq!(state.ablation.rollbacks, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn empty_hunk_batches_never_inflate_proven_hunks() {
+        let root = run_tmp("nohunks");
+        std::fs::write(root.join("a.rs"), "one\n").unwrap();
+        let client = ScriptClient {
+            order: Arc::new(Mutex::new(Vec::new())),
+            requests: Default::default(),
+            queue: Mutex::new(VecDeque::from([
+                script_resp(
+                    vec![("c1", "view", serde_json::json!({"path": "a.rs"}))],
+                    StopReason::ToolUse,
+                ),
+                text_resp("done"),
+            ])),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &GateBatch,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("go".into())],
+            &cancel,
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        assert_eq!(
+            state.ablation.proven_hunks, 0,
+            "read-only batch: nothing proven, nothing counted"
+        );
+        assert_eq!(state.ablation.rollbacks, 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
