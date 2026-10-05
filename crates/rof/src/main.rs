@@ -17,9 +17,10 @@ use snapshot::TreeService;
 use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
-const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--dump-events PATH]
+const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH]
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
---context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget";
+--context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget
+--compaction FRAC: checkpoint the older context once the estimate crosses FRAC of the token budget (0 < FRAC <= 1). OFF-BY-DEFAULT and UNVALIDATED: the S-1 compaction experiment has not run yet, so leave it unset unless running that experiment.";
 
 #[derive(Debug, PartialEq)]
 struct Args {
@@ -42,6 +43,8 @@ struct Args {
     proof_cmd: Option<String>,
     incentives: agent_loop::IncentivesLevel,
     bets: bool,
+    /// Compaction trigger fraction; `None` = checkpoint off (default).
+    compaction: Option<f64>,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -61,6 +64,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut proof_cmd: Option<String> = None;
     let mut incentives = agent_loop::IncentivesLevel::Full;
     let mut bets = false;
+    let mut compaction: Option<f64> = None;
     let mut i = 2;
     while i < a.len() {
         let flag = a[i];
@@ -143,6 +147,18 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--bets" => {
                 bets = true;
             }
+            "--compaction" => {
+                let s = take(&mut i, inline)?;
+                let f: f64 = s
+                    .parse()
+                    .map_err(|_| format!("--compaction needs a fraction in (0, 1], got {s:?}"))?;
+                if !f.is_finite() || f <= 0.0 || f > 1.0 {
+                    return Err(format!(
+                        "--compaction needs a fraction in (0, 1], got {s:?}"
+                    ));
+                }
+                compaction = Some(f);
+            }
             other => return Err(format!("unknown flag {other:?}\n{USAGE}")),
         }
         i += 1;
@@ -164,6 +180,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         proof_cmd,
         incentives,
         bets,
+        compaction,
     })
 }
 
@@ -192,6 +209,26 @@ fn budget_for(args: &Args) -> BudgetGuard {
         None => {}
     }
     BudgetGuard::new(b, Instant::now())
+}
+
+/// One run's loop config from the parsed flags. The compaction checkpoint is
+/// opt-in: absent `--compaction` leaves the default disabled config, so the
+/// run stays byte-identical.
+fn run_config(args: &Args) -> RunConfig {
+    let mut cfg = RunConfig {
+        goal: args.goal.clone(),
+        model: args.model.clone(),
+        context_files: args.context_files.clone(),
+        max_tokens: args.max_tokens.unwrap_or(8_000),
+        incentives: args.incentives,
+        proof_cmd: args.proof_cmd.clone(),
+        ..RunConfig::default()
+    };
+    if let Some(frac) = args.compaction {
+        cfg.compaction.enabled = true;
+        cfg.compaction.frac = frac;
+    }
+    cfg
 }
 
 fn resolve_endpoint(flag: Option<&str>, env: Option<&str>) -> Result<String, String> {
@@ -329,15 +366,7 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
             workdir: &args.workdir,
             emitter: &mut emitter,
             bets: bets_hook,
-            cfg: RunConfig {
-                goal: args.goal.clone(),
-                model: args.model.clone(),
-                context_files: args.context_files.clone(),
-                max_tokens: args.max_tokens.unwrap_or(8_000),
-                incentives: args.incentives,
-                proof_cmd: args.proof_cmd.clone(),
-                ..RunConfig::default()
-            },
+            cfg: run_config(args),
         },
         vec![Input::User(args.goal.clone())],
         &cancel,
@@ -453,6 +482,8 @@ mod tests {
             "app/a.py",
             "--dump-events",
             "/tmp/ev.json",
+            "--compaction",
+            "0.6",
         ]))
         .unwrap();
         assert_eq!(
@@ -474,6 +505,7 @@ mod tests {
                 bets: false,
                 incentives: agent_loop::IncentivesLevel::Full,
                 proof_cmd: None,
+                compaction: Some(0.6),
             }
         );
         let b = parse_args(&argv(&[
@@ -489,6 +521,7 @@ mod tests {
             (b.endpoint, b.budget_steps, b.budget_actions, b.dump_events),
             (None, None, None, None)
         );
+        assert_eq!(b.compaction, None, "absent --compaction stays off");
     }
 
     #[test]
@@ -557,6 +590,53 @@ mod tests {
                 "m",
                 "--budget-actions",
                 "many",
+            ],
+            vec![
+                "rof",
+                "run",
+                "--goal",
+                "g",
+                "--workdir",
+                "/w",
+                "--model",
+                "m",
+                "--compaction",
+            ],
+            vec![
+                "rof",
+                "run",
+                "--goal",
+                "g",
+                "--workdir",
+                "/w",
+                "--model",
+                "m",
+                "--compaction",
+                "many",
+            ],
+            vec![
+                "rof",
+                "run",
+                "--goal",
+                "g",
+                "--workdir",
+                "/w",
+                "--model",
+                "m",
+                "--compaction",
+                "0",
+            ],
+            vec![
+                "rof",
+                "run",
+                "--goal",
+                "g",
+                "--workdir",
+                "/w",
+                "--model",
+                "m",
+                "--compaction",
+                "1.5",
             ],
             vec!["rof", "run", "--goal"],
         ] {
@@ -722,7 +802,27 @@ mod tests {
             bets: false,
             incentives: agent_loop::IncentivesLevel::Full,
             proof_cmd: None,
+            compaction: None,
         }
+    }
+
+    #[test]
+    fn compaction_flag_reaches_run_config_off_by_default() {
+        let dir = Path::new("/tmp/w");
+        let off = run_config(&args_for(dir, None));
+        assert!(!off.compaction.enabled, "absent flag leaves compaction off");
+        assert_eq!(off.compaction.frac, 0.7, "default frac untouched");
+        assert_eq!(off.compaction.keep_tokens, 20_000, "keep stays the default");
+
+        let mut on = args_for(dir, None);
+        on.compaction = Some(0.5);
+        let cfg = run_config(&on);
+        assert!(
+            cfg.compaction.enabled,
+            "--compaction enables the checkpoint"
+        );
+        assert_eq!(cfg.compaction.frac, 0.5);
+        assert_eq!(cfg.compaction.keep_tokens, 20_000, "keep stays the default");
     }
 
     #[test]
