@@ -334,6 +334,10 @@ struct ViewArgs {
     path: String,
     #[serde(default)]
     max_bytes: Option<u64>,
+    /// 1-indexed first line to read; absent keeps the whole-file byte-capped
+    /// read (and is therefore the only path `max_bytes` had before).
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 fn view_schema() -> Value {
@@ -343,9 +347,59 @@ fn view_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "path": {"type": "string", "maxLength": 4096},
-            "max_bytes": {"type": "integer"}
+            "max_bytes": {"type": "integer"},
+            "offset": {"type": "integer"}
         }
     })
+}
+
+/// Page of whole lines from 1-indexed `offset`: lines that fit the `cap`-byte
+/// read cap and `OUT_CAP` chars, plus an exact continuation notice naming the
+/// next offset. Only a first line that alone exceeds a budget is cut (the
+/// notice then says so instead of promising an exact line boundary).
+fn view_page(all: &[&str], offset: usize, cap: usize) -> Result<(String, bool), ToolError> {
+    let start = offset.max(1) - 1;
+    let total = all.len();
+    if start >= total {
+        return Err(ToolError::Failed(format!(
+            "offset {offset} beyond end of file ({total} lines total)"
+        )));
+    }
+    let mut shown: Vec<&str> = Vec::new();
+    let (mut bytes, mut chars) = (0usize, 0usize);
+    for line in &all[start..] {
+        let sep = usize::from(!shown.is_empty());
+        if bytes + line.len() + sep > cap || chars + line.chars().count() + sep > OUT_CAP {
+            break;
+        }
+        bytes += line.len() + sep;
+        chars += line.chars().count() + sep;
+        shown.push(line);
+    }
+    if shown.is_empty() {
+        let (head, _) = cap_chars(all[start].to_string(), cap.min(OUT_CAP));
+        return Ok((
+            format!(
+                "{head}\n[Line {} of {total} exceeds the read cap and was truncated. Use offset={} to continue.]",
+                start + 1,
+                start + 2
+            ),
+            true,
+        ));
+    }
+    let body = shown.join("\n");
+    if start + shown.len() < total {
+        return Ok((
+            format!(
+                "{body}\n[Showing lines {}-{} of {total}. Use offset={} to continue.]",
+                start + 1,
+                start + shown.len(),
+                start + shown.len() + 1
+            ),
+            true,
+        ));
+    }
+    Ok((body, false))
 }
 
 #[async_trait]
@@ -353,7 +407,7 @@ impl Tool for ViewTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "view".to_string(),
-            description: "read a file under the tool root, byte-capped".to_string(),
+            description: "read a file under the tool root, byte-capped; optional 1-indexed offset pages by line".to_string(),
             schema: view_schema(),
         }
     }
@@ -375,13 +429,20 @@ impl Tool for ViewTool {
         .map_err(path_err)?;
         let data = std::fs::read(&p).map_err(|e| ToolError::Failed(e.to_string()))?;
         let cap = view_read_cap(args.max_bytes);
-        let n = data.len().min(cap);
-        let (content, truncated) =
-            cap_chars(String::from_utf8_lossy(&data[..n]).to_string(), OUT_CAP);
-        Ok(ToolOutcome {
-            truncated: truncated || data.len() > n,
-            content,
-        })
+        let Some(offset) = args.offset else {
+            // No offset: the byte-capped whole-file read, unchanged.
+            let n = data.len().min(cap);
+            let (content, truncated) =
+                cap_chars(String::from_utf8_lossy(&data[..n]).to_string(), OUT_CAP);
+            return Ok(ToolOutcome {
+                truncated: truncated || data.len() > n,
+                content,
+            });
+        };
+        let text = String::from_utf8_lossy(&data);
+        let lines: Vec<&str> = text.lines().collect();
+        let (content, truncated) = view_page(&lines, offset, cap)?;
+        Ok(ToolOutcome { content, truncated })
     }
 }
 
@@ -1321,6 +1382,109 @@ mod tests {
         assert_eq!(view_read_cap(Some(u64::MAX)), VIEW_CAP);
         assert_eq!(view_read_cap(Some(VIEW_CAP as u64 + 1)), VIEW_CAP);
         assert_eq!(view_read_cap(Some(42)), 42);
+    }
+
+    #[tokio::test]
+    async fn view_no_offset_path_unchanged() {
+        let root = tmp_root();
+        std::fs::write(root.join("f.txt"), "alpha\nbeta\n").unwrap();
+        std::fs::write(root.join("big.txt"), "a".repeat(VIEW_CAP + 100)).unwrap();
+        let r = reg(policy(&root));
+        // Small file: exact bytes, no notice, not truncated.
+        let whole = run(&r, "view", json!({"path": "f.txt"})).await.unwrap();
+        assert_eq!(whole.content, "alpha\nbeta\n");
+        assert!(!whole.truncated);
+        // max_bytes is still a pure byte narrowing.
+        let capped = run(&r, "view", json!({"path": "f.txt", "max_bytes": 3}))
+            .await
+            .unwrap();
+        assert_eq!(capped.content, "alp");
+        assert!(capped.truncated);
+        // Over-cap file: first OUT_CAP chars, still no notice.
+        let big = run(&r, "view", json!({"path": "big.txt"})).await.unwrap();
+        assert_eq!(big.content, "a".repeat(OUT_CAP));
+        assert!(big.truncated);
+    }
+
+    #[tokio::test]
+    async fn view_offset_pages_and_names_next_offset() {
+        let root = tmp_root();
+        let text: String = (1..=100).map(|i| format!("line {i:03}\n")).collect();
+        std::fs::write(root.join("f.txt"), &text).unwrap();
+        let many: String = (1..=1000).map(|i| format!("line {i:04}\n")).collect();
+        std::fs::write(root.join("many.txt"), &many).unwrap();
+        let r = reg(policy(&root));
+        // max_bytes 40 = four 9-byte lines; the fifth does not fit.
+        let p1 = run(
+            &r,
+            "view",
+            json!({"path": "f.txt", "offset": 1, "max_bytes": 40}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            p1.content,
+            "line 001\nline 002\nline 003\nline 004\n[Showing lines 1-4 of 100. Use offset=5 to continue.]"
+        );
+        assert!(p1.truncated);
+        // The named offset resumes exactly where the previous page stopped.
+        let p2 = run(
+            &r,
+            "view",
+            json!({"path": "f.txt", "offset": 5, "max_bytes": 40}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            p2.content,
+            "line 005\nline 006\nline 007\nline 008\n[Showing lines 5-8 of 100. Use offset=9 to continue.]"
+        );
+        // OUT_CAP chars is the other half of the page bound (no max_bytes):
+        // 7999 chars = 800 nine-char rows plus separators, and the notice
+        // counts from there.
+        let many_page = run(&r, "view", json!({"path": "many.txt", "offset": 1}))
+            .await
+            .unwrap();
+        assert!(
+            many_page
+                .content
+                .contains("[Showing lines 1-800 of 1000. Use offset=801 to continue.]"),
+            "{}",
+            &many_page.content[many_page.content.len().saturating_sub(120)..]
+        );
+        assert!(many_page.content.chars().count() <= OUT_CAP + 80);
+        // Tail page: everything from the offset fits, no notice.
+        let tail = run(&r, "view", json!({"path": "f.txt", "offset": 99}))
+            .await
+            .unwrap();
+        assert_eq!(tail.content, "line 099\nline 100");
+        assert!(!tail.truncated);
+        // Out-of-range offset fails loudly and names the line count.
+        let err = run(&r, "view", json!({"path": "f.txt", "offset": 101}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("beyond end of file"), "{err}");
+        // Optional with a default: absent dispatches (checked above), and the
+        // argument is never coerced from a string.
+        assert!(run(&r, "view", json!({"path": "f.txt", "offset": "5"}))
+            .await
+            .is_err());
+        assert!(run(&r, "view", json!({"path": "f.txt", "offset": -1}))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn view_page_cut_first_line_flags_truncation() {
+        let long = "x".repeat(VIEW_CAP);
+        let all = vec![long.as_str(), "b"];
+        let (content, truncated) = view_page(&all, 1, VIEW_CAP).unwrap();
+        assert!(content.starts_with(&"x".repeat(OUT_CAP)), "{content}");
+        assert!(
+            content.contains("exceeds the read cap and was truncated. Use offset=2 to continue."),
+            "{content}"
+        );
+        assert!(truncated);
     }
 
     #[test]
