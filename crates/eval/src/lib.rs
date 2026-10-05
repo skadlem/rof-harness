@@ -538,6 +538,123 @@ pub fn wilson_ci(passed: u64, total: u64) -> (f64, f64, f64) {
     )
 }
 
+/// Per-rep outcomes for one cell: one task inside one arm of a comparison.
+/// `reps` are the raw per-rep scores in [0, 1] the storage already carries
+/// (matrix-v1: `tests_passed / (tests_passed + tests_failed)`); an empty
+/// `reps` means the cell was never measured and can only withhold numbers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CellReps {
+    pub task: String,
+    pub reps: Vec<f64>,
+}
+
+/// The same task measured in both arms — the pairing unit is the task, same
+/// convention as [`paired_bootstrap`] (reps average inside a task first).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatchedPair {
+    pub control: CellReps,
+    pub treatment: CellReps,
+}
+
+/// Report-honesty flags (pi `evals/report.ts:336-357`); no new statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReportFlag {
+    /// Reps inside one cell disagree, so the cell is not a stable estimate.
+    /// Raw per-rep scores are compared: 5/7 vs 6/7 flags, not just solved.
+    Flaky,
+    /// Control arm passes 100%: no headroom for a positive delta.
+    ControlSaturatedPass,
+    /// Control arm fails 100%: no headroom for a negative delta.
+    ControlSaturatedFail,
+    /// Treatment arm passes 100%.
+    TreatmentSaturatedPass,
+    /// Treatment arm fails 100%.
+    TreatmentSaturatedFail,
+}
+
+/// One paired comparison (e.g. the swd cell: rof against a rival). Both pass
+/// rates and `lift` are `None` (WITHHELD) when the pair set is empty, any
+/// expected pair is blocked, or any cell is unmeasured — a number computed
+/// from nothing is never emitted. Saturation flags therefore only fire on
+/// published rates; a withheld rate makes no headroom claim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComparisonReport {
+    pub control_pass_rate: Option<f64>,
+    pub treatment_pass_rate: Option<f64>,
+    pub lift: Option<f64>,
+    pub flags: Vec<ReportFlag>,
+    pub eligible_pairs: usize,
+    pub blocked_pairs: usize,
+}
+
+impl ComparisonReport {
+    /// Summarize `pairs` (tasks measured in both arms) with `blocked_pairs`
+    /// expected pairs that could not be resolved (e.g. a rival cell with zero
+    /// logs). Flaky compares the stored per-rep scores for exact equality —
+    /// no tolerance, no new interval math is invented.
+    pub fn from_pairs(pairs: &[MatchedPair], blocked_pairs: usize) -> Self {
+        let eligible_pairs = pairs
+            .iter()
+            .filter(|p| !p.control.reps.is_empty() && !p.treatment.reps.is_empty())
+            .count();
+        let publish = blocked_pairs == 0 && eligible_pairs == pairs.len() && eligible_pairs > 0;
+        let arm_rate = |side: fn(&MatchedPair) -> &CellReps| {
+            pairs
+                .iter()
+                .map(|p| {
+                    let reps = &side(p).reps;
+                    reps.iter().sum::<f64>() / reps.len() as f64
+                })
+                .sum::<f64>()
+                / pairs.len() as f64
+        };
+        let (control_pass_rate, treatment_pass_rate) = if publish {
+            (
+                Some(arm_rate(|p| &p.control)),
+                Some(arm_rate(|p| &p.treatment)),
+            )
+        } else {
+            (None, None)
+        };
+        let lift = match (control_pass_rate, treatment_pass_rate) {
+            (Some(c), Some(t)) => Some(t - c),
+            _ => None,
+        };
+        let unanimous = |cell: &CellReps| {
+            cell.reps
+                .first()
+                .is_none_or(|first| cell.reps.iter().all(|r| r == first))
+        };
+        let mut flags = Vec::new();
+        if control_pass_rate == Some(1.0) {
+            flags.push(ReportFlag::ControlSaturatedPass);
+        }
+        if control_pass_rate == Some(0.0) {
+            flags.push(ReportFlag::ControlSaturatedFail);
+        }
+        if treatment_pass_rate == Some(1.0) {
+            flags.push(ReportFlag::TreatmentSaturatedPass);
+        }
+        if treatment_pass_rate == Some(0.0) {
+            flags.push(ReportFlag::TreatmentSaturatedFail);
+        }
+        if pairs
+            .iter()
+            .any(|p| !unanimous(&p.control) || !unanimous(&p.treatment))
+        {
+            flags.push(ReportFlag::Flaky);
+        }
+        Self {
+            control_pass_rate,
+            treatment_pass_rate,
+            lift,
+            flags,
+            eligible_pairs,
+            blocked_pairs,
+        }
+    }
+}
+
 /// Slice definition: frozen ids + tags living in-repo, reproducible byte-for-byte.
 pub fn slice_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -900,6 +1017,106 @@ mod tests {
         );
         let (_, lo2, hi2) = paired_bootstrap(&pairs, 10_000, 43).unwrap();
         assert!(hi2 > lo2, "interval has width on mixed pairs");
+    }
+
+    fn rep_cell(task: &str, passed: &[u32], total: u32) -> CellReps {
+        CellReps {
+            task: task.into(),
+            reps: passed
+                .iter()
+                .map(|p| f64::from(*p) / f64::from(total))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn flaky_fires_on_stored_swd_reps() {
+        // Stored source: ~/.local/share/rof-tb/work/matrix-v1/matrix.json,
+        // `rof_runs` rows with task == "session-window-debug" (the swd cell,
+        // 3 single-shot reps): r1 6/7, r2 4/7, r3 5/7 (tests_passed /
+        // tests_failed from the proxy verdicts). research/DECISIONS.md:102
+        // cites the same cell as 5/7, 6/7, 5/7; either form disagrees across
+        // reps and must flag flaky. Rival pi reps in the same file: 2/7 x3.
+        let stored = MatchedPair {
+            control: rep_cell("session-window-debug", &[6, 4, 5], 7),
+            treatment: rep_cell("session-window-debug", &[2, 2, 2], 7),
+        };
+        assert_eq!(
+            ComparisonReport::from_pairs(&[stored], 0).flags,
+            vec![ReportFlag::Flaky]
+        );
+        let cited = rep_cell("session-window-debug", &[5, 6, 5], 7);
+        let cited = MatchedPair {
+            control: cited.clone(),
+            treatment: cited,
+        };
+        assert_eq!(
+            ComparisonReport::from_pairs(&[cited], 0).flags,
+            vec![ReportFlag::Flaky]
+        );
+    }
+
+    #[test]
+    fn blocked_or_empty_pairs_withhold_the_rate() {
+        let pair = || MatchedPair {
+            control: rep_cell("t", &[2, 2, 2], 4),
+            treatment: rep_cell("t", &[3, 3, 3], 4),
+        };
+        let empty = ComparisonReport::from_pairs(&[], 0);
+        assert_eq!(empty.control_pass_rate, None);
+        assert_eq!(empty.treatment_pass_rate, None);
+        assert_eq!(empty.lift, None);
+        let blocked = ComparisonReport::from_pairs(&[pair()], 1);
+        assert_eq!(blocked.control_pass_rate, None);
+        assert_eq!(blocked.treatment_pass_rate, None);
+        assert_eq!(blocked.lift, None);
+        assert_eq!((blocked.eligible_pairs, blocked.blocked_pairs), (1, 1));
+        // An unmeasured cell (no reps) withholds too — it is never read as 0.
+        let unmeasured = ComparisonReport::from_pairs(
+            &[MatchedPair {
+                control: rep_cell("t", &[], 4),
+                treatment: rep_cell("t", &[3, 3, 3], 4),
+            }],
+            0,
+        );
+        assert_eq!(unmeasured.control_pass_rate, None);
+        assert_eq!(unmeasured.eligible_pairs, 0);
+        let published = ComparisonReport::from_pairs(&[pair()], 0);
+        assert_eq!(published.control_pass_rate, Some(0.5));
+        assert_eq!(published.treatment_pass_rate, Some(0.75));
+        assert_eq!(published.lift, Some(0.25));
+    }
+
+    #[test]
+    fn unanimous_cell_with_headroom_is_not_flaky() {
+        let pair = MatchedPair {
+            control: rep_cell("t", &[2, 2, 2], 4),
+            treatment: rep_cell("t", &[3, 3, 3], 4),
+        };
+        let report = ComparisonReport::from_pairs(&[pair], 0);
+        assert!(report.flags.is_empty(), "{:?}", report.flags);
+        assert_eq!(report.control_pass_rate, Some(0.5));
+        assert_eq!(report.treatment_pass_rate, Some(0.75));
+    }
+
+    #[test]
+    fn saturation_flags_on_all_pass_or_all_fail_arms() {
+        let pair = |control: &[u32], treatment: &[u32]| MatchedPair {
+            control: rep_cell("t", control, 4),
+            treatment: rep_cell("t", treatment, 4),
+        };
+        let pass = ComparisonReport::from_pairs(&[pair(&[4, 4, 4], &[2, 2, 2])], 0);
+        assert!(pass.flags.contains(&ReportFlag::ControlSaturatedPass));
+        assert!(!pass.flags.contains(&ReportFlag::Flaky));
+        let fail = ComparisonReport::from_pairs(&[pair(&[0, 0, 0], &[2, 2, 2])], 0);
+        assert!(fail.flags.contains(&ReportFlag::ControlSaturatedFail));
+        let t_pass = ComparisonReport::from_pairs(&[pair(&[2, 2, 2], &[4, 4, 4])], 0);
+        assert!(t_pass.flags.contains(&ReportFlag::TreatmentSaturatedPass));
+        let t_fail = ComparisonReport::from_pairs(&[pair(&[2, 2, 2], &[0, 0, 0])], 0);
+        assert!(t_fail.flags.contains(&ReportFlag::TreatmentSaturatedFail));
+        // Withheld rates make no headroom claim: no saturation flag fires.
+        let withheld = ComparisonReport::from_pairs(&[pair(&[4, 4, 4], &[2, 2, 2])], 1);
+        assert_eq!(withheld.flags, Vec::<ReportFlag>::new());
     }
 
     #[test]
