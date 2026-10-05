@@ -783,12 +783,12 @@ fn split_cmd(cmd: &str) -> Vec<String> {
     parts
 }
 
-/// Tool-output bound: `verify::condense_output` keeps signal lines anywhere in the full output (noise dropped, ≤80 kept lines), then `OUT_CAP` chars is the outer cap; the `ok` verdict is exit-status on the raw output, decided before condensing.
+/// Tool-output bound: `verify::condense_output` keeps signal lines anywhere in the full output (noise dropped, ≤80 kept lines), then `OUT_CAP` chars is the outer cap whose bool reports a real cut (the loop marks that result `[truncated]`); the `ok` verdict is exit-status on the raw output, decided before condensing.
 async fn run_allowed(
     policy: &Policy,
     cmd: &str,
     timeout: Duration,
-) -> Result<(bool, String), ToolError> {
+) -> Result<(bool, String, bool), ToolError> {
     if !policy.allowed_commands.iter().any(|a| a == cmd)
         && !prefix_allowed(&policy.allowed_prefixes, cmd)
     {
@@ -819,8 +819,8 @@ async fn run_allowed(
         s.push_str(&err);
     }
     let ok = out.status.success();
-    let (content, _) = cap_chars(condense_output(&s, None), OUT_CAP);
-    Ok((ok, content))
+    let (content, cap_cut) = cap_chars(condense_output(&s, None), OUT_CAP);
+    Ok((ok, content, cap_cut))
 }
 
 static SYNTAX_N: AtomicUsize = AtomicUsize::new(0);
@@ -841,8 +841,8 @@ async fn check_syntax(policy: &Policy, candidate: &str) -> Result<(), ToolError>
     let res = run_allowed(policy, &cmdline, EXEC_TIMEOUT).await;
     let _ = std::fs::remove_file(&tmp);
     match res {
-        Ok((true, _)) => Ok(()),
-        Ok((false, out)) => Err(ToolError::Failed(format!("syntax check failed: {out}"))),
+        Ok((true, _, _)) => Ok(()),
+        Ok((false, out, _)) => Err(ToolError::Failed(format!("syntax check failed: {out}"))),
         Err(e) => Err(e),
     }
 }
@@ -886,11 +886,8 @@ impl Tool for ExecTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: CmdArgs = parse_args(&inv.args)?;
-        let (_ok, content) = run_allowed(&self.policy, &args.cmd, EXEC_TIMEOUT).await?;
-        Ok(ToolOutcome {
-            content,
-            truncated: false,
-        })
+        let (_ok, content, truncated) = run_allowed(&self.policy, &args.cmd, EXEC_TIMEOUT).await?;
+        Ok(ToolOutcome { content, truncated })
     }
 }
 
@@ -918,17 +915,14 @@ impl Tool for TestTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: CmdArgs = parse_args(&inv.args)?;
-        let (ok, out) = run_allowed(&self.policy, &args.cmd, EXEC_TIMEOUT).await?;
+        let (ok, out, truncated) = run_allowed(&self.policy, &args.cmd, EXEC_TIMEOUT).await?;
         // Cascade policy (what FAIL does to the loop) lives in loop/bets, not here.
         let content = if ok {
             format!("PASS: {}\n{out}", args.cmd)
         } else {
             format!("FAIL: {}\n{out}", args.cmd)
         };
-        Ok(ToolOutcome {
-            content,
-            truncated: false,
-        })
+        Ok(ToolOutcome { content, truncated })
     }
 }
 
@@ -1523,6 +1517,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.content, "hello; echo PWNED error");
+    }
+
+    #[tokio::test]
+    async fn exec_over_cap_output_marks_truncated() {
+        // Raw stdout above OUT_CAP chars: cap_chars really cuts bytes, so the
+        // outcome must flag it (agent-loop renders the `[truncated]` marker).
+        let root = tmp_root();
+        let mut pol = (*policy(&root)).clone();
+        pol.allowed_prefixes.push("cat".to_string());
+        let r = reg(Arc::new(pol));
+        let line = format!("error: {} x\n", "a".repeat(120));
+        std::fs::write(root.join("big.txt"), line.repeat(100)).unwrap();
+        let out = run(&r, "exec", json!({"cmd": "cat big.txt"}))
+            .await
+            .unwrap();
+        assert!(out.truncated, "cap-cut exec must be flagged");
+        assert_eq!(out.content.chars().count(), OUT_CAP);
+    }
+
+    #[tokio::test]
+    async fn exec_condensed_under_cap_not_truncated() {
+        // >80 matched lines is condensation (kept-lines omitted), not a cut:
+        // no bytes were discarded by OUT_CAP, so truncated must stay false.
+        let root = tmp_root();
+        let mut pol = (*policy(&root)).clone();
+        pol.allowed_prefixes.push("cat".to_string());
+        let r = reg(Arc::new(pol));
+        let line = format!("error: {}\n", "a".repeat(48));
+        std::fs::write(root.join("many.txt"), line.repeat(100)).unwrap();
+        let out = run(&r, "exec", json!({"cmd": "cat many.txt"}))
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("kept-lines over cap omitted"),
+            "{}",
+            out.content
+        );
+        assert!(!out.truncated, "condensed output is not a truncation");
     }
 
     #[tokio::test]
