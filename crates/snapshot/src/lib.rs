@@ -284,7 +284,14 @@ impl TreeService {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        if combined.contains("nothing to commit") || combined.contains("nothing added to commit") {
+        // Benign no-op baselines: a clean tree, or dirt git refuses to stage
+        // (e.g. modified content inside an embedded repo — the gitlink sha
+        // never moves, so `add -A` stages nothing). Measured crash:
+        // sanitize-git-repo pilot death (research/diag-snapshot-anomaly.md).
+        if combined.contains("nothing to commit")
+            || combined.contains("nothing added to commit")
+            || combined.contains("no changes added to commit")
+        {
             return Ok(());
         }
         Err(other(format!("git commit: {}", combined.trim_end())))
@@ -415,6 +422,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn embedded_repo_dirt_is_a_benign_no_op_baseline() {
+        // Regression: modified content inside a nested git repo stages as an
+        // unchanged gitlink, so the baseline commit reports "no changes added
+        // to commit" and (before this gate) killed the whole run.
+        let dir = scratch("embed");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        let inner = dir.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {:?}", out);
+        };
+        git(&["init", "-q"], &inner);
+        std::fs::write(inner.join("f.txt"), "x\n").unwrap();
+        git(&["add", "f.txt"], &inner);
+        git(
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "i",
+            ],
+            &inner,
+        );
+        tree.ensure().unwrap();
+        std::fs::write(inner.join("f.txt"), "dirty\n").unwrap();
+        tree.baseline().unwrap(); // was Err("git commit: ... no changes added to commit")
+        tree.baseline().unwrap(); // idempotent
     }
 
     #[test]
