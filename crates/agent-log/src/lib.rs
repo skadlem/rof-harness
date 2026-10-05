@@ -7,7 +7,7 @@
 //! strings are data, never record boundaries.
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -128,9 +128,46 @@ pub struct LogWriter {
     out: BufWriter<std::fs::File>,
 }
 
+/// Drop bytes after the last LF (the whole file if it has no LF): a log whose
+/// last byte is LF ends on a record boundary, anything else is a crash-torn
+/// partial write. Recorded items are never touched — they always end in LF.
+fn truncate_torn_tail(path: &Path) -> std::io::Result<()> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut reader = &file;
+    let mut last = [0u8; 1];
+    reader.seek(SeekFrom::End(-1))?;
+    reader.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    let mut raw = Vec::new();
+    reader.seek(SeekFrom::Start(0))?;
+    reader.read_to_end(&mut raw)?;
+    let keep = raw.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    drop(file);
+    OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_len(keep as u64)
+}
+
 impl LogWriter {
-    /// Open for create+append. Never truncates, never edits in place.
+    /// Open for create+append, repairing a torn tail on disk first: bytes after
+    /// the last LF (or the whole file, if it has no LF) are dropped, so an
+    /// append after a crash cannot merge an item into a fragment. Recorded
+    /// items are never edited; a clean log (empty, or ending in LF) is left
+    /// untouched. Repairing a file to 0 bytes puts the Header obligation on
+    /// the caller: `read_log` requires the first item to be a `Header`.
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        truncate_torn_tail(path)?;
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             out: BufWriter::new(file),
@@ -377,6 +414,45 @@ mod tests {
             ItemKind::Input { text, .. } => assert_eq!(text, "a\u{2028}b"),
             other => panic!("expected Input, got {other:?}"),
         }
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn torn_tail_then_append() {
+        let p = tmp_path();
+        let mut w = LogWriter::open(&p).unwrap();
+        w.append(&header(1)).unwrap();
+        drop(w);
+        // Crash mid-write: append a partial line with no LF.
+        let mut raw = std::fs::read(&p).unwrap();
+        raw.extend(b"{\"seq\":2,\"id\":\"id0002\",\"parent_id\":null");
+        std::fs::write(&p, raw).unwrap();
+
+        let mut w = LogWriter::open(&p).unwrap();
+        w.append(&turn_start(2, "t1")).unwrap();
+        w.append(&turn_end(3, "t1")).unwrap();
+        drop(w);
+
+        let items = read_log(&p).unwrap();
+        assert_eq!(
+            items.iter().map(|i| i.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(matches!(items[0].kind, ItemKind::Header { .. }));
+        assert!(matches!(items[2].kind, ItemKind::TurnEnd { .. }));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn partial_only_file_is_truncated_to_zero() {
+        let p = tmp_path();
+        std::fs::write(&p, b"{\"seq\":1,\"id\":").unwrap(); // no LF, no Header
+        let mut w = LogWriter::open(&p).unwrap();
+        w.append(&header(1)).unwrap();
+        drop(w);
+        let items = read_log(&p).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0].kind, ItemKind::Header { .. }));
         std::fs::remove_file(&p).ok();
     }
 
