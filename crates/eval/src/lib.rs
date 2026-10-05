@@ -398,8 +398,10 @@ pub fn preflight(instances: &[Instance]) -> Vec<String> {
 pub struct InstanceReport {
     pub id: String,
     pub verdict: Verdict,
-    pub tokens_in: u64,
-    pub tokens_out: u64,
+    /// Cumulative `TurnEnd.usage_totals`: `None` = the dump carried no TurnEnd
+    /// at all (missing/truncated), so the counts are unknown — `null`, never 0.
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
     /// Carried from `TurnEnd.usage_totals.cost_usd`: `None` = no billed turn
     /// was priced (serialises to `null`), never flattened to 0.0.
     pub dollars: Option<f64>,
@@ -415,7 +417,9 @@ pub struct RunReport {
 }
 
 impl RunReport {
-    /// Guardrail metric (≤1.3× budget): `None` when nothing solved.
+    /// Guardrail metric (≤1.3× budget): `None` when nothing solved, or when
+    /// any instance's token counts are unknown (a partial sum would hide the
+    /// missing dump behind a smaller number).
     pub fn tokens_per_solved(&self) -> Option<f64> {
         let solved = self
             .instances
@@ -425,11 +429,10 @@ impl RunReport {
         if solved == 0 {
             return None;
         }
-        let total: u64 = self
+        let total = self
             .instances
             .iter()
-            .map(|r| r.tokens_in + r.tokens_out)
-            .sum();
+            .try_fold(0u64, |sum, r| Some(sum + r.tokens_in? + r.tokens_out?))?;
         Some(total as f64 / solved as f64)
     }
 }
@@ -437,7 +440,9 @@ impl RunReport {
 /// Build a per-instance report from a rof `--dump-events` JSONL dump. The
 /// LAST `TurnEnd.usage_totals` is the run's cumulative bill (each TurnEnd
 /// folds the running totals), `MessageEnd` count is the step count, and the
-/// `RunEnd` outcome becomes `halt_reason`. `wall_secs` and `patch` are
+/// `RunEnd` outcome becomes `halt_reason`. A dump with no TurnEnd at all
+/// (missing/truncated) leaves `tokens_in`/`tokens_out`/`dollars` `None` —
+/// absence, never a zero. `wall_secs` and `patch` are
 /// caller-measured (the dump carries neither). Typed event parsing: a schema
 /// drift is a compile error here, never silently zero.
 pub fn instance_report(
@@ -449,7 +454,7 @@ pub fn instance_report(
 ) -> std::io::Result<InstanceReport> {
     use agent_event::{AgentEvent, RunOutcome, UsageReport};
     let text = std::fs::read_to_string(events_jsonl)?;
-    let mut totals = UsageReport::default();
+    let mut totals: Option<UsageReport> = None;
     let mut steps = 0u32;
     let mut halt: Option<String> = None;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -457,7 +462,7 @@ pub fn instance_report(
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         match ev {
             AgentEvent::MessageEnd { .. } => steps += 1,
-            AgentEvent::TurnEnd { usage_totals, .. } => totals = usage_totals,
+            AgentEvent::TurnEnd { usage_totals, .. } => totals = Some(usage_totals),
             AgentEvent::RunEnd { outcome, .. } => {
                 halt = match outcome {
                     RunOutcome::Failed(r) => Some(r),
@@ -471,9 +476,9 @@ pub fn instance_report(
     Ok(InstanceReport {
         id: id.into(),
         verdict,
-        tokens_in: totals.input_tokens,
-        tokens_out: totals.output_tokens,
-        dollars: totals.cost_usd,
+        tokens_in: totals.as_ref().map(|t| t.input_tokens),
+        tokens_out: totals.as_ref().map(|t| t.output_tokens),
+        dollars: totals.as_ref().and_then(|t| t.cost_usd),
         wall_secs,
         steps,
         halt_reason: halt,
@@ -985,7 +990,7 @@ mod tests {
         let r = instance_report("t1", Verdict::Resolved, &p, 12, "diff --git a").unwrap();
         assert_eq!(
             (r.tokens_in, r.tokens_out),
-            (25, 6),
+            (Some(25), Some(6)),
             "last cumulative TurnEnd"
         );
         assert_eq!(r.dollars, Some(0.5), "cost_usd flows into dollars");
@@ -1016,6 +1021,29 @@ mod tests {
         assert_eq!(r.dollars, None, "unpriced usage is absence, not $0.00");
         let v = serde_json::to_value(&r).unwrap();
         assert!(v["dollars"].is_null(), "absence must serialise to null");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn instance_report_without_turn_end_reports_null_not_zero() {
+        let dir = tmp();
+        let p = dir.join("events.jsonl");
+        // torn dump: a MessageEnd is visible but no TurnEnd ever landed, so
+        // the token counts are unknown — they must read null, not 0.
+        std::fs::write(
+            &p,
+            "{\"type\":\"MessageEnd\",\"id\":1,\"message\":{\"role\":\"Assistant\",\"content\":\"\"},\"interrupted\":false,\"usage\":null}\n",
+        )
+        .unwrap();
+        let r = instance_report("t1", Verdict::Unresolved, &p, 3, "").unwrap();
+        assert_eq!(r.tokens_in, None, "no TurnEnd => unknown tokens, not 0");
+        assert_eq!(r.tokens_out, None);
+        assert_eq!(r.dollars, None);
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(
+            v["tokens_in"].is_null() && v["tokens_out"].is_null(),
+            "absence must serialise to null: {v}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1143,11 +1171,11 @@ mod tests {
 
     #[test]
     fn tokens_per_solved_guards_division() {
-        let rep = |id: &str, v: Verdict, t: u64| InstanceReport {
+        let rep = |id: &str, v: Verdict, t: Option<u64>| InstanceReport {
             id: id.into(),
             verdict: v,
             tokens_in: t,
-            tokens_out: 0,
+            tokens_out: Some(0),
             dollars: None,
             wall_secs: 0,
             steps: 0,
@@ -1158,11 +1186,22 @@ mod tests {
         assert_eq!(empty.tokens_per_solved(), None);
         let r = RunReport {
             instances: vec![
-                rep("a", Verdict::Resolved, 100),
-                rep("b", Verdict::Unresolved, 100),
+                rep("a", Verdict::Resolved, Some(100)),
+                rep("b", Verdict::Unresolved, Some(100)),
             ],
         };
         assert_eq!(r.tokens_per_solved(), Some(200.0));
+        let unknown = RunReport {
+            instances: vec![
+                rep("a", Verdict::Resolved, Some(100)),
+                rep("b", Verdict::Unresolved, None),
+            ],
+        };
+        assert_eq!(
+            unknown.tokens_per_solved(),
+            None,
+            "an unknown token count makes the total unknown, not smaller"
+        );
     }
 
     #[test]
