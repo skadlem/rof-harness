@@ -400,7 +400,9 @@ pub struct InstanceReport {
     pub verdict: Verdict,
     pub tokens_in: u64,
     pub tokens_out: u64,
-    pub dollars: f64,
+    /// Carried from `TurnEnd.usage_totals.cost_usd`: `None` = no billed turn
+    /// was priced (serialises to `null`), never flattened to 0.0.
+    pub dollars: Option<f64>,
     pub wall_secs: u64,
     pub steps: u32,
     pub halt_reason: Option<String>,
@@ -471,7 +473,7 @@ pub fn instance_report(
         verdict,
         tokens_in: totals.input_tokens,
         tokens_out: totals.output_tokens,
-        dollars: totals.cost_usd.unwrap_or(0.0),
+        dollars: totals.cost_usd,
         wall_secs,
         steps,
         halt_reason: halt,
@@ -986,7 +988,7 @@ mod tests {
             (25, 6),
             "last cumulative TurnEnd"
         );
-        assert_eq!(r.dollars, 0.5, "cost_usd flows into dollars");
+        assert_eq!(r.dollars, Some(0.5), "cost_usd flows into dollars");
         assert_eq!(r.steps, 2);
         assert_eq!(r.halt_reason.as_deref(), Some("steps"));
         assert_eq!(r.wall_secs, 12);
@@ -994,6 +996,26 @@ mod tests {
         assert_eq!(r.patch_digest, same.patch_digest, "digest is stable");
         let other = instance_report("t1", Verdict::Resolved, &p, 12, "diff --git b").unwrap();
         assert_ne!(r.patch_digest, other.patch_digest);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unpriced_usage_reports_null_not_zero() {
+        let dir = tmp();
+        let p = dir.join("events.jsonl");
+        std::fs::write(
+            &p,
+            concat!(
+                "{\"type\":\"MessageEnd\",\"id\":1,\"message\":{\"role\":\"Assistant\",\"content\":\"\"},\"interrupted\":false,\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_tokens\":3,\"reasoning_tokens\":1,\"cost_usd\":null}}\n",
+                "{\"type\":\"TurnEnd\",\"turn\":1,\"reason\":\"BudgetExceeded\",\"usage_totals\":{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_tokens\":3,\"reasoning_tokens\":1,\"cost_usd\":null}}\n",
+                "{\"type\":\"RunEnd\",\"outcome\":{\"Failed\":\"tokens\"},\"messages\":[]}\n",
+            ),
+        )
+        .unwrap();
+        let r = instance_report("t1", Verdict::Unresolved, &p, 3, "").unwrap();
+        assert_eq!(r.dollars, None, "unpriced usage is absence, not $0.00");
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v["dollars"].is_null(), "absence must serialise to null");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1126,7 +1148,7 @@ mod tests {
             verdict: v,
             tokens_in: t,
             tokens_out: 0,
-            dollars: 0.0,
+            dollars: None,
             wall_secs: 0,
             steps: 0,
             halt_reason: None,
