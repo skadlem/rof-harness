@@ -576,6 +576,21 @@ fn sanitize(name: &str) -> String {
 /// excluded from retrieval and from every path the file tools resolve
 /// (`tools::resolve_under`).
 fn copy_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    copy_tree_files(src, dst)?;
+    if src.join(".git").is_dir() {
+        crate::engine::tree::copy_git_state(src, dst)?;
+    } else {
+        // A source without git still gets a substrate: rollback and the write
+        // gate work on every task copy, not just repo tasks.
+        crate::engine::tree::TreeService::new(dst.to_path_buf()).ensure()?;
+    }
+    Ok(())
+}
+
+/// Plain recursive file copy with no git side effects: the substrate above
+/// runs once at the top level so subdirs never become their own repos
+/// (nested repos record as gitlinks and break the next baseline commit).
+fn copy_tree_files(src: &Path, dst: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -595,19 +610,12 @@ fn copy_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
         if ft.is_dir() {
             // Best effort: unreadable subtrees fail the copy loudly; a
             // half-copied tree must never run as if it were whole.
-            copy_tree(&from, &to)?;
+            copy_tree_files(&from, &to)?;
         } else if ft.is_file() {
             std::fs::copy(&from, &to)?;
         }
         // Symlinks and sockets are skipped: they escape the tree or
         // cannot be meaningfully copied per task.
-    }
-    if src.join(".git").is_dir() {
-        crate::engine::tree::copy_git_state(src, dst)?;
-    } else {
-        // A source without git still gets a substrate: rollback and the write
-        // gate work on every task copy, not just repo tasks.
-        crate::engine::tree::TreeService::new(dst.to_path_buf()).ensure()?;
     }
     Ok(())
 }
