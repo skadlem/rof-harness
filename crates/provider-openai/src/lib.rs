@@ -7,7 +7,8 @@ use provider_core::{
     LlmError, Request, Response, StopReason, ToolCallRef, Usage,
 };
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Per-endpoint capability profile. Thresholds are re-measured per endpoint,
 /// never transferred (v1 profile.rs lesson).
@@ -80,6 +81,9 @@ impl LlmClient for OpenAiCompat {
         // Cold-start extension: 503s get up to 8 attempts with 60s sleeps
         // (~4 min, covers Modal scale-from-zero); other retryable errors keep
         // 5; truncated attempts follow the ladder until it has no rung left.
+        // A server `Retry-After` above `RETRY_AFTER_CAP` is terminal instead,
+        // and the computed 2^attempt backoff carries 0–25% jitter so locked-
+        // step workers do not stampede (pi provider-retry.ts:44-58,66).
         let mut last_err = "no attempts".to_string();
         let mut last_after: Option<Duration> = None;
         // Billed attempts are metered: sum what each carried so the error
@@ -91,13 +95,9 @@ impl LlmClient for OpenAiCompat {
         let mut attempt = 0u32;
         loop {
             if attempt > 0 {
-                let d = last_after.take().unwrap_or_else(|| {
-                    if is_cold_start(&last_err) {
-                        Duration::from_secs(60)
-                    } else {
-                        Duration::from_secs(2u64.pow(attempt.min(10)))
-                    }
-                });
+                let Some(d) = schedule_delay(last_after.take(), &last_err, attempt) else {
+                    break;
+                };
                 tokio::time::sleep(d).await;
             }
             match self.once(model, req, &knobs).await {
@@ -414,6 +414,51 @@ fn merge_usage(acc: Option<Usage>, next: Option<Usage>) -> Option<Usage> {
     match (acc, next) {
         (Some(a), Some(n)) => Some(a.plus(&n)),
         (a, n) => a.or(n),
+    }
+}
+
+/// Cap on a server-requested `Retry-After` delay. Pi fails fast above its
+/// 60 s `maxRetryDelayMs` default (`provider-retry.ts:44-58`): a longer ask is
+/// terminal, never slept on.
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
+
+/// Process-local draw counter, mixed into the clock stamp so two draws in the
+/// same clock tick (or on a coarse clock) still differ.
+static JITTER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 0–25% multiplicative jitter for the exponential rungs
+/// (pi `provider-retry.ts:66`). Entropy: wall-clock nanoseconds at retry time
+/// (parallel workers reach a retry at distinct instants) mixed with a
+/// process-local draw counter; splitmix64 finalizer so coarse clock granularity
+/// cannot bias the low bits. No `rand` dependency.
+fn backoff_jitter_factor() -> f64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() ^ u64::from(d.subsec_nanos()));
+    let seq = JITTER_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut x = now ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    (x % 250) as f64 / 1000.0
+}
+
+/// Backoff before retry `attempt` (1-based): the pre-existing 2^attempt-second
+/// rung, clamped at 2^10, plus 0–25% multiplicative jitter.
+fn backoff_delay(attempt: u32) -> Duration {
+    let base = 2u64.pow(attempt.min(10));
+    Duration::from_secs_f64(base as f64 * (1.0 + backoff_jitter_factor()))
+}
+
+/// Delay before retrying. `None` = terminal: the server asked for more than
+/// `RETRY_AFTER_CAP`. Without a header, cold-start 503s keep the 60 s rung
+/// (8 attempts) and other errors keep the jittered 2^attempt rung.
+fn schedule_delay(after: Option<Duration>, last_err: &str, attempt: u32) -> Option<Duration> {
+    match after {
+        Some(d) if d > RETRY_AFTER_CAP => None,
+        Some(d) => Some(d),
+        None if is_cold_start(last_err) => Some(Duration::from_secs(60)),
+        None => Some(backoff_delay(attempt)),
     }
 }
 
@@ -1239,6 +1284,36 @@ mod tests {
         );
     }
 
+    /// A server asking for an hour is a capacity statement, not a retry hint:
+    /// return the terminal error instead of sleeping (pi `provider-retry.ts:44-58`).
+    #[tokio::test]
+    async fn retry_after_above_cap_is_terminal_without_sleeping() {
+        std::env::set_var("TEST_OAI_KEY_R3", "k");
+        let (ep, bodies) = serve(vec![Canned {
+            status: 429,
+            headers: vec![("Retry-After".into(), "3600".into())],
+            body: "no capacity for an hour".into(),
+        }]);
+        let c = client_on(&ep, "TEST_OAI_KEY_R3");
+        let mut req = req_with_tool();
+        req.tools.clear();
+        let t = Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(5), c.complete("m", &req))
+            .await
+            .expect("Retry-After above the cap must fail fast, not sleep")
+            .unwrap_err();
+        match err {
+            LlmError::Metered { source, .. } => assert!(source.contains("429"), "{source}"),
+            other => panic!("expected Metered, got {other:?}"),
+        }
+        assert_eq!(bodies.lock().unwrap().len(), 1, "terminal: no re-send");
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "elapsed {:?}",
+            t.elapsed()
+        );
+    }
+
     #[tokio::test]
     async fn complete_ladder_sends_thinking_disabled_on_reasoning_only_truncation() {
         std::env::set_var("TEST_OAI_KEY_L1", "k");
@@ -1339,6 +1414,73 @@ mod tests {
                 .as_secs()
                 > 200_000_000
         );
+    }
+
+    #[test]
+    fn schedule_delay_caps_server_requests_at_60s() {
+        // Above the cap: terminal, however large the ask — and both header
+        // encodings (seconds, HTTP-date) funnel through here.
+        assert!(schedule_delay(Some(Duration::from_secs(3600)), "429", 1).is_none());
+        assert!(schedule_delay(Some(Duration::from_secs(61)), "429", 1).is_none());
+        assert!(
+            schedule_delay(parse_retry_after("Sun, 06 Nov 2034 08:49:37 GMT"), "429", 1).is_none()
+        );
+        // Exactly the cap is still honoured, verbatim.
+        assert_eq!(
+            schedule_delay(Some(Duration::from_secs(60)), "429", 1),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            schedule_delay(Some(Duration::from_secs(1)), "429", 1),
+            Some(Duration::from_secs(1))
+        );
+        // No header: cold-start 503 keeps its 60 s rung, other errors the
+        // jittered 2^attempt rung.
+        assert_eq!(
+            schedule_delay(None, "503 Service Unavailable", 3),
+            Some(Duration::from_secs(60))
+        );
+        let d = schedule_delay(None, "429 Too Many Requests", 1).unwrap();
+        assert!(
+            d >= Duration::from_secs(2) && d <= Duration::from_millis(2500),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn backoff_delay_jitter_stays_within_rung_bounds() {
+        // 0–25% multiplicative jitter: every draw stays in [base, 1.25*base],
+        // rung magnitudes and ordering are the pre-jitter 2^attempt ladder,
+        // and the 2^10 clamp is unchanged.
+        let mut prev_hi = Duration::ZERO;
+        for attempt in 1..=11u32 {
+            let base = Duration::from_secs(2u64.pow(attempt.min(10)));
+            let mut lo = Duration::MAX;
+            let mut hi = Duration::ZERO;
+            let mut samples = Vec::new();
+            for _ in 0..128 {
+                let d = backoff_delay(attempt);
+                assert!(d >= base, "attempt {attempt}: {d:?} below base {base:?}");
+                assert!(
+                    d.as_secs_f64() <= base.as_secs_f64() * 1.25,
+                    "attempt {attempt}: {d:?} above 1.25*{base:?}"
+                );
+                lo = lo.min(d);
+                hi = hi.max(d);
+                samples.push(d);
+            }
+            assert!(
+                samples.iter().any(|d| *d != samples[0]),
+                "attempt {attempt}: jitter draws must vary"
+            );
+            if attempt <= 10 {
+                assert!(lo > prev_hi, "attempt {attempt}: rungs must stay ordered");
+            } else {
+                // 2^10 clamp unchanged: same rung magnitude as attempt 10.
+                assert_eq!(base, Duration::from_secs(1024));
+            }
+            prev_hi = hi;
+        }
     }
 
     #[test]
