@@ -262,12 +262,69 @@ pub fn condense_output(s: &str, baseline: Option<&str>) -> String {
         );
     }
     let omitted = kept.len().saturating_sub(80);
-    let body = kept[..kept.len().min(80)].join("\n");
+    let body = if omitted > 0 {
+        pick_kept(&kept).join("\n")
+    } else {
+        kept.join("\n")
+    };
     if omitted > 0 || dropped > 0 {
         format!("{body}\n[...{dropped} noise lines and {omitted} kept-lines over cap omitted]")
     } else {
         body
     }
+}
+
+/// Exit-(c) budget: exactly 80 of the matched lines. The matched set's last
+/// line is always kept (a pytest `test result:` summary sits there), and the
+/// remaining 79 rank specific signal substrings (`FAILED`, panics, assertions,
+/// pytest summaries) ahead of the high-volume `error`/`warning` matches. Each
+/// class contributes its own head and tail, so a verdict in the middle of a
+/// message flood survives instead of being sliced off.
+fn pick_kept<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+    const BUDGET: usize = 80;
+    let last = lines.len() - 1;
+    let (mut specific, mut generic) = (Vec::new(), Vec::new());
+    for (i, l) in lines[..last].iter().enumerate() {
+        if is_specific(l.trim()) {
+            specific.push(i);
+        } else {
+            generic.push(i);
+        }
+    }
+    let mut picked = vec![last];
+    if specific.len() >= BUDGET - 1 {
+        picked.extend(head_tail(&specific, BUDGET - 1));
+    } else {
+        picked.extend(&specific);
+        picked.extend(head_tail(&generic, BUDGET - 1 - specific.len()));
+    }
+    picked.sort_unstable();
+    picked.into_iter().map(|i| lines[i]).collect()
+}
+
+/// First and last `budget` entries of `idx`, extra slot on the head side.
+fn head_tail(idx: &[usize], budget: usize) -> Vec<usize> {
+    if idx.len() <= budget {
+        return idx.to_vec();
+    }
+    let head = budget.div_ceil(2);
+    let mut out = idx[..head].to_vec();
+    out.extend_from_slice(&idx[idx.len() - (budget - head)..]);
+    out
+}
+
+fn is_specific(t: &str) -> bool {
+    [
+        "FAILED",
+        "panicked",
+        "assertion",
+        "test result",
+        "failures:",
+        "left:",
+        "right:",
+    ]
+    .iter()
+    .any(|k| t.contains(k))
 }
 
 #[cfg(test)]
@@ -377,6 +434,50 @@ mod tests {
         );
         let green = condense_output("   Compiling rof v0.1.0\n    Finished dev profile\n", None);
         assert!(green.contains("no actionable lines"));
+    }
+
+    #[test]
+    fn condense_over_cap_keeps_tail_verdict_line() {
+        // The old tail-biased `kept[..80]` slice dropped the pytest summary
+        // when a flood of warnings preceded it; the cap must keep the tail.
+        let mut raw = String::new();
+        for i in 0..85 {
+            raw.push_str(&format!("warning: unused variable var_{i}\n"));
+        }
+        raw.push_str("test result: FAILED. 3 failed, 97 passed in 1.20s\n");
+        let out = condense_output(&raw, None);
+        assert!(out.contains("test result: FAILED. 3 failed"), "{out}");
+        assert!(out.contains("warning: unused variable var_0"), "{out}");
+        assert!(out.contains("warning: unused variable var_84"), "{out}");
+        assert!(
+            out.ends_with("[...0 noise lines and 6 kept-lines over cap omitted]"),
+            "{out}"
+        );
+        assert_eq!(out.lines().count(), 81, "{out}");
+    }
+
+    #[test]
+    fn condense_over_cap_ranks_specific_mid_set_line() {
+        // Specific tokens outrank error/warning floods: a panic at matched
+        // index 95 survives although both the old `kept[..80]` slice and a
+        // plain first-40/last-40 window would drop it.
+        let mut raw = String::new();
+        for i in 0..95 {
+            raw.push_str(&format!("warning: early {i}\n"));
+        }
+        raw.push_str("thread 'main' panicked at src/lib.rs:1\n");
+        for i in 0..100 {
+            raw.push_str(&format!("warning: late {i}\n"));
+        }
+        let out = condense_output(&raw, None);
+        assert!(out.contains("panicked at src/lib.rs:1"), "{out}");
+        assert!(out.contains("warning: early 0"), "{out}");
+        assert!(out.contains("warning: late 99"), "{out}");
+        assert_eq!(
+            out.lines().filter(|l| l.starts_with("warning")).count(),
+            79,
+            "{out}"
+        );
     }
 
     #[test]
