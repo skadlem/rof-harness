@@ -159,9 +159,66 @@ pub fn checks_pass(results: &[CheckResult]) -> bool {
     results.iter().all(|c| c.passed)
 }
 
+fn is_noise(t: &str) -> bool {
+    t.is_empty()
+        || t.starts_with("Compiling")
+        || t.starts_with("Finished")
+        || t.starts_with("Running")
+        || t.starts_with("Doc-tests")
+        || t.starts_with("Blocking")
+        || (t.starts_with("test ") && t.ends_with("... ok"))
+}
+
+const TAIL_LINES: usize = 12;
+const TAIL_BYTES: usize = 2000;
+
+/// Keep-list matched nothing: a bare Python traceback, panic backtrace or
+/// timeout notice carries no signal substring, only a tail. Keep the last
+/// `TAIL_LINES` raw lines within `TAIL_BYTES`; a pure-noise tail (all
+/// `is_noise`) keeps the old empty-result sentence so green build logs stay
+/// as terse as before.
+fn condense_tail(s: &str) -> String {
+    let all: Vec<&str> = s.lines().collect();
+    if all.is_empty() {
+        return "(no actionable lines in 0 lines of output)".to_string();
+    }
+    let mut first = all.len();
+    let mut bytes = 0usize;
+    while first > 0 && all.len() - first < TAIL_LINES {
+        let cost = all[first - 1].len() + 1;
+        if bytes + cost > TAIL_BYTES {
+            break;
+        }
+        bytes += cost;
+        first -= 1;
+    }
+    let mut body = if first == all.len() {
+        // Even the last line alone exceeds the budget: keep its tail bytes.
+        first -= 1;
+        let line = all[first];
+        let mut from = line.len().saturating_sub(TAIL_BYTES);
+        while !line.is_char_boundary(from) {
+            from += 1;
+        }
+        line[from..].to_string()
+    } else {
+        all[first..].join("\n")
+    };
+    if !all[first..].iter().any(|l| !is_noise(l.trim())) {
+        return format!("(no actionable lines in {} lines of output)", all.len());
+    }
+    if first > 0 {
+        body.push_str(&format!("\n[...{first} earlier lines omitted]"));
+    }
+    body
+}
+
 /// Drop build noise, keep signal substrings, cap line count. With a
 /// baseline (`Some` pre-existing output), kept lines already present in
-/// the baseline are dropped as noise so only new signal surfaces.
+/// the baseline are dropped as noise so only new signal surfaces. When
+/// the keep-list matches nothing at all, [`condense_tail`] returns the raw
+/// tail instead of the empty-result sentence; baseline suppression alone
+/// keeps that sentence.
 pub fn condense_output(s: &str, baseline: Option<&str>) -> String {
     const KEEP: [&str; 9] = [
         "FAILED",
@@ -176,21 +233,16 @@ pub fn condense_output(s: &str, baseline: Option<&str>) -> String {
     ];
     let base: Option<HashSet<&str>> = baseline.map(|b| b.lines().collect());
     let mut kept: Vec<&str> = Vec::new();
+    let mut matched = 0usize;
     let mut dropped = 0usize;
     for line in s.lines() {
         let t = line.trim();
-        let noise = t.is_empty()
-            || t.starts_with("Compiling")
-            || t.starts_with("Finished")
-            || t.starts_with("Running")
-            || t.starts_with("Doc-tests")
-            || t.starts_with("Blocking")
-            || (t.starts_with("test ") && t.ends_with("... ok"));
-        if noise {
+        if is_noise(t) {
             dropped += 1;
             continue;
         }
         if KEEP.iter().any(|k| t.contains(k)) {
+            matched += 1;
             if base.as_ref().is_some_and(|bs| bs.contains(line)) {
                 dropped += 1;
                 continue;
@@ -199,6 +251,9 @@ pub fn condense_output(s: &str, baseline: Option<&str>) -> String {
         } else {
             dropped += 1;
         }
+    }
+    if kept.is_empty() && matched == 0 {
+        return condense_tail(s);
     }
     if kept.is_empty() {
         return format!(
@@ -335,6 +390,43 @@ mod tests {
         assert!(with.contains("error new"), "{with}");
         let all_old = condense_output("error old\n", Some("error old\n"));
         assert!(all_old.contains("no actionable lines"), "{all_old}");
+    }
+
+    #[test]
+    fn condense_keeps_bare_traceback_tail() {
+        // No KEEP substring anywhere ("ValueError" is not "error"): the only
+        // actionable line sits past the keep-list's reach, at the end.
+        let mut raw = String::from("Traceback (most recent call last):\n");
+        for i in 0..40 {
+            raw.push_str(&format!("  File frame_{i}.rs, in <module>\n"));
+        }
+        raw.push_str("ValueError: boom\n");
+        let out = condense_output(&raw, None);
+        assert!(out.contains("ValueError: boom"), "{out}");
+        assert!(out.contains("earlier lines omitted"), "{out}");
+        assert!(!out.contains("no actionable lines"), "{out}");
+        assert!(out.lines().count() <= TAIL_LINES + 1, "{out}");
+        // The byte budget holds even for one huge last line.
+        let huge = format!("Traceback:\n{}\n", "z".repeat(10_000));
+        let cut = condense_output(&huge, None);
+        assert_eq!(cut.lines().next().unwrap().len(), TAIL_BYTES, "{cut}");
+        // Pure-noise tail keeps the terse sentence (green build logs).
+        let green = condense_output("   Compiling a\n    Finished dev\n", None);
+        assert!(green.contains("no actionable lines"), "{green}");
+    }
+
+    #[test]
+    fn condense_unchanged_when_keep_list_matches() {
+        // Non-empty keep-list: byte-identical to the pre-fallback rendering.
+        let raw = "   Compiling x\nerror: E0308\nfiller a\nfiller b\n";
+        assert_eq!(
+            condense_output(raw, None),
+            "error: E0308\n[...3 noise lines and 0 kept-lines over cap omitted]"
+        );
+        assert_eq!(
+            condense_output(raw, Some("error: E0308\n")),
+            "(no actionable lines in 4 lines of output)"
+        );
     }
 
     #[test]
