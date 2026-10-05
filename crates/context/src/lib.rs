@@ -16,6 +16,40 @@ pub const MIN_WINDOW: usize = 2_000;
 /// Old observations kept verbatim (SWE-agent collapse-5, +3.0pp over full history).
 pub const COLLAPSE_KEEP: usize = 5;
 
+/// Hysteresis for the collapse boundary: the boundary advances only once the
+/// verbatim window would reach `COLLAPSE_KEEP + H`, then it stubs the whole
+/// excess in one batch, so it moves once per H tool rows instead of once per
+/// row. `0` = the collapse-5 tail rule (byte-identical, the default). Every
+/// move rewrites history and invalidates the provider prefix-cache suffix
+/// (research/cost-decomposition.md: 82.1% of avoidable miss dollars).
+pub const COLLAPSE_HYSTERESIS: usize = 0;
+
+/// Hysteresis knob: env `COLLAPSE_HYSTERESIS` overrides the default (A/B arm;
+/// the default stays [`COLLAPSE_HYSTERESIS`]). The env leg is deliberately not
+/// unit-tested (mutation races parallel tests; THINKING_KEEP precedent): the
+/// fold takes H as a plain parameter and tests drive [`collapse_boundary`]
+/// directly.
+pub fn collapse_hysteresis() -> usize {
+    std::env::var("COLLAPSE_HYSTERESIS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(COLLAPSE_HYSTERESIS)
+}
+
+/// Stub boundary over `tool_count` tool rows: rows before the returned index
+/// collapse, rows from it on stay verbatim. `hysteresis == 0` is the
+/// collapse-5 tail rule (all but the last `keep`). With `hysteresis == h > 0`
+/// the boundary is a multiple of h and advances only when the window would
+/// reach `keep + h`: the window never exceeds `keep + h` and (once the history
+/// holds `keep` rows) never shrinks below `keep`, and each move stubs the
+/// whole accumulated excess at once (h rows when one row arrives per fold).
+pub fn collapse_boundary(tool_count: usize, keep: usize, hysteresis: usize) -> usize {
+    if hysteresis == 0 {
+        return tool_count.saturating_sub(keep);
+    }
+    hysteresis * (tool_count.saturating_sub(keep) / hysteresis)
+}
+
 /// Active file window in lines (SWE-agent: 30 lines −3.7pp, full file −5.3pp).
 pub const WINDOW_LINES: usize = 100;
 
@@ -481,6 +515,40 @@ mod tests {
         assert_eq!(c.chars().count(), 4);
         assert_eq!(c, "λλλλ");
         assert_eq!(cut_chars("abc", 99), "abc");
+    }
+
+    #[test]
+    fn collapse_boundary_steps_in_h_batches_and_h0_is_the_tail_rule() {
+        assert_eq!(COLLAPSE_HYSTERESIS, 0); // default = today
+        for h in 1..=8 {
+            let mut moves = Vec::new();
+            let mut prev = 0;
+            for t in 0..=80 {
+                let b = collapse_boundary(t, COLLAPSE_KEEP, h);
+                assert_eq!(b % h, 0, "t={t} h={h}: boundary {b} not an H multiple");
+                let window = t - b;
+                assert!(window <= COLLAPSE_KEEP + h, "t={t} h={h}: window {window}");
+                assert!(
+                    window >= COLLAPSE_KEEP.min(t),
+                    "t={t} h={h}: window {window}"
+                );
+                if b != prev {
+                    moves.push(t);
+                    prev = b;
+                }
+            }
+            // First move at keep+h, then exactly every h rows: one batch per h.
+            let want: Vec<usize> = (0..(80 - COLLAPSE_KEEP) / h)
+                .map(|n| COLLAPSE_KEEP + h + n * h)
+                .collect();
+            assert_eq!(moves, want, "h={h}");
+        }
+        for t in 0..=80 {
+            assert_eq!(
+                collapse_boundary(t, COLLAPSE_KEEP, 0),
+                t.saturating_sub(COLLAPSE_KEEP)
+            );
+        }
     }
 
     #[test]

@@ -915,9 +915,10 @@ impl LoopState {
 
     /// Transcript fold: the request is derived from the log, not held.
     /// Collapse-5 over tool observations (context economics): the last
-    /// `COLLAPSE_KEEP` tool results go verbatim, older ones shrink to a
-    /// `[collapsed: Nb — re-open to edit]` stub plus their first 120 chars as
-    /// folded. Stable order preserved, so prefix caches survive.
+    /// `COLLAPSE_KEEP` tool results go verbatim (up to `COLLAPSE_KEEP + H`
+    /// under hysteresis H; see [`Self::raw_messages_with`]), older ones shrink
+    /// to a `[collapsed: Nb — re-open to edit]` stub plus their first 120 chars
+    /// as folded. Stable order preserved, so prefix caches survive.
     ///
     /// Echoed reasoning is trimmed to the last [`THINKING_KEEP`] assistant
     /// rows: on a thinking-heavy trace it was 64% of input (measured: 128k of
@@ -941,8 +942,15 @@ impl LoopState {
         out
     }
 
-    /// The raw log fold: every message, collapse-5 + thinking trim applied.
+    /// The raw log fold: every message, collapse + thinking trim applied, with
+    /// the collapse hysteresis read from [`context::collapse_hysteresis`].
     fn raw_messages(&self) -> Vec<ProviderMessage> {
+        self.raw_messages_with(context::collapse_hysteresis())
+    }
+
+    /// [`Self::raw_messages`] with the collapse hysteresis taken as a plain
+    /// parameter: tests drive H directly instead of mutating the environment.
+    fn raw_messages_with(&self, hysteresis: usize) -> Vec<ProviderMessage> {
         let mut out = Vec::new();
         for item in &self.items {
             match &item.kind {
@@ -1002,14 +1010,17 @@ impl LoopState {
             .filter(|(_, m)| m.role == "tool")
             .map(|(i, _)| i)
             .collect();
-        if tool_idx.len() > context::COLLAPSE_KEEP {
-            for &i in &tool_idx[..tool_idx.len() - context::COLLAPSE_KEEP] {
-                // Bytes at fold time + a 120-char head: enough to tell the
-                // observation apart from a re-read of the file.
-                let bytes = out[i].content.len();
-                let head: String = out[i].content.chars().take(120).collect();
-                out[i].content = format!("[collapsed: {bytes}b — re-open to edit] {head}");
-            }
+        // Collapse boundary: rows before it stub, the tail stays verbatim.
+        // H=0 moves it one row per fold (collapse-5); hysteresis H batches the
+        // move to once per H rows so the untouched prefix stays cache-hittable.
+        let boundary =
+            context::collapse_boundary(tool_idx.len(), context::COLLAPSE_KEEP, hysteresis);
+        for &i in &tool_idx[..boundary] {
+            // Bytes at fold time + a 120-char head: enough to tell the
+            // observation apart from a re-read of the file.
+            let bytes = out[i].content.len();
+            let head: String = out[i].content.chars().take(120).collect();
+            out[i].content = format!("[collapsed: {bytes}b — re-open to edit] {head}");
         }
         out
     }
@@ -2901,6 +2912,124 @@ mod tests {
         );
         assert_eq!(msgs[2].content, "line2-head\nline2-tail");
         assert_eq!(msgs[2].tool_call_id.as_deref(), Some("c2"));
+    }
+
+    /// Tool-only history of `n` rows, content `obs-{i}` (5 bytes each).
+    fn tool_history(n: usize) -> LoopState {
+        let mut s = LoopState::new();
+        for i in 0..n {
+            s.items.push(Item {
+                seq: s.items.len() as u64,
+                id: format!("t{i}"),
+                parent_id: None,
+                recorded_at: SystemTime::now(),
+                kind: ItemKind::ToolResult {
+                    call_id: format!("c{i}"),
+                    content: format!("obs-{i}"),
+                    is_error: false,
+                    recovery: None,
+                },
+            });
+        }
+        s
+    }
+
+    /// The boundary a fold used: the contiguous leading stub prefix (fixtures
+    /// are tool-only, so it is also the stub count). A stub behind a verbatim
+    /// row would mean the fold moved the boundary one row at a time.
+    fn stub_boundary(msgs: &[ProviderMessage]) -> usize {
+        const STUB: &str = "[collapsed: ";
+        let b = msgs.iter().filter(|m| m.content.starts_with(STUB)).count();
+        assert!(
+            msgs[..b].iter().all(|m| m.content.starts_with(STUB)),
+            "stubs must be the leading prefix"
+        );
+        assert!(
+            msgs[b..].iter().all(|m| !m.content.starts_with(STUB)),
+            "stub behind a verbatim row: boundary moved one row at a time"
+        );
+        b
+    }
+
+    /// H=0 is today's collapse-5 fold, byte for byte: 3 of 8 tool rows stub,
+    /// the last 5 stay verbatim; the env-less default folds the same bytes.
+    #[test]
+    fn collapse_hysteresis_zero_is_byte_identical_to_collapse_5() {
+        let s = tool_history(8);
+        let msgs = s.raw_messages_with(0);
+        let got: Vec<(&str, String, Option<&str>)> = msgs
+            .iter()
+            .map(|m| {
+                (
+                    m.role.as_str(),
+                    m.content.clone(),
+                    m.tool_call_id.as_deref(),
+                )
+            })
+            .collect();
+        let stub = |i: usize| format!("[collapsed: 5b — re-open to edit] obs-{i}");
+        let want = vec![
+            ("tool", stub(0), Some("c0")),
+            ("tool", stub(1), Some("c1")),
+            ("tool", stub(2), Some("c2")),
+            ("tool", "obs-3".into(), Some("c3")),
+            ("tool", "obs-4".into(), Some("c4")),
+            ("tool", "obs-5".into(), Some("c5")),
+            ("tool", "obs-6".into(), Some("c6")),
+            ("tool", "obs-7".into(), Some("c7")),
+        ];
+        assert_eq!(got, want);
+        // Default knob (env unset) takes the byte-identical path.
+        assert_eq!(
+            serde_json::to_string(&s.raw_messages()).unwrap(),
+            serde_json::to_string(&msgs).unwrap()
+        );
+    }
+
+    /// H=5 over a growing history: one boundary move per 5 added rows, each
+    /// moving a 5-row batch (H=0 moves every row: 25 moves vs 5). The verbatim
+    /// window stays inside [COLLAPSE_KEEP, COLLAPSE_KEEP + H] throughout.
+    #[test]
+    fn collapse_hysteresis_moves_boundary_once_per_h_rows_in_one_batch() {
+        let folds: Vec<(usize, usize)> = (1..=30)
+            .map(|t| (t, stub_boundary(&tool_history(t).raw_messages_with(5))))
+            .collect();
+        let mut moves = Vec::new();
+        let mut prev = 0;
+        for &(t, b) in &folds {
+            assert_eq!(b, 5 * (t.saturating_sub(5) / 5), "boundary at t={t}");
+            let window = t - b;
+            assert!(
+                (5.min(t)..=10).contains(&window),
+                "t={t}: verbatim window {window} outside [KEEP, KEEP+H]"
+            );
+            if b != prev {
+                moves.push(t);
+                prev = b;
+            }
+        }
+        // Exact move turns; between moves the stub set never grows.
+        assert_eq!(moves, vec![10, 15, 20, 25, 30]);
+        for w in folds.windows(2) {
+            let delta = w[1].1 - w[0].1;
+            assert!(
+                delta == 0 || delta == 5,
+                "t={}: boundary moved {delta} rows, not one H-batch",
+                w[1].0
+            );
+        }
+        // H=0 control: the boundary tracks the tail, one row per fold.
+        let h0: Vec<usize> = (1..=30)
+            .map(|t| stub_boundary(&tool_history(t).raw_messages_with(0)))
+            .collect();
+        assert_eq!(
+            h0,
+            (1..=30usize)
+                .map(|t| t.saturating_sub(5))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(h0.iter().filter(|&&b| b != 0).count(), 25);
+        assert_eq!(moves.len(), 5);
     }
 
     #[test]
