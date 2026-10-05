@@ -234,6 +234,146 @@ pub fn cut_chars(_text: &str, _max_chars: usize) -> &str {
     }
 }
 
+// ===== compaction checkpoint (refs-gap-matrix rank 2) =====
+
+/// Tool results in the summarizer payload are cut to this many chars: a
+/// checkpoint buys a summary, not a second copy of the transcript.
+pub const SUMMARY_TOOL_CAP: usize = 2_000;
+
+/// Compaction checkpoint knobs. `Default` is OFF: until a caller opts in, the
+/// collapse-5 request path is byte-identical.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionConfig {
+    pub enabled: bool,
+    /// Trigger fraction of the token budget (0.7 = checkpoint at 70%).
+    pub frac: f64,
+    /// Recent tokens kept verbatim (pi `keepRecentTokens`).
+    pub keep_tokens: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            frac: 0.7,
+            keep_tokens: 20_000,
+        }
+    }
+}
+
+/// Usage anchor: the provider-reported prompt tokens of the last settled
+/// request and the history length that request carried. The estimate walks
+/// only the messages the anchor does not cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageAnchor {
+    pub messages: usize,
+    pub input_tokens: u64,
+}
+
+/// One conversation message as the compactor sees it: wire role and the text
+/// the summarizer reads (assistant thinking and tool calls are folded into
+/// `content` by the caller). `role == "tool"` marks a tool result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactMessage {
+    pub role: String,
+    pub content: String,
+}
+
+fn chars_to_tokens(chars: usize) -> u64 {
+    (chars as u64).div_ceil(4)
+}
+
+/// Chars/4 token estimate, no tokenizer. Anchored: the last request's
+/// provider-reported input plus every message appended after it. An anchor
+/// longer than the list (or none at all: the first request, and the request
+/// right after a checkpoint) falls back to the whole list. The estimate
+/// covers the history only — the system head and the tool declarations ride
+/// the anchor once a request has settled.
+pub fn estimate_tokens(messages: &[CompactMessage], anchor: Option<&UsageAnchor>) -> u64 {
+    let anchor = anchor.filter(|a| a.messages <= messages.len());
+    let from = anchor.map(|a| a.messages).unwrap_or(0);
+    let chars: usize = messages[from..]
+        .iter()
+        .map(|m| m.content.chars().count())
+        .sum();
+    anchor.map(|a| a.input_tokens).unwrap_or(0) + chars_to_tokens(chars)
+}
+
+/// Trigger: enabled and the estimate is strictly above `budget_tokens * frac`.
+pub fn compaction_due(estimate: u64, budget_tokens: u64, cfg: &CompactionConfig) -> bool {
+    cfg.enabled && (estimate as f64) > budget_tokens as f64 * cfg.frac
+}
+
+/// Cut point: index of the first history message kept verbatim. Walks back
+/// from the newest message accumulating chars/4 until the kept tail reaches
+/// `keep_tokens`, then keeps from the closest valid cut at or after that
+/// point. A tool result is never a cut point: the assistant call that
+/// produced it stays with it. When trailing tool results alone blow the
+/// budget, the cut falls back to that assistant call rather than into the
+/// group. `None` = below the keep budget, or nothing to summarize.
+pub fn cut_point(messages: &[CompactMessage], keep_tokens: usize) -> Option<usize> {
+    if messages.len() < 2 {
+        return None;
+    }
+    let mut accumulated = 0u64;
+    let mut crossing = None;
+    for i in (1..messages.len()).rev() {
+        accumulated += chars_to_tokens(messages[i].content.chars().count());
+        if accumulated >= keep_tokens as u64 {
+            crossing = Some(i);
+            break;
+        }
+    }
+    let crossing = crossing?;
+    let valid = |i: usize| messages[i].role != "tool";
+    (crossing..messages.len())
+        .find(|&i| valid(i))
+        .or_else(|| (1..crossing).rev().find(|&i| valid(i)))
+}
+
+/// Summarizer payload: one `[role]: text` block per message, tool results cut
+/// to [`SUMMARY_TOOL_CAP`] chars with an explicit truncation marker.
+pub fn summary_payload(messages: &[CompactMessage]) -> String {
+    let parts: Vec<String> = messages
+        .iter()
+        .map(|m| {
+            let text = if m.role == "tool" {
+                truncate_for_summary(&m.content)
+            } else {
+                m.content.clone()
+            };
+            format!("[{}]: {text}", m.role)
+        })
+        .collect();
+    parts.join("\n\n")
+}
+
+fn truncate_for_summary(text: &str) -> String {
+    let total = text.chars().count();
+    if total <= SUMMARY_TOOL_CAP {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(SUMMARY_TOOL_CAP).collect();
+    format!(
+        "{head}\n\n[... {} more characters truncated]",
+        total - SUMMARY_TOOL_CAP
+    )
+}
+
+/// Summarizer instruction: structured checkpoint, never a continuation of the
+/// conversation. Kept short: it is one extra request per checkpoint.
+pub const SUMMARY_PROMPT: &str = "Summarize the conversation above as a context checkpoint for an agent that must \
+continue the work. Do not continue the conversation or answer anything in it. Use this exact format:\n\
+## Goal\n[the task being accomplished]\n\
+## Progress\n[done / in progress / blocked, with exact file paths and commands]\n\
+## Key decisions\n[what was decided and why, including errors hit and how they were resolved]\n\
+## Next steps\n[the immediate next action]";
+
+/// System row of the summarizer request: the summary call must not act.
+pub const SUMMARY_SYSTEM: &str =
+    "You are a context summarization assistant. Read the conversation and output \
+only the structured summary requested; never continue the conversation and never call a tool.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +496,92 @@ mod tests {
         let big = named_file_contents(&dir, "big.rs", 2000).unwrap();
         assert_eq!(big.chars().count(), 2000);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn msg(role: &str, chars: usize) -> CompactMessage {
+        CompactMessage {
+            role: role.into(),
+            content: "x".repeat(chars),
+        }
+    }
+
+    #[test]
+    fn estimate_is_anchor_plus_chars4_over_the_tail() {
+        let msgs = vec![msg("user", 4), msg("assistant", 8)];
+        let anchor = UsageAnchor {
+            messages: 1,
+            input_tokens: 100,
+        };
+        assert_eq!(estimate_tokens(&msgs, Some(&anchor)), 102);
+        // Whole list when nothing settled yet: ceil(12 / 4).
+        assert_eq!(estimate_tokens(&msgs, None), 3);
+        // An anchor longer than the list is stale, not authoritative.
+        let stale = UsageAnchor {
+            messages: 9,
+            input_tokens: 100,
+        };
+        assert_eq!(estimate_tokens(&msgs, Some(&stale)), 3);
+        // Chars/4 rounds up: a 1-char tail is not free.
+        assert_eq!(estimate_tokens(&[msg("user", 1)], None), 1);
+    }
+
+    #[test]
+    fn compaction_due_is_strict_and_disabled_never_fires() {
+        let cfg = CompactionConfig {
+            enabled: true,
+            frac: 0.5,
+            keep_tokens: 20_000,
+        };
+        assert!(!compaction_due(100_000, 200_000, &cfg), "at the threshold");
+        assert!(compaction_due(100_001, 200_000, &cfg), "just above");
+        assert!(!compaction_due(99_999, 200_000, &cfg), "just below");
+        let off = CompactionConfig {
+            enabled: false,
+            ..cfg
+        };
+        assert!(!compaction_due(u64::MAX, 1, &off));
+    }
+
+    /// The cut walks back until the kept tail reaches the budget and lands on
+    /// a non-tool message; each message here is 40 chars = 10 tokens.
+    #[test]
+    fn cut_point_keeps_recent_tail_and_never_starts_on_a_tool_result() {
+        let msgs = vec![
+            msg("user", 4),
+            msg("assistant", 40),
+            msg("tool", 40),
+            msg("assistant", 40),
+            msg("tool", 40),
+        ];
+        // Crossing lands on the assistant at 3: keep [3, 4] = 20 tokens.
+        assert_eq!(cut_point(&msgs, 15), Some(3));
+        // Crossing lands on the tool result at 4: the cut backs up to the
+        // assistant call that produced it instead of orphaning the result.
+        assert_eq!(cut_point(&msgs, 10), Some(3));
+        assert_eq!(msgs[cut_point(&msgs, 10).unwrap()].role, "assistant");
+        // Whole history below the keep budget: nothing to summarize.
+        assert_eq!(cut_point(&msgs, 100), None);
+        // A lone trailing tool result cannot be cut around at all.
+        assert_eq!(cut_point(&[msg("user", 4), msg("tool", 40)], 1), None);
+        assert_eq!(cut_point(&[msg("user", 4)], 1), None);
+    }
+
+    #[test]
+    fn summary_payload_caps_tool_results_only() {
+        let payload = summary_payload(&[
+            msg("user", 4),
+            msg("tool", 2_500),
+            CompactMessage {
+                role: "assistant".into(),
+                content: "short".into(),
+            },
+        ]);
+        assert!(payload.starts_with("[user]: xxxx\n\n[tool]: x"));
+        assert!(payload.contains("[... 500 more characters truncated]"));
+        assert!(payload.ends_with("[assistant]: short"));
+        // Only the tool block is cut: 2500 x's became 2000.
+        assert_eq!(payload.matches('x').count(), 4 + SUMMARY_TOOL_CAP);
+        let small = summary_payload(&[msg("tool", 10)]);
+        assert_eq!(small, format!("[tool]: {}", "x".repeat(10)));
     }
 }

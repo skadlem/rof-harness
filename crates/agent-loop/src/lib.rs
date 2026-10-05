@@ -240,6 +240,17 @@ pub struct ToolCallState {
     pub result: Option<ToolResult>,
 }
 
+/// One applied compaction checkpoint: the request fold replaces raw history
+/// `[..keep_from]` with `summary`. The durable items are untouched — the log
+/// keeps the raw transcript; only what the model sees is folded.
+#[derive(Debug, Clone)]
+pub struct Checkpoint {
+    /// Index into the RAW history fold. Raw history only appends, so the
+    /// index never shifts; a later checkpoint composes on top of it.
+    pub keep_from: usize,
+    pub summary: String,
+}
+
 pub struct LoopState {
     pub turn: u64,
     pub step: u32,
@@ -292,6 +303,15 @@ pub struct LoopState {
     pub incentives: IncentivesLevel,
     pub drain_timeout: Duration,
     pub drain_until: Option<Instant>,
+    /// Compaction checkpoint (default off): the request fold replaces the raw
+    /// prefix with one summary. `None` = no checkpoint applied.
+    pub checkpoint: Option<Checkpoint>,
+    /// Checkpoint estimate anchor: history length + provider-reported prompt
+    /// tokens of the last settled request.
+    pub anchor: Option<context::UsageAnchor>,
+    /// Turn of the last checkpoint attempt: never twice in a row without new
+    /// turns between (a refused summary is not retried every step).
+    pub compacted_turn: Option<u64>,
 }
 
 impl LoopState {
@@ -330,6 +350,9 @@ impl LoopState {
             incentives: IncentivesLevel::Full,
             drain_timeout: Duration::from_secs(30),
             drain_until: None,
+            checkpoint: None,
+            anchor: None,
+            compacted_turn: None,
         }
     }
 
@@ -903,7 +926,23 @@ impl LoopState {
     /// `reasoning_content: ""` for these rows in a thinking-mode
     /// conversation. chosen-not-measured: dropping older reasoning may
     /// degrade cross-turn reasoning continuity; the A/B is pending.
+    ///
+    /// An active [`Checkpoint`] replaces raw history `[..keep_from]` with its
+    /// summary row; with no checkpoint this is exactly [`Self::raw_messages`],
+    /// so the disabled path is byte-identical to collapse-5.
     pub fn derived_messages(&self) -> Vec<ProviderMessage> {
+        let raw = self.raw_messages();
+        let Some(cp) = &self.checkpoint else {
+            return raw;
+        };
+        let mut out = Vec::with_capacity(raw.len() - cp.keep_from + 1);
+        out.push(summary_message(&cp.summary));
+        out.extend_from_slice(&raw[cp.keep_from..]);
+        out
+    }
+
+    /// The raw log fold: every message, collapse-5 + thinking trim applied.
+    fn raw_messages(&self) -> Vec<ProviderMessage> {
         let mut out = Vec::new();
         for item in &self.items {
             match &item.kind {
@@ -988,6 +1027,21 @@ fn message_content(message: &Value) -> String {
         .and_then(|c| c.as_str())
         .map(str::to_owned)
         .unwrap_or_else(|| message.to_string())
+}
+
+/// Header of the one row a checkpoint injects: the model must read it as
+/// context state, not as a new user instruction.
+const CHECKPOINT_PREFIX: &str =
+    "[context checkpoint: earlier turns were summarized to save tokens; the durable log still holds them]";
+
+fn summary_message(summary: &str) -> ProviderMessage {
+    ProviderMessage {
+        role: "user".into(),
+        content: format!("{CHECKPOINT_PREFIX}\n{summary}"),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        thinking: None,
+    }
 }
 
 /// One tested mapping: durable log vocabulary to live event vocabulary.
@@ -1350,6 +1404,8 @@ pub struct RunConfig {
     /// run against each leading-prefix tree in `workdir`. `None` = the uniform
     /// proof flag (the batch's tool results all passed).
     pub proof_cmd: Option<String>,
+    /// Compaction checkpoint knobs (default OFF: no summary call, no fold).
+    pub compaction: context::CompactionConfig,
 }
 
 impl Default for RunConfig {
@@ -1364,6 +1420,7 @@ impl Default for RunConfig {
             log_path: None,
             incentives: IncentivesLevel::Full,
             proof_cmd: None,
+            compaction: context::CompactionConfig::default(),
         }
     }
 }
@@ -1613,6 +1670,134 @@ fn build_request(
         thinking: Thinking::Auto,
         extras: Value::Null,
     }
+}
+
+/// The compactor's view of one message: assistant thinking and tool calls are
+/// folded into the text (the summarizer must see what was done), everything
+/// else keeps its content. This same view feeds the token estimate, so an
+/// appended assistant row is charged for its thinking and arguments.
+fn compact_view(messages: &[ProviderMessage]) -> Vec<context::CompactMessage> {
+    messages
+        .iter()
+        .map(|m| {
+            let content = if m.role == "assistant" {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(t) = &m.thinking {
+                    if !t.is_empty() {
+                        parts.push(format!("[thinking] {t}"));
+                    }
+                }
+                if !m.content.is_empty() {
+                    parts.push(m.content.clone());
+                }
+                for c in &m.tool_calls {
+                    parts.push(format!("{}({})", c.name, c.args));
+                }
+                parts.join("\n")
+            } else {
+                m.content.clone()
+            };
+            context::CompactMessage {
+                role: m.role.clone(),
+                content,
+            }
+        })
+        .collect()
+}
+
+/// Compaction checkpoint at the step head: estimate the folded context from
+/// the last settled request's usage plus chars/4 for what followed, and when
+/// it crosses `budget_tokens * frac` replace the older prefix with ONE
+/// summarizer call's output. Returns true when a checkpoint was applied.
+///
+/// The summary call is metered like any other request (tokens, spend, run
+/// totals); a summary that errored, hit the length stop, or came back empty
+/// is refused and the window is left unchanged. Either way the turn is
+/// latched: never compact twice in a row without new turns between.
+async fn checkpoint<P: LlmClient>(
+    state: &mut LoopState,
+    provider: &P,
+    cfg: &RunConfig,
+    emitter: &mut Emitter,
+) -> bool {
+    let cc = &cfg.compaction;
+    if !cc.enabled || state.compacted_turn == Some(state.turn) {
+        return false;
+    }
+    let folded = state.derived_messages();
+    let view = compact_view(&folded);
+    let estimate = context::estimate_tokens(&view, state.anchor.as_ref());
+    if !context::compaction_due(estimate, state.budget.config().max_tokens, cc) {
+        return false;
+    }
+    let Some(cut) = context::cut_point(&view, cc.keep_tokens) else {
+        return false;
+    };
+    state.compacted_turn = Some(state.turn); // attempt latch: no retry storm
+    let req = Request {
+        messages: vec![
+            ProviderMessage {
+                role: "system".into(),
+                content: context::SUMMARY_SYSTEM.into(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                thinking: None,
+            },
+            ProviderMessage {
+                role: "user".into(),
+                content: format!(
+                    "<conversation>\n{}\n</conversation>\n\n{}",
+                    context::summary_payload(&view[..cut]),
+                    context::SUMMARY_PROMPT
+                ),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                thinking: None,
+            },
+        ],
+        tools: Vec::new(), // a summary must not act
+        max_tokens: cfg.max_tokens,
+        thinking: Thinking::Off,
+        extras: Value::Null,
+    };
+    let summary = match provider.complete(&cfg.model, &req).await {
+        Ok(resp) => {
+            state.record_usage(&resp.billed_usage());
+            match resp.stop {
+                StopReason::Stop if !resp.message.content.trim().is_empty() => {
+                    Ok(resp.message.content.trim().to_owned())
+                }
+                stop => Err(format!("summary stop {stop:?}")),
+            }
+        }
+        Err(e) => {
+            if let LlmError::Metered { usage: Some(u), .. } = &e {
+                state.record_usage(u);
+            }
+            Err(format!("summary call failed: {e:?}"))
+        }
+    };
+    let summary = match summary {
+        Ok(s) => s,
+        Err(why) => {
+            emitter.emit(AgentEvent::Error {
+                error: AgentError {
+                    code: "compaction-refused".into(),
+                    message: why,
+                },
+            });
+            return false;
+        }
+    };
+    // Compose with an earlier checkpoint: the new summary absorbs the old one
+    // (folded[0] is the previous summary), so the cut maps back to raw history.
+    let keep_from = match &state.checkpoint {
+        Some(prev) => prev.keep_from + cut - 1,
+        None => cut,
+    };
+    state.checkpoint = Some(Checkpoint { keep_from, summary });
+    state.anchor = None; // the compacted request re-anchors on its own usage
+    true
 }
 
 /// Split `TreeService::patch` text into the fragments
@@ -1868,6 +2053,10 @@ pub async fn run<P: LlmClient>(
                 }
             },
         };
+        // Checkpoint before the real request, after the budget admitted the
+        // step: the summary request is real spend and must never be paid for
+        // a step the guard would have refused.
+        checkpoint(state, provider, &cfg, emitter).await;
         let req = build_request(state, registry, workdir, &cfg);
         match provider.complete(&cfg.model, &req).await {
             Err(e) => {
@@ -1926,6 +2115,15 @@ pub async fn run<P: LlmClient>(
             }
             Ok(resp) => {
                 let turn = state.turn;
+                // Checkpoint anchor: this request's history length and its
+                // provider-reported prompt tokens (the final attempt's, not
+                // the retry ladder's sum). History only (`len() - 1`: the one
+                // system head), so the next estimate walks exactly the
+                // messages appended after it.
+                state.anchor = Some(context::UsageAnchor {
+                    messages: req.messages.len().saturating_sub(1),
+                    input_tokens: resp.usage.input,
+                });
                 // Meter the BILL, not just the final attempt: a recovered
                 // retry ladder was billed every failed re-send too.
                 let billed = resp.billed_usage();
@@ -4363,6 +4561,493 @@ mod tests {
         }
         assert!(check_pairing(emitter.history()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- compaction checkpoint (default off) ---
+
+    use agent_budget::BudgetConfig;
+
+    fn compaction(frac: f64, keep_tokens: usize) -> context::CompactionConfig {
+        context::CompactionConfig {
+            enabled: true,
+            frac,
+            keep_tokens,
+        }
+    }
+
+    /// A scripted summary response: `input` is what the totals read.
+    fn summary_resp(text: &str, stop: StopReason, input: u64) -> Response {
+        let mut r = text_resp(text);
+        r.stop = stop;
+        r.usage.input = input;
+        r.usage.cost_usd = Some(0.02);
+        r
+    }
+
+    /// One scripted run; hands back everything the checkpoint assertions need.
+    /// `followups` open later turns (a checkpoint is per turn).
+    async fn run_script(
+        name: &str,
+        queue: Vec<Response>,
+        cfg: RunConfig,
+        budget_tokens: u64,
+        followups: Vec<&str>,
+        goal: &str,
+    ) -> (Outcome, Arc<Mutex<Vec<Request>>>, LoopState, Emitter) {
+        let root = run_tmp(name);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = ScriptClient {
+            order: Arc::new(Mutex::new(Vec::new())),
+            requests: requests.clone(),
+            queue: Mutex::new(VecDeque::from(queue)),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        state.budget = BudgetGuard::new(
+            BudgetConfig {
+                max_tokens: budget_tokens,
+                ..config_for(Capability::UnattendedBatch)
+            },
+            Instant::now(),
+        );
+        for f in followups {
+            state.followups.push_back(f.into());
+        }
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg,
+            },
+            vec![Input::User(goal.into())],
+            &cancel,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&root);
+        (outcome, requests, state, emitter)
+    }
+
+    fn last_totals(emitter: &Emitter) -> UsageReport {
+        emitter
+            .history()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                AgentEvent::TurnEnd { usage_totals, .. } => Some(usage_totals.clone()),
+                _ => None,
+            })
+            .expect("a TurnEnd frame")
+    }
+
+    /// One write round billed `input` prompt tokens: the estimate (anchor +
+    /// tail chars/4) crosses `budget_tokens * frac` at the next step head.
+    fn write_round(
+        calls: Vec<(&str, &str, serde_json::Value)>,
+        content: &str,
+        input: u64,
+    ) -> Response {
+        let mut r = script_resp(calls, StopReason::ToolUse);
+        r.message.content = content.into();
+        r.usage.input = input;
+        r
+    }
+
+    #[tokio::test]
+    async fn run_checkpoint_fires_once_keeps_the_tail_and_meters_the_summary() {
+        use agent_event::check_pairing;
+        // Round 1 is below the trigger (100 + tail), round 2 crosses it (1000 +
+        // tail > 2000 * 0.3): the checkpoint summarizes round 1 and keeps
+        // round 2 verbatim.
+        let queue = vec![
+            write_round(
+                vec![(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "f1.txt", "content": "x\n"}),
+                )],
+                "write-f1",
+                100,
+            ),
+            write_round(
+                vec![(
+                    "c2",
+                    "write",
+                    serde_json::json!({"path": "f2.txt", "content": "y\n"}),
+                )],
+                "write-f2",
+                1_000,
+            ),
+            summary_resp("## Goal\nfinish the task", StopReason::Stop, 100),
+            text_resp("all done"),
+        ];
+        let cfg = RunConfig {
+            compaction: compaction(0.3, 15),
+            ..RunConfig::default()
+        };
+        let (outcome, requests, state, emitter) =
+            run_script("compact-on", queue, cfg, 2_000, Vec::new(), "goal-1").await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 4, "two agent calls + summary + finishing call");
+        // The summary call happens exactly once: no tools, summarizer system
+        // row, the older round inside the payload, the kept tail outside it.
+        let summary_calls: Vec<&Request> = reqs.iter().filter(|r| r.tools.is_empty()).collect();
+        assert_eq!(summary_calls.len(), 1);
+        let sreq = summary_calls[0];
+        assert_eq!(sreq.messages[0].content, context::SUMMARY_SYSTEM);
+        let payload = &sreq.messages[1].content;
+        assert!(
+            payload.starts_with("<conversation>\n[user]: goal-1"),
+            "{payload}"
+        );
+        assert!(payload.contains("write(") && payload.contains("f1.txt"));
+        assert!(payload.contains("[tool]: wrote f1.txt"));
+        assert!(
+            !payload.contains("wrote f2.txt"),
+            "kept tail is not summarized"
+        );
+        assert!(payload.ends_with(context::SUMMARY_PROMPT));
+        // Post-checkpoint request: one summary row replaces the old prefix,
+        // the newest assistant call + its result ride verbatim.
+        let post = &reqs[3];
+        assert!(post.messages[1].content.starts_with(CHECKPOINT_PREFIX));
+        assert!(post.messages[1]
+            .content
+            .contains("## Goal\nfinish the task"));
+        let wire = serde_json::to_string(post).unwrap();
+        assert!(
+            !wire.contains("goal-1"),
+            "the summarized prefix was dropped"
+        );
+        assert!(!wire.contains("wrote f1.txt"), "replaced, not duplicated");
+        assert_eq!(post.messages[2].role, "assistant");
+        assert_eq!(post.messages[2].tool_calls[0].id, "c2");
+        assert_eq!(post.messages[3].tool_call_id.as_deref(), Some("c2"));
+        assert!(post.messages[3].content.starts_with("wrote f2.txt"));
+        // Real spend, priced like any other request: run totals (and so every
+        // TurnEnd frame) carry the summary call.
+        let totals = last_totals(&emitter);
+        assert_eq!(totals.input_tokens, 100 + 1_000 + 100 + 10);
+        assert_eq!(totals.cost_usd, Some(0.01 + 0.01 + 0.02 + 0.01));
+        assert!(state.checkpoint.is_some());
+        assert_eq!(state.compacted_turn, Some(1));
+        assert!(check_pairing(emitter.history()));
+    }
+
+    #[tokio::test]
+    async fn run_checkpoint_cut_never_splits_a_call_from_its_results() {
+        // Two results in one batch, each 3 estimated tokens: with keep_tokens
+        // 3 the crossing lands ON the newest tool result, so the cut has to
+        // back up to the assistant call that produced the group.
+        let queue = vec![
+            write_round(
+                vec![
+                    (
+                        "c1",
+                        "write",
+                        serde_json::json!({"path": "f1.txt", "content": "x\n"}),
+                    ),
+                    (
+                        "c2",
+                        "write",
+                        serde_json::json!({"path": "f2.txt", "content": "y\n"}),
+                    ),
+                ],
+                "batch",
+                1_000,
+            ),
+            summary_resp("## Goal\nfinish the task", StopReason::Stop, 100),
+            text_resp("all done"),
+        ];
+        let cfg = RunConfig {
+            compaction: compaction(0.5, 3),
+            ..RunConfig::default()
+        };
+        let (outcome, requests, state, _emitter) =
+            run_script("compact-cut", queue, cfg, 1_200, Vec::new(), "goal-1").await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        assert!(state.checkpoint.is_some());
+        let reqs = requests.lock().unwrap();
+        let post = &reqs[2];
+        // [system, summary, assistant(c1,c2), tool c1, tool c2]
+        assert_eq!(post.messages[2].role, "assistant");
+        assert_eq!(post.messages[2].tool_calls.len(), 2);
+        assert_eq!(post.messages[3].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(post.messages[4].tool_call_id.as_deref(), Some("c2"));
+        for (i, m) in post.messages.iter().enumerate() {
+            if m.role == "tool" {
+                let id = m.tool_call_id.as_deref().unwrap();
+                assert!(
+                    post.messages[..i]
+                        .iter()
+                        .any(|p| p.tool_calls.iter().any(|c| c.id == id)),
+                    "tool result {id} kept without its call"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_checkpoint_refuses_a_length_stopped_summary_and_keeps_the_window() {
+        use agent_event::check_pairing;
+        let queue = vec![
+            write_round(
+                vec![(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "f1.txt", "content": "x\n"}),
+                )],
+                "write-f1",
+                1_000,
+            ),
+            summary_resp("## Goal\npartial", StopReason::MaxTokens, 200),
+            text_resp("all done"),
+        ];
+        let cfg = RunConfig {
+            compaction: compaction(0.2, 15),
+            ..RunConfig::default()
+        };
+        let (outcome, requests, state, emitter) =
+            run_script("compact-refuse", queue, cfg, 1_500, Vec::new(), "goal-1").await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(
+            reqs.iter().filter(|r| r.tools.is_empty()).count(),
+            1,
+            "a refused summary is not retried every step"
+        );
+        // Window unchanged: the original prefix, no checkpoint row.
+        let wire = serde_json::to_string(&reqs[2]).unwrap();
+        assert!(wire.contains("goal-1"));
+        assert!(!wire.contains("## Goal\npartial"));
+        assert!(state.checkpoint.is_none());
+        // Refused, but still billed: the spend is in the totals and the
+        // refusal is visible in the event stream.
+        assert_eq!(last_totals(&emitter).input_tokens, 1_000 + 200 + 10);
+        assert!(emitter.history().iter().any(|e| matches!(
+            e,
+            AgentEvent::Error { error } if error.code == "compaction-refused"
+        )));
+        assert!(check_pairing(emitter.history()));
+    }
+
+    #[tokio::test]
+    async fn run_checkpoint_never_twice_without_a_new_turn() {
+        // Round 1 triggers the checkpoint. Round 2's settle re-anchors the
+        // estimate above the threshold again, still inside turn 1: the latch
+        // is the only thing stopping a second summary call.
+        let queue = vec![
+            write_round(
+                vec![(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "f1.txt", "content": "x\n"}),
+                )],
+                "write-f1",
+                1_000,
+            ),
+            summary_resp("## Goal\nfinish the task", StopReason::Stop, 100),
+            write_round(
+                vec![(
+                    "c2",
+                    "write",
+                    serde_json::json!({"path": "f2.txt", "content": "y\n"}),
+                )],
+                "write-f2",
+                1_000,
+            ),
+            text_resp("all done"),
+        ];
+        let cfg = RunConfig {
+            compaction: compaction(0.2, 15),
+            ..RunConfig::default()
+        };
+        let (outcome, requests, state, _emitter) =
+            run_script("compact-latch", queue, cfg, 3_000, Vec::new(), "goal-1").await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 4, "two agent calls + summary + finishing call");
+        assert_eq!(
+            reqs.iter().filter(|r| r.tools.is_empty()).count(),
+            1,
+            "one checkpoint per turn"
+        );
+        assert_eq!(state.compacted_turn, Some(1));
+        let post = &reqs[3];
+        assert!(post.messages[1].content.starts_with(CHECKPOINT_PREFIX));
+        assert_eq!(
+            serde_json::to_string(post)
+                .unwrap()
+                .matches(CHECKPOINT_PREFIX)
+                .count(),
+            1,
+            "one checkpoint row, not a chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_checkpoint_composes_on_a_new_turn() {
+        use agent_event::check_pairing;
+        // Turn 1 checkpoints rounds 1-2 (keep_from 3). The followup opens turn
+        // 2, where a second checkpoint absorbs the first summary plus round 3:
+        // `keep_from` must map the folded cut back onto raw history.
+        let mut turn_one_done = text_resp("turn one done");
+        turn_one_done.usage.input = 1_000; // arms turn 2's estimate
+        let queue = vec![
+            write_round(
+                vec![(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "f1.txt", "content": "x\n"}),
+                )],
+                "write-f1",
+                100,
+            ),
+            write_round(
+                vec![(
+                    "c2",
+                    "write",
+                    serde_json::json!({"path": "f2.txt", "content": "y\n"}),
+                )],
+                "write-f2",
+                1_000,
+            ),
+            summary_resp("## Goal\ncheckpoint one", StopReason::Stop, 100),
+            write_round(
+                vec![(
+                    "c3",
+                    "write",
+                    serde_json::json!({"path": "f3.txt", "content": "z\n"}),
+                )],
+                "write-f3",
+                1_000,
+            ),
+            turn_one_done,
+            summary_resp("## Goal\ncheckpoint two", StopReason::Stop, 100),
+            text_resp("turn two done"),
+        ];
+        let cfg = RunConfig {
+            compaction: compaction(0.2, 15),
+            ..RunConfig::default()
+        };
+        let (outcome, requests, state, emitter) = run_script(
+            "compact-turn2",
+            queue,
+            cfg,
+            4_000,
+            vec!["keep going"],
+            "goal-1",
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        let reqs = requests.lock().unwrap();
+        assert_eq!(
+            reqs.len(),
+            7,
+            "two checkpoints + four agent calls + one finish"
+        );
+        assert_eq!(reqs.iter().filter(|r| r.tools.is_empty()).count(), 2);
+        // The second summary is an update: the first summary is inside its
+        // payload, not lost.
+        let payload2 = &reqs[5].messages[1].content;
+        assert!(payload2.contains("checkpoint one"), "{payload2}");
+        assert!(payload2.contains("[tool]: wrote f2.txt"));
+        // Final request: [system, summary2, round 3, turn-1 finish, followup].
+        let post = &reqs[6];
+        assert_eq!(post.messages.len(), 6);
+        assert!(post.messages[1].content.contains("checkpoint two"));
+        assert_eq!(post.messages[2].role, "assistant");
+        assert_eq!(post.messages[3].tool_call_id.as_deref(), Some("c3"));
+        assert_eq!(post.messages[4].content, "turn one done");
+        assert!(post.messages[5].content.starts_with("keep going"));
+        let wire = serde_json::to_string(post).unwrap();
+        assert!(!wire.contains("goal-1"));
+        assert!(!wire.contains("wrote f1.txt") && !wire.contains("wrote f2.txt"));
+        assert!(wire.contains("wrote f3.txt"), "round 3 stayed verbatim");
+        assert!(
+            !wire.contains("checkpoint one"),
+            "absorbed by checkpoint two"
+        );
+        assert_eq!(state.checkpoint.as_ref().unwrap().keep_from, 5);
+        assert_eq!(state.compacted_turn, Some(2));
+        assert!(check_pairing(emitter.history()));
+    }
+
+    #[tokio::test]
+    async fn run_compaction_off_is_byte_identical_to_collapse_5() {
+        use agent_event::check_pairing;
+        // Trigger-ready: budget 8000, frac 0.1 (threshold 800), keep_tokens 3
+        // and every round billed 1000 prompt tokens — every knob but `enabled`
+        // is set to fire. Default `enabled: false` is the only thing holding.
+        let mut queue: VecDeque<Response> = VecDeque::new();
+        for i in 1..=7 {
+            let id = format!("c{i}");
+            let path = format!("f{i}.txt");
+            queue.push_back(write_round(
+                vec![(
+                    id.as_str(),
+                    "write",
+                    serde_json::json!({"path": path, "content": "x\n"}),
+                )],
+                &format!("script-step-{i}"),
+                1_000,
+            ));
+        }
+        queue.push_back(text_resp("all done"));
+        let cfg = RunConfig {
+            compaction: context::CompactionConfig {
+                frac: 0.1,
+                keep_tokens: 3,
+                ..context::CompactionConfig::default()
+            },
+            ..RunConfig::default()
+        };
+        let (outcome, requests, state, emitter) = run_script(
+            "compact-off",
+            queue.into(),
+            cfg,
+            8_000,
+            Vec::new(),
+            "goal-1",
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 8, "no summary call on the off path");
+        assert!(reqs.iter().all(|r| !r.tools.is_empty()));
+        assert!(state.checkpoint.is_none() && state.compacted_turn.is_none());
+        assert!(state.anchor.is_some(), "the trigger was armed and held");
+        // Collapse-5 bytes, exactly as the disabled path always produced them.
+        let content_of = |id: &str| {
+            reqs[7]
+                .messages
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("missing tool message {id}"))
+                .content
+                .clone()
+        };
+        assert_eq!(
+            content_of("c1"),
+            "[collapsed: 12b — re-open to edit] wrote f1.txt"
+        );
+        assert_eq!(
+            content_of("c2"),
+            "[collapsed: 12b — re-open to edit] wrote f2.txt"
+        );
+        assert_eq!(content_of("c3"), "wrote f3.txt");
+        assert!(!serde_json::to_string(&reqs[7])
+            .unwrap()
+            .contains(CHECKPOINT_PREFIX));
+        assert!(check_pairing(emitter.history()));
     }
 
     /// Prefix-cache stability end to end: the system head is byte-identical
