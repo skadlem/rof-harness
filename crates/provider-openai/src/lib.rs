@@ -604,8 +604,16 @@ fn wire_usage(u: Option<WireUsage>, model: &str) -> Option<Usage> {
 /// Unknown models price `None`: never fabricate a cost.
 fn price_usd(model: &str, input: u64, cache_read: u64, output: u64) -> Option<f64> {
     let (hit, miss, out) = match model {
-        m if m.starts_with("deepseek-flash") => (0.006, 0.30, 1.20),
-        m if m.starts_with("deepseek-v4.1-flash") => (0.006, 0.30, 1.20),
+        // Legacy alias `deepseek-v4-flash` is served by the same model billed
+        // at the Flash price (research/DECISIONS.md:74: "deepseek-flash IS
+        // DeepSeek-V4.1-Flash (legacy deepseek-v4-flash served by it, billed
+        // at Flash price — api-docs footnote 2026-10-03)").
+        m if m.starts_with("deepseek-flash")
+            || m.starts_with("deepseek-v4-flash")
+            || m.starts_with("deepseek-v4.1-flash") =>
+        {
+            (0.006, 0.30, 1.20)
+        }
         m if m.starts_with("deepseek-v4-pro") => (0.044, 1.32, 3.96),
         _ => return None,
     };
@@ -1053,6 +1061,13 @@ mod tests {
         assert!(
             (go - 0.453).abs() < 1e-9,
             "go flash prices like direct flash: {go}"
+        );
+        // legacy alias: same model billed at the Flash price
+        // (research/DECISIONS.md:74)
+        let legacy = price_usd("deepseek-v4-flash", 1_000_000, 500_000, 250_000).unwrap();
+        assert!(
+            (legacy - 0.453).abs() < 1e-9,
+            "legacy alias prices like flash: {legacy}"
         );
         assert_eq!(
             price_usd("gpt-4o", 10, 0, 10),
