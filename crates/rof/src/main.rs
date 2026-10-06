@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use agent_budget::{config_for, BudgetGuard, Capability};
+use agent_budget::{config_for, with_steps, BudgetGuard, Capability};
 use agent_event::{AgentEvent, Emitter};
 use agent_loop::{Input, LoopState, NoBets, Outcome, Run, RunConfig};
 use provider_core::LlmClient;
@@ -200,15 +200,13 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
 
 /// Budget for one run: explicit flags win; context-pinned runs without a
 /// token flag get the pilot default; otherwise the library UnattendedBatch
-/// config (50k tokens).
+/// config (50k tokens). The step override is `agent_budget::with_steps`
+/// (warn clamp + refund re-derive live there, never here); precedence
+/// (cfg-over-state) is documented on `agent_loop::run`.
 fn budget_for(args: &Args) -> BudgetGuard {
     let mut b = config_for(Capability::UnattendedBatch);
     if let Some(n) = args.budget_steps {
-        b.max_steps = NonZeroU32::new(n).expect("parse rejects 0");
-        b.warn_steps = b
-            .warn_steps
-            .min(NonZeroU32::new(n.saturating_sub(1).max(1)).expect("max(1) is non-zero"));
-        b.max_refunds = n / 4;
+        b = with_steps(b, NonZeroU32::new(n).expect("parse rejects 0"));
     }
     if let Some(n) = args.budget_actions {
         b.actions_per_trial = n;
@@ -420,6 +418,8 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     reg.register(Arc::new(tools_std::exec_tool(policy.clone())));
     reg.register(Arc::new(tools_std::test_tool(policy)));
     let mut state = LoopState::new();
+    // Pre-seeded budget: `run` never rebuilds it (precedence is documented
+    // on `agent_loop::run`: cfg-over-state).
     state.budget = budget_for(args);
     let gate = Gate {
         incremental: args.proof_cmd.is_some(),
@@ -1156,6 +1156,18 @@ mod tests {
         pinned.budget_steps = Some(5);
         assert_eq!(budget_for(&pinned).config().max_tokens, 50_000);
         assert_eq!(budget_for(&pinned).config().max_steps.get(), 5);
+        // The step override is the single `agent_budget::with_steps`
+        // implementation: warn clamps to min(warn, max-1), refunds re-derive.
+        assert_eq!(budget_for(&pinned).config().warn_steps.get(), 4);
+        assert_eq!(budget_for(&pinned).config().max_refunds, 1);
+        assert_eq!(
+            budget_for(&pinned).config().warn_steps,
+            agent_budget::with_steps(
+                agent_budget::config_for(agent_budget::Capability::UnattendedBatch),
+                NonZeroU32::new(5).unwrap()
+            )
+            .warn_steps
+        );
         // --budget-actions overrides the trial action cap.
         pinned.budget_actions = Some(9);
         assert_eq!(budget_for(&pinned).config().actions_per_trial, 9);
@@ -1333,12 +1345,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn budget_halt_exits_3() {
+    async fn admitted_step_text_answer_is_done() {
         let dir = tmp();
         std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
         let client = ScriptClient::new(vec![text_resp()]);
         let r = execute(&client, &args_for(&dir, Some(1))).await;
-        assert!(matches!(r.outcome, Outcome::Halted(_)), "{:?}", r.outcome);
-        assert_eq!(exit_code(&r.outcome), 3);
+        // Admitted-step-wins: the single permitted step ran and the model
+        // answered with no further work, so it ends Done, not Halted.
+        // (Halted is for runs that still need steps when the budget dies.)
+        assert!(matches!(r.outcome, Outcome::Done), "{:?}", r.outcome);
+        assert_eq!(exit_code(&r.outcome), 0);
     }
 }

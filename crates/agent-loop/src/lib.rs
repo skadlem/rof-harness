@@ -39,9 +39,10 @@ const THINKING_KEEP: usize = 2;
 
 /// Echoed-reasoning trim knob: env `THINKING_KEEP` overrides the keep-count
 /// (A/B arm B = a large value echoes everything). Default stays
-/// [`THINKING_KEEP`] (chosen-not-measured; the K=2 A/B validates). Not unit
-/// tested for the env leg (env mutation races under parallel tests); the live
-/// A/B measures the arms directly.
+/// [`THINKING_KEEP`] (chosen-not-measured; the K=2 A/B validates). Read once
+/// per run via [`LoopState::resolve_fold_config`]: the fold uses the cached
+/// [`LoopState::thinking_keep`], so the env leg is tested through the snapshot
+/// (a mid-run change is ignored), never per-fold.
 fn thinking_keep() -> usize {
     std::env::var("THINKING_KEEP")
         .ok()
@@ -274,6 +275,18 @@ pub struct Checkpoint {
     pub summary: String,
 }
 
+/// Mid-run verification nudge state (Full incentives only): nudges used
+/// (cap [`VERIFY_NUDGE_CAP`]), edits at the last nudge (a second declare
+/// without an intervening write stays silent), the passing-verify-since-write
+/// flag, and the request-scoped hold text for the next request tail.
+#[derive(Debug, Clone, Default)]
+pub struct VerifyState {
+    pub nudges_used: u32,
+    pub edits_at_last_nudge: u32,
+    pub verified_since_write: bool,
+    pub hold: Option<String>,
+}
+
 /// Shared turn/step state for both drivers. `run` is the canonical shipped
 /// driver; every field below is live in `run` (single-flight `in_flight` via
 /// `start_provider_call`/`finish_provider_msg`, `steering`/`followups` via
@@ -295,6 +308,14 @@ pub struct LoopState {
     /// already carried. Frozen once, compared per request: unchanged -> cached
     /// run-start bytes, changed -> dropped to the normal view/edit flow.
     pub pins: Option<Vec<(String, String)>>,
+    /// Transcript-fold knobs frozen at run head ([`Self::resolve_fold_config`]):
+    /// echoed-reasoning keep-count (`THINKING_KEEP`) and the collapse
+    /// hysteresis (`COLLAPSE_HYSTERESIS`). The fold reads these, never the
+    /// environment, so a mid-run env change cannot flip request bytes or
+    /// rotate the cached prefix. Defaults are the constants; `run` resolves
+    /// the env once before the first request.
+    pub thinking_keep: usize,
+    pub collapse_hysteresis: usize,
     pub steering: VecDeque<QueuedInput>,
     pub followups: VecDeque<String>,
     pub wake_requested: bool,
@@ -327,14 +348,8 @@ pub struct LoopState {
     pub pending_directives: VecDeque<String>,
     /// Successful `edit`|`write` tool results so far (the zero-edit trigger).
     pub edits: u32,
-    /// Mid-run verification nudge (Full only): nudges used (cap
-    /// [`VERIFY_NUDGE_CAP`]), edits at the last nudge (second declare without
-    /// an intervening write stays silent), passing-verify-since-write flag,
-    /// and the request-scoped hold text for the next request tail.
-    pub verify_nudges_used: u32,
-    pub edits_at_last_nudge: u32,
-    pub verified_since_write: bool,
-    pub verify_hold: Option<String>,
+    /// Mid-run verification nudge (Full only); see [`VerifyState`].
+    pub verify: VerifyState,
     /// One-shot latches: the half-cap and near-cap directives fire once each.
     pub half_directive_sent: bool,
     pub late_directive_sent: bool,
@@ -366,6 +381,8 @@ impl LoopState {
             items: Vec::new(),
             file_map: None,
             pins: None,
+            thinking_keep: THINKING_KEEP,
+            collapse_hysteresis: context::COLLAPSE_HYSTERESIS,
             steering: VecDeque::new(),
             followups: VecDeque::new(),
             wake_requested: false,
@@ -387,10 +404,7 @@ impl LoopState {
             lessons: VecDeque::new(),
             pending_directives: VecDeque::new(),
             edits: 0,
-            verify_nudges_used: 0,
-            edits_at_last_nudge: 0,
-            verified_since_write: false,
-            verify_hold: None,
+            verify: VerifyState::default(),
             half_directive_sent: false,
             late_directive_sent: false,
             ablation: bets::AblationMetrics::default(),
@@ -401,6 +415,16 @@ impl LoopState {
             anchor: None,
             compacted_turn: None,
         }
+    }
+
+    /// Run-head snapshot of the transcript-fold env knobs: reads
+    /// `THINKING_KEEP` / `COLLAPSE_HYSTERESIS` once into
+    /// [`Self::thinking_keep`] / [`Self::collapse_hysteresis`]. `run` calls
+    /// this before the first request; the fold never reads the environment
+    /// after, so a mid-run env change cannot flip behavior.
+    pub fn resolve_fold_config(&mut self) {
+        self.thinking_keep = thinking_keep();
+        self.collapse_hysteresis = context::collapse_hysteresis();
     }
 
     pub fn open_tools(&self) -> usize {
@@ -687,7 +711,7 @@ impl LoopState {
                 self.push_assistant(&message, &stop_label);
                 if message.tool_calls.is_empty() {
                     if let Some(text) = self.verify_nudge_due() {
-                        self.verify_hold = Some(text.clone());
+                        self.verify.hold = Some(text.clone());
                         // Durable hold record: the request tail never reaches the
                         // log (derived folds items only) while directives ride a
                         // ToolResult tail, so the hold needs its own log row for
@@ -752,13 +776,13 @@ impl LoopState {
         if self.incentives < IncentivesLevel::Full {
             return None;
         }
-        if self.verify_nudges_used >= VERIFY_NUDGE_CAP {
+        if self.verify.nudges_used >= VERIFY_NUDGE_CAP {
             return None;
         }
-        if self.edits <= self.edits_at_last_nudge {
+        if self.edits <= self.verify.edits_at_last_nudge {
             return None;
         }
-        if self.verified_since_write {
+        if self.verify.verified_since_write {
             return None;
         }
         let cap = self.budget.config().actions_per_trial;
@@ -767,8 +791,8 @@ impl LoopState {
             return None;
         }
         // Exhausted budget gets no grace hold: consult the guard `terminate`
-        // halts on, covering steps/tokens/spend/wallclock/trials/refines and
-        // both action caps in one AND-gate read.
+        // halts on, covering steps/tokens/spend/wallclock and both action
+        // caps in one AND-gate read.
         if self.budget.exceeded().is_some() {
             return None;
         }
@@ -791,8 +815,8 @@ impl LoopState {
         if !cfg.max_wallclock.is_zero() && self.budget.elapsed() >= cfg.max_wallclock {
             return None;
         }
-        self.verify_nudges_used += 1;
-        self.edits_at_last_nudge = self.edits;
+        self.verify.nudges_used += 1;
+        self.verify.edits_at_last_nudge = self.edits;
         Some(VERIFY_NUDGE.into())
     }
 
@@ -834,9 +858,9 @@ impl LoopState {
                 // A successful write invalidates earlier verification; a
                 // passing verification run covers writes since the last one.
                 if name == "edit" || name == "write" {
-                    self.verified_since_write = false;
+                    self.verify.verified_since_write = false;
                 } else if is_verification {
-                    self.verified_since_write = true;
+                    self.verify.verified_since_write = true;
                 }
             }
         }
@@ -1107,13 +1131,16 @@ impl LoopState {
     }
 
     /// The raw log fold: every message, collapse + thinking trim applied, with
-    /// the collapse hysteresis read from [`context::collapse_hysteresis`].
+    /// the collapse hysteresis from the run-head snapshot
+    /// ([`Self::resolve_fold_config`]), never the environment.
     fn raw_messages(&self) -> Vec<ProviderMessage> {
-        self.raw_messages_with(context::collapse_hysteresis())
+        self.raw_messages_with(self.collapse_hysteresis)
     }
 
     /// [`Self::raw_messages`] with the collapse hysteresis taken as a plain
     /// parameter: tests drive H directly instead of mutating the environment.
+    /// The thinking keep-count always comes from the run-head snapshot
+    /// ([`Self::thinking_keep`]).
     fn raw_messages_with(&self, hysteresis: usize) -> Vec<ProviderMessage> {
         let mut out = Vec::new();
         for item in &self.items {
@@ -1161,12 +1188,12 @@ impl LoopState {
             }
         }
         // Echoed reasoning is trimmed here, before the wire layer sees it:
-        // keep the last thinking_keep() assistant rows, blank the older ones.
+        // keep the last cached `thinking_keep` assistant rows, blank the older ones.
         let keep_from = out
             .iter()
             .filter(|m| m.role == "assistant")
             .count()
-            .saturating_sub(thinking_keep());
+            .saturating_sub(self.thinking_keep);
         for (n, m) in out.iter_mut().filter(|m| m.role == "assistant").enumerate() {
             if n < keep_from {
                 m.thinking = None;
@@ -1518,7 +1545,7 @@ pub async fn drive_tick(
                                 // Same as `run`'s `VerifyHold => continue`: the
                                 // turn stays alive (`call_model` latched in
                                 // `step_claim`) and the next request carries
-                                // `verify_hold` on its tail. No `ToolStart`.
+                                // `verify.hold` on its tail. No `ToolStart`.
                             }
                             ClaimOutcome::Done
                             | ClaimOutcome::Truncated(_)
@@ -1926,7 +1953,7 @@ fn build_request(
     }
     // Held verification nudge (Full only; None elsewhere, so other arms stay
     // byte-identical): peeked here, taken by `run` only on successful send.
-    if let Some(nudge) = state.verify_hold.as_ref().cloned() {
+    if let Some(nudge) = state.verify.hold.as_ref().cloned() {
         messages.push(ProviderMessage {
             role: "user".into(),
             content: nudge,
@@ -2250,7 +2277,7 @@ fn settle_tool_msg(state: &mut LoopState, msg: ToolMsg) -> bool {
 /// Batch-scope counter snapshot: the rows `tree.rollback` (or a gate
 /// `Aborted`) destroys must not linger in the counters. `edits`,
 /// `actions_this_trial` (+ the tripwire streak/sig that describes those
-/// actions), and `verified_since_write` are refunded to this snapshot on a
+/// actions), and `verify.verified_since_write` are refunded to this snapshot on a
 /// full-batch rollback. Directive one-shot latches are NOT refunded: fired
 /// text is already durable on a `ToolResult` tail and must not repeat.
 #[derive(Debug, Clone)]
@@ -2272,7 +2299,7 @@ fn snapshot_batch(state: &LoopState) -> BatchSnapshot {
         same_action_streak: state.budget.counters().same_action_streak,
         last_sig: state.last_sig.clone(),
         last_obs: state.last_obs,
-        verified_since_write: state.verified_since_write,
+        verified_since_write: state.verify.verified_since_write,
     }
 }
 
@@ -2287,7 +2314,7 @@ fn refund_batch(state: &mut LoopState, snap: &BatchSnapshot) {
     state.budget.counters_mut().same_action_streak = snap.same_action_streak;
     state.last_sig = snap.last_sig.clone();
     state.last_obs = snap.last_obs;
-    state.verified_since_write = snap.verified_since_write;
+    state.verify.verified_since_write = snap.verified_since_write;
 }
 
 /// Headless multi-tick run on real siblings: [`LlmClient`] provider,
@@ -2301,6 +2328,13 @@ fn refund_batch(state: &mut LoopState, snap: &BatchSnapshot) {
 /// grace step runs inside `start_provider_call`, the halt lands after.
 /// Inputs seed here (Crash queues like User, recorded with Crash source);
 /// followups ride `state.followups`. Parked-idle with empty queues is Done.
+///
+/// Precedence — the single place this is stated (cfg-over-state): `cfg`
+/// wins over pre-set `LoopState` fields. `run` applies `cfg.incentives` over
+/// `state.incentives` and resolves the fold knobs from the environment;
+/// `state.budget` arrives pre-seeded (rof builds it from the capability
+/// preset plus CLI overrides via the `agent_budget` constructors) and `run`
+/// never rebuilds it.
 pub async fn run<P: LlmClient>(
     state: &mut LoopState,
     r: Run<'_, P>,
@@ -2316,8 +2350,11 @@ pub async fn run<P: LlmClient>(
         bets,
         cfg,
     } = r;
+    // Cfg-over-state (precedence is documented on `run`): cfg wins over
+    // pre-set state; the fold knobs resolve from the env once, here.
     state.drain_timeout = cfg.drain_timeout;
     state.incentives = cfg.incentives;
+    state.resolve_fold_config();
     let root = CancellationToken::new();
     let run_id = state.next_emit_id();
     emitter.emit(AgentEvent::RunStart {
@@ -2543,7 +2580,7 @@ pub async fn run<P: LlmClient>(
                 // The request (including any peeked hold row) reached the
                 // provider: consume the hold now. A provider Err below keeps
                 // it armed for the in-step retry.
-                state.verify_hold.take();
+                state.verify.hold.take();
                 let turn = state.turn;
                 // Checkpoint anchor: this request's history length and its
                 // provider-reported prompt tokens (the final attempt's, not
@@ -2741,7 +2778,7 @@ pub async fn run<P: LlmClient>(
                         }
                         let mut batch_failed = false;
                         // Pre-batch counters: a full rollback refunds `edits` /
-                        // `actions` / `verified_since_write` past the verdict.
+                        // `actions` / `verify.verified_since_write` past the verdict.
                         let batch_snap = snapshot_batch(state);
                         for c in &calls {
                             if cancel.is_cancelled() {
@@ -3507,7 +3544,7 @@ mod tests {
             ("tool", "obs-7".into(), Some("c7")),
         ];
         assert_eq!(got, want);
-        // Default knob (env unset) takes the byte-identical path.
+        // Cached default (no env read) folds the byte-identical path.
         assert_eq!(
             serde_json::to_string(&s.raw_messages()).unwrap(),
             serde_json::to_string(&msgs).unwrap()
@@ -3558,6 +3595,89 @@ mod tests {
         );
         assert_eq!(h0.iter().filter(|&&b| b != 0).count(), 25);
         assert_eq!(moves.len(), 5);
+    }
+
+    /// Run-head snapshot: both fold knobs resolve from the env once, and a
+    /// mid-run env change no longer flips the fold. This is the only test
+    /// that sets these vars; the fold itself never reads them (only
+    /// `resolve_fold_config` does) and run-path tests assert behavior, not
+    /// fold bytes, so the save/restore window cannot flip a parallel test.
+    #[test]
+    fn fold_knobs_frozen_at_run_head_mid_run_env_change_ignored() {
+        let saved_thinking = std::env::var("THINKING_KEEP").ok();
+        let saved_hyst = std::env::var("COLLAPSE_HYSTERESIS").ok();
+        // Fixture with both signals: 8 tool rows (collapse) + 4 thinking
+        // assistants (echo trim).
+        let mut s = tool_history(8);
+        for i in 0..4 {
+            s.push_assistant(
+                &AssistantMessage {
+                    content: format!("step-{i}"),
+                    tool_calls: Vec::new(),
+                    thinking: Some(format!("reason-{i}")),
+                },
+                "Stop",
+            );
+        }
+        std::env::set_var("THINKING_KEEP", "99");
+        std::env::set_var("COLLAPSE_HYSTERESIS", "5");
+        s.resolve_fold_config();
+        assert_eq!((s.thinking_keep, s.collapse_hysteresis), (99, 5));
+        // H=5 over 8 rows: boundary 5*((8-5)/5) = 0, no stubs; keep 99:
+        // every thinking row survives.
+        assert_eq!(stub_boundary(&s.derived_messages()), 0);
+        let before = serde_json::to_string(&s.derived_messages()).unwrap();
+        assert_eq!(before.matches("reason-").count(), 4);
+        // Mid-run env change: the fold must not move.
+        std::env::set_var("THINKING_KEEP", "0");
+        std::env::set_var("COLLAPSE_HYSTERESIS", "0");
+        let after = serde_json::to_string(&s.derived_messages()).unwrap();
+        assert_eq!(before, after, "mid-run env change flipped the fold");
+        // A fresh head re-resolves: the new env takes effect only there.
+        s.resolve_fold_config();
+        assert_eq!((s.thinking_keep, s.collapse_hysteresis), (0, 0));
+        let re = serde_json::to_string(&s.derived_messages()).unwrap();
+        assert_ne!(re, before, "re-resolve must pick up the new env");
+        assert_eq!(stub_boundary(&s.derived_messages()), 3); // H=0 collapse-5
+        match saved_thinking {
+            Some(v) => std::env::set_var("THINKING_KEEP", v),
+            None => std::env::remove_var("THINKING_KEEP"),
+        }
+        match saved_hyst {
+            Some(v) => std::env::set_var("COLLAPSE_HYSTERESIS", v),
+            None => std::env::remove_var("COLLAPSE_HYSTERESIS"),
+        }
+    }
+
+    /// The cached fields alone steer the fold: no env touched at all.
+    #[test]
+    fn fold_uses_cached_knobs_not_the_environment() {
+        let mut s = tool_history(8);
+        s.collapse_hysteresis = 5;
+        assert_eq!(stub_boundary(&s.derived_messages()), 0);
+        s.collapse_hysteresis = 0;
+        assert_eq!(stub_boundary(&s.derived_messages()), 3);
+        for i in 0..4 {
+            s.push_assistant(
+                &AssistantMessage {
+                    content: format!("step-{i}"),
+                    tool_calls: Vec::new(),
+                    thinking: Some(format!("reason-{i}")),
+                },
+                "Stop",
+            );
+        }
+        let thinking = |s: &LoopState| {
+            s.derived_messages()
+                .iter()
+                .filter(|m| m.role == "assistant")
+                .filter_map(|m| m.thinking.clone())
+                .collect::<Vec<_>>()
+        };
+        s.thinking_keep = 1;
+        assert_eq!(thinking(&s), vec!["reason-3".to_string()]);
+        s.thinking_keep = 99;
+        assert_eq!(thinking(&s).len(), 4);
     }
 
     #[test]
@@ -3786,13 +3906,14 @@ mod tests {
         assert_eq!(s.edits, 1);
         let outcome = declare(&mut s);
         assert!(matches!(outcome, ClaimOutcome::VerifyHold));
-        assert_eq!(s.verify_hold.as_deref(), Some(VERIFY_NUDGE));
+        assert_eq!(s.verify.hold.as_deref(), Some(VERIFY_NUDGE));
         assert!(s
-            .verify_hold
+            .verify
+            .hold
             .unwrap()
             .starts_with("Unverified declare held:"));
-        assert_eq!(s.verify_nudges_used, 1);
-        assert_eq!(s.edits_at_last_nudge, 1);
+        assert_eq!(s.verify.nudges_used, 1);
+        assert_eq!(s.verify.edits_at_last_nudge, 1);
         assert!(s.call_model); // turn held alive for the next request
         assert!(s.pending_directives.is_empty()); // request tail only: no double delivery
     }
@@ -3801,8 +3922,8 @@ mod tests {
     fn verify_nudge_needs_edits_before_first_fire() {
         let mut s = LoopState::new();
         assert!(matches!(declare(&mut s), ClaimOutcome::Done));
-        assert_eq!(s.verify_nudges_used, 0);
-        assert!(s.verify_hold.is_none());
+        assert_eq!(s.verify.nudges_used, 0);
+        assert!(s.verify.hold.is_none());
     }
 
     #[test]
@@ -3811,8 +3932,8 @@ mod tests {
         ok_round(&mut s, "e1", "edit", Value::Null);
         ok_round(&mut s, "t1", "test", Value::Null);
         assert!(matches!(declare(&mut s), ClaimOutcome::Done));
-        assert_eq!(s.verify_nudges_used, 0);
-        assert!(s.verify_hold.is_none());
+        assert_eq!(s.verify.nudges_used, 0);
+        assert!(s.verify.hold.is_none());
     }
 
     #[test]
@@ -3894,7 +4015,7 @@ mod tests {
             call_id: "t1".into(),
             result: failing,
         }));
-        assert!(!s.verified_since_write);
+        assert!(!s.verify.verified_since_write);
         assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
     }
 
@@ -3937,7 +4058,7 @@ mod tests {
         assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
         // "Blocked" answer: text again, no intervening write -> Done.
         assert!(matches!(declare(&mut s), ClaimOutcome::Done));
-        assert_eq!(s.verify_nudges_used, 1);
+        assert_eq!(s.verify.nudges_used, 1);
     }
 
     #[test]
@@ -3947,8 +4068,8 @@ mod tests {
             s.incentives = level;
             ok_round(&mut s, "e1", "edit", Value::Null);
             assert!(matches!(declare(&mut s), ClaimOutcome::Done));
-            assert_eq!(s.verify_nudges_used, 0);
-            assert!(s.verify_hold.is_none());
+            assert_eq!(s.verify.nudges_used, 0);
+            assert!(s.verify.hold.is_none());
         }
     }
 
@@ -3966,7 +4087,7 @@ mod tests {
         ok_round(&mut s, "e1", "edit", Value::Null);
         s.budget.counters_mut().actions_this_trial = cap * 9 / 10;
         assert!(matches!(declare(&mut s), ClaimOutcome::Done));
-        assert!(s.verify_hold.is_none());
+        assert!(s.verify.hold.is_none());
     }
 
     #[test]
@@ -3976,10 +4097,10 @@ mod tests {
         assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
         ok_round(&mut s, "e2", "edit", Value::Null); // intervening write
         assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
-        assert_eq!(s.verify_nudges_used, 2);
+        assert_eq!(s.verify.nudges_used, 2);
         ok_round(&mut s, "e3", "edit", Value::Null); // budget spent
         assert!(matches!(declare(&mut s), ClaimOutcome::Done));
-        assert_eq!(s.verify_nudges_used, 2);
+        assert_eq!(s.verify.nudges_used, 2);
     }
 
     #[test]
@@ -4014,10 +4135,10 @@ mod tests {
         );
         assert!(!prev.content.contains(VERIFY_NUDGE));
         // Peek, not consume: a provider Err+retry must re-arm.
-        assert!(state.verify_hold.is_some());
+        assert!(state.verify.hold.is_some());
         assert_eq!(state.items.len(), rows); // request rows never persisted
                                              // Simulate `run`'s take-on-successful-send.
-        state.verify_hold.take();
+        state.verify.hold.take();
         let r2 = build_request(&mut state, &registry, &root, &cfg);
         assert!(r2
             .messages
@@ -6907,7 +7028,7 @@ mod tests {
     /// `drive_tick` VerifyHold parity: an unverified declare holds the turn
     /// alive through the shared `step_claim` path, exactly like `run`'s
     /// `VerifyHold => continue` (no `ToolStart`, `call_model` latched,
-    /// `verify_hold` set for the next request tail).
+    /// `verify.hold` set for the next request tail).
     #[tokio::test]
     async fn drive_tick_verify_hold_matches_run() {
         let mut s = LoopState::new();
@@ -6950,7 +7071,7 @@ mod tests {
         assert!(matches!(v, PhaseVerdict::Continue));
         assert_eq!(s.edits, 1);
         assert_eq!(s.budget.counters().actions_this_trial, 1);
-        assert!(!s.verified_since_write);
+        assert!(!s.verify.verified_since_write);
         // Unverified declare: held, not Done. No `ToolStart` for the empty
         // declare, `call_model` keeps the turn alive for the next request.
         assert!(s.start_provider_call(&root).is_some());
@@ -6966,8 +7087,8 @@ mod tests {
         let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
         assert!(matches!(v, PhaseVerdict::Continue));
         assert!(s.call_model);
-        assert_eq!(s.verify_hold.as_deref(), Some(VERIFY_NUDGE));
-        assert_eq!(s.verify_nudges_used, 1);
+        assert_eq!(s.verify.hold.as_deref(), Some(VERIFY_NUDGE));
+        assert_eq!(s.verify.nudges_used, 1);
         assert!(emitter.history()[frames_before..]
             .iter()
             .all(|e| !matches!(e, AgentEvent::ToolStart { .. })));
@@ -6975,7 +7096,7 @@ mod tests {
 
     /// Rollback refunds batch counters: `edits`, `actions_this_trial` (+ the
     /// tripwire streak/sig describing those actions), and
-    /// `verified_since_write` return to the pre-batch snapshot on a full
+    /// `verify.verified_since_write` return to the pre-batch snapshot on a full
     /// rollback, so rolled-back edits leave no stale counters behind.
     #[test]
     fn rollback_refunds_edits_actions_and_verified() {
@@ -6983,7 +7104,7 @@ mod tests {
         // Verified baseline: one write covered by a passing test.
         ok_round(&mut s, "w0", "write", serde_json::json!({"path": "a"}));
         ok_round(&mut s, "t0", "test", Value::Null);
-        assert!(s.verified_since_write);
+        assert!(s.verify.verified_since_write);
         let snap = snapshot_batch(&s);
         let edits_before = s.edits;
         let actions_before = s.budget.counters().actions_this_trial;
@@ -7014,7 +7135,7 @@ mod tests {
         // The batch moved the counters and dirtied the verified flag.
         assert_eq!(s.edits, edits_before + 1);
         assert_eq!(s.budget.counters().actions_this_trial, actions_before + 1);
-        assert!(!s.verified_since_write);
+        assert!(!s.verify.verified_since_write);
         // The tree rolled the batch back: refund to the snapshot.
         refund_batch(&mut s, &snap);
         assert_eq!(s.edits, snap.edits);
@@ -7028,8 +7149,8 @@ mod tests {
         );
         assert_eq!(s.last_sig, snap.last_sig);
         assert_eq!(s.last_obs, snap.last_obs);
-        assert_eq!(s.verified_since_write, snap.verified_since_write);
-        assert!(s.verified_since_write);
+        assert_eq!(s.verify.verified_since_write, snap.verified_since_write);
+        assert!(s.verify.verified_since_write);
     }
 
     /// Per-step budget: a fresh step head resets to [`STEP_RETRY_BUDGET`]
@@ -7168,17 +7289,17 @@ mod tests {
         state.admit_steering();
         ok_round(&mut state, "e1", "edit", Value::Null);
         assert!(matches!(declare(&mut state), ClaimOutcome::VerifyHold));
-        assert!(state.verify_hold.is_some());
+        assert!(state.verify.hold.is_some());
         let cfg = RunConfig::default();
         // Peek: still armed after the build.
         let r1 = build_request(&mut state, &registry, &root, &cfg);
         assert!(r1.messages.iter().any(|m| m.content == VERIFY_NUDGE));
-        assert!(state.verify_hold.is_some(), "peek must not consume");
+        assert!(state.verify.hold.is_some(), "peek must not consume");
         // Provider Err path in `run` keeps it: rebuild still carries it.
         let r_retry = build_request(&mut state, &registry, &root, &cfg);
         assert!(r_retry.messages.iter().any(|m| m.content == VERIFY_NUDGE));
         // `run`'s take-on-Ok: delivered once, never twice.
-        state.verify_hold.take();
+        state.verify.hold.take();
         let r2 = build_request(&mut state, &registry, &root, &cfg);
         assert!(r2.messages.iter().all(|m| m.content != VERIFY_NUDGE));
         let _ = std::fs::remove_dir_all(&root);
@@ -7201,7 +7322,7 @@ mod tests {
         let assistant_declares: Vec<&ProviderMessage> = req
             .messages
             .iter()
-            .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty() == false)
+            .filter(|m| m.role == "assistant" && m.tool_calls.is_empty())
             .collect();
         let _ = assistant_declares;
         let last = req.messages.last().unwrap();
@@ -7238,7 +7359,7 @@ mod tests {
         ok_round(&mut s, "e1", "edit", Value::Null);
         s.budget.counters_mut().steps = max - 1;
         assert!(matches!(declare(&mut s), ClaimOutcome::Done));
-        assert!(s.verify_hold.is_none());
+        assert!(s.verify.hold.is_none());
         // Zero remaining (already at max): silent Done.
         let mut s = LoopState::new();
         ok_round(&mut s, "e1", "edit", Value::Null);
@@ -7253,7 +7374,7 @@ mod tests {
         ok_round(&mut s, "e1", "edit", Value::Null);
         s.budget.counters_mut().tokens = s.budget.config().max_tokens;
         assert!(matches!(declare(&mut s), ClaimOutcome::Done));
-        assert!(s.verify_hold.is_none());
+        assert!(s.verify.hold.is_none());
     }
 
     /// (2) spend cap vetoes the hold.
@@ -7264,7 +7385,7 @@ mod tests {
         let limit = s.budget.config().max_spend_cents.unwrap();
         s.budget.counters_mut().spent_cents = limit;
         assert!(matches!(declare(&mut s), ClaimOutcome::Done));
-        assert!(s.verify_hold.is_none());
+        assert!(s.verify.hold.is_none());
     }
 
     /// (2) wallclock cap vetoes the hold.
@@ -7282,7 +7403,7 @@ mod tests {
         // `ok_round` already burned edits=1 on the old guard; restore it.
         s.edits = 1;
         assert!(matches!(declare(&mut s), ClaimOutcome::Done));
-        assert!(s.verify_hold.is_none());
+        assert!(s.verify.hold.is_none());
     }
 
     /// (2) exhausted budget (any cap, e.g. actions) gets no grace hold:
@@ -7294,7 +7415,7 @@ mod tests {
         s.budget.counters_mut().actions_this_trial = s.budget.config().actions_per_trial;
         assert!(s.budget.exceeded().is_some());
         assert!(matches!(declare(&mut s), ClaimOutcome::Done));
-        assert!(s.verify_hold.is_none());
+        assert!(s.verify.hold.is_none());
     }
 
     /// (3) replay: the hold fire persists a durable Attempt record so the log

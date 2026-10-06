@@ -7,12 +7,13 @@ use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 /// Static caps. Every cap is finite: a cap that defaults to infinity is not a cap.
+/// Single-trial design: the driver has no trial/refine boundaries (`run` is
+/// one trial; `actions_per_trial` never resets), so there are no trials or
+/// refines caps — the step cap and the per-run action cap are the live bounds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetConfig {
     pub max_steps: NonZeroU32,
     pub warn_steps: NonZeroU32,
-    pub max_trials: NonZeroU32,
-    pub max_refines: NonZeroU32,
     pub max_tokens: u64,
     pub max_wallclock: Duration,
     pub max_spend_cents: Option<u64>,
@@ -38,8 +39,6 @@ pub const SPEND_ON_CENTS: u64 = 400;
 #[derive(Debug, Clone, Default)]
 pub struct BudgetCounters {
     pub steps: u32,
-    pub trials: u32,
-    pub refines: u32,
     pub tokens: u64,
     pub spent_cents: u64,
     pub refunds: u32,
@@ -50,8 +49,6 @@ pub struct BudgetCounters {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BudgetHalt {
     Steps,
-    Trials,
-    Refines,
     Tokens,
     Wallclock,
     Spend,
@@ -76,8 +73,6 @@ pub struct BudgetExceeded {
 pub fn halt_name(h: &BudgetHalt) -> &'static str {
     match h {
         BudgetHalt::Steps => "steps",
-        BudgetHalt::Trials => "trials",
-        BudgetHalt::Refines => "refines",
         BudgetHalt::Tokens => "tokens",
         BudgetHalt::Wallclock => "wallclock",
         BudgetHalt::Spend => "spend",
@@ -126,17 +121,15 @@ impl BudgetGuard {
     }
 
     /// Peek the first tripped counter without touching the grace latch.
+    /// No trials/refines arms: the driver is single-trial (no trial/refine
+    /// boundaries exist in `run`, so those counters could never increment
+    /// and the arms could never fire). The per-run action cap
+    /// (`TrialActions`, which never resets) is the live trial boundary.
     fn peek(&self) -> Option<BudgetHalt> {
         let c = &self.counters;
         let cfg = &self.config;
         if c.steps >= cfg.max_steps.get() {
             return Some(BudgetHalt::Steps);
-        }
-        if c.trials >= cfg.max_trials.get() {
-            return Some(BudgetHalt::Trials);
-        }
-        if c.refines >= cfg.max_refines.get() {
-            return Some(BudgetHalt::Refines);
         }
         if cfg.max_tokens > 0 && c.tokens >= cfg.max_tokens {
             return Some(BudgetHalt::Tokens);
@@ -188,8 +181,6 @@ impl BudgetGuard {
         let cfg = &self.config;
         match halt {
             BudgetHalt::Steps => (c.steps as u64, cfg.max_steps.get() as u64),
-            BudgetHalt::Trials => (c.trials as u64, cfg.max_trials.get() as u64),
-            BudgetHalt::Refines => (c.refines as u64, cfg.max_refines.get() as u64),
             BudgetHalt::Tokens => (c.tokens, cfg.max_tokens),
             BudgetHalt::Wallclock => (self.elapsed().as_secs(), cfg.max_wallclock.as_secs()),
             BudgetHalt::Spend => (c.spent_cents, cfg.max_spend_cents.unwrap_or(0)),
@@ -264,14 +255,27 @@ pub fn config_for(cap: Capability) -> BudgetConfig {
     BudgetConfig {
         max_steps: nz(steps),
         warn_steps: nz(warn),
-        max_trials: nz(6),
-        max_refines: nz(3),
         max_tokens: 50_000,
         max_wallclock: Duration::from_secs(wall_secs),
         max_spend_cents: spend,
         same_action_cycles: 3,
         actions_per_trial: 30,
         max_refunds: steps / 4,
+    }
+}
+
+/// Step-cap override: an explicit step budget wins over the capability
+/// preset. Warn clamps to `min(warn, max-1)` headroom and refunds re-derive
+/// as 25% of the step cap. Single implementation: callers (rof `budget_for`)
+/// apply this instead of re-implementing the clamp math.
+pub fn with_steps(base: BudgetConfig, steps: NonZeroU32) -> BudgetConfig {
+    BudgetConfig {
+        warn_steps: base.warn_steps.min(
+            NonZeroU32::new(steps.get().saturating_sub(1).max(1)).expect("max(1) is non-zero"),
+        ),
+        max_refunds: steps.get() / 4,
+        max_steps: steps,
+        ..base
     }
 }
 
@@ -297,14 +301,6 @@ mod tests {
         let mut g = unattended();
         g.counters_mut().steps = g.config().max_steps.get();
         assert_eq!(terminal(&g), BudgetHalt::Steps);
-
-        let mut g = unattended();
-        g.counters_mut().trials = g.config().max_trials.get();
-        assert_eq!(terminal(&g), BudgetHalt::Trials);
-
-        let mut g = unattended();
-        g.counters_mut().refines = g.config().max_refines.get();
-        assert_eq!(terminal(&g), BudgetHalt::Refines);
 
         let mut g = unattended();
         g.counters_mut().tokens = g.config().max_tokens;
@@ -403,8 +399,6 @@ mod tests {
             assert!(c.max_steps.get() > 0);
             assert!(c.warn_steps.get() > 0);
             assert!(c.warn_steps.get() < c.max_steps.get());
-            assert!(c.max_trials.get() > 0);
-            assert!(c.max_refines.get() > 0);
             assert!(c.max_tokens > 0);
             assert!(!c.max_wallclock.is_zero());
             assert!(c.same_action_cycles > 0);
@@ -429,10 +423,7 @@ mod tests {
             Capability::Eval,
         ] {
             let c = config_for(cap);
-            assert_eq!(
-                (c.max_trials.get(), c.max_refines.get(), c.max_tokens),
-                (6, 3, 50_000)
-            );
+            assert_eq!(c.max_tokens, 50_000);
             assert_eq!((c.same_action_cycles, c.actions_per_trial), (3, 30));
             assert_eq!(c.max_refunds, c.max_steps.get() / 4);
         }
@@ -443,5 +434,27 @@ mod tests {
         assert_eq!(config_for(Capability::Interactive).max_spend_cents, None);
         assert_eq!(config_for(Capability::Subagent).max_spend_cents, None);
         assert_eq!(config_for(Capability::Subagent).max_steps.get(), 50);
+    }
+
+    #[test]
+    fn step_override_clamps_warn_and_rederives_refunds() {
+        // UnattendedBatch preset is 20 steps / warn 12.
+        let small = with_steps(config_for(Capability::UnattendedBatch), nz(7));
+        assert_eq!(small.max_steps.get(), 7);
+        assert_eq!(small.warn_steps.get(), 6); // min(12, 7-1): headroom
+        assert_eq!(small.max_refunds, 1); // 7 / 4
+                                          // A raise keeps the preset warn and scales refunds.
+        let big = with_steps(config_for(Capability::UnattendedBatch), nz(30));
+        assert_eq!(big.max_steps.get(), 30);
+        assert_eq!(big.warn_steps.get(), 12);
+        assert_eq!(big.max_refunds, 7);
+        // Degenerate floor: warn keeps headroom at 1, refunds hit 0.
+        let one = with_steps(config_for(Capability::UnattendedBatch), nz(1));
+        assert_eq!((one.max_steps.get(), one.warn_steps.get()), (1, 1));
+        assert_eq!(one.max_refunds, 0);
+        // Everything else rides the preset untouched.
+        assert_eq!(small.max_tokens, 50_000);
+        assert_eq!(small.actions_per_trial, 30);
+        assert_eq!(small.max_spend_cents, Some(SPEND_ON_CENTS));
     }
 }
