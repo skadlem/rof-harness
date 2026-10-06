@@ -85,9 +85,10 @@ impl TreeService {
         Ok(())
     }
 
-    /// `__pycache__/` + `*.pyc` in the copy-local `.git/info/exclude`:
+    /// Bytecode + build dirs in the copy-local `.git/info/exclude`:
     /// measured, baseline commits (`commit_all` = `git add -A`) were absorbing
-    /// bytecode. Local to the copy — never tracked, never a global git setting.
+    /// bytecode; `cargo`/`npm` outputs would do the same. Local to the copy —
+    /// never tracked, never a global git setting.
     fn exclude_bytecode(&self) -> Result<()> {
         if !self.root.join(".git").is_dir() {
             return Ok(()); // gitfile (worktree/submodule): not this copy's repo dir
@@ -96,7 +97,14 @@ impl TreeService {
         std::fs::create_dir_all(&info)?;
         let path = info.join("exclude");
         let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-        for pat in ["__pycache__/", "*.pyc"] {
+        for pat in [
+            "__pycache__/",
+            "*.pyc",
+            "target/",
+            "node_modules/",
+            "dist/",
+            "build/",
+        ] {
             if !text.lines().any(|l| l == pat) {
                 if !text.is_empty() && !text.ends_with('\n') {
                     text.push('\n');
@@ -172,10 +180,10 @@ impl TreeService {
 
     /// Full-text fragments for one [`DiffSummary::untracked`] entry: a
     /// collapsed `dir/` entry expands via `ls-files --others` (which honours
-    /// the bytecode exclude, so ignored junk never leaks into the patch)
+    /// the copy-local exclude, so ignored junk never leaks into the patch)
     /// into one `diff --no-index` fragment per file; anything undiffable
-    /// (vanished path, embedded-repo gitlink) falls back to the same stub
-    /// header the bounded path emits, so evidence stays honest.
+    /// (vanished path, embedded-repo gitlink) falls back to a stub header,
+    /// so evidence stays honest.
     fn full_untracked_fragments(&self, path: &str) -> Result<Vec<String>> {
         if self.root.join(path).is_dir() {
             let out = self.git(["ls-files", "--others", "--exclude-standard", "--", path])?;
@@ -219,13 +227,14 @@ impl TreeService {
                 String::from_utf8_lossy(&out.stderr).trim_end()
             )));
         }
-        // Raced away between `diff_at` and now: stub, like the bounded path.
+        // Raced away between `diff_at` and now: stub header, the only
+        // non-restorable shape left (no `@@` for `split_patch`).
         Ok(self.untracked_stub(rel))
     }
 
-    /// Byte-twin of the stub header [`TreeService::patch_at`] emits:
-    /// duplicated (not shared) so the bounded model-evidence path stays
-    /// byte-identical.
+    /// Fallback stub header for vanished/undiffable untracked paths (no `@@`,
+    /// so `split_patch` yields nothing restorable and restore fails closed).
+    /// Everything present on disk takes the `diff --no-index` hunk path above.
     fn untracked_stub(&self, path: &str) -> String {
         let shown = match std::fs::metadata(self.root.join(path)).map(|m| m.len()) {
             Ok(bytes) => format!(" (untracked, new file, {bytes} bytes)"),
@@ -279,8 +288,9 @@ impl TreeService {
         })
     }
 
-    /// The ONLY diff text produced: `diff --patch` plus one evidence line
-    /// per untracked path (empty in `git diff`), cut to both caps.
+    /// The ONLY bounded diff text: `diff --patch` plus real new-file hunks
+    /// for untracked paths (`git diff --no-index`, so `split_patch` /
+    /// `restore_hunks` can replay them), cut to both caps.
     pub fn patch(&self, diff: &DiffSummary) -> Result<PatchText> {
         self.patch_at(diff, None)
     }
@@ -289,11 +299,15 @@ impl TreeService {
         let raw = self.git(["diff", "--patch"].into_iter().chain(rev))?;
         let mut text = String::from_utf8_lossy(&raw.stdout).into_owned();
         for path in &diff.untracked {
-            let shown = match std::fs::metadata(self.root.join(path)).map(|m| m.len()) {
-                Ok(bytes) => format!(" (untracked, new file, {bytes} bytes)"),
-                Err(_) => " (untracked, new file)".to_string(),
-            };
-            text.push_str(&format!("--- /dev/null\n+++ b/{path}{shown}\n"));
+            for fragment in self.full_untracked_fragments(path)? {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&fragment);
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+            }
         }
         Ok(bound_patch(&text))
     }
@@ -333,6 +347,8 @@ impl TreeService {
         cmd.arg("-C")
             .arg(&self.root)
             .args(["apply", "-"])
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -369,7 +385,9 @@ impl TreeService {
     }
 
     /// Tolerates the one benign failure: a tree matching HEAD has nothing
-    /// to commit, and HEAD already is the baseline then.
+    /// to commit, and HEAD already is the baseline then. The match is on the
+    /// English text because [`TreeService::git_status`] pins `LC_ALL=C` /
+    /// `LANG=C` on every git child, so the output is locale-stable.
     fn commit_all(&self, message: &str) -> Result<()> {
         self.git(["add", "-A"])?;
         let out = self.git_status(["commit", "--quiet", "-m", message])?;
@@ -385,10 +403,7 @@ impl TreeService {
         // (e.g. modified content inside an embedded repo — the gitlink sha
         // never moves, so `add -A` stages nothing). Measured crash:
         // sanitize-git-repo pilot death (research/diag-snapshot-anomaly.md).
-        if combined.contains("nothing to commit")
-            || combined.contains("nothing added to commit")
-            || combined.contains("no changes added to commit")
-        {
+        if is_nothing_to_commit(&combined) {
             return Ok(());
         }
         Err(other(format!("git commit: {}", combined.trim_end())))
@@ -422,13 +437,26 @@ impl TreeService {
             .env("GIT_AUTHOR_NAME", "rof")
             .env("GIT_AUTHOR_EMAIL", "rof@local")
             .env("GIT_COMMITTER_NAME", "rof")
-            .env("GIT_COMMITTER_EMAIL", "rof@local");
+            .env("GIT_COMMITTER_EMAIL", "rof@local")
+            // Fixed locale: `commit_all` matches the English
+            // "nothing to commit" text, so every git child runs under C.
+            .env("LC_ALL", "C")
+            .env("LANG", "C");
         cmd.output().map_err(|e| other(format!("spawn git: {e}")))
     }
 }
 
 fn other(msg: String) -> Error {
     Error::other(msg)
+}
+
+/// English "nothing to commit" forms git prints under `LC_ALL=C` (pinned in
+/// [`TreeService::git_status`]): clean tree plus the two staged-nothing forms
+/// (embedded-repo dirt stages an unchanged gitlink, so `add -A` is a no-op).
+fn is_nothing_to_commit(combined: &str) -> bool {
+    combined.contains("nothing to commit")
+        || combined.contains("nothing added to commit")
+        || combined.contains("no changes added to commit")
 }
 
 /// Whole lines only: a line that does not fit is dropped, so a multi-byte
@@ -674,6 +702,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn nothing_to_commit_matcher_covers_english_forms() {
+        for s in [
+            "nothing to commit, working tree clean",
+            "nothing added to commit but untracked files present",
+            "no changes added to commit (use \"git add\" and/or \"git commit -a\")",
+        ] {
+            assert!(is_nothing_to_commit(s), "{s}");
+        }
+        assert!(!is_nothing_to_commit("fatal: not a git repository"));
+        assert!(!is_nothing_to_commit(""));
+    }
+
+    #[test]
+    fn baseline_stable_under_hostile_locale_env() {
+        let dir = scratch("locale");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        tree.ensure().unwrap();
+        // Hostile parent locale: git children still run under C (see
+        // `git_status`), so the benign no-op baseline still parses.
+        let old_lc = std::env::var("LC_ALL").ok();
+        let old_lang = std::env::var("LANG").ok();
+        std::env::set_var("LC_ALL", "xx_XX.UTF-8");
+        std::env::set_var("LANG", "xx_XX.UTF-8");
+        tree.baseline().unwrap();
+        tree.baseline().unwrap(); // nothing to commit: benign, not an error
+        match old_lc {
+            Some(v) => std::env::set_var("LC_ALL", v),
+            None => std::env::remove_var("LC_ALL"),
+        }
+        match old_lang {
+            Some(v) => std::env::set_var("LANG", v),
+            None => std::env::remove_var("LANG"),
+        }
+        assert!(tree.diff().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ensure_excludes_build_dirs_from_commits() {
+        let dir = scratch("build-dirs");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        for d in ["target", "node_modules", "dist", "build"] {
+            let sub = dir.join(d);
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join("out.bin"), "junk\n").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("inner/target")).unwrap();
+        std::fs::write(dir.join("inner/target/nested.bin"), "junk\n").unwrap();
+        tree.ensure().unwrap();
+        tree.baseline().unwrap();
+
+        let ls = tree.git(["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        let committed = String::from_utf8_lossy(&ls.stdout).into_owned();
+        assert!(committed.contains("a.rs"), "{committed}");
+        for junk in ["out.bin", "nested.bin", "target", "node_modules", "dist"] {
+            assert!(
+                !committed.contains(junk),
+                "build output reached the commit: {committed}"
+            );
+        }
+        assert!(
+            tree.diff().unwrap().is_empty(),
+            "build output stays out of evidence"
+        );
+        let exclude = std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap();
+        for pat in ["target/", "node_modules/", "dist/", "build/"] {
+            assert!(
+                exclude.lines().any(|l| l == pat),
+                "missing exclude {pat}: {exclude}"
+            );
+        }
+    }
+
     /// One `git diff --patch` fragment per hunk: each file's header lines
     /// (`diff --git`/`index`/`---`/`+++`) lead its first `@@`, later `@@`
     /// lines repeat that header. Fragments end without a trailing newline —
@@ -840,7 +943,7 @@ mod tests {
         );
         assert!(
             !bounded.text.contains("new-file-content line 0299"),
-            "bounded untracked stays stub-only"
+            "bounded cut drops the untracked tail"
         );
         // Same tree, same tracked bytes: the bounded whole-line prefix
         // (marker stripped) is a prefix of the unbounded text.
@@ -869,5 +972,101 @@ mod tests {
                 "unborn HEAD stays Err: {e}"
             );
         }
+    }
+
+    #[test]
+    fn patch_embeds_new_file_hunk_restorable() {
+        let dir = scratch("newfile-hunk");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        tree.ensure().unwrap();
+        tree.baseline().unwrap();
+
+        std::fs::write(dir.join("made.rs"), "new-file-marker-9d2c\nsecond\n").unwrap();
+        let diff = tree.diff().unwrap();
+        assert_eq!(diff.untracked, vec!["made.rs"]);
+        let p = tree.patch(&diff).unwrap();
+        assert!(!p.truncated);
+        assert!(
+            p.text.contains("+new-file-marker-9d2c"),
+            "contents, not stub-only: {}",
+            p.text
+        );
+        assert!(
+            p.text.contains("@@"),
+            "split_patch needs a hunk header: {}",
+            p.text
+        );
+        let hunks = split_patch(&p.text);
+        assert_eq!(hunks.len(), 1, "{hunks:?}");
+        // Full restore replays the creation (was: split yielded [] == rollback).
+        let d = tree.restore_hunks(&hunks).unwrap();
+        assert_eq!(d.changed, vec!["made.rs"]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("made.rs")).unwrap(),
+            "new-file-marker-9d2c\nsecond\n"
+        );
+    }
+
+    #[test]
+    fn partial_prefix_with_new_file_restores_instead_of_failing() {
+        let dir = scratch("partial-newfile");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\ntwo\nthree\nfour\n").unwrap();
+        tree.ensure().unwrap();
+        tree.baseline().unwrap();
+
+        std::fs::write(dir.join("a.rs"), "ONE\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(dir.join("made.rs"), "made-marker-51ef\n").unwrap();
+        let hunks = split_patch(&tree.patch(&tree.diff().unwrap()).unwrap().text);
+        assert_eq!(hunks.len(), 2, "{hunks:?}"); // was 1 + stub tail that failed closed
+        assert!(hunks[0].contains("a.rs"), "tracked hunk first: {hunks:?}");
+        assert!(hunks[1].contains("made.rs"), "{hunks:?}");
+        // Keep only the tracked prefix: no apply error, new file reverted.
+        let d = tree.restore_hunks(&hunks[..1]).unwrap();
+        assert_eq!(d.changed, vec!["a.rs"]);
+        assert!(!dir.join("made.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "ONE\ntwo\nthree\nfour\n"
+        );
+        // Keep both: the Partial-kept new file restores with contents.
+        let d = tree.restore_hunks(&hunks).unwrap();
+        assert_eq!(d.changed, vec!["a.rs", "made.rs"]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("made.rs")).unwrap(),
+            "made-marker-51ef\n"
+        );
+    }
+
+    #[test]
+    fn patch_since_start_bounded_carries_new_file_contents() {
+        let dir = scratch("since-newfile");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        tree.ensure().unwrap();
+        std::fs::write(dir.join("a.rs"), "two\n").unwrap();
+        tree.baseline().unwrap();
+        std::fs::write(dir.join("made.rs"), "since-marker-3b77\n").unwrap();
+        let (d, p) = tree.patch_since_start().unwrap();
+        assert!(!p.truncated);
+        assert_eq!(d.changed, vec!["a.rs", "made.rs"]);
+        assert!(
+            p.text.contains("+two") && p.text.contains("+since-marker-3b77"),
+            "tracked edit plus new-file contents: {}",
+            p.text
+        );
+        assert_eq!(split_patch(&p.text).len(), 2, "{}", p.text);
+        // Whole-run hunks are start-relative (not baseline-relative), so the
+        // restorable check stays on the per-batch patch: it carries the same
+        // new-file hunk and replays it from baseline.
+        let batch = tree.patch(&tree.diff().unwrap()).unwrap();
+        let hunks = split_patch(&batch.text);
+        assert_eq!(hunks.len(), 1, "{hunks:?}");
+        tree.restore_hunks(&hunks).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("made.rs")).unwrap(),
+            "since-marker-3b77\n"
+        );
     }
 }

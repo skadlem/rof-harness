@@ -613,7 +613,16 @@ impl LoopState {
     }
 
     fn push_assistant(&mut self, message: &AssistantMessage, stop_label: &str) {
-        let value = serde_json::to_value(message).unwrap_or(Value::Null);
+        // Fail-closed serialization: a serialization failure must never store
+        // a silent Null (which would later fold to "null" text). The marker
+        // keeps the row parseable and names the failure explicitly.
+        let value = serde_json::to_value(message).unwrap_or_else(|e| {
+            serde_json::json!({
+                "content": format!("[assistant serialization failed: {e}]"),
+                "tool_calls": [],
+                "thinking": null
+            })
+        });
         append_to(
             &mut self.items,
             ItemKind::Assistant {
@@ -626,7 +635,7 @@ impl LoopState {
 
     /// Claim: validate the settled message before anything executes.
     pub fn step_claim(&mut self, message: AssistantMessage, stop: StopReason) -> ClaimOutcome {
-        let stop_label = format!("{stop:?}");
+        let stop_label = stop_label(stop);
         match stop {
             StopReason::MaxTokens => {
                 // Pi truncation guard: fail the whole batch unexecuted.
@@ -678,9 +687,23 @@ impl LoopState {
                 self.push_assistant(&message, &stop_label);
                 if message.tool_calls.is_empty() {
                     if let Some(text) = self.verify_nudge_due() {
-                        self.verify_hold = Some(text);
+                        self.verify_hold = Some(text.clone());
+                        // Durable hold record: the request tail never reaches the
+                        // log (derived folds items only) while directives ride a
+                        // ToolResult tail, so the hold needs its own log row for
+                        // replay to reproduce the fire. `Attempt` is log-only
+                        // (never folded into `derived_messages`); the
+                        // model-visible copy rides the next request as its own
+                        // user-role row, so no old row is ever mutated.
+                        append_to(
+                            &mut self.items,
+                            ItemKind::Attempt {
+                                error: text,
+                                will_retry: true,
+                            },
+                        );
                         // Hold the turn alive: the next request carries the
-                        // directive on its tail, so no old row is ever mutated.
+                        // directive on its own tail row.
                         self.call_model = true;
                         return ClaimOutcome::VerifyHold;
                     }
@@ -720,8 +743,11 @@ impl LoopState {
     /// declare would land Done while writes since the last nudge are
     /// unverified. Latches like the half/late one-shots: at most
     /// [`VERIFY_NUDGE_CAP`] per run, never twice without an intervening
-    /// write, never inside the action cap's last 10%. Returns the directive
-    /// text and burns one nudge when due.
+    /// write, never inside the action cap's last 10%, never without headroom
+    /// for a test run plus a re-declare (2 steps), and never when any budget
+    /// cap already tripped (the same AND-gate [`Self::terminate`] halts on,
+    /// so an exhausted budget gets no grace hold via `VerifyHold => continue`).
+    /// Returns the directive text and burns one nudge when due.
     fn verify_nudge_due(&mut self) -> Option<String> {
         if self.incentives < IncentivesLevel::Full {
             return None;
@@ -738,6 +764,31 @@ impl LoopState {
         let cap = self.budget.config().actions_per_trial;
         let actions = self.budget.counters().actions_this_trial;
         if cap > 0 && actions.saturating_mul(10) >= cap.saturating_mul(9) {
+            return None;
+        }
+        // Exhausted budget gets no grace hold: consult the guard `terminate`
+        // halts on, covering steps/tokens/spend/wallclock/trials/refines and
+        // both action caps in one AND-gate read.
+        if self.budget.exceeded().is_some() {
+            return None;
+        }
+        // Reserve test-then-declare: the hold buys two more model calls.
+        let cfg = self.budget.config();
+        let counters = self.budget.counters();
+        if cfg.max_steps.get().saturating_sub(counters.steps) < 2 {
+            return None;
+        }
+        // Explicit per-cap reads (duplicating `exceeded` for provenance):
+        // tokens/spend/wallclock each veto the hold when already tripped.
+        if cfg.max_tokens > 0 && counters.tokens >= cfg.max_tokens {
+            return None;
+        }
+        if let Some(limit) = cfg.max_spend_cents {
+            if counters.spent_cents >= limit {
+                return None;
+            }
+        }
+        if !cfg.max_wallclock.is_zero() && self.budget.elapsed() >= cfg.max_wallclock {
             return None;
         }
         self.verify_nudges_used += 1;
@@ -995,7 +1046,9 @@ impl LoopState {
         if self.call_model {
             return PhaseVerdict::Continue;
         }
-        if self.budget.counters().same_action_streak >= self.budget.config().same_action_cycles {
+        if self.budget.config().same_action_cycles > 0
+            && self.budget.counters().same_action_streak >= self.budget.config().same_action_cycles
+        {
             self.push_lesson("same action repeated without progress; vary the approach".into());
         }
         // 5. Semantic termination: drained turn, empty queues, follow-up poll.
@@ -1074,12 +1127,16 @@ impl LoopState {
                 }),
                 ItemKind::Assistant { message, .. } => {
                     // Stored as JSON: recover structured calls for strict providers.
-                    let am: AssistantMessage =
-                        serde_json::from_value(message.clone()).unwrap_or(AssistantMessage {
-                            content: message_content(message),
+                    // Fail-closed: a corrupt row must surface an explicit marker,
+                    // never a silent default or raw-JSON content.
+                    let am: AssistantMessage = match serde_json::from_value(message.clone()) {
+                        Ok(am) => am,
+                        Err(e) => AssistantMessage {
+                            content: format!("[corrupt assistant row: {e}]"),
                             tool_calls: Vec::new(),
                             thinking: None,
-                        });
+                        },
+                    };
                     out.push(ProviderMessage {
                         role: "assistant".into(),
                         content: am.content,
@@ -1172,12 +1229,20 @@ fn is_verification_call(name: &str, args: &Value) -> bool {
         })
 }
 
-fn message_content(message: &Value) -> String {
-    message
-        .get("content")
-        .and_then(|c| c.as_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| message.to_string())
+/// Stable stop-reason label for the durable log: explicit match, never
+/// `Debug`, so a variant rename cannot silently rotate stored bytes.
+fn stop_label(stop: StopReason) -> String {
+    match stop {
+        StopReason::Pending => "Pending",
+        StopReason::Stop => "Stop",
+        StopReason::ToolUse => "ToolUse",
+        StopReason::MaxTokens => "MaxTokens",
+        StopReason::Refused => "Refused",
+        StopReason::Error => "Error",
+        StopReason::Aborted => "Aborted",
+        StopReason::Deferred => "Deferred",
+    }
+    .to_owned()
 }
 
 /// Header of the one row a checkpoint injects: the model must read it as
@@ -1842,15 +1907,33 @@ fn build_request(
     messages.extend(state.derived_messages()); // once: raw history, collapse-5 intact
 
     // Prefix-cache tail: the only per-request bytes. Never persisted.
+    // The held nudge rides its own user-role row, never merged into the
+    // model's declare text (the last derived row after an unverified declare
+    // is the model's own assistant row). Peek only: `run` takes on
+    // successful send, so a provider Err+retry re-arms instead of losing it.
+    let budget = budget_line(state);
     if let Some(last) = messages[1..].last_mut() {
         last.content.push('\n');
-        last.content.push_str(&budget_line(state));
-        // Held verification nudge (Full only; None elsewhere, so other
-        // arms stay byte-identical): consumed once, never persisted.
-        if let Some(nudge) = state.verify_hold.take() {
-            last.content.push('\n');
-            last.content.push_str(&nudge);
-        }
+        last.content.push_str(&budget);
+    } else {
+        messages.push(ProviderMessage {
+            role: "user".into(),
+            content: budget,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            thinking: None,
+        });
+    }
+    // Held verification nudge (Full only; None elsewhere, so other arms stay
+    // byte-identical): peeked here, taken by `run` only on successful send.
+    if let Some(nudge) = state.verify_hold.as_ref().cloned() {
+        messages.push(ProviderMessage {
+            role: "user".into(),
+            content: nudge,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            thinking: None,
+        });
     }
     Request {
         messages,
@@ -2075,6 +2158,10 @@ async fn incremental_hunks(
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
+                // kill_on_drop (tokio default false): a timed-out proof child
+                // must not keep running and mutating the workdir after we
+                // report timeout, mirroring tools-std's exec guard.
+                .kill_on_drop(true)
                 .status(),
         )
         .await
@@ -2453,6 +2540,10 @@ pub async fn run<P: LlmClient>(
                 }
             }
             Ok(resp) => {
+                // The request (including any peeked hold row) reached the
+                // provider: consume the hold now. A provider Err below keeps
+                // it armed for the in-step retry.
+                state.verify_hold.take();
                 let turn = state.turn;
                 // Checkpoint anchor: this request's history length and its
                 // provider-reported prompt tokens (the final attempt's, not
@@ -2487,10 +2578,89 @@ pub async fn run<P: LlmClient>(
                 match outcome {
                     ClaimOutcome::VerifyHold => {
                         // Unverified declare held: the turn stays alive and
-                        // the next request carries the directive on its tail.
+                        // the next request carries the directive on its own row.
+                        // Durable hold record syncs at the next loop head before
+                        // that request, so the file never lags the wire.
+                        if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
+                            return finish_run(
+                                state,
+                                None,
+                                emitter,
+                                run_id,
+                                &mut synced,
+                                Outcome::Failed("log append failed".into()),
+                            );
+                        }
                         continue;
                     }
-                    ClaimOutcome::Done | ClaimOutcome::Truncated(_) | ClaimOutcome::Refused => {
+                    ClaimOutcome::Done => {
+                        // Already-started final step: `record_step` at the head
+                        // may have hit max, so `terminate`'s `exceeded` would
+                        // preempt this Done with Halted(steps). The admitted
+                        // step's declare wins when drained with no followups.
+                        if state.in_flight.is_none()
+                            && state.open_tools() == 0
+                            && !state.call_model
+                            && state.steering.is_empty()
+                            && state.followups.is_empty()
+                            && matches!(
+                                state.budget.exceeded().as_ref().map(|e| &e.halt),
+                                Some(BudgetHalt::Steps)
+                            )
+                        {
+                            return finish_run(
+                                state,
+                                writer.as_mut(),
+                                emitter,
+                                run_id,
+                                &mut synced,
+                                Outcome::Done,
+                            );
+                        }
+                        let before = state.turn;
+                        match state.terminate() {
+                            PhaseVerdict::Return(o) => {
+                                return finish_run(
+                                    state,
+                                    writer.as_mut(),
+                                    emitter,
+                                    run_id,
+                                    &mut synced,
+                                    o,
+                                );
+                            }
+                            _ => {
+                                if !close_hopped_turn(
+                                    state,
+                                    writer.as_mut(),
+                                    emitter,
+                                    &mut synced,
+                                    before,
+                                ) {
+                                    return finish_run(
+                                        state,
+                                        None,
+                                        emitter,
+                                        run_id,
+                                        &mut synced,
+                                        Outcome::Failed("log append failed".into()),
+                                    );
+                                }
+                                if state.phase == Phase::Idle && state.is_idle() {
+                                    return finish_run(
+                                        state,
+                                        writer.as_mut(),
+                                        emitter,
+                                        run_id,
+                                        &mut synced,
+                                        Outcome::Done,
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    ClaimOutcome::Truncated(_) | ClaimOutcome::Refused => {
                         let before = state.turn;
                         match state.terminate() {
                             PhaseVerdict::Return(o) => {
@@ -3822,16 +3992,37 @@ mod tests {
         state.admit_steering();
         ok_round(&mut state, "e1", "edit", Value::Null);
         assert!(matches!(declare(&mut state), ClaimOutcome::VerifyHold));
+        // Durable hold record for replay: the declare's Attempt row.
         let rows = state.items.len();
+        assert!(state.items.iter().any(|i| matches!(
+            &i.kind,
+            ItemKind::Attempt { error, will_retry: true } if error == VERIFY_NUDGE
+        )));
         let cfg = RunConfig::default();
         let r1 = build_request(&mut state, &registry, &root, &cfg);
-        let tail = r1.messages.last().unwrap().content.clone();
-        assert!(tail.contains("budgets remaining:"), "{tail}");
-        assert!(tail.contains(VERIFY_NUDGE), "{tail}");
-        assert!(state.verify_hold.is_none()); // consumed: delivered once
-        assert_eq!(state.items.len(), rows); // request-scoped: never persisted
+        // Attribution: the hold is its own user-role row, never merged into
+        // the model's assistant declare text. Budgets stay on the prior tail.
+        assert!(r1.messages.len() >= 3);
+        let last = r1.messages.last().unwrap();
+        let prev = &r1.messages[r1.messages.len() - 2];
+        assert_eq!(last.role, "user");
+        assert_eq!(last.content, VERIFY_NUDGE);
+        assert!(
+            prev.content.contains("budgets remaining:"),
+            "{}",
+            prev.content
+        );
+        assert!(!prev.content.contains(VERIFY_NUDGE));
+        // Peek, not consume: a provider Err+retry must re-arm.
+        assert!(state.verify_hold.is_some());
+        assert_eq!(state.items.len(), rows); // request rows never persisted
+                                             // Simulate `run`'s take-on-successful-send.
+        state.verify_hold.take();
         let r2 = build_request(&mut state, &registry, &root, &cfg);
-        assert!(!r2.messages.last().unwrap().content.contains(VERIFY_NUDGE));
+        assert!(r2
+            .messages
+            .iter()
+            .all(|m| !m.content.contains(VERIFY_NUDGE)));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4665,6 +4856,7 @@ mod tests {
                 "ToolResult",
                 "Attempt",
                 "Assistant",
+                "Attempt",
                 "Assistant",
                 "TurnEnd",
                 "TurnStart",
@@ -4673,6 +4865,13 @@ mod tests {
                 "TurnEnd",
             ]
         );
+        // Durable hold record: the unverified declare's Attempt carries the
+        // nudge text for replay; the model-visible copy rode the next
+        // request as its own user-role row.
+        assert!(file_items.iter().any(|i| matches!(
+            &i.kind,
+            ItemKind::Attempt { error, will_retry: true } if error.contains("Unverified declare held")
+        )));
         // The failed call is a durable error result, not a throw.
         let boom = file_items
             .iter()
@@ -5911,20 +6110,33 @@ mod tests {
         }
         // Fresh counters on the tail of every request: one step per call, one
         // action per executed tool, 15 tokens metered per settle. The fourth
-        // request also carries the held verification nudge past the budgets.
-        for (req, tail) in reqs.iter().zip([
+        // request carries the held nudge as its own user-role row past the
+        // budgets (never merged into the assistant declare text).
+        for (req, tail) in reqs.iter().take(3).zip([
             "budgets remaining: steps 19/20; actions 30/30; tokens 50000/50000",
             "budgets remaining: steps 18/20; actions 29/30; tokens 49985/50000",
             "budgets remaining: steps 17/20; actions 28/30; tokens 49970/50000",
-            "budgets remaining: steps 16/20; actions 28/30; tokens 49955/50000",
         ]) {
             let last = &req.messages.last().unwrap().content;
             assert!(last.contains(tail), "{last:?} must carry {tail:?}");
             assert!(
-                last.ends_with(tail) || last.ends_with(VERIFY_NUDGE),
-                "{last:?} must end with the budget tail or the held nudge"
+                last.ends_with(tail),
+                "{last:?} must end with the budget tail"
             );
+            assert!(!last.contains(VERIFY_NUDGE));
         }
+        let hold_req = &reqs[3];
+        let tail = "budgets remaining: steps 16/20; actions 28/30; tokens 49955/50000";
+        let last = hold_req.messages.last().unwrap();
+        let prev = &hold_req.messages[hold_req.messages.len() - 2];
+        assert_eq!(last.role, "user");
+        assert_eq!(last.content, VERIFY_NUDGE);
+        assert!(
+            prev.content.contains(tail),
+            "{} must carry {tail:?}",
+            prev.content
+        );
+        assert!(prev.content.ends_with(tail));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -6667,6 +6879,7 @@ mod tests {
                 "ToolCall",
                 "ToolResult",
                 "Assistant",
+                "Attempt",
                 "Assistant",
                 "TurnEnd"
             ]
@@ -6939,5 +7152,308 @@ mod tests {
                 && error.message.contains("cancelled")
         )));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- PHASE 5 fixes: attribution, headroom, replay, termination, log boundary ---
+
+    /// (1) consumption: `build_request` peeks without consuming; `run` takes
+    /// only on successful send, so a provider Err+retry re-arms the hold.
+    #[test]
+    fn verify_hold_peek_survives_retry_and_takes_on_success() {
+        let root = run_tmp("hold-peek");
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        state.phase = Phase::Running;
+        state.apply_input(Input::User("go".into()));
+        state.admit_steering();
+        ok_round(&mut state, "e1", "edit", Value::Null);
+        assert!(matches!(declare(&mut state), ClaimOutcome::VerifyHold));
+        assert!(state.verify_hold.is_some());
+        let cfg = RunConfig::default();
+        // Peek: still armed after the build.
+        let r1 = build_request(&mut state, &registry, &root, &cfg);
+        assert!(r1.messages.iter().any(|m| m.content == VERIFY_NUDGE));
+        assert!(state.verify_hold.is_some(), "peek must not consume");
+        // Provider Err path in `run` keeps it: rebuild still carries it.
+        let r_retry = build_request(&mut state, &registry, &root, &cfg);
+        assert!(r_retry.messages.iter().any(|m| m.content == VERIFY_NUDGE));
+        // `run`'s take-on-Ok: delivered once, never twice.
+        state.verify_hold.take();
+        let r2 = build_request(&mut state, &registry, &root, &cfg);
+        assert!(r2.messages.iter().all(|m| m.content != VERIFY_NUDGE));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (1) attribution: the hold is its own user-role row, never merged into
+    /// the model's assistant declare text.
+    #[test]
+    fn verify_hold_own_row_not_merged_into_assistant_declare() {
+        let root = run_tmp("hold-attr");
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        state.phase = Phase::Running;
+        state.apply_input(Input::User("go".into()));
+        state.admit_steering();
+        ok_round(&mut state, "e1", "edit", Value::Null);
+        assert!(matches!(declare(&mut state), ClaimOutcome::VerifyHold));
+        let req = build_request(&mut state, &registry, &root, &RunConfig::default());
+        // The declare row is assistant; the hold row is a separate user row.
+        let assistant_declares: Vec<&ProviderMessage> = req
+            .messages
+            .iter()
+            .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty() == false)
+            .collect();
+        let _ = assistant_declares;
+        let last = req.messages.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert_eq!(last.content, VERIFY_NUDGE);
+        for m in &req.messages[1..req.messages.len() - 1] {
+            assert!(!m.content.contains(VERIFY_NUDGE), "merged into {m:?}");
+        }
+        // The assistant declare text itself never carries the nudge.
+        let declares: Vec<&ProviderMessage> = req
+            .messages
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .collect();
+        assert!(!declares.is_empty());
+        for d in declares {
+            assert!(!d.content.contains(VERIFY_NUDGE));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (2) reserve: fewer than 2 steps remaining vetoes the hold (test +
+    /// re-declare need two calls).
+    #[test]
+    fn verify_nudge_no_hold_without_two_step_headroom() {
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        let max = s.budget.config().max_steps.get();
+        // Two remaining: hold fires.
+        s.budget.counters_mut().steps = max - 2;
+        assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
+        // One remaining: silent Done, no grace hold.
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        s.budget.counters_mut().steps = max - 1;
+        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+        assert!(s.verify_hold.is_none());
+        // Zero remaining (already at max): silent Done.
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        s.budget.counters_mut().steps = max;
+        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+    }
+
+    /// (2) tokens cap vetoes the hold.
+    #[test]
+    fn verify_nudge_no_hold_when_tokens_exhausted() {
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        s.budget.counters_mut().tokens = s.budget.config().max_tokens;
+        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+        assert!(s.verify_hold.is_none());
+    }
+
+    /// (2) spend cap vetoes the hold.
+    #[test]
+    fn verify_nudge_no_hold_when_spend_exhausted() {
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        let limit = s.budget.config().max_spend_cents.unwrap();
+        s.budget.counters_mut().spent_cents = limit;
+        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+        assert!(s.verify_hold.is_none());
+    }
+
+    /// (2) wallclock cap vetoes the hold.
+    #[test]
+    fn verify_nudge_no_hold_when_wallclock_exhausted() {
+        use agent_budget::{config_for, BudgetGuard, Capability};
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        // Elapsed past the wallclock cap: consults the same gate `terminate` halts on.
+        s.budget = BudgetGuard::new(
+            config_for(Capability::UnattendedBatch),
+            Instant::now() - Duration::from_secs(10_000),
+        );
+        // Re-apply the write (new guard reset the counters): one edit, unverified.
+        // `ok_round` already burned edits=1 on the old guard; restore it.
+        s.edits = 1;
+        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+        assert!(s.verify_hold.is_none());
+    }
+
+    /// (2) exhausted budget (any cap, e.g. actions) gets no grace hold:
+    /// consults `terminate`'s AND-gate instead of bypassing it via `continue`.
+    #[test]
+    fn verify_nudge_no_hold_when_budget_exceeded() {
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        s.budget.counters_mut().actions_this_trial = s.budget.config().actions_per_trial;
+        assert!(s.budget.exceeded().is_some());
+        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+        assert!(s.verify_hold.is_none());
+    }
+
+    /// (3) replay: the hold fire persists a durable Attempt record so the log
+    /// (and a file replay via `read_log`) reproduces the fire, while the
+    /// model-visible copy rides the next request as its own row.
+    #[test]
+    fn verify_hold_persisted_as_attempt_for_replay() {
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
+        let holds: Vec<&str> = s
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Attempt {
+                    error,
+                    will_retry: true,
+                } if error == VERIFY_NUDGE => Some(error.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(holds.len(), 1);
+        // Replay from the items vec reproduces the fire.
+        let replayed = s.items.clone();
+        assert!(replayed.iter().any(|i| matches!(
+            &i.kind,
+            ItemKind::Attempt { error, .. } if error == VERIFY_NUDGE
+        )));
+        // `derived_messages` still folds items only (Attempt is log-only),
+        // so the durable row is the replay source, not a folded message.
+        assert!(s
+            .derived_messages()
+            .iter()
+            .all(|m| m.content != VERIFY_NUDGE));
+    }
+
+    /// (4) `same_action_cycles == 0` disables the tripwire lesson, mirroring
+    /// `observe_action`'s `> 0` guard.
+    #[test]
+    fn terminate_same_action_zero_disables_lesson() {
+        use agent_budget::{config_for, BudgetConfig, BudgetGuard, Capability};
+        let mut s = LoopState::new();
+        let cfg = BudgetConfig {
+            same_action_cycles: 0,
+            ..config_for(Capability::UnattendedBatch)
+        };
+        s.budget = BudgetGuard::new(cfg, Instant::now());
+        // Streak 0 >= cycles 0 would fire without the guard.
+        assert_eq!(s.budget.counters().same_action_streak, 0);
+        assert!(matches!(s.terminate(), PhaseVerdict::Continue));
+        assert!(s.lessons.is_empty(), "cycles=0 must not lesson");
+    }
+
+    /// (5) already-started final step: `record_step` hit max at the head, the
+    /// admitted step's Done still lands Done instead of Halted(steps).
+    #[tokio::test]
+    async fn last_step_done_wins_over_steps_halt() {
+        let root = run_tmp("last-done");
+        let client = ScriptClient {
+            order: Default::default(),
+            requests: Default::default(),
+            queue: Mutex::new(VecDeque::from([text_resp("finished")])),
+        };
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let max = state.budget.config().max_steps.get();
+        state.budget.counters_mut().steps = max - 1;
+        let mut emitter = Emitter::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("go".into())],
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+        assert_eq!(state.budget.counters().steps, max);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (7) stop labels are explicit matches, never `Debug`.
+    #[test]
+    fn stop_label_is_explicit_not_debug() {
+        assert_eq!(stop_label(StopReason::Pending), "Pending");
+        assert_eq!(stop_label(StopReason::Stop), "Stop");
+        assert_eq!(stop_label(StopReason::ToolUse), "ToolUse");
+        assert_eq!(stop_label(StopReason::MaxTokens), "MaxTokens");
+        assert_eq!(stop_label(StopReason::Refused), "Refused");
+        assert_eq!(stop_label(StopReason::Error), "Error");
+        assert_eq!(stop_label(StopReason::Aborted), "Aborted");
+        assert_eq!(stop_label(StopReason::Deferred), "Deferred");
+    }
+
+    /// (7) corrupt assistant rows surface an explicit marker, never silent
+    /// defaults or raw JSON.
+    #[test]
+    fn assistant_corrupt_row_is_explicit_marker_not_raw_json() {
+        // Corrupt stored rows (Null and object-without-content): explicit
+        // corrupt marker, never silent defaults or raw JSON (`Null` -> "null",
+        // `{"bad":1}` -> raw object text).
+        for bad in [Value::Null, serde_json::json!({"bad": 1})] {
+            let mut s = LoopState::new();
+            s.items.push(Item {
+                seq: 1,
+                id: "x".into(),
+                parent_id: None,
+                recorded_at: SystemTime::now(),
+                kind: ItemKind::Assistant {
+                    message: bad,
+                    stop_reason: "Stop".into(),
+                    interrupted: false,
+                },
+            });
+            let msgs = s.derived_messages();
+            assert_eq!(msgs.len(), 1);
+            assert!(
+                msgs[0].content.starts_with("[corrupt assistant row:"),
+                "{}",
+                msgs[0].content
+            );
+            // Fail-closed marker, not silent wrong data: never the bare
+            // raw-JSON fallback nor an empty default.
+            assert_ne!(msgs[0].content, "null");
+            assert!(!msgs[0].content.contains("bad"));
+            assert!(!msgs[0].content.is_empty());
+        }
+    }
+
+    /// (7) `push_assistant` never stores a silent Null.
+    #[test]
+    fn push_assistant_never_stores_null() {
+        let mut s = LoopState::new();
+        s.push_assistant(
+            &AssistantMessage {
+                content: "hi".into(),
+                tool_calls: Vec::new(),
+                thinking: None,
+            },
+            "Stop",
+        );
+        match &s.items[0].kind {
+            ItemKind::Assistant {
+                message,
+                stop_reason,
+                ..
+            } => {
+                assert_ne!(message, &Value::Null);
+                assert_eq!(message["content"], "hi");
+                assert_eq!(stop_reason, "Stop");
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        }
     }
 }

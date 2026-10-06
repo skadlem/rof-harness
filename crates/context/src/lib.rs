@@ -191,18 +191,29 @@ impl ContextAssembler {
     }
 }
 
+/// Safety bound on file-map paths, applied post-sort (see [`file_map`]).
+/// Kept at the pre-6b walk-stop value so caller budgets (200 at the
+/// agent-loop call sites) still resolve to the alphabetically-first
+/// `max_paths` paths for any tree; larger asks clamp here, deterministically.
+pub const FILE_MAP_WALK_CAP: usize = 2000;
+
 /// Byte-stable capped path listing for the file map (rides the cached prefix).
 /// Sorted, dotfiles and build/VCS dirs skipped, truncated to `max_paths`.
+/// Deterministic: the full depth-capped walk is collected first, then sorted,
+/// then truncated, so the output is the alphabetically-first `max_paths`
+/// paths (clamped to [`FILE_MAP_WALK_CAP`] when the caller asks for more).
+/// Depth is capped at 8; the cap truncation happens after the sort, never
+/// mid-walk in `read_dir` order.
 pub fn file_map(_root: &Path, _max_paths: usize) -> Vec<String> {
     let mut v = Vec::new();
     walk(_root, _root, 0, &mut v);
     v.sort();
-    v.truncate(_max_paths);
+    v.truncate(_max_paths.min(FILE_MAP_WALK_CAP));
     v
 }
 
 fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
-    if depth > 8 || out.len() >= 2000 {
+    if depth > 8 {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -651,5 +662,73 @@ mod tests {
         assert_eq!(payload.matches('x').count(), 4 + SUMMARY_TOOL_CAP);
         let small = summary_payload(&[msg("tool", 10)]);
         assert_eq!(small, format!("[tool]: {}", "x".repeat(10)));
+    }
+
+    fn file_map_tmp(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ctx-filemap-{prefix}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn file_map_is_sorted_truncated_and_repeatable() {
+        let dir = file_map_tmp("sorted");
+        for name in ["c.rs", "a.rs", "b.rs"] {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        let first = file_map(&dir, 2);
+        assert_eq!(first, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        assert_eq!(
+            file_map(&dir, 99),
+            first
+                .iter()
+                .chain([&"c.rs".to_string()])
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(file_map(&dir, 99), file_map(&dir, 99));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_map_matches_sorted_full_walk_past_the_cap() {
+        let dir = file_map_tmp("largetree");
+        let total = FILE_MAP_WALK_CAP + 300;
+        for i in 0..total {
+            std::fs::write(dir.join(format!("f{i:05}.rs")), "x").unwrap();
+        }
+        // Independent oracle: no cap, zero-padded names already sort lexically.
+        let mut full: Vec<String> = (0..total).map(|i| format!("f{i:05}.rs")).collect();
+        full.sort();
+        let got200 = file_map(&dir, 200);
+        assert_eq!(got200.len(), 200);
+        assert_eq!(got200, full[..200]);
+        assert!(got200.windows(2).all(|w| w[0] <= w[1]));
+        // Oversized asks clamp at the documented post-sort cap, still alpha-first.
+        let got_big = file_map(&dir, total + 1000);
+        assert_eq!(got_big.len(), FILE_MAP_WALK_CAP);
+        assert_eq!(got_big, full[..FILE_MAP_WALK_CAP]);
+        // Same tree, repeated runs: byte-identical.
+        assert_eq!(file_map(&dir, 200), got200);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_map_identical_for_reversed_creation_order() {
+        let mk = |prefix: &str, rev: bool| {
+            let dir = file_map_tmp(prefix);
+            let mut names: Vec<String> = (0..50).map(|i| format!("g{i:03}.rs")).collect();
+            if rev {
+                names.reverse();
+            }
+            for n in &names {
+                std::fs::write(dir.join(n), "x").unwrap();
+            }
+            let out = file_map(&dir, 50);
+            std::fs::remove_dir_all(&dir).unwrap();
+            out
+        };
+        assert_eq!(mk("fwd", false), mk("rev", true));
     }
 }

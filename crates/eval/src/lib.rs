@@ -34,6 +34,15 @@ fn toml_int(content: &str, keys: &[&str]) -> Option<u64> {
     for line in content.lines() {
         if let Some((k, v)) = line.split_once('=') {
             if keys.contains(&k.trim()) {
+                let token = v.trim().trim_matches(['"', '\'']).trim();
+                if let Ok(n) = token.parse() {
+                    return Some(n);
+                }
+                if let Ok(f) = token.parse::<f64>() {
+                    if f.is_finite() && f >= 0.0 {
+                        return Some(f as u64);
+                    }
+                }
                 let digits: String = v.chars().filter(|c| c.is_ascii_digit()).collect();
                 if let Ok(n) = digits.parse() {
                     return Some(n);
@@ -836,6 +845,15 @@ mod tests {
         let one = load_tb_slice(&root, &["bbb".to_string()]).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].image, "img-b");
+    }
+
+    #[test]
+    fn toml_int_parses_floats_by_truncation() {
+        let keys = &["timeout"];
+        assert_eq!(toml_int("timeout = 900\n", keys), Some(900));
+        assert_eq!(toml_int("timeout = 900.0\n", keys), Some(900));
+        assert_eq!(toml_int("timeout = 0.5\n", keys), Some(0));
+        assert_eq!(toml_int("timeout = fast\n", keys), None);
     }
 
     #[test]
