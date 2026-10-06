@@ -4513,3 +4513,125 @@ fn push_assistant_never_stores_null() {
         other => panic!("expected Assistant, got {other:?}"),
     }
 }
+
+/// Production-shaped check tool: mirrors `TestTool` — command failure is
+/// `Ok` with FAIL content and `success: false`, never `Err`.
+struct ProdCheck;
+
+#[async_trait::async_trait]
+impl CoreTool for ProdCheck {
+    fn definition(&self) -> CoreToolDef {
+        CoreToolDef {
+            name: "test".into(),
+            description: "production-shaped check".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "required": ["cmd"],
+                "additionalProperties": false,
+                "properties": {"cmd": {"type": "string"}}
+            }),
+        }
+    }
+    fn prepare(&self, call: &CoreToolCall) -> CoreCallStatus {
+        CoreCallStatus::Dispatch(CoreInvocation {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            args: call.args.clone(),
+        })
+    }
+    async fn execute(
+        &self,
+        inv: CoreInvocation,
+        _cancel: CancellationToken,
+    ) -> Result<CoreToolOutcome, CoreToolError> {
+        let cmd = inv.args.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+        // Always fails: the FAIL-content shape the old code mistook for a pass.
+        Ok(CoreToolOutcome {
+            content: format!("FAIL: {cmd}\n1 failed"),
+            truncated: false,
+            success: false,
+        })
+    }
+}
+
+/// End-to-end through `run()`: a FAIL-content `test` outcome maps to an
+/// error result and verifies nothing, so the declare is held live (the 4th
+/// request carries the nudge) instead of landing Done.
+#[tokio::test]
+async fn run_e2e_failing_test_does_not_verify_but_holds_declare() {
+    let root = run_tmp("verify-e2e");
+    std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+    let client = ScriptClient {
+        order: Arc::new(Mutex::new(Vec::new())),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([
+            script_resp(
+                vec![(
+                    "w1",
+                    "write",
+                    serde_json::json!({"path": "a.rs", "content": "v2\n"}),
+                )],
+                StopReason::ToolUse,
+            ),
+            script_resp(
+                vec![("t1", "test", serde_json::json!({"cmd": "check"}))],
+                StopReason::ToolUse,
+            ),
+            text_resp("done"),
+            text_resp("done again"),
+        ])),
+    };
+    let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+        [("agent".to_string(), vec!["write".into(), "test".into()])].into(),
+    )));
+    registry.register(Arc::new(WriteFile { root: root.clone() }));
+    registry.register(Arc::new(ProdCheck));
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let cancel = CancellationToken::new();
+    // Queue runs dry after the second declare: the run ends on transport,
+    // but the hold must have fired first — that is what this test proves.
+    let _outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("ship it".into())],
+        &cancel,
+    )
+    .await;
+    // The hold added a round trip and delivered the nudge live.
+    let reqs = client.requests.lock().unwrap();
+    assert!(reqs.len() >= 4, "held declare adds a round trip");
+    let hold_req = serde_json::to_string(&reqs[3]).unwrap();
+    assert!(hold_req.contains(VERIFY_NUDGE), "nudge delivered live");
+    drop(reqs);
+    // The FAIL-content result is an error row, and it verified nothing.
+    let fail_rows: Vec<_> = state
+        .items
+        .iter()
+        .filter_map(|i| match &i.kind {
+            ItemKind::ToolResult {
+                content, is_error, ..
+            } => Some((content.clone(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        fail_rows.iter().any(|(c, e)| *e && c.contains("FAIL")),
+        "FAIL outcome is an error row: {fail_rows:?}"
+    );
+    assert!(
+        state.items.iter().any(|i| matches!(
+            &i.kind,
+            ItemKind::Attempt { error, will_retry: true } if error == VERIFY_NUDGE
+        )),
+        "hold recorded as a retryable attempt"
+    );
+}
