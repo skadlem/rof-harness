@@ -52,6 +52,11 @@ fn thinking_keep() -> usize {
 /// Model-facing notice when one failed tool reverts the whole batch.
 const ROLLBACK_NOTICE: &str = "a tool in your last batch failed and the whole batch was reverted — your successful changes in it are gone; re-apply them";
 
+/// Mid-run verification nudge: held-declare directive (spec draft verbatim)
+/// plus the per-run budget. Full incentives only; Base/Contract never see it.
+const VERIFY_NUDGE: &str = "Unverified declare held: no passing verification run since your last write. Either run the task's verification now, or state exactly what blocks it (missing tool/package/file) and what you verified instead. Declaring without one of those two is not completing.";
+const VERIFY_NUDGE_CAP: u32 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateStatus {
     Open,
@@ -219,11 +224,15 @@ pub struct ToolMsg {
 }
 
 /// Claim-phase outcome for one settled assistant message.
+/// `VerifyHold` (Full incentives only) holds the turn alive on an unverified
+/// declare: the run continues and the directive rides the next request tail
+/// (request-scoped, never persisted), never an old ToolResult row.
 #[derive(Debug, Clone)]
 pub enum ClaimOutcome {
     Dispatch(Vec<ToolCall>),
     Truncated(usize),
     Done,
+    VerifyHold,
     Refused,
     HardExit(String),
 }
@@ -237,6 +246,9 @@ pub struct InFlight {
 #[derive(Debug, Clone)]
 pub struct ToolCallState {
     pub name: String,
+    /// True when this call is a verification run (`test`, or `exec` with
+    /// pytest in args): an ok result marks verification since the last write.
+    pub is_verification: bool,
     pub result: Option<ToolResult>,
 }
 
@@ -292,6 +304,14 @@ pub struct LoopState {
     pub pending_directives: VecDeque<String>,
     /// Successful `edit`|`write` tool results so far (the zero-edit trigger).
     pub edits: u32,
+    /// Mid-run verification nudge (Full only): nudges used (cap
+    /// [`VERIFY_NUDGE_CAP`]), edits at the last nudge (second declare without
+    /// an intervening write stays silent), passing-verify-since-write flag,
+    /// and the request-scoped hold text for the next request tail.
+    pub verify_nudges_used: u32,
+    pub edits_at_last_nudge: u32,
+    pub verified_since_write: bool,
+    pub verify_hold: Option<String>,
     /// One-shot latches: the half-cap and near-cap directives fire once each.
     pub half_directive_sent: bool,
     pub late_directive_sent: bool,
@@ -344,6 +364,10 @@ impl LoopState {
             lessons: VecDeque::new(),
             pending_directives: VecDeque::new(),
             edits: 0,
+            verify_nudges_used: 0,
+            edits_at_last_nudge: 0,
+            verified_since_write: false,
+            verify_hold: None,
             half_directive_sent: false,
             late_directive_sent: false,
             ablation: bets::AblationMetrics::default(),
@@ -599,6 +623,7 @@ impl LoopState {
                         tc.id.clone(),
                         ToolCallState {
                             name: tc.name.clone(),
+                            is_verification: false, // never dispatched: never verification
                             result: Some(ToolResult {
                                 content,
                                 is_error: true,
@@ -620,6 +645,13 @@ impl LoopState {
             _ => {
                 self.push_assistant(&message, &stop_label);
                 if message.tool_calls.is_empty() {
+                    if let Some(text) = self.verify_nudge_due() {
+                        self.verify_hold = Some(text);
+                        // Hold the turn alive: the next request carries the
+                        // directive on its tail, so no old row is ever mutated.
+                        self.call_model = true;
+                        return ClaimOutcome::VerifyHold;
+                    }
                     return ClaimOutcome::Done;
                 }
                 let mut calls = Vec::with_capacity(message.tool_calls.len());
@@ -636,6 +668,7 @@ impl LoopState {
                         tc.id.clone(),
                         ToolCallState {
                             name: tc.name.clone(),
+                            is_verification: is_verification_call(&tc.name, &tc.args),
                             result: None,
                         },
                     );
@@ -648,6 +681,35 @@ impl LoopState {
                 ClaimOutcome::Dispatch(calls)
             }
         }
+    }
+
+    /// Mid-run verification nudge gate (Full incentives only): fires when a
+    /// declare would land Done while writes since the last nudge are
+    /// unverified. Latches like the half/late one-shots: at most
+    /// [`VERIFY_NUDGE_CAP`] per run, never twice without an intervening
+    /// write, never inside the action cap's last 10%. Returns the directive
+    /// text and burns one nudge when due.
+    fn verify_nudge_due(&mut self) -> Option<String> {
+        if self.incentives < IncentivesLevel::Full {
+            return None;
+        }
+        if self.verify_nudges_used >= VERIFY_NUDGE_CAP {
+            return None;
+        }
+        if self.edits <= self.edits_at_last_nudge {
+            return None;
+        }
+        if self.verified_since_write {
+            return None;
+        }
+        let cap = self.budget.config().actions_per_trial;
+        let actions = self.budget.counters().actions_this_trial;
+        if cap > 0 && actions.saturating_mul(10) >= cap.saturating_mul(9) {
+            return None;
+        }
+        self.verify_nudges_used += 1;
+        self.edits_at_last_nudge = self.edits;
+        Some(VERIFY_NUDGE.into())
     }
 
     /// First terminal reason wins: a later Completed must not downgrade MaxTokens.
@@ -675,8 +737,24 @@ impl LoopState {
                 recovery: None,
             },
         );
+        let probe = self
+            .tool_calls
+            .get(&msg.call_id)
+            .map(|c| (c.name.clone(), c.is_verification));
+        let ok = !msg.result.is_error;
         if let Some(c) = self.tool_calls.get_mut(&msg.call_id) {
             c.result = Some(msg.result);
+        }
+        if ok {
+            if let Some((name, is_verification)) = probe {
+                // A successful write invalidates earlier verification; a
+                // passing verification run covers writes since the last one.
+                if name == "edit" || name == "write" {
+                    self.verified_since_write = false;
+                } else if is_verification {
+                    self.verified_since_write = true;
+                }
+            }
         }
         if self.batch_complete() {
             self.call_model = true;
@@ -1030,6 +1108,12 @@ impl Default for LoopState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A passing result on one of these counts as a verification run since the
+/// last write: the `test` tool, or `exec` with pytest in args.
+fn is_verification_call(name: &str, args: &Value) -> bool {
+    name == "test" || (name == "exec" && args.to_string().contains("pytest"))
 }
 
 fn message_content(message: &Value) -> String {
@@ -1673,6 +1757,12 @@ fn build_request(
     if let Some(last) = messages[1..].last_mut() {
         last.content.push('\n');
         last.content.push_str(&budget_line(state));
+        // Held verification nudge (Full only; None elsewhere, so other
+        // arms stay byte-identical): consumed once, never persisted.
+        if let Some(nudge) = state.verify_hold.take() {
+            last.content.push('\n');
+            last.content.push_str(&nudge);
+        }
     }
     Request {
         messages,
@@ -2157,6 +2247,11 @@ pub async fn run<P: LlmClient>(
                 }
                 emit_message_frames(state, &resp.message, Some(&billed), emitter);
                 match outcome {
+                    ClaimOutcome::VerifyHold => {
+                        // Unverified declare held: the turn stays alive and
+                        // the next request carries the directive on its tail.
+                        continue;
+                    }
                     ClaimOutcome::Done | ClaimOutcome::Truncated(_) | ClaimOutcome::Refused => {
                         let before = state.turn;
                         match state.terminate() {
@@ -2584,6 +2679,7 @@ mod tests {
             "c1".into(),
             ToolCallState {
                 name: "edit".into(),
+                is_verification: false,
                 result: None,
             },
         );
@@ -2742,6 +2838,7 @@ mod tests {
             "c1".into(),
             ToolCallState {
                 name: "edit".into(),
+                is_verification: false,
                 result: None,
             },
         );
@@ -3223,6 +3320,191 @@ mod tests {
         );
         s.queue_directives();
         assert_eq!(s.pending_directives.len(), 2); // both one-shot
+    }
+
+    /// One successful tool round through the claim seam, mirroring run():
+    /// Dispatch registers name+args, the ok result lands, edits count here
+    /// (run() owns the counter in production).
+    fn ok_round(s: &mut LoopState, id: &str, name: &str, args: Value) {
+        let outcome = s.step_claim(
+            assistant(vec![ToolCallRef {
+                id: id.into(),
+                name: name.into(),
+                args,
+            }]),
+            StopReason::ToolUse,
+        );
+        assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
+        assert!(s.record_tool_result(ToolMsg {
+            call_id: id.into(),
+            result: result(),
+        }));
+        if name == "edit" || name == "write" {
+            s.edits += 1;
+        }
+    }
+
+    fn declare(s: &mut LoopState) -> ClaimOutcome {
+        s.step_claim(assistant(vec![]), StopReason::Stop)
+    }
+
+    #[test]
+    fn verify_nudge_fires_on_done_with_unverified_edits() {
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        assert_eq!(s.edits, 1);
+        let outcome = declare(&mut s);
+        assert!(matches!(outcome, ClaimOutcome::VerifyHold));
+        assert_eq!(s.verify_hold.as_deref(), Some(VERIFY_NUDGE));
+        assert!(s
+            .verify_hold
+            .unwrap()
+            .starts_with("Unverified declare held:"));
+        assert_eq!(s.verify_nudges_used, 1);
+        assert_eq!(s.edits_at_last_nudge, 1);
+        assert!(s.call_model); // turn held alive for the next request
+        assert!(s.pending_directives.is_empty()); // request tail only: no double delivery
+    }
+
+    #[test]
+    fn verify_nudge_needs_edits_before_first_fire() {
+        let mut s = LoopState::new();
+        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+        assert_eq!(s.verify_nudges_used, 0);
+        assert!(s.verify_hold.is_none());
+    }
+
+    #[test]
+    fn verify_nudge_silent_when_test_passed_since_write() {
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        ok_round(&mut s, "t1", "test", Value::Null);
+        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+        assert_eq!(s.verify_nudges_used, 0);
+        assert!(s.verify_hold.is_none());
+    }
+
+    #[test]
+    fn verify_nudge_exec_pytest_counts_but_plain_exec_does_not() {
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        ok_round(&mut s, "x1", "exec", Value::String("ls".into()));
+        assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        ok_round(&mut s, "x1", "exec", Value::String("pytest -q".into()));
+        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+    }
+
+    #[test]
+    fn verify_nudge_failed_test_is_not_passing() {
+        let mut s = LoopState::new();
+        let outcome = s.step_claim(
+            assistant(vec![ToolCallRef {
+                id: "e1".into(),
+                name: "edit".into(),
+                args: Value::Null,
+            }]),
+            StopReason::ToolUse,
+        );
+        assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
+        assert!(s.record_tool_result(ToolMsg {
+            call_id: "e1".into(),
+            result: result(),
+        }));
+        s.edits += 1;
+        let outcome = s.step_claim(
+            assistant(vec![ToolCallRef {
+                id: "t1".into(),
+                name: "test".into(),
+                args: Value::Null,
+            }]),
+            StopReason::ToolUse,
+        );
+        assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
+        assert!(s.record_tool_result(ToolMsg {
+            call_id: "t1".into(),
+            result: ToolResult {
+                content: "1 failed".into(),
+                is_error: true,
+            },
+        }));
+        assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
+    }
+
+    #[test]
+    fn verify_nudge_silent_on_second_declare_without_write() {
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
+        // "Blocked" answer: text again, no intervening write -> Done.
+        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+        assert_eq!(s.verify_nudges_used, 1);
+    }
+
+    #[test]
+    fn verify_nudge_silent_in_base_and_contract() {
+        for level in [IncentivesLevel::Base, IncentivesLevel::Contract] {
+            let mut s = LoopState::new();
+            s.incentives = level;
+            ok_round(&mut s, "e1", "edit", Value::Null);
+            assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+            assert_eq!(s.verify_nudges_used, 0);
+            assert!(s.verify_hold.is_none());
+        }
+    }
+
+    #[test]
+    fn verify_nudge_silent_inside_cap_tail_tenth() {
+        let mut s = LoopState::new();
+        let cap = s.budget.config().actions_per_trial;
+        assert!(cap >= 10, "tail math needs a non-trivial cap");
+        // Just below the last 10%: still fires.
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        s.budget.counters_mut().actions_this_trial = cap * 9 / 10 - 1;
+        assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
+        // Inside the last 10%: silent.
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        s.budget.counters_mut().actions_this_trial = cap * 9 / 10;
+        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+        assert!(s.verify_hold.is_none());
+    }
+
+    #[test]
+    fn verify_nudge_caps_at_two_per_run() {
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
+        ok_round(&mut s, "e2", "edit", Value::Null); // intervening write
+        assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
+        assert_eq!(s.verify_nudges_used, 2);
+        ok_round(&mut s, "e3", "edit", Value::Null); // budget spent
+        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+        assert_eq!(s.verify_nudges_used, 2);
+    }
+
+    #[test]
+    fn verify_hold_rides_next_request_tail_once_and_leaves_log() {
+        let root = run_tmp("verify-hold");
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        state.phase = Phase::Running;
+        state.apply_input(Input::User("build it".into()));
+        state.admit_steering();
+        ok_round(&mut state, "e1", "edit", Value::Null);
+        assert!(matches!(declare(&mut state), ClaimOutcome::VerifyHold));
+        let rows = state.items.len();
+        let cfg = RunConfig::default();
+        let r1 = build_request(&mut state, &registry, &root, &cfg);
+        let tail = r1.messages.last().unwrap().content.clone();
+        assert!(tail.contains("budgets remaining:"), "{tail}");
+        assert!(tail.contains(VERIFY_NUDGE), "{tail}");
+        assert!(state.verify_hold.is_none()); // consumed: delivered once
+        assert_eq!(state.items.len(), rows); // request-scoped: never persisted
+        let r2 = build_request(&mut state, &registry, &root, &cfg);
+        assert!(!r2.messages.last().unwrap().content.contains(VERIFY_NUDGE));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3975,6 +4257,9 @@ mod tests {
                 ),
                 text_resp("batch rounds done"),
                 text_resp("second done"),
+                // Held-declare round trip: the first done is held (unverified
+                // writes), the second lands Done, the third closes turn 2.
+                text_resp("third done"),
             ])),
         };
         let registry = run_registry(&root);
@@ -4006,10 +4291,11 @@ mod tests {
         // Proven prefix kept on disk, failed batch rolled back.
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "v2\n");
         assert!(!root.join("b.rs").exists());
-        // Budget consumed: one step per model call, tokens + spend metered.
-        assert_eq!(state.budget.counters().steps, 4);
-        assert_eq!(state.budget.counters().tokens, 60);
-        assert_eq!(state.budget.counters().spent_cents, 4);
+        // Budget consumed: one step per model call, tokens + spend metered
+        // (five calls: the held declare adds one round trip).
+        assert_eq!(state.budget.counters().steps, 5);
+        assert_eq!(state.budget.counters().tokens, 75);
+        assert_eq!(state.budget.counters().spent_cents, 5);
         // No cap tripped: the one grace step stayed untouched.
         assert!(state.budget.exceeded().is_none());
         // Events ordered and paired across two turns plus the run pair.
@@ -4023,8 +4309,8 @@ mod tests {
         assert!(matches!(history.last().unwrap(), AgentEvent::RunEnd { .. }));
         assert_eq!(kinds.iter().filter(|k| **k == "TurnStart").count(), 2);
         assert_eq!(kinds.iter().filter(|k| **k == "TurnEnd").count(), 2);
-        assert_eq!(kinds.iter().filter(|k| **k == "MessageStart").count(), 4);
-        assert_eq!(kinds.iter().filter(|k| **k == "MessageEnd").count(), 4);
+        assert_eq!(kinds.iter().filter(|k| **k == "MessageStart").count(), 5);
+        assert_eq!(kinds.iter().filter(|k| **k == "MessageEnd").count(), 5);
         assert_eq!(kinds.iter().filter(|k| **k == "ToolStart").count(), 3);
         assert_eq!(kinds.iter().filter(|k| **k == "ToolEnd").count(), 3);
         // File log validates and is balanced: header first.
@@ -4047,6 +4333,7 @@ mod tests {
                 "ToolResult",
                 "ToolResult",
                 "Attempt",
+                "Assistant",
                 "Assistant",
                 "TurnEnd",
                 "TurnStart",
@@ -4087,6 +4374,9 @@ mod tests {
                     StopReason::ToolUse,
                 ),
                 settled,
+                // Held-declare round trip: the first done is held (unverified
+                // write), the second lands Done.
+                text_resp("done"),
             ])),
         };
         let registry = run_registry(&root);
@@ -4119,7 +4409,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(ends.len(), 2, "one MessageEnd per settle");
+        assert_eq!(ends.len(), 3, "one MessageEnd per settle");
         assert_eq!(
             (
                 ends[0].input_tokens,
@@ -4130,7 +4420,8 @@ mod tests {
         );
         assert_eq!(ends[0].reasoning_tokens, None); // provider reported none
         assert_eq!(ends[1].reasoning_tokens, Some(3));
-        // TurnEnd totals sum both settles (10+10 in, 5+5 out, 0.01+0.01).
+        assert_eq!(ends[2].reasoning_tokens, None); // post-hold declare
+                                                    // TurnEnd totals sum all three settles (10 each in, 5 each out).
         let totals = history
             .iter()
             .find_map(|e| match e {
@@ -4138,11 +4429,11 @@ mod tests {
                 _ => None,
             })
             .expect("turn closes with totals");
-        assert_eq!((totals.input_tokens, totals.output_tokens), (20, 10));
+        assert_eq!((totals.input_tokens, totals.output_tokens), (30, 15));
         assert_eq!(totals.reasoning_tokens, Some(3)); // reported-only sum, not erased by None
-        assert_eq!(totals.cost_usd, Some(0.02));
-        assert_eq!(state.usage_totals.input_tokens, 20);
-        assert_eq!(state.budget.counters().tokens, 30);
+        assert_eq!(totals.cost_usd, Some(0.03));
+        assert_eq!(state.usage_totals.input_tokens, 30);
+        assert_eq!(state.budget.counters().tokens, 45);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4269,6 +4560,9 @@ mod tests {
                     StopReason::ToolUse,
                 ),
                 text_resp("done"),
+                // Held-declare round trip: the first done is held (unverified
+                // writes), the second lands Done.
+                text_resp("done"),
             ])),
         };
         let registry = run_registry(&root);
@@ -4353,6 +4647,9 @@ mod tests {
                     StopReason::ToolUse,
                 ),
                 text_resp("done"),
+                // Held-declare round trip: the first done is held (unverified
+                // write), the second lands Done.
+                text_resp("done"),
             ])),
         };
         let registry = run_registry(&root);
@@ -4377,10 +4674,11 @@ mod tests {
         )
         .await;
         assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
-        // Step-head, post-batch, step-head interleave with the two model calls.
+        // Step-head, post-batch, step-head interleave with the three model
+        // calls (the held declare adds one round trip, no batch hooks).
         assert_eq!(
             *order.lock().unwrap(),
-            vec!["bets", "model", "bets", "bets", "model"],
+            vec!["bets", "model", "bets", "bets", "model", "bets", "model"],
         );
         assert_eq!(
             std::fs::read_to_string(root.join("f.txt")).unwrap(),
@@ -4592,6 +4890,9 @@ mod tests {
             queue.push_back(resp);
         }
         queue.push_back(text_resp("all done"));
+        // Held-declare round trip: the first done is held (unverified
+        // writes), the second lands Done.
+        queue.push_back(text_resp("done again"));
         let client = ScriptClient {
             order,
             requests: requests.clone(),
@@ -4618,7 +4919,7 @@ mod tests {
         .await;
         assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
         let reqs = requests.lock().unwrap();
-        assert_eq!(reqs.len(), 8); // 7 tool rounds + the finishing text call
+        assert_eq!(reqs.len(), 9); // 7 tool rounds + held declare + final text
         for (i, req) in reqs.iter().enumerate() {
             assert_eq!(req.messages[0].role, "system");
             let wire = serde_json::to_string(req).unwrap();
@@ -4815,6 +5116,9 @@ mod tests {
             ),
             summary_resp("## Goal\nfinish the task", StopReason::Stop, 100),
             text_resp("all done"),
+            // Held-declare round trip: the first done is held (unverified
+            // writes), the second lands Done.
+            text_resp("done again"),
         ];
         let cfg = RunConfig {
             compaction: compaction(0.3, 15),
@@ -4824,7 +5128,11 @@ mod tests {
             run_script("compact-on", queue, cfg, 2_000, Vec::new(), "goal-1").await;
         assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
         let reqs = requests.lock().unwrap();
-        assert_eq!(reqs.len(), 4, "two agent calls + summary + finishing call");
+        assert_eq!(
+            reqs.len(),
+            5,
+            "two agent calls + summary + held + finishing call"
+        );
         // The summary call happens exactly once: no tools, summarizer system
         // row, the older round inside the payload, the kept tail outside it.
         let summary_calls: Vec<&Request> = reqs.iter().filter(|r| r.tools.is_empty()).collect();
@@ -4863,8 +5171,8 @@ mod tests {
         // Real spend, priced like any other request: run totals (and so every
         // TurnEnd frame) carry the summary call.
         let totals = last_totals(&emitter);
-        assert_eq!(totals.input_tokens, 100 + 1_000 + 100 + 10);
-        assert_eq!(totals.cost_usd, Some(0.01 + 0.01 + 0.02 + 0.01));
+        assert_eq!(totals.input_tokens, 100 + 1_000 + 100 + 10 + 10);
+        assert_eq!(totals.cost_usd, Some(0.01 + 0.01 + 0.02 + 0.01 + 0.01));
         assert!(state.checkpoint.is_some());
         assert_eq!(state.compacted_turn, Some(1));
         assert!(check_pairing(emitter.history()));
@@ -4894,6 +5202,9 @@ mod tests {
             ),
             summary_resp("## Goal\nfinish the task", StopReason::Stop, 100),
             text_resp("all done"),
+            // Held-declare round trip: the first done is held (unverified
+            // writes), the second lands Done.
+            text_resp("done again"),
         ];
         let cfg = RunConfig {
             compaction: compaction(0.5, 3),
@@ -4938,6 +5249,9 @@ mod tests {
             ),
             summary_resp("## Goal\npartial", StopReason::MaxTokens, 200),
             text_resp("all done"),
+            // Held-declare round trip: the first done is held (unverified
+            // write), the second lands Done.
+            text_resp("done again"),
         ];
         let cfg = RunConfig {
             compaction: compaction(0.2, 15),
@@ -4947,7 +5261,7 @@ mod tests {
             run_script("compact-refuse", queue, cfg, 1_500, Vec::new(), "goal-1").await;
         assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
         let reqs = requests.lock().unwrap();
-        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs.len(), 4);
         assert_eq!(
             reqs.iter().filter(|r| r.tools.is_empty()).count(),
             1,
@@ -4960,7 +5274,7 @@ mod tests {
         assert!(state.checkpoint.is_none());
         // Refused, but still billed: the spend is in the totals and the
         // refusal is visible in the event stream.
-        assert_eq!(last_totals(&emitter).input_tokens, 1_000 + 200 + 10);
+        assert_eq!(last_totals(&emitter).input_tokens, 1_000 + 200 + 10 + 10);
         assert!(emitter.history().iter().any(|e| matches!(
             e,
             AgentEvent::Error { error } if error.code == "compaction-refused"
@@ -4994,6 +5308,9 @@ mod tests {
                 1_000,
             ),
             text_resp("all done"),
+            // Held-declare round trip: the first done is held (unverified
+            // writes), the second lands Done.
+            text_resp("done again"),
         ];
         let cfg = RunConfig {
             compaction: compaction(0.2, 15),
@@ -5003,7 +5320,11 @@ mod tests {
             run_script("compact-latch", queue, cfg, 3_000, Vec::new(), "goal-1").await;
         assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
         let reqs = requests.lock().unwrap();
-        assert_eq!(reqs.len(), 4, "two agent calls + summary + finishing call");
+        assert_eq!(
+            reqs.len(),
+            5,
+            "two agent calls + summary + held + finishing call"
+        );
         assert_eq!(
             reqs.iter().filter(|r| r.tools.is_empty()).count(),
             1,
@@ -5030,6 +5351,12 @@ mod tests {
         // `keep_from` must map the folded cut back onto raw history.
         let mut turn_one_done = text_resp("turn one done");
         turn_one_done.usage.input = 1_000; // arms turn 2's estimate
+                                           // Held-declare round trip: turn one done is held (unverified
+                                           // writes); the repeat lands Done. input 1000 re-arms turn 2's
+                                           // checkpoint estimate exactly like the held response did; the short
+                                           // text keeps the keep_tokens cut on the same row.
+        let mut turn_one_again = text_resp("done again");
+        turn_one_again.usage.input = 1_000;
         let queue = vec![
             write_round(
                 vec![(
@@ -5060,6 +5387,7 @@ mod tests {
                 1_000,
             ),
             turn_one_done,
+            turn_one_again,
             summary_resp("## Goal\ncheckpoint two", StopReason::Stop, 100),
             text_resp("turn two done"),
         ];
@@ -5071,7 +5399,7 @@ mod tests {
             "compact-turn2",
             queue,
             cfg,
-            4_000,
+            5_000,
             vec!["keep going"],
             "goal-1",
         )
@@ -5080,23 +5408,24 @@ mod tests {
         let reqs = requests.lock().unwrap();
         assert_eq!(
             reqs.len(),
-            7,
-            "two checkpoints + four agent calls + one finish"
+            8,
+            "two checkpoints + five agent calls + one finish"
         );
         assert_eq!(reqs.iter().filter(|r| r.tools.is_empty()).count(), 2);
         // The second summary is an update: the first summary is inside its
         // payload, not lost.
-        let payload2 = &reqs[5].messages[1].content;
+        let payload2 = &reqs[6].messages[1].content;
         assert!(payload2.contains("checkpoint one"), "{payload2}");
         assert!(payload2.contains("[tool]: wrote f2.txt"));
-        // Final request: [system, summary2, round 3, turn-1 finish, followup].
-        let post = &reqs[6];
-        assert_eq!(post.messages.len(), 6);
+        // Final request: [system, summary2, round 3, turn-1 finishes, followup].
+        let post = &reqs[7];
+        assert_eq!(post.messages.len(), 7);
         assert!(post.messages[1].content.contains("checkpoint two"));
         assert_eq!(post.messages[2].role, "assistant");
         assert_eq!(post.messages[3].tool_call_id.as_deref(), Some("c3"));
         assert_eq!(post.messages[4].content, "turn one done");
-        assert!(post.messages[5].content.starts_with("keep going"));
+        assert_eq!(post.messages[5].content, "done again");
+        assert!(post.messages[6].content.starts_with("keep going"));
         let wire = serde_json::to_string(post).unwrap();
         assert!(!wire.contains("goal-1"));
         assert!(!wire.contains("wrote f1.txt") && !wire.contains("wrote f2.txt"));
@@ -5131,6 +5460,9 @@ mod tests {
             ));
         }
         queue.push_back(text_resp("all done"));
+        // Held-declare round trip: the first done is held (unverified
+        // writes), the second lands Done.
+        queue.push_back(text_resp("done again"));
         let cfg = RunConfig {
             compaction: context::CompactionConfig {
                 frac: 0.1,
@@ -5150,7 +5482,7 @@ mod tests {
         .await;
         assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
         let reqs = requests.lock().unwrap();
-        assert_eq!(reqs.len(), 8, "no summary call on the off path");
+        assert_eq!(reqs.len(), 9, "no summary call on the off path");
         assert!(reqs.iter().all(|r| !r.tools.is_empty()));
         assert!(state.checkpoint.is_none() && state.compacted_turn.is_none());
         assert!(state.anchor.is_some(), "the trigger was armed and held");
@@ -5203,6 +5535,9 @@ mod tests {
                     StopReason::ToolUse,
                 ),
                 text_resp("done"),
+                // Held-declare round trip: the first done is held (unverified
+                // write), the second lands Done.
+                text_resp("done"),
             ])),
         };
         let registry = run_registry(&root);
@@ -5226,15 +5561,15 @@ mod tests {
         assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
         assert!(root.join("b.rs").exists(), "mid-run write happened");
         let reqs = client.requests.lock().unwrap();
-        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs.len(), 4);
         // File map frozen at run start: b.rs was written mid-run and never
         // shows up; the head bytes match across all requests.
         let sys = &reqs[0].messages[0].content;
         assert!(sys.contains("a.rs") && !sys.contains("b.rs"), "{sys}");
         assert_eq!(sys, &reqs[1].messages[0].content);
         assert_eq!(sys, &reqs[2].messages[0].content);
-        // Identical prefix up to each request's final message, the only one
-        // the budget line touches.
+        assert_eq!(sys, &reqs[3].messages[0].content); // Identical prefix up to each request's final message, the only one
+                                                       // the budget line touches.
         for pair in reqs.windows(2) {
             let head = &pair[0].messages[..pair[0].messages.len() - 1];
             assert!(pair[1].messages.len() > head.len(), "request lost history");
@@ -5243,14 +5578,20 @@ mod tests {
             }
         }
         // Fresh counters on the tail of every request: one step per call, one
-        // action per executed tool, 15 tokens metered per settle.
+        // action per executed tool, 15 tokens metered per settle. The fourth
+        // request also carries the held verification nudge past the budgets.
         for (req, tail) in reqs.iter().zip([
             "budgets remaining: steps 19/20; actions 30/30; tokens 50000/50000",
             "budgets remaining: steps 18/20; actions 29/30; tokens 49985/50000",
             "budgets remaining: steps 17/20; actions 28/30; tokens 49970/50000",
+            "budgets remaining: steps 16/20; actions 28/30; tokens 49955/50000",
         ]) {
             let last = &req.messages.last().unwrap().content;
-            assert!(last.ends_with(tail), "{last:?} must end with {tail:?}");
+            assert!(last.contains(tail), "{last:?} must carry {tail:?}");
+            assert!(
+                last.ends_with(tail) || last.ends_with(VERIFY_NUDGE),
+                "{last:?} must end with the budget tail or the held nudge"
+            );
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5274,7 +5615,13 @@ mod tests {
         let client = ScriptClient {
             order: Arc::new(Mutex::new(Vec::new())),
             requests: requests.clone(),
-            queue: Mutex::new(VecDeque::from([first, text_resp("done")])),
+            queue: Mutex::new(VecDeque::from([
+                first,
+                text_resp("done"),
+                // Held-declare round trip: the first done is held (unverified
+                // write), the second lands Done.
+                text_resp("done"),
+            ])),
         };
         let registry = run_registry(&root);
         let mut state = LoopState::new();
@@ -5306,7 +5653,7 @@ mod tests {
             .expect("assistant row stored");
         assert_eq!(stored["thinking"], "must edit a.txt");
         let reqs = requests.lock().unwrap();
-        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs.len(), 3);
         // Turn 1 has no assistant history: nothing to echo there.
         assert!(reqs[0].messages.iter().all(|m| m.thinking.is_none()));
         let echoed = reqs[1]
@@ -5549,6 +5896,9 @@ mod tests {
                     StopReason::ToolUse,
                 ),
                 text_resp("done"),
+                // Held-declare round trip: the first done is held (unverified
+                // writes), the second lands Done.
+                text_resp("done"),
             ])),
         };
         let registry = run_registry(&root);
@@ -5720,6 +6070,9 @@ mod tests {
                     StopReason::ToolUse,
                 ),
                 text_resp("done"),
+                // Held-declare round trip: the first done is held (unverified
+                // writes), the second lands Done.
+                text_resp("done"),
             ])),
         };
         let registry = run_registry(&root);
@@ -5765,6 +6118,9 @@ mod tests {
                     )],
                     StopReason::ToolUse,
                 ),
+                text_resp("done"),
+                // Held-declare round trip: the first done is held (unverified
+                // write), the second lands Done.
                 text_resp("done"),
             ])),
         };
@@ -5849,6 +6205,9 @@ mod tests {
             queue: Mutex::new(VecDeque::from([
                 script_resp(vec![write_call("c1")], StopReason::ToolUse),
                 text_resp("done"),
+                // Held-declare round trip: the first done is held (unverified
+                // write), the second lands Done.
+                text_resp("done"),
             ])),
         };
         let registry = run_registry(&run_root);
@@ -5930,6 +6289,19 @@ mod tests {
         .unwrap();
         let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
         assert!(matches!(v, PhaseVerdict::Continue));
+        s.edits += 1; // run() counts the write above; the manual driver must too
+        assert!(s.start_provider_call(&root).is_some());
+        ptx.send(ProviderMsg::Settled {
+            turn: 1,
+            message: text_resp("done").message,
+            stop: StopReason::Stop,
+            usage: None,
+        })
+        .await
+        .unwrap();
+        // Unverified declare held: the turn stays alive, no Done yet.
+        let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+        assert!(matches!(v, PhaseVerdict::Continue));
         assert!(s.start_provider_call(&root).is_some());
         ptx.send(ProviderMsg::Settled {
             turn: 1,
@@ -5961,6 +6333,7 @@ mod tests {
                 "Assistant",
                 "ToolCall",
                 "ToolResult",
+                "Assistant",
                 "Assistant",
                 "TurnEnd"
             ]

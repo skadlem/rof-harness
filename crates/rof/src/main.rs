@@ -859,7 +859,10 @@ mod tests {
         second.message.tool_calls[0].id = "c2".into();
         second.message.tool_calls[0].args =
             serde_json::json!({"path": "note.txt", "search": "bye", "replace": "later"});
-        let client = ScriptClient::new(vec![tool_resp(), second, text_resp()]);
+        let client = ScriptClient::new(vec![tool_resp(), second, text_resp(), text_resp()]);
+        // The third response (first declare) is held by the verification nudge
+        // (edits made, no passing test); the latch burns on fire, so the
+        // fourth response lands Done.
         let r = execute(&client, &args_for(&dir, None)).await;
         assert!(matches!(r.outcome, Outcome::Done), "{:?}", r.outcome);
         assert_eq!(exit_code(&r.outcome), 0);
