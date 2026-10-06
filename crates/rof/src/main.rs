@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use agent_budget::{config_for, BudgetGuard, Capability};
@@ -17,8 +17,10 @@ use snapshot::TreeService;
 use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
-const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH]
+const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log]
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
+--log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
+--no-log: disable the WAL (run without a durable log)
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget
 --compaction FRAC: checkpoint the older context once the estimate crosses FRAC of the token budget (0 < FRAC <= 1). OFF-BY-DEFAULT and UNVALIDATED: the S-1 compaction experiment has not run yet, so leave it unset unless running that experiment.";
 
@@ -40,6 +42,10 @@ struct Args {
     max_tokens: Option<usize>,
     context_files: Vec<String>,
     dump_events: Option<String>,
+    /// WAL override (`None` = default inside `--workdir`); `--no-log` wins.
+    log_path: Option<String>,
+    /// Opt out of the fail-closed WAL.
+    no_log: bool,
     proof_cmd: Option<String>,
     incentives: agent_loop::IncentivesLevel,
     bets: bool,
@@ -54,6 +60,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     }
     let (mut goal, mut workdir, mut model, mut endpoint, mut steps, mut dump) =
         (None, None, None, None, None, None);
+    let mut log_path: Option<String> = None;
+    let mut no_log = false;
     let mut api_key_env = "OPENAI_API_KEY".to_string();
     let mut headers: Vec<String> = Vec::new();
     let mut actions: Option<u32> = None;
@@ -87,6 +95,10 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--model" => model = Some(take(&mut i, inline)?),
             "--endpoint" => endpoint = Some(take(&mut i, inline)?),
             "--dump-events" => dump = Some(take(&mut i, inline)?),
+            "--log-path" => log_path = Some(take(&mut i, inline)?),
+            "--no-log" => {
+                no_log = true;
+            }
             "--allow-cmd" => allow.push(take(&mut i, inline)?),
             "--context-file" => context_files.push(take(&mut i, inline)?),
             "--max-tokens" => {
@@ -177,6 +189,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         budget_actions: actions,
         budget_tokens,
         dump_events: dump,
+        log_path,
+        no_log,
         proof_cmd,
         incentives,
         bets,
@@ -211,9 +225,74 @@ fn budget_for(args: &Args) -> BudgetGuard {
     BudgetGuard::new(b, Instant::now())
 }
 
+/// WAL filename for the shipped path: the fail-closed log lives inside
+/// `--workdir` so a real run is durable without extra flags.
+const DEFAULT_LOG_NAME: &str = ".rof-events.jsonl";
+
+/// Default WAL path for one run: inside `--workdir` (which `main` already
+/// verified is a directory, so the open cannot fail on a missing parent).
+fn default_log_path(workdir: &Path) -> PathBuf {
+    workdir.join(DEFAULT_LOG_NAME)
+}
+
+/// Shipped-path WAL wiring: default on (inside `--workdir`), `--log-path`
+/// overrides the location, `--no-log` disables it (wins over the override).
+fn resolve_log_path(args: &Args) -> Option<PathBuf> {
+    if args.no_log {
+        return None;
+    }
+    if let Some(p) = args.log_path.as_deref() {
+        return Some(PathBuf::from(p));
+    }
+    Some(default_log_path(&args.workdir))
+}
+
+/// Keep run-record sidecars (WAL + incremental dump) out of the reported
+/// patch: `snapshot` baselines `git add -A` mid-run, so a sidecar under
+/// `--workdir` would otherwise be committed and diffed into stdout.
+/// Appends the workdir-relative path to the copy-local `.git/info/exclude`
+/// (never a tracked file); paths outside the workdir cannot be staged.
+/// Runs after `ensure()` (stale sidecars are removed before its commit), so
+/// the mid-run baselines — not the initial commit — are what this excludes.
+fn exclude_sidecar(workdir: &Path, path: &Path) {
+    // Never create `.git` here: `snapshot::is_repo` is existence-based, so a
+    // bare `.git/info/exclude` would fake a repo and skip `git init`.
+    // Callers run this after `ensure()`; a missing `.git` means ensure
+    // failed and the loop reports it — exclusion then stays a no-op.
+    let git = workdir.join(".git");
+    if !git.is_dir() {
+        return;
+    }
+    let Ok(rel) = path.strip_prefix(workdir) else {
+        return;
+    };
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    if rel.is_empty() {
+        return;
+    }
+    let exclude = git.join("info/exclude");
+    if let Some(dir) = exclude.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    let text = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if text.lines().any(|l| l == rel) {
+        return;
+    }
+    let mut out = text;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&rel);
+    out.push('\n');
+    let _ = std::fs::write(&exclude, out);
+}
+
 /// One run's loop config from the parsed flags. The compaction checkpoint is
 /// opt-in: absent `--compaction` leaves the default disabled config, so the
-/// run stays byte-identical.
+/// run stays byte-identical. The WAL is the opposite: default on inside
+/// `--workdir` (fail-closed on real runs, not only tests).
 fn run_config(args: &Args) -> RunConfig {
     let mut cfg = RunConfig {
         goal: args.goal.clone(),
@@ -224,6 +303,7 @@ fn run_config(args: &Args) -> RunConfig {
         proof_cmd: args.proof_cmd.clone(),
         ..RunConfig::default()
     };
+    cfg.log_path = resolve_log_path(args);
     if let Some(frac) = args.compaction {
         cfg.compaction.enabled = true;
         cfg.compaction.frac = frac;
@@ -353,10 +433,34 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
             }
         }
     });
+    // One run, one log / one dump: truncate stale sidecars BEFORE the initial
+    // `ensure()` commit so they are never staged into it. The WAL truncate is
+    // load-bearing beyond git: `seq` restarts per run while `LogWriter` only
+    // appends, so a kept stale log would fail gapless-from-1 validation — the
+    // shipped path replaces it, same documented deal as `--dump-events`.
+    let log_path = resolve_log_path(args);
+    if let Some(p) = log_path.as_deref() {
+        let _ = std::fs::remove_file(p);
+    }
+    if let Some(path) = args.dump_events.as_deref() {
+        let _ = std::fs::remove_file(path);
+    }
     // Freeze the run-start HEAD `patch_since_start` diffs from; the loop's own
     // ensure() is idempotent and reports the same failure as a run error.
     let tree = TreeService::new(&args.workdir);
     let _ = tree.ensure();
+    // Git-exclude after `ensure()`, when `.git` is real: mid-run baselines
+    // `git add -A`, and without this the live sidecars would be committed
+    // and diffed into the reported patch. A failed dump attach falls through
+    // to `finalize_dump`, which reports the error post-run exactly as the
+    // old single-write path did; the run itself proceeds.
+    if let Some(p) = log_path.as_deref() {
+        exclude_sidecar(&args.workdir, p);
+    }
+    if let Some(path) = args.dump_events.as_deref() {
+        exclude_sidecar(&args.workdir, Path::new(path));
+        let _ = attach_dump(&mut emitter, path);
+    }
     let outcome = agent_loop::run(
         &mut state,
         Run {
@@ -388,6 +492,41 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     }
 }
 
+/// Incremental `--dump-events` mirror: truncate the previous dump (one run,
+/// one dump, same as before), then append each emitted event as one JSON
+/// line with flush + fsync before returning, so a kill leaves a valid
+/// prefix on disk instead of no file at all. The listener is sync and
+/// infallible by construction (every failure is skipped, never panics), so
+/// a slow disk cannot hang or break the run; the WAL stays the fail-closed
+/// record, this file its best-effort mirror.
+fn attach_dump(emitter: &mut Emitter, path: &str) -> Result<(), String> {
+    let _ = std::fs::remove_file(path);
+    if let Some(dir) = Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    let shared = Arc::new(Mutex::new(file));
+    emitter.on(move |event| {
+        if let Ok(line) = serde_json::to_string(event) {
+            if let Ok(mut f) = shared.lock() {
+                use std::io::Write as _;
+                let mut buf = line.into_bytes();
+                buf.push(b'\n');
+                let _ = f.write_all(&buf);
+                let _ = f.flush();
+                let _ = f.sync_all();
+            }
+        }
+    });
+    Ok(())
+}
+
 /// One run's events as JSONL (one object per line, LF) via `trace::TraceSink`.
 /// The sink only appends, so a dump replaces the previous file: one run, one dump.
 fn write_dump(path: &str, events: &[AgentEvent]) -> Result<(), String> {
@@ -397,6 +536,21 @@ fn write_dump(path: &str, events: &[AgentEvent]) -> Result<(), String> {
         sink.emit(e.clone());
     }
     Ok(())
+}
+
+/// Post-run `--dump-events` close-out: the incremental listener is the
+/// record, so when its line count already equals the lossless history the
+/// kill-resilient prefix stands as-is (no truncating rewrite). Any
+/// shortfall (attach failed, writes lost) falls back to the full replace
+/// write, preserving the old path/flag/error behavior.
+fn finalize_dump(path: &str, events: &[AgentEvent]) -> Result<(), String> {
+    let complete = std::fs::read_to_string(path)
+        .map(|t| t.lines().count() == events.len())
+        .unwrap_or(false);
+    if complete {
+        return Ok(());
+    }
+    write_dump(path, events)
 }
 
 #[tokio::main]
@@ -435,7 +589,7 @@ async fn main() {
     }
     let r = execute(&provider, &args).await;
     if let Some(path) = args.dump_events.as_deref() {
-        if let Err(e) = write_dump(path, &r.events) {
+        if let Err(e) = finalize_dump(path, &r.events) {
             eprintln!("cannot write {path}: {e}");
             std::process::exit(2);
         }
@@ -482,6 +636,8 @@ mod tests {
             "app/a.py",
             "--dump-events",
             "/tmp/ev.json",
+            "--log-path",
+            "/tmp/w.log",
             "--compaction",
             "0.6",
         ]))
@@ -502,6 +658,8 @@ mod tests {
                 context_files: vec!["app/a.py".into()],
                 max_tokens: None,
                 dump_events: Some("/tmp/ev.json".into()),
+                log_path: Some("/tmp/w.log".into()),
+                no_log: false,
                 bets: false,
                 incentives: agent_loop::IncentivesLevel::Full,
                 proof_cmd: None,
@@ -521,6 +679,7 @@ mod tests {
             (b.endpoint, b.budget_steps, b.budget_actions, b.dump_events),
             (None, None, None, None)
         );
+        assert_eq!((b.log_path, b.no_log), (None, false));
         assert_eq!(b.compaction, None, "absent --compaction stays off");
     }
 
@@ -688,12 +847,27 @@ mod tests {
 
     struct ScriptClient {
         queue: std::sync::Mutex<VecDeque<Response>>,
+        /// Mid-run probe: when set, the first `complete` records whether the
+        /// dump file already holds JSON lines — proving the dump is
+        /// incremental, not a post-run write.
+        probe_dump: Option<PathBuf>,
+        probe_hit: std::sync::Mutex<bool>,
     }
 
     impl ScriptClient {
         fn new(resps: Vec<Response>) -> Self {
             Self {
                 queue: std::sync::Mutex::new(resps.into()),
+                probe_dump: None,
+                probe_hit: std::sync::Mutex::new(false),
+            }
+        }
+
+        fn with_dump_probe(resps: Vec<Response>, dump: PathBuf) -> Self {
+            Self {
+                queue: std::sync::Mutex::new(resps.into()),
+                probe_dump: Some(dump),
+                probe_hit: std::sync::Mutex::new(false),
             }
         }
     }
@@ -705,6 +879,17 @@ mod tests {
             _model: &str,
             _req: &provider_core::Request,
         ) -> Result<Response, provider_core::LlmError> {
+            if let Some(dump) = &self.probe_dump {
+                if let Ok(text) = std::fs::read_to_string(dump) {
+                    if text.lines().count() >= 1
+                        && text
+                            .lines()
+                            .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok())
+                    {
+                        *self.probe_hit.lock().unwrap() = true;
+                    }
+                }
+            }
             self.queue
                 .lock()
                 .unwrap()
@@ -799,6 +984,8 @@ mod tests {
             context_files: Vec::new(),
             max_tokens: None,
             dump_events: None,
+            log_path: None,
+            no_log: false,
             bets: false,
             incentives: agent_loop::IncentivesLevel::Full,
             proof_cmd: None,
@@ -823,6 +1010,76 @@ mod tests {
         );
         assert_eq!(cfg.compaction.frac, 0.5);
         assert_eq!(cfg.compaction.keep_tokens, 20_000, "keep stays the default");
+    }
+
+    #[test]
+    fn log_path_defaults_inside_workdir_with_opt_out_and_override() {
+        let dir = Path::new("/tmp/w");
+        assert_eq!(
+            resolve_log_path(&args_for(dir, None)),
+            Some(dir.join(".rof-events.jsonl")),
+            "shipped path defaults the WAL inside --workdir"
+        );
+        assert_eq!(
+            run_config(&args_for(dir, None)).log_path,
+            Some(dir.join(".rof-events.jsonl")),
+            "real config carries the default (not RunConfig::default None)"
+        );
+        let mut over = args_for(dir, None);
+        over.log_path = Some("/tmp/custom.jsonl".into());
+        assert_eq!(
+            run_config(&over).log_path,
+            Some(PathBuf::from("/tmp/custom.jsonl"))
+        );
+        let mut off = args_for(dir, None);
+        off.no_log = true;
+        assert_eq!(run_config(&off).log_path, None);
+        // Opt-out wins over an explicit override.
+        off.log_path = Some("/tmp/custom.jsonl".into());
+        assert_eq!(run_config(&off).log_path, None);
+    }
+
+    #[test]
+    fn log_flags_parse_plain_and_eq_forms() {
+        let a = parse_args(&argv(&[
+            "rof",
+            "run",
+            "--goal",
+            "g",
+            "--workdir",
+            "/w",
+            "--model",
+            "m",
+            "--log-path",
+            "/tmp/w.log",
+        ]))
+        .unwrap();
+        assert_eq!(a.log_path.as_deref(), Some("/tmp/w.log"));
+        assert!(!a.no_log);
+        let b = parse_args(&argv(&[
+            "rof",
+            "run",
+            "--goal",
+            "g",
+            "--workdir",
+            "/w",
+            "--model",
+            "m",
+            "--no-log",
+        ]))
+        .unwrap();
+        assert!(b.no_log);
+        assert_eq!(b.log_path, None);
+        let c = parse_args(&argv(&[
+            "rof",
+            "run",
+            "--goal=g",
+            "--workdir=/w",
+            "--model=m",
+            "--log-path=/tmp/eq.log",
+        ]))
+        .unwrap();
+        assert_eq!(c.log_path.as_deref(), Some("/tmp/eq.log"));
     }
 
     #[test]
@@ -898,6 +1155,37 @@ mod tests {
                 serde_json::from_str(line).expect("every line incl. the last parses alone");
             assert!(v.is_object(), "line is a JSON object: {line}");
         }
+    }
+
+    #[tokio::test]
+    async fn dump_events_exists_mid_run_and_wal_live() {
+        let dir = tmp();
+        std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
+        let dump = dir.join("dump.jsonl");
+        let client = ScriptClient::with_dump_probe(vec![tool_resp(), text_resp()], dump.clone());
+        let mut args = args_for(&dir, None);
+        args.dump_events = Some(dump.to_str().unwrap().into());
+        let r = execute(&client, &args).await;
+        assert!(
+            *client.probe_hit.lock().unwrap(),
+            "dump file holds JSON lines before the first provider call returns"
+        );
+        assert!(!r.events.is_empty(), "fake run must produce events");
+        let text = std::fs::read_to_string(&dump).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            r.events.len(),
+            "incremental prefix is the complete record post-run"
+        );
+        assert!(
+            dir.join(".rof-events.jsonl").is_file(),
+            "default WAL is live on the shipped path"
+        );
+        assert!(
+            !r.patch.contains("dump.jsonl") && !r.patch.contains(".rof-events.jsonl"),
+            "sidecars stay out of the reported patch: {}",
+            r.patch
+        );
     }
 
     #[tokio::test]

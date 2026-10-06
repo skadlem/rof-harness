@@ -57,6 +57,13 @@ const ROLLBACK_NOTICE: &str = "a tool in your last batch failed and the whole ba
 const VERIFY_NUDGE: &str = "Unverified declare held: no passing verification run since your last write. Either run the task's verification now, or state exactly what blocks it (missing tool/package/file) and what you verified instead. Declaring without one of those two is not completing.";
 const VERIFY_NUDGE_CAP: u32 = 2;
 
+/// Per-step provider-failure budget (init + per-step reset value).
+/// Nesting: the provider adapter retries INSIDE each `complete` (cold-start
+/// 503s up to 8 attempts with 60s sleeps, other retryables 5, plus the
+/// truncation ladder), and this budget nests OUTSIDE it — each in-step retry
+/// re-runs the full adapter ladder. Provider retry counts are unchanged here.
+const STEP_RETRY_BUDGET: u32 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateStatus {
     Open,
@@ -304,6 +311,12 @@ pub struct LoopState {
     pub usage_totals: UsageReport,
     pub emit_next: u64,
     pub open_msg: Option<u64>,
+    /// Per-step provider-failure budget: reset to [`STEP_RETRY_BUDGET`] at
+    /// each fresh step head (`start_provider_call` with no `call_model`
+    /// retry latched), so a new step after success never inherits the
+    /// previous step's consumed retries. In-step retry continuations keep
+    /// their remaining budget. See the `STEP_RETRY_BUDGET` nesting note for
+    /// the adapter 8x60s relationship.
     pub step_retries: u32,
     pub fatal_error: Option<String>,
     pub last_sig: String,
@@ -367,7 +380,7 @@ impl LoopState {
             usage_totals: UsageReport::default(),
             emit_next: 0,
             open_msg: None,
-            step_retries: 2,
+            step_retries: STEP_RETRY_BUDGET,
             fatal_error: None,
             last_sig: String::new(),
             last_obs: 0,
@@ -510,6 +523,14 @@ impl LoopState {
         });
         self.step += 1;
         self.budget.record_step();
+        // Per-step budget as named: a fresh step head resets, an in-step retry
+        // continuation (`call_model` latched by the failed attempt) keeps its
+        // remaining budget so 3 consecutive fails still exhaust (run-wide
+        // would exhaust after any 2 fails across successes; unconditional
+        // reset would never exhaust since every retry is a new step head).
+        if !self.call_model {
+            self.step_retries = STEP_RETRY_BUDGET;
+        }
         self.call_model = false;
         // Prior batch results belong to older turns; drop them so the batch
         // shape only ever sees the current batch.
@@ -2341,10 +2362,42 @@ pub async fn run<P: LlmClient>(
         };
         // Checkpoint before the real request, after the budget admitted the
         // step: the summary request is real spend and must never be paid for
-        // a step the guard would have refused.
-        checkpoint(state, provider, &cfg, emitter).await;
+        // a step the guard would have refused. Raced against cancel so Ctrl-C
+        // during the summary call returns promptly (parent-side only; the
+        // race drops the summary future and cancels the per-turn child token).
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {}
+            _ = checkpoint(state, provider, &cfg, emitter) => {}
+        }
+        if cancel.is_cancelled() {
+            turn_token.cancel();
+            state.stop_hard = true;
+            state.gate.begin_abort();
+        }
         let req = build_request(state, registry, workdir, &cfg);
-        match provider.complete(&cfg.model, &req).await {
+        // Parent-side cancel race: Ctrl-C during a model call returns promptly
+        // instead of waiting out the adapter's 8x60s ladder. The `LlmClient`
+        // trait is frozen (no token param), so the cancel branch drops the
+        // `complete` future and cancels the per-turn child token.
+        let completed = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            res = provider.complete(&cfg.model, &req) => Some(res),
+        };
+        let completed = match completed {
+            None => {
+                turn_token.cancel();
+                state.stop_hard = true;
+                state.gate.begin_abort();
+                Err(LlmError::Metered {
+                    source: "cancelled".into(),
+                    usage: None,
+                })
+            }
+            Some(res) => res,
+        };
+        match completed {
             Err(e) => {
                 let cancelled = cancel.is_cancelled() || root.is_cancelled();
                 // Metered failures carry what the attempts were billed; every
@@ -2546,12 +2599,31 @@ pub async fn run<P: LlmClient>(
                                 if let Some(inv) = inv {
                                     let name = inv.name.clone();
                                     let args = inv.args.to_string();
+                                    // Parent-side cancel race: Ctrl-C during a tool
+                                    // returns promptly instead of waiting it out.
+                                    // The race drops the `execute` future and
+                                    // cancels the per-turn child token (which
+                                    // owns each tool's child token) when it loses.
                                     let res = match registry.resolve(&inv.name) {
                                         Some(tool) => {
-                                            match tool.execute(inv, turn_token.child_token()).await
-                                            {
-                                                Ok(o) => outcome_to_result(o),
-                                                Err(e) => ToolResult::from(e),
+                                            let tool_token = turn_token.child_token();
+                                            let raced = tokio::select! {
+                                                biased;
+                                                _ = cancel.cancelled() => None,
+                                                r = tool.execute(inv, tool_token) => Some(r),
+                                            };
+                                            match raced {
+                                                None => {
+                                                    turn_token.cancel();
+                                                    state.stop_hard = true;
+                                                    state.gate.begin_abort();
+                                                    ToolResult {
+                                                        content: "cancelled".into(),
+                                                        is_error: true,
+                                                    }
+                                                }
+                                                Some(Ok(o)) => outcome_to_result(o),
+                                                Some(Err(e)) => ToolResult::from(e),
                                             }
                                         }
                                         None => ToolResult {
@@ -6745,5 +6817,127 @@ mod tests {
         assert_eq!(s.last_obs, snap.last_obs);
         assert_eq!(s.verified_since_write, snap.verified_since_write);
         assert!(s.verified_since_write);
+    }
+
+    /// Per-step budget: a fresh step head resets to [`STEP_RETRY_BUDGET`]
+    /// (init 2), an in-step retry continuation keeps its remaining budget so
+    /// 3 consecutive fails still exhaust. Run-wide would exhaust after any 2
+    /// fails across successes; unconditional reset would never exhaust.
+    #[test]
+    fn step_retries_resets_on_fresh_step_head_not_retry_continuation() {
+        let mut s = LoopState::new();
+        assert_eq!(s.step_retries, STEP_RETRY_BUDGET);
+        assert_eq!(STEP_RETRY_BUDGET, 2);
+        s.turn = 1;
+        let root = CancellationToken::new();
+        assert!(s.start_provider_call(&root).is_some());
+        assert_eq!(s.step_retries, 2);
+        assert!(s.finish_provider_msg(ProviderMsg::Failed {
+            turn: 1,
+            err: "e1".into(),
+            cancelled: false,
+            usage: None,
+        }));
+        assert_eq!(s.step_retries, 1);
+        assert!(s.call_model); // retry latched
+                               // Retry continuation keeps the remaining 1 (no reset).
+        assert!(s.start_provider_call(&root).is_some());
+        assert_eq!(s.step_retries, 1, "retry must not reset");
+        // Settle the retry successfully; the next fresh step resets to 2.
+        assert!(s.finish_provider_msg(ProviderMsg::Settled {
+            turn: 1,
+            message: assistant(vec![]),
+            stop: StopReason::Stop,
+            usage: None,
+        }));
+        assert_eq!(s.step_retries, 1, "success does not itself reset");
+        assert!(s.start_provider_call(&root).is_some());
+        assert_eq!(s.step_retries, 2, "fresh step after success resets");
+    }
+
+    /// Hanging provider that never answers unless raced: without the
+    /// parent-side `select!` the run would wait out the full sleep.
+    struct HangingClient;
+
+    #[async_trait::async_trait]
+    impl LlmClient for HangingClient {
+        async fn complete(&self, _model: &str, _req: &Request) -> Result<Response, LlmError> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(text_resp("never"))
+        }
+        fn capabilities(&self, _model: &str) -> Capabilities {
+            Capabilities {}
+        }
+        async fn resolve_key(&self, _provider: &str) -> Result<Credentials, LlmError> {
+            Ok(Credentials {
+                api_key: String::new(),
+            })
+        }
+    }
+
+    /// Cancel during `provider.complete` aborts promptly: the step records a
+    /// `Failed { cancelled: true }` (budget refunded, no `Attempt` row) and
+    /// the run returns `Cancelled` in ~50ms instead of 30s. The per-turn
+    /// child token is cancelled when the race loses (stop_hard + aborting
+    /// gate propagate it to any tool children).
+    #[tokio::test]
+    async fn cancel_during_provider_complete_aborts_promptly_as_cancelled() {
+        let root = run_tmp("cancel-race");
+        let client = HangingClient;
+        let registry = run_registry(&root);
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let cancel = CancellationToken::new();
+        let fired = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            fired.cancel();
+        });
+        let started = Instant::now();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("go".into())],
+            &cancel,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(outcome, Outcome::Cancelled),
+            "cancel must abort as Cancelled, got {outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must not wait out the 30s provider, took {elapsed:?}"
+        );
+        // Step-level `Failed { cancelled: true }`: refunded, never retried.
+        assert_eq!(
+            state.budget.counters().steps,
+            0,
+            "cancelled refunds the step"
+        );
+        assert!(
+            !state
+                .items
+                .iter()
+                .any(|i| matches!(&i.kind, ItemKind::Attempt { .. })),
+            "cancelled records no Attempt row"
+        );
+        assert!(state.stop_hard);
+        assert_eq!(state.gate.status(), GateStatus::Aborting);
+        assert!(emitter.history().iter().any(|e| matches!(
+            e,
+            AgentEvent::Error { error } if error.code == "provider-failed"
+                && error.message.contains("cancelled")
+        )));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
