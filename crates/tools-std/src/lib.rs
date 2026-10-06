@@ -437,12 +437,17 @@ impl Tool for ViewTool {
             return Ok(ToolOutcome {
                 truncated: truncated || data.len() > n,
                 content,
+                success: true,
             });
         };
         let text = String::from_utf8_lossy(&data);
         let lines: Vec<&str> = text.lines().collect();
         let (content, truncated) = view_page(&lines, offset, cap)?;
-        Ok(ToolOutcome { content, truncated })
+        Ok(ToolOutcome {
+            content,
+            truncated,
+            success: true,
+        })
     }
 }
 
@@ -556,7 +561,11 @@ impl Tool for SearchTool {
             search_dir(&base, &self.policy.root, &args.pattern, &mut hits, limit);
         }
         let (content, truncated) = cap_chars(hits.join("\n"), OUT_CAP);
-        Ok(ToolOutcome { content, truncated })
+        Ok(ToolOutcome {
+            content,
+            truncated,
+            success: true,
+        })
     }
 }
 
@@ -635,6 +644,7 @@ impl Tool for EditTool {
         Ok(ToolOutcome {
             content: format!("patched {}", args.path),
             truncated: false,
+            success: true,
         })
     }
 }
@@ -737,6 +747,7 @@ impl Tool for WriteTool {
         Ok(ToolOutcome {
             content: format!("wrote {}", args.path),
             truncated: false,
+            success: true,
         })
     }
 }
@@ -886,8 +897,12 @@ impl Tool for ExecTool {
         _cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: CmdArgs = parse_args(&inv.args)?;
-        let (_ok, content, truncated) = run_allowed(&self.policy, &args.cmd, EXEC_TIMEOUT).await?;
-        Ok(ToolOutcome { content, truncated })
+        let (ok, content, truncated) = run_allowed(&self.policy, &args.cmd, EXEC_TIMEOUT).await?;
+        Ok(ToolOutcome {
+            content,
+            truncated,
+            success: ok,
+        })
     }
 }
 
@@ -922,7 +937,11 @@ impl Tool for TestTool {
         } else {
             format!("FAIL: {}\n{out}", args.cmd)
         };
-        Ok(ToolOutcome { content, truncated })
+        Ok(ToolOutcome {
+            content,
+            truncated,
+            success: ok,
+        })
     }
 }
 
@@ -1603,8 +1622,24 @@ mod tests {
         let r = reg(policy(&root));
         let pass = run(&r, "test", json!({"cmd": "true"})).await.unwrap();
         assert!(pass.content.starts_with("PASS: true"), "{}", pass.content);
+        assert!(pass.success);
         let fail = run(&r, "test", json!({"cmd": "false"})).await.unwrap();
         assert!(fail.content.starts_with("FAIL: false"), "{}", fail.content);
+        assert!(!fail.success);
+    }
+
+    #[tokio::test]
+    async fn exec_and_test_exit_status_shapes() {
+        // Exit status propagates into `ToolOutcome.success`: zero exit is
+        // success, nonzero exit is still an Ok outcome with success false.
+        let root = tmp_root();
+        let r = reg(policy(&root));
+        let ok = run(&r, "exec", json!({"cmd": "true"})).await.unwrap();
+        assert!(ok.success);
+        assert!(!ok.truncated);
+        let err_exit = run(&r, "exec", json!({"cmd": "false"})).await.unwrap();
+        assert!(!err_exit.success);
+        assert!(!err_exit.truncated);
     }
 
     #[tokio::test]

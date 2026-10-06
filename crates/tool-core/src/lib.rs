@@ -44,6 +44,8 @@ pub struct Invocation {
 pub struct ToolOutcome {
     pub content: String,
     pub truncated: bool,
+    #[serde(default)]
+    pub success: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +341,7 @@ mod tests {
             Ok(ToolOutcome {
                 content: inv.call_id,
                 truncated: false,
+                success: true,
             })
         }
     }

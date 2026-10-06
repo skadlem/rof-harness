@@ -27,7 +27,7 @@ use provider_core::{
     AssistantMessage, LlmClient, LlmError, ProviderMessage, Request, StopReason, Thinking, Usage,
 };
 use serde_json::Value;
-use tool_core::{ToolCall, ToolResult};
+use tool_core::{ToolCall, ToolOutcome, ToolResult};
 
 /// Queued directives kept before the oldest is dropped (drop-oldest: the
 /// newest counter warning outranks stale advice, mirroring the lessons cap).
@@ -1111,9 +1111,32 @@ impl Default for LoopState {
 }
 
 /// A passing result on one of these counts as a verification run since the
-/// last write: the `test` tool, or `exec` with pytest in args.
+/// last write: the `test` tool, or `exec` whose `cmd` arg runs a test
+/// command (`pytest`, `cargo test`, `go test`, `npm test`, `npm run test`).
+/// Only the command position counts: `pip install pytest` and `grep pytest`
+/// name pytest without running it, so neither verifies.
 fn is_verification_call(name: &str, args: &Value) -> bool {
-    name == "test" || (name == "exec" && args.to_string().contains("pytest"))
+    if name == "test" {
+        return true;
+    }
+    if name != "exec" {
+        return false;
+    }
+    let cmd = args.get("cmd").and_then(Value::as_str).unwrap_or("");
+    // Shell chains run left to right; any segment may be the verify step.
+    cmd.to_lowercase()
+        .replace("&&", ";")
+        .replace("||", ";")
+        .split([';', '|'])
+        .any(|segment| {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            match tokens.as_slice() {
+                [first, ..] if *first == "pytest" || first.ends_with("/pytest") => true,
+                ["cargo", "test", ..] | ["go", "test", ..] | ["npm", "test", ..] => true,
+                ["npm", "run", "test", ..] => true,
+                _ => false,
+            }
+        })
 }
 
 fn message_content(message: &Value) -> String {
@@ -1997,6 +2020,21 @@ async fn incremental_hunks(
     Ok(flags)
 }
 
+/// [`run`] tool mapping: the tools lane reports its verdict in
+/// [`ToolOutcome::success`] (serde default false), so a failing check is an
+/// error result even though its content is ordinary output. `Err` never
+/// reaches here: the call site maps it to `is_error: true`.
+fn outcome_to_result(outcome: ToolOutcome) -> ToolResult {
+    ToolResult {
+        content: if outcome.truncated {
+            format!("{}\n[truncated]", outcome.content)
+        } else {
+            outcome.content
+        },
+        is_error: !outcome.success,
+    }
+}
+
 /// Headless multi-tick run on real siblings: [`LlmClient`] provider,
 /// [`tool_core::Registry`] tools, [`BudgetGuard`] step head,
 /// [`snapshot::TreeService`] baseline-per-batch with batch-scope rollback
@@ -2362,14 +2400,7 @@ pub async fn run<P: LlmClient>(
                                         Some(tool) => {
                                             match tool.execute(inv, turn_token.child_token()).await
                                             {
-                                                Ok(o) => ToolResult {
-                                                    content: if o.truncated {
-                                                        format!("{}\n[truncated]", o.content)
-                                                    } else {
-                                                        o.content
-                                                    },
-                                                    is_error: false,
-                                                },
+                                                Ok(o) => outcome_to_result(o),
                                                 Err(e) => ToolResult::from(e),
                                             }
                                         }
@@ -3388,11 +3419,16 @@ mod tests {
     fn verify_nudge_exec_pytest_counts_but_plain_exec_does_not() {
         let mut s = LoopState::new();
         ok_round(&mut s, "e1", "edit", Value::Null);
-        ok_round(&mut s, "x1", "exec", Value::String("ls".into()));
+        ok_round(&mut s, "x1", "exec", serde_json::json!({"cmd": "ls"}));
         assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
         let mut s = LoopState::new();
         ok_round(&mut s, "e1", "edit", Value::Null);
-        ok_round(&mut s, "x1", "exec", Value::String("pytest -q".into()));
+        ok_round(
+            &mut s,
+            "x1",
+            "exec",
+            serde_json::json!({"cmd": "pytest -q"}),
+        );
         assert!(matches!(declare(&mut s), ClaimOutcome::Done));
     }
 
@@ -3430,6 +3466,68 @@ mod tests {
             },
         }));
         assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
+    }
+
+    #[test]
+    fn verify_nudge_failed_test_outcome_does_not_verify() {
+        // FIX 1 shape: the tools lane reports a failing `test` run as
+        // `ToolOutcome { success: false, .. }` with FAIL content; run()
+        // maps it to an error ToolResult, which must not verify the write.
+        let mut s = LoopState::new();
+        ok_round(&mut s, "e1", "edit", Value::Null);
+        let outcome = s.step_claim(
+            assistant(vec![ToolCallRef {
+                id: "t1".into(),
+                name: "test".into(),
+                args: serde_json::json!({"cmd": "pytest -q"}),
+            }]),
+            StopReason::ToolUse,
+        );
+        assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
+        let failing = outcome_to_result(ToolOutcome {
+            content: "FAIL: pytest -q\n1 failed".into(),
+            truncated: false,
+            success: false,
+        });
+        assert!(failing.is_error);
+        assert!(s.record_tool_result(ToolMsg {
+            call_id: "t1".into(),
+            result: failing,
+        }));
+        assert!(!s.verified_since_write);
+        assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
+    }
+
+    #[test]
+    fn is_verification_call_command_table() {
+        // Only the command position counts: naming pytest as an argument
+        // (`pip install pytest`, `grep pytest`) is not a verification run.
+        let cases = [
+            ("test", None, true),
+            ("exec", Some("pytest"), true),
+            ("exec", Some("pytest -q"), true),
+            ("exec", Some(".venv/bin/pytest -q"), true),
+            ("exec", Some("cargo test"), true),
+            ("exec", Some("go test ./..."), true),
+            ("exec", Some("npm test"), true),
+            ("exec", Some("npm run test"), true),
+            ("exec", Some("pip install pytest"), false),
+            ("exec", Some("grep pytest"), false),
+            ("exec", Some("ls"), false),
+            ("exec", None, false),
+            ("edit", Some("pytest"), false),
+        ];
+        for (name, cmd, expected) in cases {
+            let args = match cmd {
+                Some(c) => serde_json::json!({"cmd": c}),
+                None => Value::Null,
+            };
+            assert_eq!(
+                is_verification_call(name, &args),
+                expected,
+                "name={name} cmd={cmd:?}"
+            );
+        }
     }
 
     #[test]
@@ -3714,6 +3812,7 @@ mod tests {
             Ok(tool_core::ToolOutcome {
                 content: format!("edited {}", inv.call_id),
                 truncated: false,
+                success: true,
             })
         }
     }
@@ -4105,6 +4204,7 @@ mod tests {
             Ok(CoreToolOutcome {
                 content: format!("wrote {path}"),
                 truncated: false,
+                success: true,
             })
         }
     }
@@ -4172,6 +4272,7 @@ mod tests {
             Ok(CoreToolOutcome {
                 content: format!("read {n}"),
                 truncated: false,
+                success: true,
             })
         }
     }
