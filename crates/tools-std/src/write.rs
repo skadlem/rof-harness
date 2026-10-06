@@ -4,7 +4,9 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tool_core::{CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome};
+use tool_core::{
+    CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome, TOOL_WRITE,
+};
 
 use crate::common::{dispatch, parse_args, path_err, EDIT_FILE_CAP, EDIT_REPLACE_CAP};
 use crate::policy::{resolve_under, symlink_safe, Policy, ToolPathError};
@@ -67,7 +69,7 @@ fn resolve_for_write(policy: &Policy, path: &str) -> Result<PathBuf, ToolError> 
 impl Tool for WriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "write".to_string(),
+            name: TOOL_WRITE.to_string(),
             description: "create or overwrite a whole file".to_string(),
             schema: write_schema(),
         }

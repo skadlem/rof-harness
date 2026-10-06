@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tool_core::{CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome};
+use tool_core::{
+    CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome, TOOL_TEST,
+};
 
 use crate::common::{dispatch, parse_args, EXEC_TIMEOUT};
 use crate::policy::Policy;
@@ -15,7 +17,7 @@ pub struct TestTool {
 impl Tool for TestTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "test".to_string(),
+            name: TOOL_TEST.to_string(),
             description: "run an allowlisted check, report PASS/FAIL verdict".to_string(),
             schema: cmd_schema(),
         }

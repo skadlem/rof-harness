@@ -4,7 +4,7 @@ use crate::{append_to, ClaimOutcome, IncentivesLevel, LoopState, ToolCallState, 
 use agent_log::{ItemKind, TurnEndReason};
 use provider_core::{AssistantMessage, StopReason};
 use serde_json::Value;
-use tool_core::{ToolCall, ToolResult};
+use tool_core::{ToolCall, ToolResult, TOOL_EDIT, TOOL_EXEC, TOOL_TEST, TOOL_WRITE};
 
 /// Mid-run verification nudge: held-declare directive (spec draft verbatim)
 /// plus the per-run budget. Full incentives only; Base/Contract never see it.
@@ -238,7 +238,7 @@ impl LoopState {
             if let Some((name, is_verification)) = probe {
                 // A successful write invalidates earlier verification; a
                 // passing verification run covers writes since the last one.
-                if name == "edit" || name == "write" {
+                if name == TOOL_EDIT || name == TOOL_WRITE {
                     self.verify.verified_since_write = false;
                 } else if is_verification {
                     self.verify.verified_since_write = true;
@@ -258,10 +258,10 @@ impl LoopState {
 /// Only the command position counts: `pip install pytest` and `grep pytest`
 /// name pytest without running it, so neither verifies.
 pub(crate) fn is_verification_call(name: &str, args: &Value) -> bool {
-    if name == "test" {
+    if name == TOOL_TEST {
         return true;
     }
-    if name != "exec" {
+    if name != TOOL_EXEC {
         return false;
     }
     let cmd = args.get("cmd").and_then(Value::as_str).unwrap_or("");

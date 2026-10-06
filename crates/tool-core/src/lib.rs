@@ -11,6 +11,13 @@ use tokio_util::sync::CancellationToken;
 /// Cap applied to every string handed to the model at the loop boundary.
 pub const MAX_MODEL_CHARS: usize = 40_000;
 
+/// Canonical tool names; tool-core owns the vocabulary. tools-std
+/// `definition()` names and agent-loop matching use these, never literals.
+pub const TOOL_EDIT: &str = "edit";
+pub const TOOL_WRITE: &str = "write";
+pub const TOOL_TEST: &str = "test";
+pub const TOOL_EXEC: &str = "exec";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,
@@ -516,5 +523,16 @@ mod tests {
         let big = "y".repeat(MAX_MODEL_CHARS + 10);
         let r2 = ToolResult::from(ToolError::Failed(big));
         assert!(r2.content.chars().count() <= MAX_MODEL_CHARS);
+    }
+
+    #[test]
+    fn tool_name_consts_match_definitions() {
+        // Pinned to the tools-std `definition()` names (tool-core cannot
+        // depend on tools-std, so the literals below mirror them byte for
+        // byte); any rename must update both sides together.
+        assert_eq!(TOOL_EDIT, "edit");
+        assert_eq!(TOOL_WRITE, "write");
+        assert_eq!(TOOL_TEST, "test");
+        assert_eq!(TOOL_EXEC, "exec");
     }
 }

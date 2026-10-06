@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tool_core::{CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome};
+use tool_core::{
+    CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome, TOOL_EXEC,
+};
 
 use crate::common::{dispatch, parse_args, EXEC_TIMEOUT};
 use crate::policy::Policy;
@@ -15,7 +17,7 @@ pub struct ExecTool {
 impl Tool for ExecTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "exec".to_string(),
+            name: TOOL_EXEC.to_string(),
             description: "run an allowlisted command without a shell".to_string(),
             schema: cmd_schema(),
         }

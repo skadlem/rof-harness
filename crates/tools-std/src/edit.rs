@@ -3,7 +3,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tool_core::{CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome};
+use tool_core::{
+    CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome, TOOL_EDIT,
+};
 
 use crate::common::{apply_hunk, dispatch, parse_args, path_err, EDIT_FILE_CAP, EDIT_REPLACE_CAP};
 use crate::policy::{resolve_under, Policy};
@@ -38,7 +40,7 @@ fn edit_schema() -> Value {
 impl Tool for EditTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "edit".to_string(),
+            name: TOOL_EDIT.to_string(),
             description: "replace one hunk in a file; match must be unique".to_string(),
             schema: edit_schema(),
         }

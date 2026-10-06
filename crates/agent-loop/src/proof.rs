@@ -4,7 +4,7 @@ use crate::{LoopState, PhaseVerdict, ToolMsg};
 use agent_budget::BudgetHalt;
 use std::path::Path;
 use std::time::Duration;
-use tool_core::{ToolOutcome, ToolResult};
+use tool_core::{ToolOutcome, ToolResult, TOOL_EDIT, TOOL_WRITE};
 
 /// Model-facing notice when one failed tool reverts the whole batch.
 pub(crate) const ROLLBACK_NOTICE: &str = "a tool in your last batch failed and the whole batch was reverted — your successful changes in it are gone; re-apply them";
@@ -176,7 +176,7 @@ pub(crate) fn note_tool_execution(
     result: &ToolResult,
 ) -> Option<BudgetHalt> {
     let halt = state.observe_action(&format!("{name}:{args_str}"), &result.content);
-    if !result.is_error && matches!(name, "edit" | "write") {
+    if !result.is_error && (name == TOOL_EDIT || name == TOOL_WRITE) {
         state.edits += 1;
     }
     halt
