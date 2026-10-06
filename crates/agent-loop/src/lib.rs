@@ -246,6 +246,10 @@ pub struct InFlight {
 #[derive(Debug, Clone)]
 pub struct ToolCallState {
     pub name: String,
+    /// Args JSON at claim time, for the shared `observe_action` sig
+    /// (`"{name}:{args}"`): `run` and `drive_tick` reconstruct the identical
+    /// sig from this row, so the same-action tripwire sees the same bytes.
+    pub args: String,
     /// True when this call is a verification run (`test`, or `exec` with
     /// pytest in args): an ok result marks verification since the last write.
     pub is_verification: bool,
@@ -263,6 +267,12 @@ pub struct Checkpoint {
     pub summary: String,
 }
 
+/// Shared turn/step state for both drivers. `run` is the canonical shipped
+/// driver; every field below is live in `run` (single-flight `in_flight` via
+/// `start_provider_call`/`finish_provider_msg`, `steering`/`followups` via
+/// `admit_steering`/`terminate`, `wake_requested`+`Phase::Maintenance` via the
+/// same admit path). No field is dead machinery: nothing is annotated dead
+/// and nothing may be removed under the parent-frozen ADD-only contract.
 pub struct LoopState {
     pub turn: u64,
     pub step: u32,
@@ -623,6 +633,7 @@ impl LoopState {
                         tc.id.clone(),
                         ToolCallState {
                             name: tc.name.clone(),
+                            args: tc.args.to_string(),
                             is_verification: false, // never dispatched: never verification
                             result: Some(ToolResult {
                                 content,
@@ -668,6 +679,7 @@ impl LoopState {
                         tc.id.clone(),
                         ToolCallState {
                             name: tc.name.clone(),
+                            args: tc.args.to_string(),
                             is_verification: is_verification_call(&tc.name, &tc.args),
                             result: None,
                         },
@@ -1300,13 +1312,28 @@ fn emit_message_frames(
     });
 }
 
-/// One select! tick over inbox/provider/tools/cancel (Unreal spine), with the
-/// live event seam attached. Ordering rule: the durable log append always
+/// Channel test harness over the same step helpers `run` ships.
+///
+/// `run` is the canonical shipped driver (headless multi-tick assembly on
+/// real siblings); `drive_tick` is a thin test harness for select!-shape
+/// tests, driving one inbox/provider/tool/cancel tick through the shared
+/// helpers (`step_claim` + `emit_message_frames`, `settle_tool_msg` =
+/// `note_tool_execution` + `record_tool_result` + `settle_tool_tail`). No
+/// harness-local copies: `VerifyHold`, `record_tool_result`,
+/// `observe_action`, and the `edits`/`actions` increments behave identically
+/// because both drivers call the same fns.
+///
+/// `LoopState` field note: every field is live in `run` — single-flight
+/// `in_flight` (`start_provider_call`/`finish_provider_msg`) and `steering`
+/// (`admit_steering`) ARE used and kept; there is no dead machinery to
+/// annotate, and none may be removed under the frozen contract.
+///
+/// Ordering rule: the durable log append always
 /// precedes its terminal frame in code order — `step_claim` /
 /// `record_tool_result` / the TurnEnd append below run before the matching
 /// `emit`, so replay from the log agrees with replay from events.
 /// Starting the next provider call (should_call_model -> start_provider_call)
-/// stays the caller's job; the multi-tick run() is a follow-up.
+/// stays the caller's job; the multi-tick run() is the shipped driver.
 pub async fn drive_tick(
     state: &mut LoopState,
     inbox: &mut mpsc::Receiver<Input>,
@@ -1388,16 +1415,29 @@ pub async fn drive_tick(
                         ..
                     } => {
                         // ...and Assistant + ToolCall appends inside step_claim...
+                        // Shared with `run`: the same `step_claim` + frames order.
                         let outcome = state.step_claim(message.clone(), stop);
                         emit_message_frames(state, &message, usage.as_ref(), emitter); // ...before these frames.
-                        if let ClaimOutcome::Dispatch(calls) = outcome {
-                            for c in &calls {
-                                emitter.emit(AgentEvent::ToolStart {
-                                    id: c.call_id.clone(),
-                                    name: c.name.clone(),
-                                    args: c.args.clone(),
-                                });
+                        match outcome {
+                            ClaimOutcome::Dispatch(calls) => {
+                                for c in &calls {
+                                    emitter.emit(AgentEvent::ToolStart {
+                                        id: c.call_id.clone(),
+                                        name: c.name.clone(),
+                                        args: c.args.clone(),
+                                    });
+                                }
                             }
+                            ClaimOutcome::VerifyHold => {
+                                // Same as `run`'s `VerifyHold => continue`: the
+                                // turn stays alive (`call_model` latched in
+                                // `step_claim`) and the next request carries
+                                // `verify_hold` on its tail. No `ToolStart`.
+                            }
+                            ClaimOutcome::Done
+                            | ClaimOutcome::Truncated(_)
+                            | ClaimOutcome::Refused
+                            | ClaimOutcome::HardExit(_) => {}
                         }
                     }
                     ProviderMsg::Failed { err, .. } => {
@@ -1413,8 +1453,12 @@ pub async fn drive_tick(
             // else: STALE GUARD, dropped without an event.
         }
         Some(tm) = tool_rx.recv() => {
+            // Shared with `run`: `settle_tool_msg` = `note_tool_execution`
+            // (`observe_action` + `edits += 1` on ok `edit`|`write`) +
+            // `record_tool_result` + `settle_tool_tail`, the same order `run`
+            // uses per executed call.
             let shadow = tm.clone();
-            if state.record_tool_result(tm) {
+            if settle_tool_msg(state, tm) {
                 // ToolResult appended above; terminal frame after.
                 emitter.emit(AgentEvent::ToolEnd {
                     id: shadow.call_id,
@@ -2035,6 +2079,109 @@ fn outcome_to_result(outcome: ToolOutcome) -> ToolResult {
     }
 }
 
+/// Shared step helpers: `run` (the shipped driver) and `drive_tick` (the
+/// channel test harness) call the same fns, so `VerifyHold`,
+/// `record_tool_result`, `observe_action`, and the `edits`/`actions`
+/// increments behave identically. No driver inlines its own copy.
+///
+/// Per-tool execution effects: the `observe_action` tripwire input plus the
+/// `edits += 1` on a successful `edit`|`write`. Callers run this BEFORE
+/// `record_tool_result` (the `run` order), so the counters describe the
+/// execution the durable `ToolResult` row then records. Returns the
+/// tripwire halt, if any (callers let `terminate` own the halt; the return
+/// is observed, never branched on inline).
+fn note_tool_execution(
+    state: &mut LoopState,
+    name: &str,
+    args_str: &str,
+    result: &ToolResult,
+) -> Option<BudgetHalt> {
+    let halt = state.observe_action(&format!("{name}:{args_str}"), &result.content);
+    if !result.is_error && matches!(name, "edit" | "write") {
+        state.edits += 1;
+    }
+    halt
+}
+
+/// Shared tool-tail settlement: counter directives, the budget wrap-up nudge,
+/// and delivery onto the newest `ToolResult` tail. Must run BEFORE the log
+/// sync, so the file never holds a stale tail and the row keeps the exact
+/// model-visible text. Both drivers call this after every recorded tool
+/// result.
+fn settle_tool_tail(state: &mut LoopState) {
+    state.queue_directives();
+    state.apply_budget_nudge();
+    state.deliver_directives();
+}
+
+/// Shared single-result settlement for the channel harness: the same
+/// observe/`edits`/`record`/tail order `run` uses per executed call. Looks
+/// the `name`/`args` sig up from the claim row, so the tripwire sees the
+/// identical bytes. Returns false when the call id was unknown or already
+/// answered (no effects applied).
+fn settle_tool_msg(state: &mut LoopState, msg: ToolMsg) -> bool {
+    let open = matches!(
+        state.tool_calls.get(&msg.call_id),
+        Some(c) if c.result.is_none()
+    );
+    if !open {
+        return false;
+    }
+    let (name, args_str) = state
+        .tool_calls
+        .get(&msg.call_id)
+        .map(|c| (c.name.clone(), c.args.clone()))
+        .unwrap_or_default();
+    let _ = note_tool_execution(state, &name, &args_str, &msg.result);
+    let recorded = state.record_tool_result(msg);
+    debug_assert!(recorded);
+    settle_tool_tail(state);
+    true
+}
+
+/// Batch-scope counter snapshot: the rows `tree.rollback` (or a gate
+/// `Aborted`) destroys must not linger in the counters. `edits`,
+/// `actions_this_trial` (+ the tripwire streak/sig that describes those
+/// actions), and `verified_since_write` are refunded to this snapshot on a
+/// full-batch rollback. Directive one-shot latches are NOT refunded: fired
+/// text is already durable on a `ToolResult` tail and must not repeat.
+#[derive(Debug, Clone)]
+struct BatchSnapshot {
+    edits: u32,
+    actions_this_trial: u32,
+    same_action_streak: u32,
+    last_sig: String,
+    last_obs: u64,
+    verified_since_write: bool,
+}
+
+/// Capture the pre-batch counters. Call once per `Dispatch` batch, before
+/// the first tool executes.
+fn snapshot_batch(state: &LoopState) -> BatchSnapshot {
+    BatchSnapshot {
+        edits: state.edits,
+        actions_this_trial: state.budget.counters().actions_this_trial,
+        same_action_streak: state.budget.counters().same_action_streak,
+        last_sig: state.last_sig.clone(),
+        last_obs: state.last_obs,
+        verified_since_write: state.verified_since_write,
+    }
+}
+
+/// Refund a fully rolled-back batch to its pre-batch snapshot. Call after
+/// `tree.rollback` (tool-error path) and after a gate `Aborted` restore.
+/// A gate `Partial` keeps its prefix on disk, so its counters stand (the
+/// kept hunks still describe edits; per-hunk counter attribution is
+/// deferred).
+fn refund_batch(state: &mut LoopState, snap: &BatchSnapshot) {
+    state.edits = snap.edits;
+    state.budget.counters_mut().actions_this_trial = snap.actions_this_trial;
+    state.budget.counters_mut().same_action_streak = snap.same_action_streak;
+    state.last_sig = snap.last_sig.clone();
+    state.last_obs = snap.last_obs;
+    state.verified_since_write = snap.verified_since_write;
+}
+
 /// Headless multi-tick run on real siblings: [`LlmClient`] provider,
 /// [`tool_core::Registry`] tools, [`BudgetGuard`] step head,
 /// [`snapshot::TreeService`] baseline-per-batch with batch-scope rollback
@@ -2370,6 +2517,9 @@ pub async fn run<P: LlmClient>(
                             );
                         }
                         let mut batch_failed = false;
+                        // Pre-batch counters: a full rollback refunds `edits` /
+                        // `actions` / `verified_since_write` past the verdict.
+                        let batch_snap = snapshot_batch(state);
                         for c in &calls {
                             if cancel.is_cancelled() {
                                 let content = "aborted before dispatch".to_owned();
@@ -2410,10 +2560,9 @@ pub async fn run<P: LlmClient>(
                                         },
                                     };
                                     batch_failed |= res.is_error;
-                                    state.observe_action(&format!("{name}:{args}"), &res.content);
-                                    if !res.is_error && matches!(name.as_str(), "edit" | "write") {
-                                        state.edits += 1;
-                                    }
+                                    // Shared with `drive_tick`: the same
+                                    // `note_tool_execution` + `record` order.
+                                    let _ = note_tool_execution(state, &name, &args, &res);
                                     state.record_tool_result(ToolMsg {
                                         call_id: c.call_id.clone(),
                                         result: res.clone(),
@@ -2423,9 +2572,8 @@ pub async fn run<P: LlmClient>(
                             // Directives and the nudge land on the fresh tail
                             // BEFORE the sync, so the file never holds a stale
                             // tail and the row keeps the exact model text.
-                            state.queue_directives();
-                            state.apply_budget_nudge();
-                            state.deliver_directives();
+                            // Shared with `drive_tick` (`settle_tool_tail`).
+                            settle_tool_tail(state);
                             if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
                                 return finish_run(
                                     state,
@@ -2517,6 +2665,9 @@ pub async fn run<P: LlmClient>(
                                     Outcome::Failed(format!("snapshot rollback: {e}")),
                                 );
                             }
+                            // Rolled-back edits must not linger in the
+                            // counters: refund to the pre-batch snapshot.
+                            refund_batch(state, &batch_snap);
                             // Not counted in AblationMetrics.rollbacks: this
                             // legacy rollback is pre-gate and identical in all
                             // ablation arms. rollbacks = GATE interventions
@@ -2571,6 +2722,11 @@ pub async fn run<P: LlmClient>(
                                         Outcome::Failed(format!("snapshot rollback: {e}")),
                                     );
                                 }
+                                // Gate-aborted batch is a full rollback: the
+                                // counters refund like the tool-error path.
+                                // (`Partial` keeps its prefix, so its
+                                // counters stand.)
+                                refund_batch(state, &batch_snap);
                             }
                         }
                         // Bets site 2 step hook (unchanged): Return ends the run.
@@ -2710,6 +2866,7 @@ mod tests {
             "c1".into(),
             ToolCallState {
                 name: "edit".into(),
+                args: "null".into(),
                 is_verification: false,
                 result: None,
             },
@@ -2869,6 +3026,7 @@ mod tests {
             "c1".into(),
             ToolCallState {
                 name: "edit".into(),
+                args: "null".into(),
                 is_verification: false,
                 result: None,
             },
@@ -4689,8 +4847,9 @@ mod tests {
         )
         .await;
         assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
-        // The successful edit counted, was rolled back, then re-applied.
-        assert_eq!(state.edits, 2);
+        // The failed batch's edit refunded past the rollback, then the
+        // retry re-applied: exactly one live edit remains.
+        assert_eq!(state.edits, 1);
         assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "v3\n");
         // Durable log-only row, never a model-message row.
         let notices: Vec<&str> = state
@@ -6390,7 +6549,8 @@ mod tests {
         .unwrap();
         let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
         assert!(matches!(v, PhaseVerdict::Continue));
-        s.edits += 1; // run() counts the write above; the manual driver must too
+        // Shared `settle_tool_msg` already counted the write (`edits += 1`)
+        // like `run`'s `note_tool_execution`: no manual increment here.
         assert!(s.start_provider_call(&root).is_some());
         ptx.send(ProviderMsg::Settled {
             turn: 1,
@@ -6457,5 +6617,133 @@ mod tests {
         );
         assert!(check_pairing(run_emitter.history()));
         assert!(check_pairing(emitter.history()));
+    }
+
+    /// `drive_tick` VerifyHold parity: an unverified declare holds the turn
+    /// alive through the shared `step_claim` path, exactly like `run`'s
+    /// `VerifyHold => continue` (no `ToolStart`, `call_model` latched,
+    /// `verify_hold` set for the next request tail).
+    #[tokio::test]
+    async fn drive_tick_verify_hold_matches_run() {
+        let mut s = LoopState::new();
+        s.stop_when_idle = true;
+        let mut emitter = Emitter::new();
+        let (_itx, mut irx) = mpsc::channel(8);
+        let (ptx, mut prx) = mpsc::channel(8);
+        let (ttx, mut trx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        s.apply_input(Input::User("go".into()));
+        s.admit_steering();
+        let root = CancellationToken::new();
+        assert!(s.start_provider_call(&root).is_some());
+        // One successful write via the shared harness path: `edits` and the
+        // `observe_action` tripwire increment exactly like `run`.
+        ptx.send(ProviderMsg::Settled {
+            turn: 1,
+            message: assistant(vec![ToolCallRef {
+                id: "e1".into(),
+                name: "write".into(),
+                args: serde_json::json!({"path": "w.txt"}),
+            }]),
+            stop: StopReason::ToolUse,
+            usage: None,
+        })
+        .await
+        .unwrap();
+        let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+        assert!(matches!(v, PhaseVerdict::Continue));
+        ttx.send(ToolMsg {
+            call_id: "e1".into(),
+            result: ToolResult {
+                content: "wrote w.txt".into(),
+                is_error: false,
+            },
+        })
+        .await
+        .unwrap();
+        let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+        assert!(matches!(v, PhaseVerdict::Continue));
+        assert_eq!(s.edits, 1);
+        assert_eq!(s.budget.counters().actions_this_trial, 1);
+        assert!(!s.verified_since_write);
+        // Unverified declare: held, not Done. No `ToolStart` for the empty
+        // declare, `call_model` keeps the turn alive for the next request.
+        assert!(s.start_provider_call(&root).is_some());
+        let frames_before = emitter.history().len();
+        ptx.send(ProviderMsg::Settled {
+            turn: 1,
+            message: assistant(vec![]),
+            stop: StopReason::Stop,
+            usage: None,
+        })
+        .await
+        .unwrap();
+        let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+        assert!(matches!(v, PhaseVerdict::Continue));
+        assert!(s.call_model);
+        assert_eq!(s.verify_hold.as_deref(), Some(VERIFY_NUDGE));
+        assert_eq!(s.verify_nudges_used, 1);
+        assert!(emitter.history()[frames_before..]
+            .iter()
+            .all(|e| !matches!(e, AgentEvent::ToolStart { .. })));
+    }
+
+    /// Rollback refunds batch counters: `edits`, `actions_this_trial` (+ the
+    /// tripwire streak/sig describing those actions), and
+    /// `verified_since_write` return to the pre-batch snapshot on a full
+    /// rollback, so rolled-back edits leave no stale counters behind.
+    #[test]
+    fn rollback_refunds_edits_actions_and_verified() {
+        let mut s = LoopState::new();
+        // Verified baseline: one write covered by a passing test.
+        ok_round(&mut s, "w0", "write", serde_json::json!({"path": "a"}));
+        ok_round(&mut s, "t0", "test", Value::Null);
+        assert!(s.verified_since_write);
+        let snap = snapshot_batch(&s);
+        let edits_before = s.edits;
+        let actions_before = s.budget.counters().actions_this_trial;
+        // Claim the batch that the tree will roll back, then apply the
+        // shared effects (`run`'s `note_tool_execution` + `record` order).
+        let outcome = s.step_claim(
+            assistant(vec![ToolCallRef {
+                id: "w1".into(),
+                name: "write".into(),
+                args: serde_json::json!({"path": "b"}),
+            }]),
+            StopReason::ToolUse,
+        );
+        assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
+        let (wname, wargs) = {
+            let c = &s.tool_calls["w1"];
+            (c.name.clone(), c.args.clone())
+        };
+        let w1 = ToolResult {
+            content: "wrote b".into(),
+            is_error: false,
+        };
+        let _ = note_tool_execution(&mut s, &wname, &wargs, &w1);
+        assert!(s.record_tool_result(ToolMsg {
+            call_id: "w1".into(),
+            result: w1,
+        }));
+        // The batch moved the counters and dirtied the verified flag.
+        assert_eq!(s.edits, edits_before + 1);
+        assert_eq!(s.budget.counters().actions_this_trial, actions_before + 1);
+        assert!(!s.verified_since_write);
+        // The tree rolled the batch back: refund to the snapshot.
+        refund_batch(&mut s, &snap);
+        assert_eq!(s.edits, snap.edits);
+        assert_eq!(
+            s.budget.counters().actions_this_trial,
+            snap.actions_this_trial
+        );
+        assert_eq!(
+            s.budget.counters().same_action_streak,
+            snap.same_action_streak
+        );
+        assert_eq!(s.last_sig, snap.last_sig);
+        assert_eq!(s.last_obs, snap.last_obs);
+        assert_eq!(s.verified_since_write, snap.verified_since_write);
+        assert!(s.verified_since_write);
     }
 }
