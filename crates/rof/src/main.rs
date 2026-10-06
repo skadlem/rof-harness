@@ -365,9 +365,12 @@ fn summarize(events: &[AgentEvent]) -> String {
         .join(" ")
 }
 
+/// Deliverable patch: `Ok` is the full uncut run patch for stdout (never the
+/// 8KiB/200-line evidence bound); `Err` means no start HEAD was recorded
+/// (unborn HEAD / empty workdir) and the run must not exit 0.
 struct RunResult {
     outcome: Outcome,
-    patch: String,
+    patch: Result<String, String>,
     events: Vec<AgentEvent>,
 }
 
@@ -445,8 +448,8 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     if let Some(path) = args.dump_events.as_deref() {
         let _ = std::fs::remove_file(path);
     }
-    // Freeze the run-start HEAD `patch_since_start` diffs from; the loop's own
-    // ensure() is idempotent and reports the same failure as a run error.
+    // Freeze the run-start HEAD `patch_since_start_full` diffs from; the loop's
+    // own ensure() is idempotent and reports the same failure as a run error.
     let tree = TreeService::new(&args.workdir);
     let _ = tree.ensure();
     // Git-exclude after `ensure()`, when `.git` is real: mid-run baselines
@@ -478,11 +481,16 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     .await;
     // The per-Dispatch baseline commits absorb what landed, so the index-based
     // `tree.diff()` reports an empty patch; report the whole run instead.
-    let patch = tree
-        .patch_since_start()
-        .ok()
-        .map(|(_, p)| p.text)
-        .unwrap_or_default();
+    // Full uncut deliverable: no 8KiB/200-line evidence bound, new-file
+    // contents included. `Err` is unborn HEAD / empty workdir (no baseline).
+    let patch = tree.patch_since_start_full().map_err(|e| e.to_string());
+    // Success exits 0 only when the patch computed: a `Done` run with no
+    // baseline becomes a failure outcome, so the existing exit-code path
+    // reports non-zero and `main` prints the stderr warning.
+    let outcome = match (outcome, &patch) {
+        (Outcome::Done, Err(e)) => Outcome::Failed(format!("no baseline: {e}")),
+        (outcome, _) => outcome,
+    };
     eprintln!("ablation {:?}", state.ablation);
     eprintln!("events {}", summarize(emitter.history()));
     RunResult {
@@ -594,8 +602,10 @@ async fn main() {
             std::process::exit(2);
         }
     }
-    if !r.patch.is_empty() {
-        println!("{}", r.patch);
+    match &r.patch {
+        Ok(patch) if !patch.is_empty() => println!("{patch}"),
+        Err(e) => eprintln!("warning: no baseline: {e}"),
+        _ => {}
     }
     std::process::exit(exit_code(&r.outcome));
 }
@@ -960,6 +970,55 @@ mod tests {
         }
     }
 
+    /// One edit call with caller-chosen search/replace (large-fix fixtures).
+    fn edit_resp(path: &str, search: &str, replace: &str) -> Response {
+        Response {
+            message: AssistantMessage {
+                content: "editing".into(),
+                tool_calls: vec![ToolCallRef {
+                    id: "c1".into(),
+                    name: "edit".into(),
+                    args: serde_json::json!({
+                        "path": path,
+                        "search": search,
+                        "replace": replace,
+                    }),
+                }],
+                thinking: None,
+            },
+            stop: StopReason::ToolUse,
+            usage: usage(),
+            latency_ms: 0,
+            attempts: 1,
+            raw_stop_reason: None,
+            retry_usage: None,
+        }
+    }
+
+    /// One whole-file write call (new-file deliverable fixtures).
+    fn write_resp(path: &str, content: &str) -> Response {
+        Response {
+            message: AssistantMessage {
+                content: "writing".into(),
+                tool_calls: vec![ToolCallRef {
+                    id: "c1".into(),
+                    name: "write".into(),
+                    args: serde_json::json!({
+                        "path": path,
+                        "content": content,
+                    }),
+                }],
+                thinking: None,
+            },
+            stop: StopReason::ToolUse,
+            usage: usage(),
+            latency_ms: 0,
+            attempts: 1,
+            raw_stop_reason: None,
+            retry_usage: None,
+        }
+    }
+
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     fn tmp() -> PathBuf {
@@ -1127,11 +1186,96 @@ mod tests {
             std::fs::read_to_string(dir.join("note.txt")).unwrap(),
             "later\n"
         );
+        let patch = r.patch.unwrap();
         assert!(
-            r.patch.contains("-hello") && r.patch.contains("+later"),
-            "patch must span every batch, not just the last: {}",
-            r.patch
+            patch.contains("-hello") && patch.contains("+later"),
+            "patch must span every batch, not just the last: {patch}",
         );
+    }
+
+    #[tokio::test]
+    async fn deliverable_patch_is_full_uncut_large_fix() {
+        // Evidence-bound regression: the old `patch_since_start` cut stdout
+        // at 8KiB/200 lines with a truncation marker; the deliverable path
+        // must carry the whole fix.
+        let dir = tmp();
+        std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
+        let big: String = (0..300)
+            .map(|i| format!("line-{i:04}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"))
+            .collect();
+        assert!(
+            big.len() > 8 * 1024,
+            "fixture must exceed the old byte bound"
+        );
+        let client = ScriptClient::new(vec![
+            edit_resp("note.txt", "hello", &big),
+            text_resp(),
+            text_resp(),
+        ]);
+        let r = execute(&client, &args_for(&dir, None)).await;
+        assert!(matches!(r.outcome, Outcome::Done), "{:?}", r.outcome);
+        let patch = r.patch.unwrap();
+        assert!(
+            patch.len() > 8 * 1024,
+            "deliverable stays uncut: {} bytes",
+            patch.len()
+        );
+        assert!(
+            !patch.contains(snapshot::PATCH_TRUNCATED_MARKER),
+            "no evidence-bound marker in the deliverable"
+        );
+        assert!(
+            patch.contains("line-0000-") && patch.contains("line-0299-"),
+            "head and tail of the large fix survive ({} bytes)",
+            patch.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn deliverable_patch_carries_new_file_contents() {
+        // Untracked regression: the bounded evidence path emitted stub-only
+        // headers for new files; the deliverable must carry their contents.
+        let dir = tmp();
+        std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
+        let client = ScriptClient::new(vec![
+            write_resp(
+                "brand-new.txt",
+                "new-file-contents-marker-7f3a\nsecond line\n",
+            ),
+            text_resp(),
+            text_resp(),
+        ]);
+        let r = execute(&client, &args_for(&dir, None)).await;
+        assert!(matches!(r.outcome, Outcome::Done), "{:?}", r.outcome);
+        let patch = r.patch.unwrap();
+        assert!(
+            patch.contains("brand-new.txt") && patch.contains("new-file-contents-marker-7f3a"),
+            "new-file contents reach the stdout patch: {patch}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unborn_head_is_a_no_baseline_failure_not_silent_empty_patch() {
+        // Empty workdir: `ensure()` records no start HEAD, so the full-patch
+        // fn errs; the run must warn on stderr (the same "no baseline"
+        // message `main` prints) and exit non-zero via a failure outcome —
+        // never a silent empty patch with exit 0.
+        let dir = tmp();
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+        let client = ScriptClient::new(vec![text_resp(), text_resp()]);
+        let r = execute(&client, &args_for(&dir, None)).await;
+        assert!(r.patch.is_err(), "no baseline means no patch");
+        let err = r.patch.unwrap_err();
+        assert!(
+            err.contains("start HEAD"),
+            "snapshot names the cause: {err}"
+        );
+        assert!(
+            matches!(&r.outcome, Outcome::Failed(m) if m.contains("no baseline")),
+            "failure outcome carries the stderr hint: {:?}",
+            r.outcome
+        );
+        assert_eq!(exit_code(&r.outcome), 3);
     }
 
     #[tokio::test]
@@ -1181,10 +1325,10 @@ mod tests {
             dir.join(".rof-events.jsonl").is_file(),
             "default WAL is live on the shipped path"
         );
+        let patch = r.patch.unwrap();
         assert!(
-            !r.patch.contains("dump.jsonl") && !r.patch.contains(".rof-events.jsonl"),
-            "sidecars stay out of the reported patch: {}",
-            r.patch
+            !patch.contains("dump.jsonl") && !patch.contains(".rof-events.jsonl"),
+            "sidecars stay out of the reported patch: {patch}",
         );
     }
 

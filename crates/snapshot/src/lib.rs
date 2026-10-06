@@ -24,6 +24,11 @@ impl DiffSummary {
     }
 }
 
+/// Error type for [`TreeService::patch_since_start_full`]: the same I/O
+/// error the git-overlay helpers already return, named so the
+/// deliverable-patch contract spells its failure mode.
+pub type SnapshotError = Error;
+
 /// Patch-text bounds: either cap alone leaves a hole (many tiny lines fit
 /// in few bytes; one minified line is one line however long).
 pub const PATCH_MAX_BYTES: usize = 8 * 1024;
@@ -135,6 +140,98 @@ impl TreeService {
         let diff = self.diff_at(Some(start))?;
         let patch = self.patch_at(&diff, Some(start))?;
         Ok((diff, patch))
+    }
+
+    /// The whole run's FULL patch for the deliverable path: the same start
+    /// HEAD and tracked `diff --patch` as [`TreeService::patch_since_start`],
+    /// but unbounded (no [`PATCH_MAX_BYTES`]/[`PATCH_MAX_LINES`] cut, no
+    /// [`PATCH_TRUNCATED_MARKER`]) and with new-file CONTENTS for untracked
+    /// paths via `git diff --no-index -- /dev/null <file>` instead of the
+    /// stub-only headers the bounded model-evidence path emits. Unborn HEAD
+    /// (no start recorded) stays `Err`, as today; the caller maps it.
+    pub fn patch_since_start_full(&self) -> std::result::Result<String, SnapshotError> {
+        let start = self.start.get().ok_or_else(|| {
+            other("patch_since_start_full: ensure() has not recorded a start HEAD".into())
+        })?;
+        let diff = self.diff_at(Some(start))?;
+        let raw = self.git(["diff", "--patch"].into_iter().chain(Some(start.as_str())))?;
+        let mut text = String::from_utf8_lossy(&raw.stdout).into_owned();
+        for path in &diff.untracked {
+            for fragment in self.full_untracked_fragments(path)? {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&fragment);
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+            }
+        }
+        Ok(text)
+    }
+
+    /// Full-text fragments for one [`DiffSummary::untracked`] entry: a
+    /// collapsed `dir/` entry expands via `ls-files --others` (which honours
+    /// the bytecode exclude, so ignored junk never leaks into the patch)
+    /// into one `diff --no-index` fragment per file; anything undiffable
+    /// (vanished path, embedded-repo gitlink) falls back to the same stub
+    /// header the bounded path emits, so evidence stays honest.
+    fn full_untracked_fragments(&self, path: &str) -> Result<Vec<String>> {
+        if self.root.join(path).is_dir() {
+            let out = self.git(["ls-files", "--others", "--exclude-standard", "--", path])?;
+            let mut fragments = Vec::new();
+            for entry in String::from_utf8_lossy(&out.stdout).lines() {
+                if entry.is_empty() {
+                    continue;
+                }
+                if self.root.join(entry).is_file() {
+                    fragments.push(self.diff_new_file(entry)?);
+                } else {
+                    fragments.push(self.untracked_stub(entry));
+                }
+            }
+            if fragments.is_empty() {
+                fragments.push(self.untracked_stub(path));
+            }
+            return Ok(fragments);
+        }
+        if self.root.join(path).is_file() {
+            return Ok(vec![self.diff_new_file(path)?]);
+        }
+        Ok(vec![self.untracked_stub(path)])
+    }
+
+    /// New-file contents as a `diff --no-index` fragment against `/dev/null`
+    /// (the empty-blob equivalent): handles text, no-trailing-newline, and
+    /// binary ("Binary files differ") via git itself. `--no-index` exits 1
+    /// on a real diff, so the unchecked status call is read by content: any
+    /// stdout is the fragment; empty stdout means git refused.
+    fn diff_new_file(&self, rel: &str) -> Result<String> {
+        let out = self.git_status(["diff", "--no-index", "--patch", "--", "/dev/null", rel])?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !text.is_empty() {
+            return Ok(text);
+        }
+        if self.root.join(rel).is_file() {
+            return Err(other(format!(
+                "git diff --no-index {rel}: {} | {}",
+                String::from_utf8_lossy(&out.stdout).trim_end(),
+                String::from_utf8_lossy(&out.stderr).trim_end()
+            )));
+        }
+        // Raced away between `diff_at` and now: stub, like the bounded path.
+        Ok(self.untracked_stub(rel))
+    }
+
+    /// Byte-twin of the stub header [`TreeService::patch_at`] emits:
+    /// duplicated (not shared) so the bounded model-evidence path stays
+    /// byte-identical.
+    fn untracked_stub(&self, path: &str) -> String {
+        let shown = match std::fs::metadata(self.root.join(path)).map(|m| m.len()) {
+            Ok(bytes) => format!(" (untracked, new file, {bytes} bytes)"),
+            Err(_) => " (untracked, new file)".to_string(),
+        };
+        format!("--- /dev/null\n+++ b/{path}{shown}\n")
     }
 
     /// `rev = Some(start)`: commit-to-worktree diff; `None`: index-to-worktree
@@ -682,5 +779,95 @@ mod tests {
             std::fs::read_to_string(dir.join("b.rs")).unwrap(),
             "x\ny\nz\n"
         );
+    }
+
+    /// Big-tree fixture for the bound-vs-full pair: a 300-line tracked
+    /// rewrite (blows both caps on its own) plus a 300-line untracked file
+    /// with sentinel content. Returns the tree; the start HEAD is the
+    /// `ensure()` commit, nothing baselined after.
+    fn big_tree(name: &str) -> (PathBuf, TreeService) {
+        let dir = scratch(name);
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        tree.ensure().unwrap();
+        let tracked: String = (0..300)
+            .map(|i| format!("tracked line {i:04} padding xxxxxxxxxxxxxxxxxxxx\n"))
+            .collect();
+        std::fs::write(dir.join("a.rs"), tracked).unwrap();
+        let fresh: String = (0..300)
+            .map(|i| format!("new-file-content line {i:04} padding yyyyyyyyyyyyyyyy\n"))
+            .collect();
+        std::fs::write(dir.join("fresh.rs"), fresh).unwrap();
+        (dir, tree)
+    }
+
+    #[test]
+    fn patch_since_start_full_is_unbounded_with_new_file_contents() {
+        let (_dir, tree) = big_tree("full-big");
+        let full = tree.patch_since_start_full().unwrap();
+        assert!(
+            full.len() > PATCH_MAX_BYTES,
+            "full patch stays over the byte cap: {} bytes",
+            full.len()
+        );
+        assert!(
+            full.lines().count() > PATCH_MAX_LINES,
+            "full patch stays over the line cap: {} lines",
+            full.lines().count()
+        );
+        assert!(
+            !full.contains(PATCH_TRUNCATED_MARKER),
+            "no truncation marker on the full patch"
+        );
+        assert!(
+            full.contains("tracked line 0299"),
+            "tracked tail survives uncut"
+        );
+        assert!(
+            full.contains("+new-file-content line 0299"),
+            "untracked contents present, not stub-only:\n{full}"
+        );
+    }
+
+    #[test]
+    fn bounded_patch_since_start_still_truncates_same_tree() {
+        let (_dir, tree) = big_tree("bounded-big");
+        let (_, bounded) = tree.patch_since_start().unwrap();
+        assert!(bounded.truncated, "bounded variant still cuts");
+        assert!(
+            bounded.text.contains(PATCH_TRUNCATED_MARKER),
+            "bounded variant still marks the cut"
+        );
+        assert!(
+            !bounded.text.contains("new-file-content line 0299"),
+            "bounded untracked stays stub-only"
+        );
+        // Same tree, same tracked bytes: the bounded whole-line prefix
+        // (marker stripped) is a prefix of the unbounded text.
+        let full = tree.patch_since_start_full().unwrap();
+        let prefix = bounded
+            .text
+            .strip_suffix(&format!("{PATCH_TRUNCATED_MARKER}\n"))
+            .unwrap();
+        assert!(
+            full.starts_with(prefix),
+            "tracked bytes identical between paths"
+        );
+        assert!(full.len() > bounded.text.len(), "full is strictly longer");
+    }
+
+    #[test]
+    fn patch_since_start_full_unborn_head_errors_like_bounded() {
+        let dir = scratch("full-unborn");
+        let tree = TreeService::new(&dir);
+        tree.ensure().unwrap(); // empty tree: HEAD stays unborn, no start
+        let bounded = tree.patch_since_start().unwrap_err();
+        let full: SnapshotError = tree.patch_since_start_full().unwrap_err();
+        for e in [&bounded, &full] {
+            assert!(
+                e.to_string().contains("has not recorded a start HEAD"),
+                "unborn HEAD stays Err: {e}"
+            );
+        }
     }
 }
