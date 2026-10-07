@@ -1,10 +1,12 @@
 //! Batch proof: patch splitting, incremental hunks, and bets wiring.
 
+use crate::run::blocking;
 #[cfg(test)]
 use crate::state::ToolMsg;
 use crate::{LoopState, PhaseVerdict};
 use agent_budget::BudgetHalt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tool_core::{ToolOutcome, ToolResult, TOOL_EDIT, TOOL_WRITE};
 
@@ -85,18 +87,22 @@ pub(crate) fn split_patch(patch: &snapshot::PatchText) -> Vec<String> {
 }
 
 /// The batch's patch fragments with the uniform proof flag attached to each.
-pub(crate) fn batch_hunks(
-    tree: &snapshot::TreeService,
+/// Snapshot reads run on the blocking worker (git IO off the executor).
+pub(crate) async fn batch_hunks(
+    tree: Arc<snapshot::TreeService>,
     proof_passed: bool,
 ) -> Result<Vec<(String, bool)>, String> {
-    let diff = tree.diff().map_err(|e| format!("snapshot diff: {e}"))?;
-    let patch = tree
-        .patch(&diff)
-        .map_err(|e| format!("snapshot patch: {e}"))?;
-    Ok(split_patch(&patch)
-        .into_iter()
-        .map(|h| (h, proof_passed))
-        .collect())
+    blocking(move || {
+        let diff = tree.diff().map_err(|e| format!("snapshot diff: {e}"))?;
+        let patch = tree
+            .patch(&diff)
+            .map_err(|e| format!("snapshot patch: {e}"))?;
+        Ok(split_patch(&patch)
+            .into_iter()
+            .map(|h| (h, proof_passed))
+            .collect())
+    })
+    .await
 }
 
 /// Per-hunk incremental proof (Bet A): probe every leading prefix against the
@@ -105,22 +111,34 @@ pub(crate) fn batch_hunks(
 /// ok_k. The bet gate keeps the proven LEADING prefix
 /// ([`bets::split_savepoint`]); a later hunk that passes after a failing
 /// prefix is not proven against committed state and reverts with the rest.
+/// Snapshot restores run on the blocking worker; the probe child stays async.
 /// Leaves the tree at baseline + all hunks (the last prefix); the verdict
 /// mapping below performs the final restore.
 pub(crate) async fn incremental_hunks(
-    tree: &snapshot::TreeService,
+    tree: Arc<snapshot::TreeService>,
     workdir: &Path,
     proof_cmd: &str,
 ) -> Result<Vec<(String, bool)>, String> {
-    let diff = tree.diff().map_err(|e| format!("snapshot diff: {e}"))?;
-    let patch = tree
-        .patch(&diff)
-        .map_err(|e| format!("snapshot patch: {e}"))?;
-    let hunks = split_patch(&patch);
+    let hunks = blocking({
+        let tree = tree.clone();
+        move || {
+            let diff = tree.diff().map_err(|e| format!("snapshot diff: {e}"))?;
+            let patch = tree
+                .patch(&diff)
+                .map_err(|e| format!("snapshot patch: {e}"))?;
+            Ok::<_, String>(split_patch(&patch))
+        }
+    })
+    .await?;
     let mut flags = Vec::with_capacity(hunks.len());
     for k in 0..hunks.len() {
-        tree.restore_hunks(&hunks[..=k])
-            .map_err(|e| format!("snapshot restore: {e}"))?;
+        let prefix = hunks[..=k].to_vec();
+        let tree = tree.clone();
+        blocking(move || {
+            tree.restore_hunks(&prefix)
+                .map_err(|e| format!("snapshot restore: {e}"))
+        })
+        .await?;
         let mut argv = proof_cmd.split_whitespace();
         let bin = argv.next().ok_or_else(|| "proof-cmd empty".to_string())?;
         let ok = tokio::time::timeout(

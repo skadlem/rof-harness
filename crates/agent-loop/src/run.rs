@@ -22,6 +22,7 @@ use agent_log::{Item, ItemKind, LogWriter, LOG_VERSION};
 use provider_core::{AssistantMessage, LlmClient, LlmError, Request, Response, Usage};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 #[cfg(test)]
 use tokio::sync::mpsc;
@@ -141,81 +142,7 @@ pub async fn drive_tick(
             }
         }
         Some(pm) = provider_rx.recv() => {
-            if pm.turn() == state.turn {
-                let owned = pm.clone();
-                state.finish_provider_msg(pm); // usage metered + Attempt appended here...
-                match owned {
-                    ProviderMsg::Partial { text, .. } => {
-                        let id = match state.open_msg {
-                            Some(id) => id,
-                            None => {
-                                let id = state.next_emit_id();
-                                emitter.emit(AgentEvent::MessageStart {
-                                    id,
-                                    role: Role::Assistant,
-                                    partial: Message {
-                                        role: Role::Assistant,
-                                        content: String::new(),
-                                    },
-                                });
-                                state.open_msg = Some(id);
-                                id
-                            }
-                        };
-                        emitter.emit(AgentEvent::MessageUpdate {
-                            id,
-                            delta: MessageDelta {
-                                kind: DeltaKind::Text,
-                                text: Some(text.clone()),
-                            },
-                            partial: Message {
-                                role: Role::Assistant,
-                                content: text,
-                            },
-                        });
-                    }
-                    ProviderMsg::Settled {
-                        message,
-                        stop,
-                        usage,
-                        ..
-                    } => {
-                        // ...and Assistant + ToolCall appends inside step_claim...
-                        // Shared with `run`: the same `step_claim` + frames order.
-                        let outcome = state.step_claim(message.clone(), stop, cfg);
-                        emit_message_frames(state, &message, usage.as_ref(), emitter); // ...before these frames.
-                        match outcome {
-                            ClaimOutcome::Dispatch(calls) => {
-                                for c in &calls {
-                                    emitter.emit(AgentEvent::ToolStart {
-                                        id: c.call_id.clone(),
-                                        name: c.name.clone(),
-                                        args: c.args.clone(),
-                                    });
-                                }
-                            }
-                            ClaimOutcome::VerifyHold => {
-                                // Same as `run`'s `VerifyHold => continue`: the
-                                // turn stays alive (`call_model` latched in
-                                // `step_claim`) and the next request carries
-                                // `verify.hold` on its tail. No `ToolStart`.
-                            }
-                            ClaimOutcome::Done
-                            | ClaimOutcome::Truncated(_)
-                            | ClaimOutcome::Refused
-                            | ClaimOutcome::HardExit(_) => {}
-                        }
-                    }
-                    ProviderMsg::Failed { err, .. } => {
-                        emitter.emit(AgentEvent::Error {
-                            error: AgentError {
-                                code: "provider-failed".into(),
-                                message: err,
-                            },
-                        });
-                    }
-                }
-            }
+            settle_provider_tick(state, pm, emitter, cfg);
             // else: STALE GUARD, dropped without an event.
         }
         Some(tm) = tool_rx.recv() => {
@@ -264,6 +191,95 @@ pub async fn drive_tick(
         });
     }
     verdict
+}
+
+/// Test-harness provider settle: the `drive_tick` provider arm, extracted so
+/// the harness stays under the size target. Same order as `run`'s settle
+/// (`finish_provider_msg`, then `step_claim` + frames). Stale turns drop
+/// without an event.
+#[cfg(test)]
+fn settle_provider_tick(
+    state: &mut LoopState,
+    pm: ProviderMsg,
+    emitter: &mut Emitter,
+    cfg: &RunConfig,
+) {
+    if pm.turn() == state.turn {
+        let owned = pm.clone();
+        state.finish_provider_msg(pm); // usage metered + Attempt appended here...
+        match owned {
+            ProviderMsg::Partial { text, .. } => {
+                let id = match state.open_msg {
+                    Some(id) => id,
+                    None => {
+                        let id = state.next_emit_id();
+                        emitter.emit(AgentEvent::MessageStart {
+                            id,
+                            role: Role::Assistant,
+                            partial: Message {
+                                role: Role::Assistant,
+                                content: String::new(),
+                            },
+                        });
+                        state.open_msg = Some(id);
+                        id
+                    }
+                };
+                emitter.emit(AgentEvent::MessageUpdate {
+                    id,
+                    delta: MessageDelta {
+                        kind: DeltaKind::Text,
+                        text: Some(text.clone()),
+                    },
+                    partial: Message {
+                        role: Role::Assistant,
+                        content: text,
+                    },
+                });
+            }
+            ProviderMsg::Settled {
+                message,
+                stop,
+                usage,
+                ..
+            } => {
+                // ...and Assistant + ToolCall appends inside step_claim...
+                // Shared with `run`: the same `step_claim` + frames order.
+                let outcome = state.step_claim(message.clone(), stop, cfg);
+                emit_message_frames(state, &message, usage.as_ref(), emitter); // ...before these frames.
+                match outcome {
+                    ClaimOutcome::Dispatch(calls) => {
+                        for c in &calls {
+                            emitter.emit(AgentEvent::ToolStart {
+                                id: c.call_id.clone(),
+                                name: c.name.clone(),
+                                args: c.args.clone(),
+                            });
+                        }
+                    }
+                    ClaimOutcome::VerifyHold => {
+                        // Same as `run`'s `VerifyHold => continue`: the
+                        // turn stays alive (`call_model` latched in
+                        // `step_claim`) and the next request carries
+                        // `verify.hold` on its tail. No `ToolStart`.
+                    }
+                    ClaimOutcome::Done
+                    | ClaimOutcome::Truncated(_)
+                    | ClaimOutcome::Refused
+                    | ClaimOutcome::HardExit(_) => {}
+                }
+            }
+            ProviderMsg::Failed { err, .. } => {
+                emitter.emit(AgentEvent::Error {
+                    error: AgentError {
+                        code: "provider-failed".into(),
+                        message: err,
+                    },
+                });
+            }
+        }
+    }
+    // else: STALE GUARD, dropped without an event.
 }
 
 /// Headless run knobs. `drain_timeout` defaults to 30s (unattended runs must
@@ -326,22 +342,6 @@ pub struct Run<'a, P> {
     pub cfg: RunConfig,
 }
 
-/// Append-only tail sync: the vec is the mirror, the file is the record.
-/// A failed pre-effect append is a hard failure (never run from
-/// process-only state).
-pub(crate) fn sync_log(
-    items: &[Item],
-    writer: Option<&mut LogWriter>,
-    synced: &mut usize,
-) -> std::io::Result<()> {
-    let Some(w) = writer else { return Ok(()) };
-    while *synced < items.len() {
-        w.append(&items[*synced])?;
-        *synced += 1;
-    }
-    Ok(())
-}
-
 pub(crate) fn event_outcome(outcome: &Outcome) -> EventRunOutcome {
     match outcome {
         Outcome::Done => EventRunOutcome::Passed,
@@ -368,6 +368,21 @@ pub(crate) fn hopped_turn_reason(state: &LoopState, before: u64) -> EventTurnEnd
         .unwrap_or(EventTurnEndReason::Completed)
 }
 
+/// Blocking fs/git work off the async executor: snapshot, file-map, pins,
+/// and log IO all run here so a slow disk never stalls the executor. These
+/// complete fast and are not raced against cancel (abandoning a half-done
+/// rollback would leave the workdir unknown); the provider/tool races that
+/// must return promptly keep their own `select!`.
+pub(crate) async fn blocking<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .expect("blocking worker panicked")
+}
+
 /// Private run assembly: the loop state, the snapshot tree, the append-only
 /// log writer, the live emitter, and how much of the log is durable. Every
 /// phase below goes through [`RunCtx::record`] (append + sync + emit) and
@@ -382,7 +397,7 @@ struct RunCtx<'s, 'r, P> {
     emitter: &'r mut Emitter,
     bets: &'r dyn BetsHook,
     cfg: RunConfig,
-    tree: snapshot::TreeService,
+    tree: Arc<snapshot::TreeService>,
     writer: Option<LogWriter>,
     synced: usize,
     run_id: u64,
@@ -410,21 +425,51 @@ struct BatchReport {
 }
 
 impl<P> RunCtx<'_, '_, P> {
-    /// Tail sync: `Err` is already the terminal log-append failure; the
-    /// caller finishes with it.
-    fn sync(&mut self) -> Result<(), Outcome> {
-        sync_log(&self.state.items, self.writer.as_mut(), &mut self.synced).map_err(|_| {
-            Outcome::Failed {
+    /// Tail sync on the blocking worker: the pending rows are cloned
+    /// (usually one or two small items; empty tails skip the thread hop
+    /// entirely) and appended + fsynced off the executor, preserving the old
+    /// append-only tail sync's stop-at-first-error progress (the vec is the
+    /// mirror, the file is the record; a failed pre-effect append is a hard
+    /// failure, never run from process-only state). `Err` is already the
+    /// terminal log-append failure; the caller finishes with it.
+    async fn sync(&mut self) -> Result<(), Outcome> {
+        if self.writer.is_none() || self.synced >= self.state.items.len() {
+            return Ok(());
+        }
+        let writer = self.writer.take().expect("writer checked above");
+        let pending: Vec<Item> = self.state.items[self.synced..].to_vec();
+        let base = self.synced;
+        let (writer, done, failed) = blocking(move || {
+            let mut writer = writer;
+            let mut done = base;
+            let mut failed = false;
+            for item in &pending {
+                match writer.append(item) {
+                    Ok(()) => done += 1,
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            (writer, done, failed)
+        })
+        .await;
+        self.writer = Some(writer);
+        self.synced = done;
+        if failed {
+            return Err(Outcome::Failed {
                 kind: FailureKind::Log,
                 message: "log append failed".into(),
-            }
-        })
+            });
+        }
+        Ok(())
     }
 
     /// Durable TurnEnd first, terminal frames second — never inverted. The
     /// emit still runs when the sync fails so live always sees a terminal
     /// frame.
-    fn finish(&mut self, outcome: Outcome) -> Outcome {
+    async fn finish(&mut self, outcome: Outcome) -> Outcome {
         let reason = outcome_log_reason(&outcome, self.state.turn_reason.as_ref());
         self.state.stick_turn_reason(reason.clone());
         let turn = self.state.turn;
@@ -436,7 +481,8 @@ impl<P> RunCtx<'_, '_, P> {
                 reason: reason.clone(),
             },
         );
-        let _ = sync_log(&self.state.items, self.writer.as_mut(), &mut self.synced);
+        // Best-effort durable close: the frames emit even when this fails.
+        let _ = self.sync().await;
         self.emitter.emit(AgentEvent::TurnEnd {
             turn,
             reason: turn_end_reason_to_event(&reason),
@@ -455,9 +501,9 @@ impl<P> RunCtx<'_, '_, P> {
     /// `record_tool_result`, `finish_provider_msg`) own their appends, so
     /// their frames still emit after an explicit `sync` at the same site —
     /// the same order, pinned by the characterization tests.
-    fn record(&mut self, kind: ItemKind, frame: Option<AgentEvent>) -> Result<(), Outcome> {
+    async fn record(&mut self, kind: ItemKind, frame: Option<AgentEvent>) -> Result<(), Outcome> {
         append_to(&mut self.state.items, kind);
-        self.sync()?;
+        self.sync().await?;
         if let Some(frame) = frame {
             self.emitter.emit(frame);
         }
@@ -466,11 +512,11 @@ impl<P> RunCtx<'_, '_, P> {
 
     /// Follow-up opened a new turn mid-`terminate` (closer already appended
     /// there): sync it, then emit its frame before the new TurnStart.
-    fn close_hop(&mut self, before: u64) -> Result<(), Outcome> {
+    async fn close_hop(&mut self, before: u64) -> Result<(), Outcome> {
         if self.state.turn == before || before == 0 {
             return Ok(());
         }
-        self.sync()?;
+        self.sync().await?;
         let reason = hopped_turn_reason(self.state, before);
         let usage = self.state.usage_totals.clone();
         self.emitter.emit(AgentEvent::TurnEnd {
@@ -487,11 +533,11 @@ impl<P> RunCtx<'_, '_, P> {
     /// Shared tail for terminal-ish claims (Done past its fast path,
     /// Truncated, and the post-batch verdict): terminate, hop the turn, or
     /// park Done when idle.
-    fn settle_terminal(&mut self, before: u64) -> Result<(), Outcome> {
+    async fn settle_terminal(&mut self, before: u64) -> Result<(), Outcome> {
         match self.state.terminate(&self.cfg) {
             PhaseVerdict::Return(o) => Err(o),
             _ => {
-                self.close_hop(before)?;
+                self.close_hop(before).await?;
                 if self.state.phase == Phase::Idle && self.state.is_idle() {
                     return Err(Outcome::Done);
                 }
@@ -513,7 +559,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             goal: self.cfg.goal.clone(),
         });
         if let Some(p) = self.cfg.log_path.clone() {
-            match LogWriter::open(&p) {
+            match blocking(move || LogWriter::open(&p)).await {
                 Ok(w) => self.writer = Some(w),
                 Err(e) => {
                     let o = Outcome::Failed {
@@ -531,33 +577,37 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         if self.state.items.is_empty() {
             // ponytail: the Header row has no live frame, so `record` covers
             // it with `None` instead of a bespoke append-then-sync.
-            if let Err(o) = self.record(
-                ItemKind::Header {
-                    version: LOG_VERSION,
-                    session_id: format!("run-{}", self.run_id),
-                    cwd: self.workdir.to_string_lossy().into_owned(),
-                    model: self.cfg.model.clone(),
-                },
-                None,
-            ) {
-                return Some(self.finish(o));
+            if let Err(o) = self
+                .record(
+                    ItemKind::Header {
+                        version: LOG_VERSION,
+                        session_id: format!("run-{}", self.run_id),
+                        cwd: self.workdir.to_string_lossy().into_owned(),
+                        model: self.cfg.model.clone(),
+                    },
+                    None,
+                )
+                .await
+            {
+                return Some(self.finish(o).await);
             }
         }
-        if let Err(e) = self.tree.ensure() {
+        let tree = self.tree.clone();
+        if let Err(e) = blocking(move || tree.ensure()).await {
             let o = Outcome::Failed {
                 kind: FailureKind::Snapshot,
                 message: format!("snapshot ensure: {e}"),
             };
-            return Some(self.finish(o));
+            return Some(self.finish(o).await);
         }
-        if let Err(o) = self.sync() {
-            return Some(self.finish(o));
+        if let Err(o) = self.sync().await {
+            return Some(self.finish(o).await);
         }
         for input in inputs {
             let before = self.state.turn;
             self.state.apply_input(input);
-            if let Err(o) = self.sync() {
-                return Some(self.finish(o));
+            if let Err(o) = self.sync().await {
+                return Some(self.finish(o).await);
             }
             if self.state.turn != before {
                 self.emitter.emit(AgentEvent::TurnStart {
@@ -579,21 +629,27 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         // Prefix-cache head: freeze the file map once, before the first request;
         // mid-run edits must not rotate the system message. Named-file pins freeze
         // on the same beat (dropout rule in `build_request`).
-        self.state.file_map = Some(context::file_map(self.workdir, 200).join("\n"));
-        self.state.pins = Some(pin_snapshot(&self.cfg.context_files, self.workdir));
+        // Prefix-cache freeze on the blocking worker: the directory walk
+        // and pin reads are fs IO, never executor work.
+        let root = self.workdir.to_path_buf();
+        self.state.file_map =
+            Some(blocking(move || context::file_map(&root, 200).join("\n")).await);
+        let root = self.workdir.to_path_buf();
+        let files = self.cfg.context_files.clone();
+        self.state.pins = Some(blocking(move || pin_snapshot(&files, &root)).await);
         None
     }
 
     /// Loop head: cancel latch, steering admission, bets step head, then the
     /// provider admission gate with `terminate` as the fallback.
     /// Grace runs inside `start_provider_call`, the halt lands after.
-    fn step_head(&mut self) -> Result<Head, Outcome> {
+    async fn step_head(&mut self) -> Result<Head, Outcome> {
         if self.cancel.is_cancelled() {
             self.state.stop_hard = true;
             self.state.gate.begin_abort();
         }
         self.state.admit_steering();
-        self.sync()?;
+        self.sync().await?;
         // Bets site 1: step head.
         if let PhaseVerdict::Return(o) = self.bets.on_step_head(self.state.step as u64) {
             return Ok(Head::Exit(o));
@@ -691,7 +747,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             cancelled,
             usage,
         });
-        self.sync()?;
+        self.sync().await?;
         self.emitter.emit(AgentEvent::Error {
             error: AgentError {
                 code: "provider-failed".into(),
@@ -747,7 +803,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         let outcome = self
             .state
             .step_claim(resp.message.clone(), resp.stop, &self.cfg);
-        self.sync()?;
+        self.sync().await?;
         emit_message_frames(self.state, &resp.message, Some(&billed), self.emitter);
         match outcome {
             ClaimOutcome::VerifyHold => {
@@ -755,7 +811,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 // the next request carries the directive on its own row.
                 // Durable hold record syncs at the next loop head before
                 // that request, so the file never lags the wire.
-                self.sync()?;
+                self.sync().await?;
                 Ok(())
             }
             ClaimOutcome::Done => {
@@ -776,11 +832,11 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                     return Err(Outcome::Done);
                 }
                 let before = self.state.turn;
-                self.settle_terminal(before)
+                self.settle_terminal(before).await
             }
             ClaimOutcome::Truncated(_) | ClaimOutcome::Refused => {
                 let before = self.state.turn;
-                self.settle_terminal(before)
+                self.settle_terminal(before).await
             }
             ClaimOutcome::HardExit(label) => {
                 self.state.fatal_error = Some(label.clone());
@@ -851,7 +907,8 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         calls: Vec<ToolCall>,
         turn_token: &CancellationToken,
     ) -> Result<BatchReport, Outcome> {
-        if let Err(e) = self.tree.baseline() {
+        let tree = self.tree.clone();
+        if let Err(e) = blocking(move || tree.baseline()).await {
             return Err(Outcome::Failed {
                 kind: FailureKind::Snapshot,
                 message: format!("snapshot baseline: {e}"),
@@ -903,7 +960,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             // tail and the row keeps the exact model text.
             // Shared with `drive_tick` (`settle_tool_tail`).
             settle_tool_tail(self.state, &self.cfg);
-            self.sync()?;
+            self.sync().await?;
             if let Some(done) = self
                 .state
                 .tool_calls
@@ -932,8 +989,8 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         };
         let hunks = {
             let probe = match &self.cfg.proof_cmd {
-                Some(cmd) => incremental_hunks(&self.tree, self.workdir, cmd).await,
-                None => batch_hunks(&self.tree, !batch_failed),
+                Some(cmd) => incremental_hunks(self.tree.clone(), self.workdir, cmd).await,
+                None => batch_hunks(self.tree.clone(), !batch_failed).await,
             };
             match probe {
                 Ok(h) => h,
@@ -962,9 +1019,11 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                     will_retry: true,
                 },
                 None,
-            )?;
+            )
+            .await?;
             self.state.push_directive(ROLLBACK_NOTICE.into(), &self.cfg);
-            if let Err(e) = self.tree.rollback() {
+            let tree = self.tree.clone();
+            if let Err(e) = blocking(move || tree.rollback()).await {
                 return Err(Outcome::Failed {
                     kind: FailureKind::Snapshot,
                     message: format!("snapshot rollback: {e}"),
@@ -1020,7 +1079,8 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         match verdict {
             bets::CommitVerdict::Committed => {}
             bets::CommitVerdict::Partial { savepoint } => {
-                if let Err(e) = self.tree.restore_hunks(&savepoint.kept_hunks) {
+                let tree = self.tree.clone();
+                if let Err(e) = blocking(move || tree.restore_hunks(&savepoint.kept_hunks)).await {
                     return Err(Outcome::Failed {
                         kind: FailureKind::Snapshot,
                         message: format!("snapshot restore: {e}"),
@@ -1028,7 +1088,8 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 }
             }
             bets::CommitVerdict::Aborted { .. } => {
-                if let Err(e) = self.tree.rollback() {
+                let tree = self.tree.clone();
+                if let Err(e) = blocking(move || tree.rollback()).await {
                     return Err(Outcome::Failed {
                         kind: FailureKind::Snapshot,
                         message: format!("snapshot rollback: {e}"),
@@ -1046,16 +1107,16 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             return Err(o);
         }
         let before = self.state.turn;
-        self.settle_terminal(before)
+        self.settle_terminal(before).await
     }
 
     /// Headless drive: one step head + provider round per turn until a
     /// phase returns terminal. Every `Err` is unfinished; `finish` runs it.
     async fn drive(&mut self) -> Outcome {
         loop {
-            let token = match self.step_head() {
-                Err(o) => return self.finish(o),
-                Ok(Head::Exit(o)) => return self.finish(o),
+            let token = match self.step_head().await {
+                Err(o) => return self.finish(o).await,
+                Ok(Head::Exit(o)) => return self.finish(o).await,
                 Ok(Head::Yield) => {
                     tokio::task::yield_now().await;
                     continue;
@@ -1064,7 +1125,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 Ok(Head::Call(token)) => token,
             };
             if let Err(o) = self.provider_round(token).await {
-                return self.finish(o);
+                return self.finish(o).await;
             }
         }
     }
@@ -1103,7 +1164,7 @@ pub async fn run<P: LlmClient>(
         bets,
         cfg,
     } = r;
-    let tree = snapshot::TreeService::new(workdir);
+    let tree = Arc::new(snapshot::TreeService::new(workdir));
     let mut ctx = RunCtx {
         state,
         provider,
