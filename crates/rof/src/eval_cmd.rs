@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::cli::{parse_table, Flag};
+
 pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only]";
 
 #[derive(Debug, PartialEq)]
@@ -14,53 +16,88 @@ pub(crate) struct EvalArgs {
     pub winnability_only: bool,
 }
 
+#[derive(Default)]
+struct EvalBuilder {
+    tasks_dir: Option<String>,
+    ids: Vec<String>,
+    out_dir: Option<String>,
+    report: Option<String>,
+    winnability_only: bool,
+}
+
+fn set_tasks_dir(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.tasks_dir = v;
+    Ok(())
+}
+
+fn set_ids(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.ids = v
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(())
+}
+
+fn set_out_dir(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.out_dir = v;
+    Ok(())
+}
+
+fn set_report(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.report = v;
+    Ok(())
+}
+
+fn set_winnability_only(b: &mut EvalBuilder, _: Option<String>) -> Result<(), String> {
+    b.winnability_only = true;
+    Ok(())
+}
+
+const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
+    Flag {
+        name: "--tasks-dir",
+        takes_value: true,
+        set: set_tasks_dir,
+    },
+    Flag {
+        name: "--ids",
+        takes_value: true,
+        set: set_ids,
+    },
+    Flag {
+        name: "--out-dir",
+        takes_value: true,
+        set: set_out_dir,
+    },
+    Flag {
+        name: "--report",
+        takes_value: true,
+        set: set_report,
+    },
+    Flag {
+        name: "--winnability-only",
+        takes_value: false,
+        set: set_winnability_only,
+    },
+];
+
 pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
-    let a: Vec<&str> = argv.iter().map(String::as_str).collect();
-    if a.len() < 2 || a[1] != "eval" {
-        return Err(EVAL_USAGE.into());
-    }
-    let (mut tasks_dir, mut ids, mut out_dir, mut report) = (None, Vec::new(), None, None);
-    let mut winnability_only = false;
-    let mut i = 2;
-    while i < a.len() {
-        let flag = a[i];
-        let (k, inline) = match flag.split_once('=') {
-            Some((k, v)) => (k, Some(v.to_string())),
-            None => (flag, None),
-        };
-        let take = |i: &mut usize, inline: Option<String>| -> Result<String, String> {
-            if let Some(v) = inline {
-                return Ok(v);
-            }
-            *i += 1;
-            a.get(*i)
-                .map(|s| (*s).to_string())
-                .ok_or_else(|| format!("{k} needs a value"))
-        };
-        match k {
-            "--tasks-dir" => tasks_dir = Some(take(&mut i, inline)?),
-            "--ids" => {
-                ids = take(&mut i, inline)?
-                    .split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            }
-            "--out-dir" => out_dir = Some(take(&mut i, inline)?),
-            "--report" => report = Some(take(&mut i, inline)?),
-            "--winnability-only" => {
-                winnability_only = true;
-            }
-            _ => return Err(EVAL_USAGE.into()),
-        }
-        i += 1;
-    }
+    let b = parse_table(
+        argv,
+        "eval",
+        EVAL_USAGE,
+        |_| EVAL_USAGE.into(),
+        EVAL_FLAGS,
+        EvalBuilder::default(),
+    )?;
     Ok(EvalArgs {
-        tasks_dir: PathBuf::from(tasks_dir.ok_or("missing --tasks-dir")?),
-        ids,
-        out_dir: PathBuf::from(out_dir.unwrap_or_else(|| "/tmp/rof-eval-out".into())),
-        report: report.map(PathBuf::from),
-        winnability_only,
+        tasks_dir: PathBuf::from(b.tasks_dir.ok_or("missing --tasks-dir")?),
+        ids: b.ids,
+        out_dir: PathBuf::from(b.out_dir.unwrap_or_else(|| "/tmp/rof-eval-out".into())),
+        report: b.report.map(PathBuf::from),
+        winnability_only: b.winnability_only,
     })
 }
 

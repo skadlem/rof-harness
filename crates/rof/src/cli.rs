@@ -46,26 +46,30 @@ pub(crate) struct Args {
     pub compaction: Option<f64>,
 }
 
-pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
+/// One flag definition: the long name, whether it takes a value, and the
+/// setter that applies the value (`None` for bare bool flags) to the
+/// builder. Table-driven so each flag is defined once; [`parse_table`] owns
+/// `--flag value` / `--flag=value` splitting, missing-value errors, and
+/// unknown-flag errors for both subcommands. No new dependency: the parser
+/// stays hand-rolled.
+pub(crate) struct Flag<B> {
+    pub name: &'static str,
+    pub takes_value: bool,
+    pub set: fn(&mut B, Option<String>) -> Result<(), String>,
+}
+
+pub(crate) fn parse_table<B>(
+    argv: &[String],
+    cmd: &str,
+    usage: &str,
+    unknown: impl Fn(&str) -> String,
+    table: &[Flag<B>],
+    mut b: B,
+) -> Result<B, String> {
     let a: Vec<&str> = argv.iter().map(String::as_str).collect();
-    if a.len() < 2 || a[1] != "run" {
-        return Err(USAGE.into());
+    if a.len() < 2 || a[1] != cmd {
+        return Err(usage.into());
     }
-    let (mut goal, mut workdir, mut model, mut endpoint, mut steps, mut dump) =
-        (None, None, None, None, None, None);
-    let mut log_path: Option<String> = None;
-    let mut no_log = false;
-    let mut api_key_env = "OPENAI_API_KEY".to_string();
-    let mut headers: Vec<String> = Vec::new();
-    let mut actions: Option<u32> = None;
-    let mut allow = Vec::new();
-    let mut context_files = Vec::new();
-    let mut max_tokens: Option<usize> = None;
-    let mut budget_tokens: Option<u64> = None;
-    let mut proof_cmd: Option<String> = None;
-    let mut incentives = agent_loop::IncentivesLevel::Full;
-    let mut bets = false;
-    let mut compaction: Option<f64> = None;
     let mut i = 2;
     while i < a.len() {
         let flag = a[i];
@@ -73,121 +77,320 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
             Some((k, v)) => (k, Some(v.to_string())),
             None => (flag, None),
         };
-        let take = |i: &mut usize, inline: Option<String>| -> Result<String, String> {
-            if let Some(v) = inline {
-                return Ok(v);
-            }
-            *i += 1;
-            a.get(*i)
-                .map(|s| (*s).to_string())
-                .ok_or_else(|| format!("{k} needs a value"))
+        let Some(def) = table.iter().find(|f| f.name == k) else {
+            return Err(unknown(k));
         };
-        match k {
-            "--goal" => goal = Some(take(&mut i, inline)?),
-            "--workdir" => workdir = Some(take(&mut i, inline)?),
-            "--model" => model = Some(take(&mut i, inline)?),
-            "--endpoint" => endpoint = Some(take(&mut i, inline)?),
-            "--dump-events" => dump = Some(take(&mut i, inline)?),
-            "--log-path" => log_path = Some(take(&mut i, inline)?),
-            "--no-log" => {
-                no_log = true;
-            }
-            "--allow-cmd" => allow.push(take(&mut i, inline)?),
-            "--context-file" => context_files.push(take(&mut i, inline)?),
-            "--max-tokens" => {
-                let s = take(&mut i, inline)?;
-                max_tokens =
-                    Some(s.parse().map_err(|_| {
-                        format!("--max-tokens needs a positive integer, got {s:?}")
-                    })?);
-            }
-            "--budget-tokens" => {
-                let s = take(&mut i, inline)?;
-                budget_tokens =
-                    Some(s.parse().map_err(|_| {
-                        format!("--budget-tokens needs a positive integer, got {s:?}")
-                    })?);
-            }
-            "--budget-steps" => {
-                let s = take(&mut i, inline)?;
-                let n: u32 = s
-                    .parse()
-                    .map_err(|_| format!("--budget-steps needs a positive integer, got {s:?}"))?;
-                if n == 0 {
-                    return Err("--budget-steps must be > 0".into());
+        let v = if def.takes_value {
+            Some(match inline {
+                Some(v) => v,
+                None => {
+                    i += 1;
+                    a.get(i)
+                        .map(|s| (*s).to_string())
+                        .ok_or_else(|| format!("{k} needs a value"))?
                 }
-                steps = Some(n);
-            }
-            "--budget-actions" => {
-                let s = take(&mut i, inline)?;
-                let n: u32 = s
-                    .parse()
-                    .map_err(|_| format!("--budget-actions needs a positive integer, got {s:?}"))?;
-                if n == 0 {
-                    return Err("--budget-actions must be > 0".into());
-                }
-                actions = Some(n);
-            }
-            "--proof-cmd" => {
-                proof_cmd = Some(take(&mut i, inline)?);
-            }
-            "--api-key-env" => {
-                api_key_env = take(&mut i, inline)?;
-            }
-            "--header" => {
-                headers.push(take(&mut i, inline)?);
-            }
-            "--incentives" => {
-                incentives = match take(&mut i, inline)?.as_str() {
-                    "base" => agent_loop::IncentivesLevel::Base,
-                    "contract" => agent_loop::IncentivesLevel::Contract,
-                    "full" => agent_loop::IncentivesLevel::Full,
-                    other => {
-                        return Err(format!(
-                            "--incentives needs base|contract|full, got {other:?}"
-                        ))
-                    }
-                };
-            }
-            "--bets" => {
-                bets = true;
-            }
-            "--compaction" => {
-                let s = take(&mut i, inline)?;
-                let f: f64 = s
-                    .parse()
-                    .map_err(|_| format!("--compaction needs a fraction in (0, 1], got {s:?}"))?;
-                if !f.is_finite() || f <= 0.0 || f > 1.0 {
-                    return Err(format!(
-                        "--compaction needs a fraction in (0, 1], got {s:?}"
-                    ));
-                }
-                compaction = Some(f);
-            }
-            other => return Err(format!("unknown flag {other:?}\n{USAGE}")),
-        }
+            })
+        } else {
+            None
+        };
+        (def.set)(&mut b, v)?;
         i += 1;
     }
+    Ok(b)
+}
+
+#[derive(Default)]
+struct RunBuilder {
+    goal: Option<String>,
+    workdir: Option<String>,
+    model: Option<String>,
+    endpoint: Option<String>,
+    api_key_env: Option<String>,
+    headers: Vec<String>,
+    allow_cmd: Vec<String>,
+    budget_steps: Option<u32>,
+    budget_actions: Option<u32>,
+    budget_tokens: Option<u64>,
+    max_tokens: Option<usize>,
+    context_files: Vec<String>,
+    dump_events: Option<String>,
+    log_path: Option<String>,
+    no_log: bool,
+    proof_cmd: Option<String>,
+    incentives: Option<agent_loop::IncentivesLevel>,
+    bets: bool,
+    compaction: Option<f64>,
+}
+
+fn set_goal(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.goal = v;
+    Ok(())
+}
+
+fn set_workdir(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.workdir = v;
+    Ok(())
+}
+
+fn set_model(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.model = v;
+    Ok(())
+}
+
+fn set_endpoint(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.endpoint = v;
+    Ok(())
+}
+
+fn set_dump_events(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.dump_events = v;
+    Ok(())
+}
+
+fn set_log_path(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.log_path = v;
+    Ok(())
+}
+
+fn set_no_log(b: &mut RunBuilder, _: Option<String>) -> Result<(), String> {
+    b.no_log = true;
+    Ok(())
+}
+
+fn set_allow_cmd(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    if let Some(v) = v {
+        b.allow_cmd.push(v);
+    }
+    Ok(())
+}
+
+fn set_context_file(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    if let Some(v) = v {
+        b.context_files.push(v);
+    }
+    Ok(())
+}
+
+fn set_max_tokens(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    b.max_tokens = Some(
+        s.parse()
+            .map_err(|_| format!("--max-tokens needs a positive integer, got {s:?}"))?,
+    );
+    Ok(())
+}
+
+fn set_budget_tokens(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    b.budget_tokens = Some(
+        s.parse()
+            .map_err(|_| format!("--budget-tokens needs a positive integer, got {s:?}"))?,
+    );
+    Ok(())
+}
+
+fn set_budget_steps(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    let n: u32 = s
+        .parse()
+        .map_err(|_| format!("--budget-steps needs a positive integer, got {s:?}"))?;
+    if n == 0 {
+        return Err("--budget-steps must be > 0".into());
+    }
+    b.budget_steps = Some(n);
+    Ok(())
+}
+
+fn set_budget_actions(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    let n: u32 = s
+        .parse()
+        .map_err(|_| format!("--budget-actions needs a positive integer, got {s:?}"))?;
+    if n == 0 {
+        return Err("--budget-actions must be > 0".into());
+    }
+    b.budget_actions = Some(n);
+    Ok(())
+}
+
+fn set_proof_cmd(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.proof_cmd = v;
+    Ok(())
+}
+
+fn set_api_key_env(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.api_key_env = v;
+    Ok(())
+}
+
+fn set_header(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    if let Some(v) = v {
+        b.headers.push(v);
+    }
+    Ok(())
+}
+
+fn set_incentives(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.incentives = Some(match v.as_deref() {
+        Some("base") => agent_loop::IncentivesLevel::Base,
+        Some("contract") => agent_loop::IncentivesLevel::Contract,
+        Some("full") => agent_loop::IncentivesLevel::Full,
+        other => {
+            let other = other.unwrap_or_default();
+            return Err(format!(
+                "--incentives needs base|contract|full, got {other:?}"
+            ));
+        }
+    });
+    Ok(())
+}
+
+fn set_bets(b: &mut RunBuilder, _: Option<String>) -> Result<(), String> {
+    b.bets = true;
+    Ok(())
+}
+
+fn set_compaction(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    let f: f64 = s
+        .parse()
+        .map_err(|_| format!("--compaction needs a fraction in (0, 1], got {s:?}"))?;
+    if !f.is_finite() || f <= 0.0 || f > 1.0 {
+        return Err(format!(
+            "--compaction needs a fraction in (0, 1], got {s:?}"
+        ));
+    }
+    b.compaction = Some(f);
+    Ok(())
+}
+
+const RUN_FLAGS: &[Flag<RunBuilder>] = &[
+    Flag {
+        name: "--goal",
+        takes_value: true,
+        set: set_goal,
+    },
+    Flag {
+        name: "--workdir",
+        takes_value: true,
+        set: set_workdir,
+    },
+    Flag {
+        name: "--model",
+        takes_value: true,
+        set: set_model,
+    },
+    Flag {
+        name: "--endpoint",
+        takes_value: true,
+        set: set_endpoint,
+    },
+    Flag {
+        name: "--dump-events",
+        takes_value: true,
+        set: set_dump_events,
+    },
+    Flag {
+        name: "--log-path",
+        takes_value: true,
+        set: set_log_path,
+    },
+    Flag {
+        name: "--no-log",
+        takes_value: false,
+        set: set_no_log,
+    },
+    Flag {
+        name: "--allow-cmd",
+        takes_value: true,
+        set: set_allow_cmd,
+    },
+    Flag {
+        name: "--context-file",
+        takes_value: true,
+        set: set_context_file,
+    },
+    Flag {
+        name: "--max-tokens",
+        takes_value: true,
+        set: set_max_tokens,
+    },
+    Flag {
+        name: "--budget-tokens",
+        takes_value: true,
+        set: set_budget_tokens,
+    },
+    Flag {
+        name: "--budget-steps",
+        takes_value: true,
+        set: set_budget_steps,
+    },
+    Flag {
+        name: "--budget-actions",
+        takes_value: true,
+        set: set_budget_actions,
+    },
+    Flag {
+        name: "--proof-cmd",
+        takes_value: true,
+        set: set_proof_cmd,
+    },
+    Flag {
+        name: "--api-key-env",
+        takes_value: true,
+        set: set_api_key_env,
+    },
+    Flag {
+        name: "--header",
+        takes_value: true,
+        set: set_header,
+    },
+    Flag {
+        name: "--incentives",
+        takes_value: true,
+        set: set_incentives,
+    },
+    Flag {
+        name: "--bets",
+        takes_value: false,
+        set: set_bets,
+    },
+    Flag {
+        name: "--compaction",
+        takes_value: true,
+        set: set_compaction,
+    },
+];
+
+pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
+    let b = parse_table(
+        argv,
+        "run",
+        USAGE,
+        |k| format!("unknown flag {k:?}\n{USAGE}"),
+        RUN_FLAGS,
+        RunBuilder::default(),
+    )?;
     Ok(Args {
-        goal: goal.ok_or("missing --goal")?,
-        context_files,
-        max_tokens,
-        workdir: PathBuf::from(workdir.ok_or("missing --workdir")?),
-        model: model.ok_or("missing --model")?,
-        endpoint,
-        api_key_env,
-        headers,
-        allow_cmd: allow,
-        budget_steps: steps,
-        budget_actions: actions,
-        budget_tokens,
-        dump_events: dump,
-        log_path,
-        no_log,
-        proof_cmd,
-        incentives,
-        bets,
-        compaction,
+        goal: b.goal.ok_or("missing --goal")?,
+        context_files: b.context_files,
+        max_tokens: b.max_tokens,
+        workdir: PathBuf::from(b.workdir.ok_or("missing --workdir")?),
+        model: b.model.ok_or("missing --model")?,
+        endpoint: b.endpoint,
+        api_key_env: b.api_key_env.unwrap_or_else(|| "OPENAI_API_KEY".into()),
+        headers: b.headers,
+        allow_cmd: b.allow_cmd,
+        budget_steps: b.budget_steps,
+        budget_actions: b.budget_actions,
+        budget_tokens: b.budget_tokens,
+        dump_events: b.dump_events,
+        log_path: b.log_path,
+        no_log: b.no_log,
+        proof_cmd: b.proof_cmd,
+        incentives: b.incentives.unwrap_or(agent_loop::IncentivesLevel::Full),
+        bets: b.bets,
+        compaction: b.compaction,
     })
 }
 
