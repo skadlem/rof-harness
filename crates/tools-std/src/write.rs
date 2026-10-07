@@ -50,7 +50,7 @@ fn create_parent_dirs(root: &Path, path: &str) -> Result<(), ToolError> {
             std::fs::create_dir(&cur)
                 .map_err(|e| ToolError::Failed(format!("cannot create {}: {e}", cur.display())))?;
         }
-        symlink_safe(root, &cur).map_err(path_err)?;
+        symlink_safe(root, &cur, true).map_err(path_err)?;
     }
     Ok(())
 }

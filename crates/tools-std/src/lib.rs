@@ -60,6 +60,7 @@ mod tests {
             allowed_prefixes: vec!["echo".to_string(), "cargo test".to_string()],
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
         })
     }
 
@@ -73,6 +74,7 @@ mod tests {
             allowed_prefixes: vec!["echo".to_string(), prefix],
             syntax_cmd: Some(argv.iter().map(|s| s.to_string()).collect()),
             denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
         })
     }
 
@@ -132,6 +134,96 @@ mod tests {
         }
         // Reads may traverse .git (still root-anchored + symlink-safe).
         assert!(resolve_under(&root, ".git/HEAD", false, &[]).is_ok());
+    }
+
+    #[test]
+    fn git_symlink_alias_write_denied_read_allowed() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "x\n").unwrap();
+        // A symlinked dir pointing at the substrate must not launder writes.
+        std::os::unix::fs::symlink(root.join(".git"), root.join("evil")).unwrap();
+        for rel in ["evil/config", "evil/new", "evil"] {
+            match resolve_under(&root, rel, true, &[]) {
+                Err(ToolPathError::Denied(_)) => {}
+                other => panic!("{rel} write must be denied, got {other:?}"),
+            }
+        }
+        // Reads through the alias stay allowed (same rule as plain `.git`).
+        assert!(resolve_under(&root, "evil/config", false, &[]).is_ok());
+        // A final-component link straight at a substrate file is denied too.
+        std::os::unix::fs::symlink(root.join(".git/config"), root.join("head-link")).unwrap();
+        match resolve_under(&root, "head-link", true, &[]) {
+            Err(ToolPathError::Denied(_)) => {}
+            other => panic!("head-link write must be denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secrets_globs_cover_keys_and_cloud_dirs() {
+        for (pat, hit, miss) in [
+            ("**/.env", ".env", ".env.example"),
+            ("**/.env", "a/.env", "a/.envx"),
+            ("**/.env.*", ".env.local", ".env"),
+            ("**/.env.*", "a/.env.local", "a/env.local"),
+            ("**/*.pem", "k.pem", "k.pemx"),
+            ("**/*.pem", "a/b/k.pem", "a/b/pem"),
+            ("**/*.key", "a/tls.key", "a/key"),
+            ("**/id_rsa*", "id_rsa", "x_id_rsa"),
+            ("**/id_rsa*", "a/id_rsa.pub", "a/id_rsa_pub/x"),
+            ("**/.npmrc", ".npmrc", "npmrc"),
+            ("**/.npmrc", "a/.npmrc", "a/.npmrcx"),
+            ("**/.netrc", "sub/.netrc", "sub/netrc"),
+            ("**/.aws", ".aws", ".awsx"),
+            ("**/.aws", "a/.aws", "a/aws"),
+            ("**/.aws/**", "a/.aws/config", "a/aws/config"),
+            ("**/.ssh", "a/.ssh", "a/ssh"),
+            ("**/.ssh/**", ".ssh/id_rsa", ".sshx/id_rsa"),
+        ] {
+            assert!(glob_match(pat, hit), "{pat} must match {hit}");
+            assert!(!glob_match(pat, miss), "{pat} must not match {miss}");
+        }
+    }
+
+    #[test]
+    fn env_template_allowed_but_local_and_keys_denied() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let globs = default_denied_globs();
+        for rel in [
+            ".env",
+            ".env.local",
+            "a/.env",
+            "a/.env.production",
+            "k.pem",
+            "a/tls.key",
+            "id_rsa",
+            "a/id_rsa.pub",
+            ".npmrc",
+            "sub/.netrc",
+            ".aws/config",
+            "a/.aws/credentials",
+            ".ssh/id_rsa",
+        ] {
+            for write in [true, false] {
+                match resolve_under(&root, rel, write, &globs) {
+                    Err(ToolPathError::Denied(_)) => {}
+                    other => panic!("{rel} must be denied, got {other:?}"),
+                }
+            }
+        }
+        // Templates stay usable on both reads and writes.
+        for rel in [".env.example", ".env.sample", "a/.env.template"] {
+            assert!(
+                resolve_under(&root, rel, false, &globs).is_ok(),
+                "{rel} readable"
+            );
+            assert!(
+                resolve_under(&root, rel, true, &globs).is_ok(),
+                "{rel} writable"
+            );
+        }
     }
 
     #[test]
@@ -655,6 +747,7 @@ mod tests {
             allowed_prefixes: vec!["sh".to_string()],
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
         };
         let err = run_allowed(
             &pol,
@@ -728,6 +821,7 @@ mod tests {
             allowed_prefixes: vec!["cat".to_string()],
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
         });
         let out = run(&reg(pol), "test", json!({"cmd": "cat noisy.txt"}))
             .await
