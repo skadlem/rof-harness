@@ -19,7 +19,8 @@ pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--work
 --thinking-keep N: echoed-reasoning rows kept per assistant message (flag wins over THINKING_KEEP; unset leaves the loop default)
 --collapse-hysteresis N: collapse-boundary hysteresis rows (flag wins over COLLAPSE_HYSTERESIS; unset leaves the loop default)
 --allow-dirty-workdir: run inside a dirty git workdir (default: refuse; allowed dirt appears in the reported patch)
---pass-env NAME: forward env var to exec/test children (repeatable; provider-key-shaped names stay withheld at spawn)";
+--pass-env NAME: forward env var to exec/test children (repeatable; provider-key-shaped names stay withheld at spawn)
+exit codes: 0 done, 2 usage/parse, 3 run failure (halt/cancel/provider), 4 missing credentials, 5 log failure, 6 snapshot failure, 7 empty input";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Args {

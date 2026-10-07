@@ -1,17 +1,30 @@
 //! Process exit codes and the run-end event summary on stderr.
 
 use agent_event::AgentEvent;
-use agent_loop::Outcome;
+use agent_loop::{FailureKind, Outcome};
 
 /// Startup credential-gate exit: 4, distinct from 2 (usage/parse) and 3
 /// (run failure). Missing credentials are an auth-setup problem before any
 /// spend — wrappers fix the env and retry instead of reading a run failure.
 pub(crate) const EXIT_NO_CREDENTIALS: i32 = 4;
 
+/// Run-outcome exit codes. 0/2/3 keep their historical meanings (done /
+/// usage-parse / run failure); 4 is the startup credential gate. Each
+/// [`FailureKind`] gets its own code so wrappers can react without parsing
+/// stderr — except [`FailureKind::Provider`], which keeps the historical 3
+/// as the most common run failure. 5/6/7 follow declaration order after the
+/// taken codes.
 pub(crate) fn exit_code(outcome: &Outcome) -> i32 {
     match outcome {
         Outcome::Done => 0,
-        _ => 3,
+        Outcome::Halted(_) => 3,
+        Outcome::Cancelled => 3,
+        Outcome::Failed { kind, .. } => match kind {
+            FailureKind::Log => 5,
+            FailureKind::Snapshot => 6,
+            FailureKind::Provider => 3,
+            FailureKind::Input => 7,
+        },
     }
 }
 
@@ -58,7 +71,6 @@ pub(crate) fn summarize(events: &[AgentEvent]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_loop::FailureKind;
 
     #[test]
     fn exit_and_summary_pinned() {
@@ -72,6 +84,21 @@ mod tests {
             },
         ] {
             assert_eq!(exit_code(&o), 3);
+        }
+        // Each FailureKind has its own code (Provider keeps the historic 3).
+        for (kind, code) in [
+            (FailureKind::Log, 5),
+            (FailureKind::Snapshot, 6),
+            (FailureKind::Input, 7),
+        ] {
+            assert_eq!(
+                exit_code(&Outcome::Failed {
+                    kind,
+                    message: "e".into()
+                }),
+                code,
+                "{kind:?}"
+            );
         }
         let evs = vec![
             AgentEvent::RunStart {

@@ -413,7 +413,9 @@ mod tests {
             "failure outcome carries the stderr hint: {:?}",
             r.outcome
         );
-        assert_eq!(exit_code(&r.outcome), 3);
+        // Snapshot-kind failure: exit 6 (stream S6 item 5 changed this from
+        // the old blanket 3 so wrappers can tell workdir failures apart).
+        assert_eq!(exit_code(&r.outcome), 6);
     }
 
     #[tokio::test]
