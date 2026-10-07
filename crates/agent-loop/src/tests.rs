@@ -4612,3 +4612,506 @@ async fn run_e2e_failing_test_does_not_verify_but_holds_declare() {
         "hold recorded as a retryable attempt"
     );
 }
+
+// --- S5 Step 0 characterization: event + log sequences pinned before refactor ---
+//
+// These pin the observable behavior (emitted event order, durable log order,
+// terminal outcome) for six scenarios. They assert through the event
+// vocabulary (`RunEnd`) and the log vocabulary (`ItemKind`), which the
+// refactor preserves, so they pass unchanged before and after.
+
+/// Full event order including the run/turn/error frames `event_order` filters out.
+fn full_event_order(history: &[AgentEvent]) -> Vec<&'static str> {
+    history
+        .iter()
+        .map(|e| match e {
+            AgentEvent::RunStart { .. } => "RunStart",
+            AgentEvent::RunEnd { .. } => "RunEnd",
+            AgentEvent::TurnStart { .. } => "TurnStart",
+            AgentEvent::TurnEnd { .. } => "TurnEnd",
+            AgentEvent::MessageStart { .. } => "MessageStart",
+            AgentEvent::MessageUpdate { .. } => "MessageUpdate",
+            AgentEvent::MessageEnd { .. } => "MessageEnd",
+            AgentEvent::ToolStart { .. } => "ToolStart",
+            AgentEvent::ToolEnd { .. } => "ToolEnd",
+            AgentEvent::Control(_) => "Control",
+            AgentEvent::Error { .. } => "Error",
+        })
+        .collect()
+}
+
+/// The terminal `RunEnd` outcome, cloned out for assertions that must survive
+/// the `Outcome` shape refactor (events are the stable vocabulary).
+fn run_end_of(history: &[AgentEvent]) -> agent_event::RunOutcome {
+    history
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::RunEnd { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        })
+        .expect("run ends with RunEnd")
+}
+
+#[tokio::test]
+async fn char_done_event_and_log_sequence() {
+    use agent_event::check_pairing;
+    let root = run_tmp("char-done");
+    let client = ScriptClient {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([text_resp("finished")])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+    assert_eq!(
+        run_kinds(&state.items),
+        vec!["Header", "TurnStart", "Input", "Assistant", "TurnEnd"]
+    );
+    assert_eq!(
+        full_event_order(emitter.history()),
+        vec![
+            "RunStart",
+            "TurnStart",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "TurnEnd",
+            "RunEnd",
+        ]
+    );
+    assert!(matches!(
+        run_end_of(emitter.history()),
+        agent_event::RunOutcome::Passed
+    ));
+    assert!(check_pairing(emitter.history()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn char_verify_hold_event_and_log_sequence() {
+    use agent_event::check_pairing;
+    let root = run_tmp("char-hold");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let client = ScriptClient {
+        order: Default::default(),
+        requests: requests.clone(),
+        queue: Mutex::new(VecDeque::from([
+            script_resp(
+                vec![(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "w.txt", "content": "x\n"}),
+                )],
+                StopReason::ToolUse,
+            ),
+            text_resp("done"),
+            text_resp("done"),
+        ])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+    // The held declare adds a durable Attempt row and a third round trip.
+    assert_eq!(
+        run_kinds(&state.items),
+        vec![
+            "Header",
+            "TurnStart",
+            "Input",
+            "Assistant",
+            "ToolCall",
+            "ToolResult",
+            "Assistant",
+            "Attempt",
+            "Assistant",
+            "TurnEnd",
+        ]
+    );
+    assert_eq!(
+        full_event_order(emitter.history()),
+        vec![
+            "RunStart",
+            "TurnStart",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "ToolStart",
+            "ToolEnd",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "TurnEnd",
+            "RunEnd",
+        ]
+    );
+    let reqs = requests.lock().unwrap();
+    assert_eq!(reqs.len(), 3, "held declare adds one round trip");
+    assert!(check_pairing(emitter.history()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn char_rollback_event_and_log_sequence() {
+    use agent_event::check_pairing;
+    let root = run_tmp("char-rollback");
+    std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+    let client = ScriptClient {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([
+            script_resp(
+                vec![
+                    (
+                        "c1",
+                        "write",
+                        serde_json::json!({"path": "a.rs", "content": "v2\n"}),
+                    ),
+                    ("c2", "boom", serde_json::json!({})),
+                ],
+                StopReason::ToolUse,
+            ),
+            script_resp(
+                vec![(
+                    "c3",
+                    "write",
+                    serde_json::json!({"path": "a.rs", "content": "v3\n"}),
+                )],
+                StopReason::ToolUse,
+            ),
+            text_resp("done"),
+            text_resp("done"),
+        ])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+    assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "v3\n");
+    // Failed batch: rollback Attempt row, then retry, then held declare.
+    assert_eq!(
+        run_kinds(&state.items),
+        vec![
+            "Header",
+            "TurnStart",
+            "Input",
+            "Assistant",
+            "ToolCall",
+            "ToolCall",
+            "ToolResult",
+            "ToolResult",
+            "Attempt",
+            "Assistant",
+            "ToolCall",
+            "ToolResult",
+            "Assistant",
+            "Attempt",
+            "Assistant",
+            "TurnEnd",
+        ]
+    );
+    assert_eq!(
+        full_event_order(emitter.history()),
+        vec![
+            "RunStart",
+            "TurnStart",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "ToolStart",
+            "ToolStart",
+            "ToolEnd",
+            "ToolEnd",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "ToolStart",
+            "ToolEnd",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "TurnEnd",
+            "RunEnd",
+        ]
+    );
+    assert!(check_pairing(emitter.history()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Tool that never answers unless the cancel race drops it.
+struct HangingTool;
+
+#[async_trait::async_trait]
+impl CoreTool for HangingTool {
+    fn definition(&self) -> CoreToolDef {
+        CoreToolDef {
+            name: "hang".into(),
+            description: "sleeps past any test deadline".into(),
+            schema: serde_json::json!({}),
+        }
+    }
+    fn prepare(&self, call: &CoreToolCall) -> CoreCallStatus {
+        CoreCallStatus::Dispatch(CoreInvocation {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            args: call.args.clone(),
+        })
+    }
+    async fn execute(
+        &self,
+        _inv: CoreInvocation,
+        _cancel: CancellationToken,
+    ) -> Result<CoreToolOutcome, CoreToolError> {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(CoreToolOutcome {
+            content: "never".into(),
+            truncated: false,
+            success: true,
+        })
+    }
+}
+
+#[tokio::test]
+async fn char_mid_tool_cancel_aborts_as_cancelled() {
+    let root = run_tmp("char-toolcancel");
+    std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+    let client = ScriptClient {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([script_resp(
+            vec![("c1", "hang", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )])),
+    };
+    let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+        [("agent".to_string(), vec!["hang".to_string()])].into(),
+    )));
+    registry.register(Arc::new(HangingTool));
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let cancel = CancellationToken::new();
+    let fired = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fired.cancel();
+    });
+    let started = Instant::now();
+    // Bounded drain: the cancelled tool refunds to Cancelled at the deadline.
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                drain_timeout: Duration::from_millis(100),
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("go".into())],
+        &cancel,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(matches!(outcome, Outcome::Cancelled), "got {outcome:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "must not wait out the 30s tool, took {elapsed:?}"
+    );
+    // The cancelled call is a durable error result; the failed batch's
+    // rollback notice follows before the terminal TurnEnd.
+    assert_eq!(
+        run_kinds(&state.items),
+        vec![
+            "Header",
+            "TurnStart",
+            "Input",
+            "Assistant",
+            "ToolCall",
+            "ToolResult",
+            "Attempt",
+            "TurnEnd",
+        ]
+    );
+    assert_eq!(
+        full_event_order(emitter.history()),
+        vec![
+            "RunStart",
+            "TurnStart",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "ToolStart",
+            "ToolEnd",
+            "TurnEnd",
+            "RunEnd",
+        ]
+    );
+    assert!(matches!(
+        run_end_of(emitter.history()),
+        agent_event::RunOutcome::Aborted
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A log that opens but never persists: every append fails closed.
+#[cfg(unix)]
+#[tokio::test]
+async fn char_log_append_failure_fails_closed() {
+    let root = run_tmp("char-logfail");
+    let client = ScriptClient {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([text_resp("finished")])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                log_path: Some(std::path::PathBuf::from("/dev/full")),
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    // Asserted through the stable event vocabulary (see `run_end_of`).
+    match run_end_of(emitter.history()) {
+        agent_event::RunOutcome::Failed(msg) => assert!(msg.contains("log append"), "got {msg}"),
+        other => panic!("expected failed RunEnd, got {other:?}"),
+    }
+    // The failure lands before any model call: no Message frames, but the
+    // terminal TurnEnd + RunEnd still emit so live sees a close.
+    assert_eq!(
+        full_event_order(emitter.history()),
+        vec!["RunStart", "TurnEnd", "RunEnd"]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn char_provider_failure_event_and_log_sequence() {
+    use agent_event::check_pairing;
+    let root = run_tmp("char-provfail");
+    // Empty script: every complete() call returns Err(Transport(...)).
+    let client = ScriptClient {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::new()),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    match run_end_of(emitter.history()) {
+        agent_event::RunOutcome::Failed(msg) => assert!(msg.contains("script empty"), "got {msg}"),
+        other => panic!("expected failed RunEnd, got {other:?}"),
+    }
+    drop(outcome);
+    // Three provider-failed Errors (1 initial + 2 in-step retries), then close.
+    assert_eq!(
+        full_event_order(emitter.history()),
+        vec![
+            "RunStart",
+            "TurnStart",
+            "Error",
+            "Error",
+            "Error",
+            "TurnEnd",
+            "RunEnd"
+        ]
+    );
+    // Durable attempt trail: will_retry, will_retry, exhausted.
+    let attempts: Vec<bool> = state
+        .items
+        .iter()
+        .filter_map(|i| match &i.kind {
+            ItemKind::Attempt { will_retry, .. } => Some(*will_retry),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attempts, vec![true, true, false]);
+    assert!(check_pairing(emitter.history()));
+    let _ = std::fs::remove_dir_all(&root);
+}
