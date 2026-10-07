@@ -22,7 +22,7 @@ use snapshot::TreeService;
 use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
-use cli::{budget_for, parse_args, resolve_endpoint, run_config, Args};
+use cli::{apply_env_defaults, budget_for, parse_args, resolve_endpoint, run_config, Args};
 use dump::{attach_dump, finalize_dump};
 use eval_cmd::{parse_eval, run_eval};
 use exit::{exit_code, summarize};
@@ -182,13 +182,17 @@ async fn main() {
         };
         std::process::exit(run_eval(&eargs).await);
     }
-    let args = match parse_args(&argv) {
+    let mut args = match parse_args(&argv) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(2);
         }
     };
+    if let Err(e) = apply_env_defaults(&mut args) {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
     let _workdir = match validate_workdir(&args.workdir) {
         Ok(p) => p,
         Err(e) => {

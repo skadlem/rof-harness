@@ -10,12 +10,14 @@ use agent_loop::RunConfig;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log]
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--thinking-keep N] [--collapse-hysteresis N]
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget
---compaction FRAC: checkpoint the older context once the estimate crosses FRAC of the token budget (0 < FRAC <= 1). OFF-BY-DEFAULT and UNVALIDATED: the S-1 compaction experiment has not run yet, so leave it unset unless running that experiment.";
+--compaction FRAC: checkpoint the older context once the estimate crosses FRAC of the token budget (0 < FRAC <= 1). OFF-BY-DEFAULT and UNVALIDATED: the S-1 compaction experiment has not run yet, so leave it unset unless running that experiment.
+--thinking-keep N: echoed-reasoning rows kept per assistant message (flag wins over THINKING_KEEP; unset leaves the loop default)
+--collapse-hysteresis N: collapse-boundary hysteresis rows (flag wins over COLLAPSE_HYSTERESIS; unset leaves the loop default)";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Args {
@@ -44,6 +46,11 @@ pub(crate) struct Args {
     pub bets: bool,
     /// Compaction trigger fraction; `None` = checkpoint off (default).
     pub compaction: Option<f64>,
+    /// Fold knobs: `None` = leave the loop default (`RunConfig::default`).
+    /// Flags win over `THINKING_KEEP` / `COLLAPSE_HYSTERESIS`, resolved once
+    /// at the edge by [`apply_env_defaults`]; the loop never reads the env.
+    pub thinking_keep: Option<usize>,
+    pub collapse_hysteresis: Option<usize>,
 }
 
 /// One flag definition: the long name, whether it takes a value, and the
@@ -120,6 +127,8 @@ struct RunBuilder {
     incentives: Option<agent_loop::IncentivesLevel>,
     bets: bool,
     compaction: Option<f64>,
+    thinking_keep: Option<usize>,
+    collapse_hysteresis: Option<usize>,
 }
 
 fn set_goal(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
@@ -264,6 +273,24 @@ fn set_compaction(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
+fn set_thinking_keep(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    b.thinking_keep = Some(
+        s.parse()
+            .map_err(|_| format!("--thinking-keep needs a positive integer, got {s:?}"))?,
+    );
+    Ok(())
+}
+
+fn set_collapse_hysteresis(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    b.collapse_hysteresis = Some(
+        s.parse()
+            .map_err(|_| format!("--collapse-hysteresis needs a positive integer, got {s:?}"))?,
+    );
+    Ok(())
+}
+
 const RUN_FLAGS: &[Flag<RunBuilder>] = &[
     Flag {
         name: "--goal",
@@ -360,6 +387,16 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         takes_value: true,
         set: set_compaction,
     },
+    Flag {
+        name: "--thinking-keep",
+        takes_value: true,
+        set: set_thinking_keep,
+    },
+    Flag {
+        name: "--collapse-hysteresis",
+        takes_value: true,
+        set: set_collapse_hysteresis,
+    },
 ];
 
 pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -391,7 +428,36 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         incentives: b.incentives.unwrap_or(agent_loop::IncentivesLevel::Full),
         bets: b.bets,
         compaction: b.compaction,
+        thinking_keep: b.thinking_keep,
+        collapse_hysteresis: b.collapse_hysteresis,
     })
+}
+
+/// Edge env resolution for the fold knobs: `THINKING_KEEP` /
+/// `COLLAPSE_HYSTERESIS` fill the knob only when the matching flag is
+/// absent (flag wins); unset leaves `None` and [`run_config`] falls back to
+/// the loop default. A present-but-unparsable value is a usage error, never
+/// a silent default. Runs once in `main` before anything reads the config.
+pub(crate) fn apply_env_defaults(args: &mut Args) -> Result<(), String> {
+    if args.thinking_keep.is_none() {
+        args.thinking_keep = read_env_usize("THINKING_KEEP")?;
+    }
+    if args.collapse_hysteresis.is_none() {
+        args.collapse_hysteresis = read_env_usize("COLLAPSE_HYSTERESIS")?;
+    }
+    Ok(())
+}
+
+fn read_env_usize(name: &str) -> Result<Option<usize>, String> {
+    match std::env::var(name) {
+        Err(_) => Ok(None),
+        Ok(raw) if raw.trim().is_empty() => Ok(None),
+        Ok(raw) => raw
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("{name} needs a positive integer, got {raw:?}")),
+    }
 }
 
 /// Budget for one run: explicit flags win; context-pinned runs without a
@@ -422,7 +488,10 @@ pub(crate) fn budget_for(args: &Args) -> BudgetGuard {
 /// One run's loop config from the parsed flags. The compaction checkpoint is
 /// opt-in: absent `--compaction` leaves the default disabled config, so the
 /// run stays byte-identical. The WAL is the opposite: default on inside
-/// `--workdir` (fail-closed on real runs, not only tests).
+/// `--workdir` (fail-closed on real runs, not only tests). The fold knobs
+/// (`thinking_keep`, `collapse_hysteresis`) are flag-or-env resolved at the
+/// edge by [`apply_env_defaults`]; unset falls back to the loop default here,
+/// so the loop itself never reads the environment.
 pub(crate) fn run_config(args: &Args) -> RunConfig {
     let mut cfg = RunConfig {
         goal: args.goal.clone(),
@@ -433,6 +502,9 @@ pub(crate) fn run_config(args: &Args) -> RunConfig {
         proof_cmd: args.proof_cmd.clone(),
         ..RunConfig::default()
     };
+    let dflt = RunConfig::default();
+    cfg.thinking_keep = args.thinking_keep.unwrap_or(dflt.thinking_keep);
+    cfg.collapse_hysteresis = args.collapse_hysteresis.unwrap_or(dflt.collapse_hysteresis);
     cfg.log_path = resolve_log_path(args);
     if let Some(frac) = args.compaction {
         cfg.compaction.enabled = true;
@@ -507,6 +579,8 @@ mod tests {
                 incentives: agent_loop::IncentivesLevel::Full,
                 proof_cmd: None,
                 compaction: Some(0.6),
+                thinking_keep: None,
+                collapse_hysteresis: None,
             }
         );
         let b = parse_args(&argv(&[
@@ -524,6 +598,11 @@ mod tests {
         );
         assert_eq!((b.log_path, b.no_log), (None, false));
         assert_eq!(b.compaction, None, "absent --compaction stays off");
+        assert_eq!(
+            (b.thinking_keep, b.collapse_hysteresis),
+            (None, None),
+            "absent fold flags leave the loop defaults"
+        );
     }
 
     #[test]
@@ -758,5 +837,84 @@ mod tests {
             budget_for(&args_for(dir, None)).config().actions_per_trial,
             30
         );
+    }
+
+    /// Process env is process-wide: the fold-knob env tests mutate it, so
+    /// they serialize on this lock. No other test reads these two vars.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn run_min(extra: &[&str]) -> Vec<String> {
+        let mut words = vec![
+            "rof",
+            "run",
+            "--goal",
+            "g",
+            "--workdir",
+            "/w",
+            "--model",
+            "m",
+        ];
+        words.extend(extra);
+        argv(&words)
+    }
+
+    #[test]
+    fn fold_knobs_parse_both_forms() {
+        let a = parse_args(&run_min(&[
+            "--thinking-keep",
+            "5",
+            "--collapse-hysteresis=3",
+        ]))
+        .unwrap();
+        assert_eq!((a.thinking_keep, a.collapse_hysteresis), (Some(5), Some(3)));
+    }
+
+    #[test]
+    fn fold_knobs_reject_non_numeric() {
+        for extra in [
+            vec!["--thinking-keep", "many"],
+            vec!["--thinking-keep"],
+            vec!["--collapse-hysteresis", "many"],
+            vec!["--collapse-hysteresis"],
+            vec!["--collapse-hysteresis", "-1"],
+        ] {
+            assert!(parse_args(&run_min(&extra)).is_err(), "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn fold_knobs_env_fills_flag_wins_malformed_errors() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("THINKING_KEEP", "7");
+        std::env::set_var("COLLAPSE_HYSTERESIS", "4");
+        // Env fills absent flags.
+        let mut a = parse_args(&run_min(&[])).unwrap();
+        apply_env_defaults(&mut a).unwrap();
+        assert_eq!((a.thinking_keep, a.collapse_hysteresis), (Some(7), Some(4)));
+        // Flag wins over env.
+        let mut b = parse_args(&run_min(&["--thinking-keep", "1"])).unwrap();
+        apply_env_defaults(&mut b).unwrap();
+        assert_eq!((b.thinking_keep, b.collapse_hysteresis), (Some(1), Some(4)));
+        // Present-but-unparsable is a usage error, never a silent default.
+        std::env::set_var("THINKING_KEEP", "many");
+        let mut c = parse_args(&run_min(&[])).unwrap();
+        assert!(apply_env_defaults(&mut c).is_err());
+        std::env::remove_var("THINKING_KEEP");
+        std::env::remove_var("COLLAPSE_HYSTERESIS");
+    }
+
+    #[test]
+    fn fold_knobs_reach_run_config_with_loop_defaults() {
+        use crate::fixtures::args_for;
+        let dir = Path::new("/tmp/w");
+        let dflt = RunConfig::default();
+        let cfg = run_config(&args_for(dir, None));
+        assert_eq!(cfg.thinking_keep, dflt.thinking_keep);
+        assert_eq!(cfg.collapse_hysteresis, dflt.collapse_hysteresis);
+        let mut a = args_for(dir, None);
+        a.thinking_keep = Some(9);
+        a.collapse_hysteresis = Some(6);
+        let cfg = run_config(&a);
+        assert_eq!((cfg.thinking_keep, cfg.collapse_hysteresis), (9, 6));
     }
 }
