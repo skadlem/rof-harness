@@ -44,7 +44,7 @@ fn must_include_survives_tiny_budget() {
         "opt.rs",
         "cur",
         &"y".repeat(5000),
-        Fidelity::Drop,
+        Fidelity::Exact,
         false,
     ));
     let out = a.assemble();

@@ -49,7 +49,7 @@ impl ContextAssembler {
 
     fn shape(&self, item: &ContextItem, remaining: usize) -> Option<String> {
         match &item.fidelity {
-            Fidelity::Exact | Fidelity::Drop => {
+            Fidelity::Exact => {
                 let fits = item.text.chars().count() <= remaining;
                 if fits || item.must_include {
                     Some(item.text.clone())
