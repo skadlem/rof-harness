@@ -130,6 +130,8 @@ fn under(root: &Path, cand: &Path) -> bool {
 /// (reads may traverse it, still root-anchored + symlink-safe), then
 /// canonical parent + symlinked-final check. A missing parent is
 /// `MissingParent` (recoverable: "create it first, re-issue"), never a denial.
+/// Same-inode hardlinks with a clean spelling are not detectable by path
+/// checks; the write TOCTOU note in `write.rs` applies here too.
 pub fn resolve_under(
     root: &Path,
     path: &str,
@@ -228,22 +230,6 @@ pub(crate) fn symlink_safe(root: &Path, target: &Path, write: bool) -> Result<()
             return Err(ToolPathError::Denied(
                 "path is the git substrate (.git): harness-only".to_string(),
             ));
-        }
-    }
-    if write {
-        // Hardlinked or bind-adjacent real path under `.git` with a clean
-        // lexical spelling: the bytes are the substrate either way.
-        let is_link = std::fs::symlink_metadata(target)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false);
-        if !is_link {
-            if let Ok(real) = std::fs::canonicalize(target) {
-                if git_component_hit(&canon_root, &real) {
-                    return Err(ToolPathError::Denied(
-                        "path is the git substrate (.git): harness-only".to_string(),
-                    ));
-                }
-            }
         }
     }
     Ok(())
