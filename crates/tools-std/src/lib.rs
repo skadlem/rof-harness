@@ -753,6 +753,7 @@ mod tests {
             &pol,
             "sh -c 'sleep 1; touch late-marker'",
             Duration::from_millis(100),
+            &CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -762,6 +763,147 @@ mod tests {
             !root.join("late-marker").exists(),
             "child survived the timeout"
         );
+    }
+
+    #[tokio::test]
+    async fn exec_timeout_kills_grandchild() {
+        // Middle `sh` backgrounds a grandchild `sh` and waits: killing only
+        // the direct child would orphan the grandchild, which touches the
+        // marker a second later. The process-group kill must take both.
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["sh".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+        };
+        let err = run_allowed(
+            &pol,
+            "sh -c 'sh -c \"sleep 1; touch grandchild-marker\" & wait'",
+            Duration::from_millis(200),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !root.join("grandchild-marker").exists(),
+            "grandchild survived the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_cancel_kills_group_promptly() {
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["sh".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+        };
+        let cancel = CancellationToken::new();
+        let killer = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            killer.cancel();
+        });
+        let start = std::time::Instant::now();
+        let err = run_allowed(
+            &pol,
+            "sh -c 'sh -c \"sleep 1; touch cancel-marker\" & wait'",
+            Duration::from_secs(60),
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("cancel"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cancel must return promptly"
+        );
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !root.join("cancel-marker").exists(),
+            "grandchild survived the cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_output_flood_stays_bounded() {
+        // 20MB of NUL bytes: retained pipes stay at 128KB per stream while
+        // the verdict, condensing, and outer cap behave as before.
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["head".to_string(), "cat".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+        };
+        let start = std::time::Instant::now();
+        let (ok, content, truncated) = run_allowed(
+            &pol,
+            "head -c 20000000 /dev/zero",
+            Duration::from_secs(60),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(ok);
+        assert!(truncated, "a 20MB flood must flag truncation");
+        assert!(content.chars().count() <= OUT_CAP);
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "flood must return promptly"
+        );
+        // Null stdin: `cat` with no args sees EOF and exits at once instead
+        // of blocking on an inherited terminal.
+        let (ok, _, truncated) = run_allowed(
+            &pol,
+            "cat",
+            Duration::from_secs(10),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(ok);
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn exec_env_hides_provider_key_forwards_pass_env() {
+        std::env::set_var("TOOLS_STD_TEST_PING", "pong");
+        std::env::set_var("OPENAI_API_KEY", "secret-should-not-leak");
+        let root = tmp_root();
+        let mut pol = (*policy(&root)).clone();
+        pol.allowed_prefixes.push("printenv".to_string());
+        pol.pass_env = vec![
+            "TOOLS_STD_TEST_PING".to_string(),
+            "OPENAI_API_KEY".to_string(),
+        ];
+        let r = reg(Arc::new(pol));
+        let out = run(&r, "exec", json!({"cmd": "printenv TOOLS_STD_TEST_PING"}))
+            .await
+            .unwrap();
+        assert!(out.content.contains("pong"), "{}", out.content);
+        // Listed in pass_env but key-shaped: still withheld, exit nonzero.
+        let out = run(&r, "exec", json!({"cmd": "printenv OPENAI_API_KEY"}))
+            .await
+            .unwrap();
+        assert!(!out.success);
+        assert!(
+            !out.content.contains("secret-should-not-leak"),
+            "{}",
+            out.content
+        );
+        std::env::remove_var("TOOLS_STD_TEST_PING");
+        std::env::remove_var("OPENAI_API_KEY");
     }
 
     #[test]

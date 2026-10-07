@@ -51,7 +51,7 @@ impl Tool for EditTool {
     async fn execute(
         &self,
         inv: Invocation,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: EditArgs = parse_args(&inv.args)?;
         if args.replace.len() > EDIT_REPLACE_CAP {
@@ -77,7 +77,7 @@ impl Tool for EditTool {
             apply_hunk(&original, &args.search, &args.replace).map_err(ToolError::Failed)?;
         if let Some(argv) = self.policy.syntax_cmd.clone() {
             if !argv.is_empty() {
-                check_syntax(&self.policy, &updated).await?;
+                check_syntax(&self.policy, &updated, &cancel).await?;
             }
         }
         std::fs::write(&p, updated).map_err(|e| ToolError::Failed(e.to_string()))?;

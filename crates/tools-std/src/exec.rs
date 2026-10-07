@@ -28,10 +28,11 @@ impl Tool for ExecTool {
     async fn execute(
         &self,
         inv: Invocation,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: CmdArgs = parse_args(&inv.args)?;
-        let (ok, content, truncated) = run_allowed(&self.policy, &args.cmd, EXEC_TIMEOUT).await?;
+        let (ok, content, truncated) =
+            run_allowed(&self.policy, &args.cmd, EXEC_TIMEOUT, &cancel).await?;
         Ok(ToolOutcome {
             content,
             truncated,

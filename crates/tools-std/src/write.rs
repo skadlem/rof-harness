@@ -80,7 +80,7 @@ impl Tool for WriteTool {
     async fn execute(
         &self,
         inv: Invocation,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: WriteArgs = parse_args(&inv.args)?;
         if args.content.len() > EDIT_REPLACE_CAP {
@@ -101,7 +101,7 @@ impl Tool for WriteTool {
         }
         if let Some(argv) = self.policy.syntax_cmd.clone() {
             if !argv.is_empty() {
-                check_syntax(&self.policy, &args.content).await?;
+                check_syntax(&self.policy, &args.content, &cancel).await?;
             }
         }
         std::fs::write(&p, &args.content).map_err(|e| ToolError::Failed(e.to_string()))?;
