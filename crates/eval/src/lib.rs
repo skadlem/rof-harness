@@ -1,4 +1,4 @@
-//! Thin external-gate runner. See research/bench-landscape.md checklist A–E.
+//! Thin external-gate runner.
 //! Primary: Terminal-Bench 2.1 frozen slice via Harbor protocol. Second:
 //! Multi-SWE-bench Rust slice + flash. SWE-bench Verified calibration-only.
 //! Outcome taxonomy rule: infra failures are never scored as capability.
@@ -17,10 +17,12 @@ pub use engine::{ContainerOutcome, DockerEngine, Engine};
 pub use gate::{paired_bootstrap, wilson_ci};
 pub use matrix::{CellReps, ComparisonReport, MatchedPair, ReportFlag};
 pub use oracle::{
-    apply_patch, check_swe_results, check_tb_reward, preflight, run_eval_sh, swe_test_status,
-    Verdict,
+    apply_patch, apply_patch_with_mode, check_swe_results, check_tb_reward, preflight, run_eval_sh,
+    swe_test_status, ApplyMode, ApplyOutcome, Verdict,
 };
-pub use report::{instance_report, InstanceReport, RunReport};
+pub use report::{
+    instance_report, instance_report_with_mode, InstanceReport, RunReport, APPLY_COMPARABILITY_NOTE,
+};
 pub use slices::{
     check_winnability, load_swe_slice, load_tb_slice, slice_path, Instance, SweInstance, ToolCaps,
     DEFAULT_TIMEOUT_SECS,
@@ -341,9 +343,8 @@ mod tests {
         // Stored source: ~/.local/share/rof-tb/work/matrix-v1/matrix.json,
         // `rof_runs` rows with task == "session-window-debug" (the swd cell,
         // 3 single-shot reps): r1 6/7, r2 4/7, r3 5/7 (tests_passed /
-        // tests_failed from the proxy verdicts). research/DECISIONS.md:102
-        // cites the same cell as 5/7, 6/7, 5/7; either form disagrees across
-        // reps and must flag flaky. Rival pi reps in the same file: 2/7 x3.
+        // tests_failed from the proxy verdicts). The reps disagree with each
+        // other and must flag flaky. Rival pi reps in the same file: 2/7 x3.
         let stored = MatchedPair {
             control: rep_cell("session-window-debug", &[6, 4, 5], 7),
             treatment: rep_cell("session-window-debug", &[2, 2, 2], 7),
@@ -438,6 +439,8 @@ mod tests {
             steps: 0,
             halt_reason: None,
             patch_digest: String::new(),
+            apply_mode: ApplyMode::Strict,
+            apply_detail: None,
         };
         let empty = RunReport { instances: vec![] };
         assert_eq!(empty.tokens_per_solved(), None);
@@ -459,6 +462,84 @@ mod tests {
             None,
             "an unknown token count makes the total unknown, not smaller"
         );
+    }
+
+    fn seeded_workdir() -> PathBuf {
+        let d = tmp();
+        let body: String = (1..=20).map(|i| format!("line {i:02}\n")).collect();
+        std::fs::write(d.join("f.txt"), body).unwrap();
+        d
+    }
+
+    // Context `nope N` exists nowhere in f.txt, so `git apply` rejects the
+    // hunk; `patch --fuzz=5` ignores all three context lines and lands it.
+    fn fuzz_only_patch() -> String {
+        "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -12,3 +12,4 @@\n nope 1\n nope 2\n+INSERTED\n nope 3\n"
+            .into()
+    }
+
+    fn grade_applied(outcome: &ApplyOutcome) -> Verdict {
+        if outcome.applied {
+            Verdict::Resolved
+        } else {
+            Verdict::Unresolved
+        }
+    }
+
+    #[test]
+    fn strict_is_default_and_rejects_fuzz_only_patch() {
+        assert_eq!(ApplyMode::default(), ApplyMode::Strict);
+        let d = seeded_workdir();
+        let out = apply_patch_with_mode(&d, &fuzz_only_patch(), ApplyMode::Strict).unwrap();
+        assert!(!out.applied);
+        assert_eq!(out.mode, ApplyMode::Strict);
+        assert!(
+            !out.detail.is_empty(),
+            "git stderr lands in the verdict detail"
+        );
+        assert_eq!(grade_applied(&out), Verdict::Unresolved);
+        assert!(
+            !apply_patch(&d, &fuzz_only_patch()).unwrap(),
+            "bool shorthand is Strict"
+        );
+        let body = std::fs::read_to_string(d.join("f.txt")).unwrap();
+        assert!(!body.contains("INSERTED"), "rejected patch touches nothing");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn lenient_accepts_fuzz_only_patch_and_report_says_lenient() {
+        let d = seeded_workdir();
+        let out = apply_patch_with_mode(&d, &fuzz_only_patch(), ApplyMode::Lenient).unwrap();
+        assert!(out.applied);
+        assert_eq!(out.mode, ApplyMode::Lenient);
+        assert_eq!(grade_applied(&out), Verdict::Resolved);
+        let body = std::fs::read_to_string(d.join("f.txt")).unwrap();
+        assert!(body.contains("INSERTED"), "fuzz fallback lands the hunk");
+        let events = d.join("events.jsonl");
+        std::fs::write(
+            &events,
+            "{\"type\":\"RunEnd\",\"outcome\":\"Passed\",\"messages\":[]}\n",
+        )
+        .unwrap();
+        let r = instance_report_with_mode(
+            "t1",
+            Verdict::Resolved,
+            &events,
+            1,
+            &fuzz_only_patch(),
+            ApplyMode::Lenient,
+            Some(&out.detail),
+        )
+        .unwrap();
+        assert_eq!(r.apply_mode, ApplyMode::Lenient);
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["apply_mode"], "Lenient", "the report says lenient");
+        assert!(
+            APPLY_COMPARABILITY_NOTE.contains("not comparable"),
+            "report notes earlier benchmark numbers are not comparable"
+        );
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
