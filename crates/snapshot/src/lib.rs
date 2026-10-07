@@ -1,6 +1,6 @@
 //! Git overlay transactions over a task copy: baseline / diff / rollback.
-//! Salvage of `~/rof-harness/src/engine/tree.rs` (identity, hooks off,
-//! `--no-renames`, exact names, 8KiB/200-line patch caps). Git is never on
+//! Fixed identity (`rof@local`), copied-in hooks off, rename detection off
+//! (`--no-renames`), patch text cut to 8KiB / 200 lines. Git is never on
 //! any command allowlist; rollback runs only when a retry follows, so the
 //! final tree stays readable for post-mortem.
 use serde::{Deserialize, Serialize};
@@ -42,20 +42,67 @@ pub struct PatchText {
     pub truncated: bool,
 }
 
+/// Workdir cleanliness for a path, for pre-flight guards. Ignored files
+/// never count (plain porcelain omits them): only tracked edits and
+/// non-ignored untracked files read as [`WorkdirState::Dirty`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkdirState {
+    NotARepo,
+    Clean,
+    Dirty,
+}
+
+/// Fail-closed workdir probe: anything git cannot confirm clean reads as
+/// [`WorkdirState::Dirty`]; only a missing `.git` reads as
+/// [`WorkdirState::NotARepo`].
+pub fn workdir_state(root: &Path) -> WorkdirState {
+    if !root.join(".git").exists() {
+        return WorkdirState::NotARepo;
+    }
+    match hermetic_git(root)
+        .args(["status", "--porcelain", "--no-renames"])
+        .output()
+    {
+        Ok(out)
+            if out.status.success() && String::from_utf8_lossy(&out.stdout).trim().is_empty() =>
+        {
+            WorkdirState::Clean
+        }
+        _ => WorkdirState::Dirty,
+    }
+}
+
 pub struct TreeService {
     root: PathBuf,
     /// HEAD at [`TreeService::ensure`]: the ref [`TreeService::patch_since_start`]
     /// diffs from. Recorded once because `baseline()` moves HEAD per batch, so a
     /// diff against it forgets every earlier batch.
     start: OnceLock<String>,
+    /// Copy-local ignore list written to `.git/info/exclude` by
+    /// [`TreeService::ensure`].
+    excludes: Vec<String>,
 }
+
+/// Copy-local ignore defaults: bytecode and package-manager outputs that
+/// must never reach the baseline commit or the evidence. `build/` and
+/// `dist/` are deliberately NOT here: new source files there must reach the
+/// patch, so silencing them would drop deliverable content.
+const DEFAULT_EXCLUDES: &[&str] = &["__pycache__/", "*.pyc", "target/", "node_modules/"];
 
 impl TreeService {
     pub fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
             start: OnceLock::new(),
+            excludes: DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    /// Override the copy-local ignore list (replaces the defaults): e.g. a
+    /// task whose build output must stay out of evidence re-adds `build/`.
+    pub fn with_excludes(mut self, excludes: &[&str]) -> Self {
+        self.excludes = excludes.iter().map(|s| s.to_string()).collect();
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -85,10 +132,13 @@ impl TreeService {
         Ok(())
     }
 
-    /// Bytecode + build dirs in the copy-local `.git/info/exclude`:
-    /// measured, baseline commits (`commit_all` = `git add -A`) were absorbing
-    /// bytecode; `cargo`/`npm` outputs would do the same. Local to the copy —
-    /// never tracked, never a global git setting.
+    /// Copy-local ignores in `.git/info/exclude`: baseline commits
+    /// (`commit_all` = `git add -A`) would otherwise absorb bytecode and
+    /// package-manager outputs. Local to the copy — never tracked, never a
+    /// global git setting.
+    ///
+    /// // ponytail: append-only line merge instead of `.gitignore` handling,
+    /// so no ignore-parser dependency is needed.
     fn exclude_bytecode(&self) -> Result<()> {
         if !self.root.join(".git").is_dir() {
             return Ok(()); // gitfile (worktree/submodule): not this copy's repo dir
@@ -96,24 +146,26 @@ impl TreeService {
         let info = self.root.join(".git/info");
         std::fs::create_dir_all(&info)?;
         let path = info.join("exclude");
-        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-        for pat in [
-            "__pycache__/",
-            "*.pyc",
-            "target/",
-            "node_modules/",
-            "dist/",
-            "build/",
-        ] {
-            if !text.lines().any(|l| l == pat) {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                text.push_str(pat);
-                text.push('\n');
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        // Stale harness lines (`build/`, `dist/` were defaults before they
+        // started hiding new deliverable files) are dropped unless the caller
+        // re-added them via `with_excludes`; every other existing line is
+        // kept, then missing configured patterns are appended.
+        let mut lines: Vec<String> = text
+            .lines()
+            .filter(|l| (*l != "build/" && *l != "dist/") || self.excludes.iter().any(|e| e == *l))
+            .map(str::to_string)
+            .collect();
+        for pat in &self.excludes {
+            if !lines.iter().any(|l| l == pat) {
+                lines.push(pat.clone());
             }
         }
-        std::fs::write(&path, text)?;
+        let mut out = lines.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        std::fs::write(&path, out)?;
         Ok(())
     }
 
@@ -123,7 +175,15 @@ impl TreeService {
     }
 
     /// Restores tracked files, drops created ones. Only when a retry follows.
+    /// Requires [`TreeService::ensure`] on this instance first: without a
+    /// recorded start HEAD there is no known-good state, so rolling back
+    /// could destroy work against an unknown base.
     pub fn rollback(&self) -> Result<()> {
+        if self.start.get().is_none() {
+            return Err(other(
+                "rollback: ensure() has not recorded a start HEAD".into(),
+            ));
+        }
         self.git(["checkout", "--", "."])?;
         self.git(["clean", "-fdq"])?;
         Ok(())
@@ -343,12 +403,8 @@ impl TreeService {
         if !patch.ends_with('\n') {
             patch.push('\n');
         }
-        let mut cmd = std::process::Command::new("git");
-        cmd.arg("-C")
-            .arg(&self.root)
-            .args(["apply", "-"])
-            .env("LC_ALL", "C")
-            .env("LANG", "C")
+        let mut cmd = hermetic_git(&self.root);
+        cmd.args(["apply", "-"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -384,29 +440,22 @@ impl TreeService {
         Ok(!self.git_ok(["rev-parse", "--quiet", "--verify", "HEAD"]))
     }
 
-    /// Tolerates the one benign failure: a tree matching HEAD has nothing
-    /// to commit, and HEAD already is the baseline then. The match is on the
-    /// English text because [`TreeService::git_status`] pins `LC_ALL=C` /
-    /// `LANG=C` on every git child, so the output is locale-stable.
+    /// Benign no-op baselines commit nothing: a tree matching HEAD, or dirt
+    /// git refuses to stage (modified content inside an embedded repo stages
+    /// an unchanged gitlink, so `add -A` stages nothing). The staged-empty
+    /// check owns that case, so a failed commit is always an error — no
+    /// stdout text matching.
     fn commit_all(&self, message: &str) -> Result<()> {
         self.git(["add", "-A"])?;
-        let out = self.git_status(["commit", "--quiet", "-m", message])?;
-        if out.status.success() {
+        if self
+            .git_status(["diff", "--cached", "--quiet"])
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
             return Ok(());
         }
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        // Benign no-op baselines: a clean tree, or dirt git refuses to stage
-        // (e.g. modified content inside an embedded repo — the gitlink sha
-        // never moves, so `add -A` stages nothing). Measured crash:
-        // sanitize-git-repo pilot death (research/diag-snapshot-anomaly.md).
-        if is_nothing_to_commit(&combined) {
-            return Ok(());
-        }
-        Err(other(format!("git commit: {}", combined.trim_end())))
+        self.git(["commit", "--quiet", "-m", message])?;
+        Ok(())
     }
 
     fn git<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Result<Output> {
@@ -428,35 +477,71 @@ impl TreeService {
     }
 
     fn git_status<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Result<Output> {
-        let mut cmd = std::process::Command::new("git");
-        cmd.arg("-C")
-            .arg(&self.root)
-            .args(["-c", "core.hooksPath=/dev/null"]) // copied-in hooks must not block the baseline
-            .args(args)
-            // Fixed identity: reproducible on machines with empty git config.
-            .env("GIT_AUTHOR_NAME", "rof")
-            .env("GIT_AUTHOR_EMAIL", "rof@local")
-            .env("GIT_COMMITTER_NAME", "rof")
-            .env("GIT_COMMITTER_EMAIL", "rof@local")
-            // Fixed locale: `commit_all` matches the English
-            // "nothing to commit" text, so every git child runs under C.
-            .env("LC_ALL", "C")
-            .env("LANG", "C");
+        let mut cmd = hermetic_git(&self.root);
+        cmd.args(args);
         cmd.output().map_err(|e| other(format!("spawn git: {e}")))
     }
 }
 
-fn other(msg: String) -> Error {
-    Error::other(msg)
+/// Every git child the overlay spawns: the copy's baseline must not depend
+/// on the host's git setup. Parent-inherited `GIT_DIR` (and friends) would
+/// redirect commands into the wrong repo; system/global config could turn
+/// on signing, hooks, fsmonitor, or an external diff. Command-line `-c`
+/// flags outrank any config file git still reads.
+///
+/// // ponytail: hand-rolled `Command` setup instead of a git library to keep
+/// the dependency list at serde only.
+fn hermetic_git(root: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(root)
+        // Copied-in hooks must not block the baseline; a host opt-in to
+        // signing must not break overlay commits; fsmonitor would leak host
+        // state into evidence. (No `diff.external` override: an empty value
+        // does NOT disable it — git execs "" and every diff dies with
+        // "cannot run". System/global config, the realistic leak vectors,
+        // are nulled via env below; a fresh `init` writes no local driver.)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.fsmonitor=false",
+        ])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_NAMESPACE")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_config())
+        // Fixed identity: reproducible on machines with empty git config.
+        .env("GIT_AUTHOR_NAME", "rof")
+        .env("GIT_AUTHOR_EMAIL", "rof@local")
+        .env("GIT_COMMITTER_NAME", "rof")
+        .env("GIT_COMMITTER_EMAIL", "rof@local")
+        // Fixed locale: deterministic git diagnostics in errors.
+        .env("LC_ALL", "C")
+        .env("LANG", "C");
+    cmd
 }
 
-/// English "nothing to commit" forms git prints under `LC_ALL=C` (pinned in
-/// [`TreeService::git_status`]): clean tree plus the two staged-nothing forms
-/// (embedded-repo dirt stages an unchanged gitlink, so `add -A` is a no-op).
-fn is_nothing_to_commit(combined: &str) -> bool {
-    combined.contains("nothing to commit")
-        || combined.contains("nothing added to commit")
-        || combined.contains("no changes added to commit")
+/// Config-file sink for `GIT_CONFIG_GLOBAL`: the null device, so no user or
+/// host global config is read. Unix primary; `NUL` elsewhere.
+#[cfg(unix)]
+fn null_config() -> &'static str {
+    "/dev/null"
+}
+
+#[cfg(not(unix))]
+fn null_config() -> &'static str {
+    "NUL"
+}
+
+fn other(msg: String) -> Error {
+    Error::other(msg)
 }
 
 /// Whole lines only: a line that does not fit is dropped, so a multi-byte
@@ -549,11 +634,21 @@ mod tests {
         dir
     }
 
+    /// Process env is process-wide: a test that mutates it would break a
+    /// parallel test's raw `git` spawn mid-flight. Hold the guard in every
+    /// test that sets process env AND in every test that spawns raw git.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn embedded_repo_dirt_is_a_benign_no_op_baseline() {
         // Regression: modified content inside a nested git repo stages as an
         // unchanged gitlink, so the baseline commit reports "no changes added
         // to commit" and (before this gate) killed the whole run.
+        let _guard = env_guard(); // spawns raw git: serialize vs env-mutating tests
         let dir = scratch("embed");
         let tree = TreeService::new(&dir);
         std::fs::write(dir.join("a.rs"), "one\n").unwrap();
@@ -623,6 +718,55 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("a.rs")).unwrap(), before);
         assert!(!dir.join("b.rs").exists());
         assert!(tree.diff().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rollback_before_ensure_errors() {
+        let dir = scratch("rollback-no-ensure");
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        let tree = TreeService::new(&dir);
+        let e = tree.rollback().unwrap_err();
+        assert!(e.to_string().contains("ensure()"), "{e}");
+        // Nothing was touched: no repo created, file intact.
+        assert!(!dir.join(".git").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), "one\n");
+    }
+
+    #[test]
+    fn rollback_without_recorded_start_errors() {
+        // ensure() ran but the tree was empty: HEAD unborn, no start rev.
+        let dir = scratch("rollback-unborn");
+        let tree = TreeService::new(&dir);
+        tree.ensure().unwrap();
+        let e = tree.rollback().unwrap_err();
+        assert!(e.to_string().contains("start HEAD"), "{e}");
+    }
+
+    #[test]
+    fn workdir_state_reports_repo_cleanliness() {
+        let plain = scratch("state-plain");
+        assert_eq!(workdir_state(&plain), WorkdirState::NotARepo);
+
+        let dir = scratch("state-dirty");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        tree.ensure().unwrap();
+        tree.baseline().unwrap();
+        assert_eq!(workdir_state(&dir), WorkdirState::Clean);
+
+        std::fs::write(dir.join("a.rs"), "two\n").unwrap();
+        assert_eq!(workdir_state(&dir), WorkdirState::Dirty);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        assert_eq!(workdir_state(&dir), WorkdirState::Clean);
+
+        std::fs::write(dir.join("new.txt"), "x\n").unwrap();
+        assert_eq!(workdir_state(&dir), WorkdirState::Dirty);
+
+        // Ignored bytecode does not count as dirty.
+        std::fs::remove_file(dir.join("new.txt")).unwrap();
+        std::fs::create_dir(dir.join("__pycache__")).unwrap();
+        std::fs::write(dir.join("__pycache__/x.pyc"), "junk\n").unwrap();
+        assert_eq!(workdir_state(&dir), WorkdirState::Clean);
     }
 
     #[test]
@@ -703,26 +847,15 @@ mod tests {
     }
 
     #[test]
-    fn nothing_to_commit_matcher_covers_english_forms() {
-        for s in [
-            "nothing to commit, working tree clean",
-            "nothing added to commit but untracked files present",
-            "no changes added to commit (use \"git add\" and/or \"git commit -a\")",
-        ] {
-            assert!(is_nothing_to_commit(s), "{s}");
-        }
-        assert!(!is_nothing_to_commit("fatal: not a git repository"));
-        assert!(!is_nothing_to_commit(""));
-    }
-
-    #[test]
     fn baseline_stable_under_hostile_locale_env() {
+        let _guard = env_guard();
         let dir = scratch("locale");
         let tree = TreeService::new(&dir);
         std::fs::write(dir.join("a.rs"), "one\n").unwrap();
         tree.ensure().unwrap();
         // Hostile parent locale: git children still run under C (see
-        // `git_status`), so the benign no-op baseline still parses.
+        // `hermetic_git`), and the benign no-op baseline needs no output
+        // parsing (staged-empty check), so locale cannot skew it.
         let old_lc = std::env::var("LC_ALL").ok();
         let old_lang = std::env::var("LANG").ok();
         std::env::set_var("LC_ALL", "xx_XX.UTF-8");
@@ -741,7 +874,61 @@ mod tests {
     }
 
     #[test]
-    fn ensure_excludes_build_dirs_from_commits() {
+    fn parent_git_dir_env_is_ignored() {
+        let _guard = env_guard();
+        let dir = scratch("gitdir-env");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        // Hostile parent env: every overlay child strips GIT_DIR, so the
+        // copy still baselines, diffs, and rolls back in place.
+        let old = std::env::var("GIT_DIR").ok();
+        std::env::set_var("GIT_DIR", "/nonexistent-git-dir");
+        let outcome = (|| -> Result<()> {
+            tree.ensure()?;
+            tree.baseline()?;
+            std::fs::write(dir.join("a.rs"), "two\n").unwrap();
+            assert!(!tree.diff()?.is_empty());
+            tree.rollback()?;
+            assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), "one\n");
+            Ok(())
+        })();
+        match old {
+            Some(v) => std::env::set_var("GIT_DIR", v),
+            None => std::env::remove_var("GIT_DIR"),
+        }
+        outcome.unwrap();
+    }
+
+    #[test]
+    fn global_gpgsign_true_does_not_break_baseline() {
+        let _guard = env_guard();
+        let dir = scratch("gpgsign");
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        std::fs::write(dir.join("signing.config"), "[commit]\n\tgpgsign = true\n").unwrap();
+        // Hostile parent global config: without the hermetic `-c
+        // commit.gpgsign=false` the baseline commit dies in gpg ("No secret
+        // key"); the overlay must not depend on host signing setup.
+        let old = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        std::env::set_var("GIT_CONFIG_GLOBAL", dir.join("signing.config"));
+        let tree = TreeService::new(&dir);
+        let outcome = (|| -> Result<()> {
+            tree.ensure()?;
+            tree.baseline()?;
+            tree.baseline()?;
+            Ok(())
+        })();
+        match old {
+            Some(v) => std::env::set_var("GIT_CONFIG_GLOBAL", v),
+            None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+        }
+        outcome.unwrap();
+    }
+
+    #[test]
+    fn ensure_excludes_bytecode_and_package_outputs_from_commits() {
+        // `target/` and `node_modules/` stay silenced; `build/` and `dist/`
+        // are NOT defaults anymore — new files there must reach the patch,
+        // so excluding them silently dropped deliverable content.
         let dir = scratch("build-dirs");
         let tree = TreeService::new(&dir);
         std::fs::write(dir.join("a.rs"), "one\n").unwrap();
@@ -758,23 +945,76 @@ mod tests {
         let ls = tree.git(["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
         let committed = String::from_utf8_lossy(&ls.stdout).into_owned();
         assert!(committed.contains("a.rs"), "{committed}");
-        for junk in ["out.bin", "nested.bin", "target", "node_modules", "dist"] {
+        for shipped in ["build/out.bin", "dist/out.bin"] {
+            assert!(
+                committed.contains(shipped),
+                "new deliverable file must ship: {committed}"
+            );
+        }
+        for junk in ["target/out.bin", "node_modules/out.bin", "nested.bin"] {
             assert!(
                 !committed.contains(junk),
                 "build output reached the commit: {committed}"
             );
         }
-        assert!(
-            tree.diff().unwrap().is_empty(),
-            "build output stays out of evidence"
-        );
         let exclude = std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap();
-        for pat in ["target/", "node_modules/", "dist/", "build/"] {
+        for pat in ["target/", "node_modules/"] {
             assert!(
                 exclude.lines().any(|l| l == pat),
                 "missing exclude {pat}: {exclude}"
             );
         }
+        for pat in ["build/", "dist/"] {
+            assert!(
+                !exclude.lines().any(|l| l == pat),
+                "stale exclude {pat} hides deliverable files: {exclude}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_file_under_build_reaches_baseline_and_patch() {
+        let dir = scratch("build-patch");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        tree.ensure().unwrap();
+        tree.baseline().unwrap();
+
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join("build/new.txt"), "build-marker-7a1e\n").unwrap();
+        // Untracked under build/: visible in evidence, not ignored away
+        // (porcelain collapses the new dir to `build/`; the patch expands it
+        // per file via `ls-files --others`).
+        let d = tree.diff().unwrap();
+        assert_eq!(d.changed, vec!["build/"]);
+        assert_eq!(d.untracked, vec!["build/"]);
+        let p = tree.patch(&d).unwrap();
+        assert!(p.text.contains("+build-marker-7a1e"), "{}", p.text);
+        // ... and the next baseline absorbs it instead of dropping it.
+        tree.baseline().unwrap();
+        let ls = tree.git(["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        let committed = String::from_utf8_lossy(&ls.stdout).into_owned();
+        assert!(committed.contains("build/new.txt"), "{committed}");
+    }
+
+    #[test]
+    fn with_excludes_re_adds_build_silence() {
+        let dir = scratch("with-excludes");
+        let tree = TreeService::new(&dir).with_excludes(&["target/", "build/"]);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join("build/out.bin"), "junk\n").unwrap();
+        tree.ensure().unwrap();
+        tree.baseline().unwrap();
+
+        let ls = tree.git(["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        let committed = String::from_utf8_lossy(&ls.stdout).into_owned();
+        assert!(committed.contains("a.rs"), "{committed}");
+        assert!(
+            !committed.contains("out.bin"),
+            "caller-silenced output reached the commit: {committed}"
+        );
+        assert!(tree.diff().unwrap().is_empty());
     }
 
     /// One `git diff --patch` fragment per hunk: each file's header lines
