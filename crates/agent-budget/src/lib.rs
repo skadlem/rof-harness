@@ -1,4 +1,4 @@
-//! AND-gate budget owner. See research/crate-agent-budget.md.
+//! AND-gate budget owner.
 //! Step unit: one model call. Check [`BudgetGuard::may_step`] once at the
 //! step head, after tool results are folded in and before the model call.
 

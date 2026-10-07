@@ -1,4 +1,4 @@
-//! The three capability bets, feature-flagged. See research/bets-prior-art.md.
+//! The three capability bets, feature-flagged.
 //! Ablation order is mechanically necessary: commit predicate = satisfied claim,
 //! so the claim field (B) precedes proof gating (A); racing (C) needs both.
 //! Every bet emits ablation metrics from day one or the ablation has no data.
