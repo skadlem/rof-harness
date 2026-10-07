@@ -1,4 +1,4 @@
-//! Live event vocabulary (TUI/headless contract). See research/crate-agent-event.md.
+//! Live event vocabulary (TUI/headless contract).
 
 mod emitter;
 mod event;

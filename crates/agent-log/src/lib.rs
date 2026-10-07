@@ -1,4 +1,4 @@
-//! Append-only durable Item log (JSONL). See `research/crate-agent-log.md`.
+//! Append-only durable Item log (JSONL).
 //!
 //! Locked rules: pre-effect items are appended and flushed before the effect;
 //! a failed pre-effect append is a hard turn failure (propagate it and end the

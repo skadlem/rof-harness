@@ -37,7 +37,7 @@ pub(crate) fn nz(n: u32) -> NonZeroU32 {
 }
 
 /// Capability presets. UnattendedBatch 20/12 is measured; LongTask 40/25 is
-/// chosen-to-be-validated. See research/crate-agent-budget.md §2.3/§2.5.
+/// chosen-to-be-validated.
 pub fn config_for(cap: Capability) -> BudgetConfig {
     let (steps, warn, wall_secs, spend) = match cap {
         Capability::Interactive => (100, 80, 3600, None),
