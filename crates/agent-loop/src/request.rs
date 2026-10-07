@@ -17,7 +17,7 @@ impl LoopState {
     /// to a `[collapsed: Nb — re-open to edit]` stub plus their first 120 chars
     /// as folded. Stable order preserved, so prefix caches survive.
     ///
-    /// Echoed reasoning is trimmed to the last [`THINKING_KEEP`] assistant
+    /// Echoed reasoning is trimmed to the last `cfg.thinking_keep` assistant
     /// rows: on a thinking-heavy trace it was 64% of input (measured: 128k of
     /// 224k tokens), and keeping the last two cuts that ~68%. Wire key
     /// presence is unaffected — the wire layer still emits
@@ -28,8 +28,8 @@ impl LoopState {
     /// An active [`Checkpoint`] replaces raw history `[..keep_from]` with its
     /// summary row; with no checkpoint this is exactly [`Self::raw_messages`],
     /// so the disabled path is byte-identical to collapse-5.
-    pub fn derived_messages(&self) -> Vec<ProviderMessage> {
-        let raw = self.raw_messages();
+    pub fn derived_messages(&self, cfg: &RunConfig) -> Vec<ProviderMessage> {
+        let raw = self.raw_messages(cfg);
         let Some(cp) = &self.checkpoint else {
             return raw;
         };
@@ -40,17 +40,20 @@ impl LoopState {
     }
 
     /// The raw log fold: every message, collapse + thinking trim applied, with
-    /// the collapse hysteresis from the run-head snapshot
-    /// ([`Self::resolve_fold_config`]), never the environment.
-    pub(crate) fn raw_messages(&self) -> Vec<ProviderMessage> {
-        self.raw_messages_with(self.collapse_hysteresis)
+    /// the collapse hysteresis and keep-count from `cfg` ([`RunConfig`], the
+    /// single source of run configuration).
+    pub(crate) fn raw_messages(&self, cfg: &RunConfig) -> Vec<ProviderMessage> {
+        self.raw_messages_with(cfg, cfg.collapse_hysteresis)
     }
 
     /// [`Self::raw_messages`] with the collapse hysteresis taken as a plain
-    /// parameter: tests drive H directly instead of mutating the environment.
-    /// The thinking keep-count always comes from the run-head snapshot
-    /// ([`Self::thinking_keep`]).
-    pub(crate) fn raw_messages_with(&self, hysteresis: usize) -> Vec<ProviderMessage> {
+    /// parameter: tests drive H directly instead of threading configs.
+    /// The thinking keep-count always comes from `cfg`.
+    pub(crate) fn raw_messages_with(
+        &self,
+        cfg: &RunConfig,
+        hysteresis: usize,
+    ) -> Vec<ProviderMessage> {
         let mut out = Vec::new();
         for item in &self.items {
             match &item.kind {
@@ -97,12 +100,12 @@ impl LoopState {
             }
         }
         // Echoed reasoning is trimmed here, before the wire layer sees it:
-        // keep the last cached `thinking_keep` assistant rows, blank the older ones.
+        // keep the last `cfg.thinking_keep` assistant rows, blank the older ones.
         let keep_from = out
             .iter()
             .filter(|m| m.role == "assistant")
             .count()
-            .saturating_sub(self.thinking_keep);
+            .saturating_sub(cfg.thinking_keep);
         for (n, m) in out.iter_mut().filter(|m| m.role == "assistant").enumerate() {
             if n < keep_from {
                 m.thinking = None;
@@ -269,7 +272,7 @@ pub(crate) fn build_request(
         tool_call_id: None,
         thinking: None,
     }];
-    messages.extend(state.derived_messages()); // once: raw history, collapse-5 intact
+    messages.extend(state.derived_messages(cfg)); // once: raw history, collapse-5 intact
 
     // Prefix-cache tail: the only per-request bytes. Never persisted.
     // The held nudge rides its own user-role row, never merged into the
@@ -361,7 +364,7 @@ pub(crate) async fn checkpoint<P: LlmClient>(
     if !cc.enabled || state.compacted_turn == Some(state.turn) {
         return false;
     }
-    let folded = state.derived_messages();
+    let folded = state.derived_messages(cfg);
     let view = compact_view(&folded);
     let estimate = context::estimate_tokens(&view, state.anchor.as_ref());
     if !context::compaction_due(estimate, state.budget.config().max_tokens, cc) {

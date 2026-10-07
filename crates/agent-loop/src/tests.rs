@@ -1,6 +1,8 @@
 use crate::proof::{note_tool_execution, outcome_to_result, refund_batch, snapshot_batch};
 use crate::request::{build_request, CHECKPOINT_PREFIX};
+use crate::run::drive_tick;
 use crate::state::{turn_end_reason_to_event, STEP_RETRY_BUDGET};
+use crate::state::{InFlight, ProviderMsg, ToolMsg};
 use crate::verify::{is_verification_call, stop_label, VERIFY_NUDGE};
 use crate::*;
 use agent_budget::{config_for, BudgetGuard, BudgetHalt, Capability};
@@ -133,12 +135,15 @@ fn single_flight_provider_call() {
 #[test]
 fn termination_order() {
     let mut s = LoopState::new(); // fresh parks, it does not exit
-    assert!(matches!(s.terminate(), PhaseVerdict::Continue));
+    assert!(matches!(
+        s.terminate(&RunConfig::default()),
+        PhaseVerdict::Continue
+    ));
     let mut s = LoopState::new(); // cancel beats budget
     s.stop_hard = true;
     s.budget.counters_mut().steps = s.budget.config().max_steps.get();
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Cancelled)
     ));
     let mut s = LoopState::new(); // hard error beats budget
@@ -146,32 +151,35 @@ fn termination_order() {
     let max = s.budget.config().max_steps.get();
     s.budget.counters_mut().steps = max;
     assert!(matches!(
-        s.terminate(),
-        PhaseVerdict::Return(Outcome::Failed(_))
+        s.terminate(&RunConfig::default()),
+        PhaseVerdict::Return(Outcome::Failed { .. })
     ));
     let mut s = LoopState::new(); // budget beats done-shaped state
     s.stop_when_idle = true;
     let max = s.budget.config().max_steps.get();
     s.budget.counters_mut().steps = max;
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Halted(_))
     ));
     let mut s = LoopState::new(); // refusal is terminal-with-error
     s.turn_reason = Some(TurnEndReason::Error("refused".into()));
     assert!(matches!(
-        s.terminate(),
-        PhaseVerdict::Return(Outcome::Failed(_))
+        s.terminate(&RunConfig::default()),
+        PhaseVerdict::Return(Outcome::Failed { .. })
     ));
     let mut s = LoopState::new(); // idle + StopWhenIdle exits
     s.stop_when_idle = true;
-    assert!(matches!(s.terminate(), PhaseVerdict::Return(Outcome::Done)));
+    assert!(matches!(
+        s.terminate(&RunConfig::default()),
+        PhaseVerdict::Return(Outcome::Done)
+    ));
     // guard halt labels surface verbatim
     let mut s = LoopState::new();
     let max = s.budget.config().max_steps.get();
     s.budget.counters_mut().steps = max;
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Halted(ref s)) if s == "steps"
     ));
 }
@@ -181,7 +189,11 @@ fn truncation_fails_batch_unexecuted() {
     let mut s = LoopState::new();
     s.turn = 1;
     let before = s.items.len();
-    let outcome = s.step_claim(assistant(vec![call("a"), call("b")]), StopReason::MaxTokens);
+    let outcome = s.step_claim(
+        assistant(vec![call("a"), call("b")]),
+        StopReason::MaxTokens,
+        &RunConfig::default(),
+    );
     assert!(matches!(outcome, ClaimOutcome::Truncated(2)));
     for id in ["a", "b"] {
         let state = &s.tool_calls[id];
@@ -193,7 +205,7 @@ fn truncation_fails_batch_unexecuted() {
     s.stick_turn_reason(TurnEndReason::Completed); // sticky: no downgrade
     assert_eq!(s.turn_reason, Some(TurnEndReason::MaxTokens));
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Halted(_))
     ));
 }
@@ -223,6 +235,51 @@ fn steering_admitted_only_at_pre_boundary() {
     s.admit_steering();
     assert_eq!((s.phase, s.turn), (Phase::Running, 1));
     assert!(!s.wake_requested);
+}
+
+/// RAII turn guard: appends TurnEnd on drop, always, even on unwind.
+/// TEST-ONLY substrate: prod turns use `open_turn`/`append_to(TurnEnd)`;
+/// only the test below constructs this. Kept for the unwind-safety
+/// property, not wired into `run()`.
+struct TurnGuard<'a> {
+    items: Option<&'a mut Vec<Item>>,
+    turn_id: String,
+    reason: TurnEndReason,
+}
+
+impl<'a> TurnGuard<'a> {
+    fn open(items: &'a mut Vec<Item>, turn: u64) -> Self {
+        let turn_id = format!("turn-{turn}");
+        append_to(
+            items,
+            ItemKind::TurnStart {
+                turn_id: turn_id.clone(),
+                prev_turn_id: None,
+            },
+        );
+        Self {
+            items: Some(items),
+            turn_id,
+            reason: TurnEndReason::Completed,
+        }
+    }
+    fn end(mut self, reason: TurnEndReason) {
+        self.reason = reason;
+    }
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(items) = self.items.take() {
+            append_to(
+                items,
+                ItemKind::TurnEnd {
+                    turn_id: self.turn_id.clone(),
+                    reason: self.reason.clone(),
+                },
+            );
+        }
+    }
 }
 
 #[test]
@@ -262,17 +319,24 @@ fn stop_hard_drains_bounded() {
             result: None,
         },
     );
-    assert!(matches!(s.terminate(), PhaseVerdict::Break));
-    s.drain_timeout = Duration::ZERO; // deadline passes: terminal now
+    assert!(matches!(
+        s.terminate(&RunConfig::default()),
+        PhaseVerdict::Break
+    ));
+    // deadline passes: terminal now.
+    let zero_drain = RunConfig {
+        drain_timeout: Duration::ZERO,
+        ..RunConfig::default()
+    };
     s.drain_until = None;
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&zero_drain),
         PhaseVerdict::Return(Outcome::Cancelled)
     ));
     let mut s = LoopState::new(); // idle cancels at once
     s.stop_hard = true;
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Cancelled)
     ));
 }
@@ -291,7 +355,10 @@ fn in_step_retry_then_hard_exit() {
     }));
     assert!(s.call_model); // retry reuses the open step
     assert!(s.in_flight.is_none());
-    assert!(matches!(s.terminate(), PhaseVerdict::Continue));
+    assert!(matches!(
+        s.terminate(&RunConfig::default()),
+        PhaseVerdict::Continue
+    ));
     s.step_retries = 0;
     s.start_provider_call(&root);
     assert!(s.finish_provider_msg(ProviderMsg::Failed {
@@ -302,8 +369,8 @@ fn in_step_retry_then_hard_exit() {
     }));
     assert_eq!(s.fatal_error.as_deref(), Some("dead"));
     assert!(matches!(
-        s.terminate(),
-        PhaseVerdict::Return(Outcome::Failed(_))
+        s.terminate(&RunConfig::default()),
+        PhaseVerdict::Return(Outcome::Failed { .. })
     ));
     assert!(!s.should_call_model()); // closed gate says nay
 }
@@ -350,7 +417,11 @@ fn failed_attempt_usage_is_metered_and_still_retries() {
 fn crash_repair_synthesizes_results() {
     let mut s = LoopState::new();
     s.turn = 1;
-    let outcome = s.step_claim(assistant(vec![call("a"), call("b")]), StopReason::ToolUse);
+    let outcome = s.step_claim(
+        assistant(vec![call("a"), call("b")]),
+        StopReason::ToolUse,
+        &RunConfig::default(),
+    );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     assert_eq!(s.crash_repair("boom"), 2);
     assert_eq!(s.crash_repair("boom"), 0); // idempotent
@@ -375,7 +446,7 @@ fn tripwire_and_thirty_action_abort() {
     }
     assert!(matches!(last, Some(BudgetHalt::TrialActions)));
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Halted(_))
     ));
     // varying the observation resets the streak
@@ -392,7 +463,7 @@ fn derived_messages_fold_history() {
     s.phase = Phase::Running;
     s.apply_input(Input::User("build it".into()));
     s.admit_steering();
-    let msgs = s.derived_messages();
+    let msgs = s.derived_messages(&RunConfig::default());
     assert_eq!(msgs.len(), 1);
     assert_eq!(
         (msgs[0].role.as_str(), msgs[0].content.as_str()),
@@ -417,7 +488,7 @@ fn derived_messages_collapse_5_and_ids() {
             },
         });
     }
-    let msgs = s.derived_messages();
+    let msgs = s.derived_messages(&RunConfig::default());
     assert_eq!(msgs.len(), 7);
     assert_eq!(
         msgs[0].content,
@@ -473,7 +544,7 @@ fn stub_boundary(msgs: &[ProviderMessage]) -> usize {
 #[test]
 fn collapse_hysteresis_zero_is_byte_identical_to_collapse_5() {
     let s = tool_history(8);
-    let msgs = s.raw_messages_with(0);
+    let msgs = s.raw_messages_with(&RunConfig::default(), 0);
     let got: Vec<(&str, String, Option<&str>)> = msgs
         .iter()
         .map(|m| {
@@ -498,7 +569,7 @@ fn collapse_hysteresis_zero_is_byte_identical_to_collapse_5() {
     assert_eq!(got, want);
     // Cached default (no env read) folds the byte-identical path.
     assert_eq!(
-        serde_json::to_string(&s.raw_messages()).unwrap(),
+        serde_json::to_string(&s.raw_messages(&RunConfig::default())).unwrap(),
         serde_json::to_string(&msgs).unwrap()
     );
 }
@@ -509,7 +580,12 @@ fn collapse_hysteresis_zero_is_byte_identical_to_collapse_5() {
 #[test]
 fn collapse_hysteresis_moves_boundary_once_per_h_rows_in_one_batch() {
     let folds: Vec<(usize, usize)> = (1..=30)
-        .map(|t| (t, stub_boundary(&tool_history(t).raw_messages_with(5))))
+        .map(|t| {
+            (
+                t,
+                stub_boundary(&tool_history(t).raw_messages_with(&RunConfig::default(), 5)),
+            )
+        })
         .collect();
     let mut moves = Vec::new();
     let mut prev = 0;
@@ -537,7 +613,7 @@ fn collapse_hysteresis_moves_boundary_once_per_h_rows_in_one_batch() {
     }
     // H=0 control: the boundary tracks the tail, one row per fold.
     let h0: Vec<usize> = (1..=30)
-        .map(|t| stub_boundary(&tool_history(t).raw_messages_with(0)))
+        .map(|t| stub_boundary(&tool_history(t).raw_messages_with(&RunConfig::default(), 0)))
         .collect();
     assert_eq!(
         h0,
@@ -549,15 +625,10 @@ fn collapse_hysteresis_moves_boundary_once_per_h_rows_in_one_batch() {
     assert_eq!(moves.len(), 5);
 }
 
-/// Run-head snapshot: both fold knobs resolve from the env once, and a
-/// mid-run env change no longer flips the fold. This is the only test
-/// that sets these vars; the fold itself never reads them (only
-/// `resolve_fold_config` does) and run-path tests assert behavior, not
-/// fold bytes, so the save/restore window cannot flip a parallel test.
+/// Fold knobs come from `RunConfig`, never the environment: the same state
+/// folds differently under different configs, and no env var is read.
 #[test]
-fn fold_knobs_frozen_at_run_head_mid_run_env_change_ignored() {
-    let saved_thinking = std::env::var("THINKING_KEEP").ok();
-    let saved_hyst = std::env::var("COLLAPSE_HYSTERESIS").ok();
+fn fold_knobs_come_from_run_config_not_the_environment() {
     // Fixture with both signals: 8 tool rows (collapse) + 4 thinking
     // assistants (echo trim).
     let mut s = tool_history(8);
@@ -571,44 +642,41 @@ fn fold_knobs_frozen_at_run_head_mid_run_env_change_ignored() {
             "Stop",
         );
     }
-    std::env::set_var("THINKING_KEEP", "99");
-    std::env::set_var("COLLAPSE_HYSTERESIS", "5");
-    s.resolve_fold_config();
-    assert_eq!((s.thinking_keep, s.collapse_hysteresis), (99, 5));
+    let wide = RunConfig {
+        thinking_keep: 99,
+        collapse_hysteresis: 5,
+        ..RunConfig::default()
+    };
     // H=5 over 8 rows: boundary 5*((8-5)/5) = 0, no stubs; keep 99:
     // every thinking row survives.
-    assert_eq!(stub_boundary(&s.derived_messages()), 0);
-    let before = serde_json::to_string(&s.derived_messages()).unwrap();
+    assert_eq!(stub_boundary(&s.derived_messages(&wide)), 0);
+    let before = serde_json::to_string(&s.derived_messages(&wide)).unwrap();
     assert_eq!(before.matches("reason-").count(), 4);
-    // Mid-run env change: the fold must not move.
-    std::env::set_var("THINKING_KEEP", "0");
-    std::env::set_var("COLLAPSE_HYSTERESIS", "0");
-    let after = serde_json::to_string(&s.derived_messages()).unwrap();
-    assert_eq!(before, after, "mid-run env change flipped the fold");
-    // A fresh head re-resolves: the new env takes effect only there.
-    s.resolve_fold_config();
-    assert_eq!((s.thinking_keep, s.collapse_hysteresis), (0, 0));
-    let re = serde_json::to_string(&s.derived_messages()).unwrap();
-    assert_ne!(re, before, "re-resolve must pick up the new env");
-    assert_eq!(stub_boundary(&s.derived_messages()), 3); // H=0 collapse-5
-    match saved_thinking {
-        Some(v) => std::env::set_var("THINKING_KEEP", v),
-        None => std::env::remove_var("THINKING_KEEP"),
-    }
-    match saved_hyst {
-        Some(v) => std::env::set_var("COLLAPSE_HYSTERESIS", v),
-        None => std::env::remove_var("COLLAPSE_HYSTERESIS"),
-    }
+    // Same state, tighter config: the fold moves with the config.
+    let tight = RunConfig {
+        thinking_keep: 0,
+        collapse_hysteresis: 0,
+        ..RunConfig::default()
+    };
+    let after = serde_json::to_string(&s.derived_messages(&tight)).unwrap();
+    assert_ne!(after, before, "tighter config must move the fold");
+    assert_eq!(stub_boundary(&s.derived_messages(&tight)), 3); // H=0 collapse-5
 }
 
-/// The cached fields alone steer the fold: no env touched at all.
+/// The config fields alone steer the fold: no env touched at all.
 #[test]
-fn fold_uses_cached_knobs_not_the_environment() {
+fn fold_uses_config_knobs_not_the_environment() {
     let mut s = tool_history(8);
-    s.collapse_hysteresis = 5;
-    assert_eq!(stub_boundary(&s.derived_messages()), 0);
-    s.collapse_hysteresis = 0;
-    assert_eq!(stub_boundary(&s.derived_messages()), 3);
+    let cfg = RunConfig {
+        collapse_hysteresis: 5,
+        ..RunConfig::default()
+    };
+    assert_eq!(stub_boundary(&s.derived_messages(&cfg)), 0);
+    let cfg = RunConfig {
+        collapse_hysteresis: 0,
+        ..RunConfig::default()
+    };
+    assert_eq!(stub_boundary(&s.derived_messages(&cfg)), 3);
     for i in 0..4 {
         s.push_assistant(
             &AssistantMessage {
@@ -619,17 +687,23 @@ fn fold_uses_cached_knobs_not_the_environment() {
             "Stop",
         );
     }
-    let thinking = |s: &LoopState| {
-        s.derived_messages()
+    let thinking = |s: &LoopState, cfg: &RunConfig| {
+        s.derived_messages(cfg)
             .iter()
             .filter(|m| m.role == "assistant")
             .filter_map(|m| m.thinking.clone())
             .collect::<Vec<_>>()
     };
-    s.thinking_keep = 1;
-    assert_eq!(thinking(&s), vec!["reason-3".to_string()]);
-    s.thinking_keep = 99;
-    assert_eq!(thinking(&s).len(), 4);
+    let cfg = RunConfig {
+        thinking_keep: 1,
+        ..RunConfig::default()
+    };
+    assert_eq!(thinking(&s, &cfg), vec!["reason-3".to_string()]);
+    let cfg = RunConfig {
+        thinking_keep: 99,
+        ..RunConfig::default()
+    };
+    assert_eq!(thinking(&s, &cfg).len(), 4);
 }
 
 #[test]
@@ -645,7 +719,7 @@ fn derived_messages_keeps_thinking_on_last_two_assistants() {
             "Stop",
         );
     }
-    let msgs = s.derived_messages();
+    let msgs = s.derived_messages(&RunConfig::default());
     let thinking: Vec<Option<&str>> = msgs
         .iter()
         .filter(|m| m.role == "assistant")
@@ -667,11 +741,29 @@ async fn drive_tick_select_spine() {
     let cancel = CancellationToken::new();
     let mut emitter = Emitter::new();
     itx.send(Input::User("go".into())).await.unwrap();
-    let verdict = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let verdict = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(verdict, PhaseVerdict::Continue));
     assert_eq!(s.turn, 1);
     itx.send(Input::StopHard).await.unwrap();
-    let verdict = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let verdict = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(verdict, PhaseVerdict::Return(Outcome::Cancelled)));
 }
 
@@ -684,7 +776,16 @@ async fn cancel_token_drives_stop() {
     let cancel = CancellationToken::new();
     let mut emitter = Emitter::new();
     cancel.cancel();
-    let verdict = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let verdict = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(verdict, PhaseVerdict::Return(Outcome::Cancelled)));
 }
 
@@ -747,7 +848,11 @@ fn lessons_cap_at_three() {
 fn budget_nudge_appends_to_tool_result_tail_once() {
     let mut s = LoopState::new();
     s.turn = 1;
-    let outcome = s.step_claim(assistant(vec![call("a")]), StopReason::ToolUse);
+    let outcome = s.step_claim(
+        assistant(vec![call("a")]),
+        StopReason::ToolUse,
+        &RunConfig::default(),
+    );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     assert!(s.record_tool_result(ToolMsg {
         call_id: "a".into(),
@@ -772,14 +877,18 @@ fn no_tail_keeps_directive_queued_and_nudge_latch_unburned() {
     assert!(s.apply_budget_nudge().is_none());
     // A queued directive with no tail stays queued (retry, not drop).
     s.budget.counters_mut().actions_this_trial = s.budget.config().actions_per_trial / 2;
-    s.queue_directives();
+    s.queue_directives(&RunConfig::default());
     assert_eq!(s.pending_directives.len(), 1);
     assert_eq!(s.deliver_directives(), 0);
     assert_eq!(s.pending_directives.len(), 1);
     // First recorded result creates the tail: both land, once each.
     s.turn = 1;
     assert!(matches!(
-        s.step_claim(assistant(vec![call("a")]), StopReason::ToolUse),
+        s.step_claim(
+            assistant(vec![call("a")]),
+            StopReason::ToolUse,
+            &RunConfig::default()
+        ),
         ClaimOutcome::Dispatch(_)
     ));
     assert!(s.record_tool_result(ToolMsg {
@@ -807,21 +916,21 @@ fn directive_triggers_fire_once_at_half_and_late_cap() {
     let mut s = LoopState::new();
     let cap = s.budget.config().actions_per_trial;
     s.budget.counters_mut().actions_this_trial = cap / 2;
-    s.queue_directives();
+    s.queue_directives(&RunConfig::default());
     assert_eq!(
         s.pending_directives.front().unwrap(),
         "0 edits so far after 15 actions. Stop reading. Apply your first edit with the edit tool NOW."
     );
-    s.queue_directives();
+    s.queue_directives(&RunConfig::default());
     assert_eq!(s.pending_directives.len(), 1); // half-cap latch holds
     s.edits = 1; // an edit silences only the zero-edit rule
     s.budget.counters_mut().actions_this_trial = cap * 4 / 5;
-    s.queue_directives();
+    s.queue_directives(&RunConfig::default());
     assert_eq!(
         s.pending_directives.back().unwrap(),
         "only 6 actions remain before the run is stopped. Finish and submit your patch now."
     );
-    s.queue_directives();
+    s.queue_directives(&RunConfig::default());
     assert_eq!(s.pending_directives.len(), 2); // both one-shot
 }
 
@@ -836,6 +945,7 @@ fn ok_round(s: &mut LoopState, id: &str, name: &str, args: Value) {
             args,
         }]),
         StopReason::ToolUse,
+        &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     assert!(s.record_tool_result(ToolMsg {
@@ -848,7 +958,7 @@ fn ok_round(s: &mut LoopState, id: &str, name: &str, args: Value) {
 }
 
 fn declare(s: &mut LoopState) -> ClaimOutcome {
-    s.step_claim(assistant(vec![]), StopReason::Stop)
+    s.step_claim(assistant(vec![]), StopReason::Stop, &RunConfig::default())
 }
 
 #[test]
@@ -915,6 +1025,7 @@ fn verify_nudge_failed_test_is_not_passing() {
             args: Value::Null,
         }]),
         StopReason::ToolUse,
+        &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     assert!(s.record_tool_result(ToolMsg {
@@ -929,6 +1040,7 @@ fn verify_nudge_failed_test_is_not_passing() {
             args: Value::Null,
         }]),
         StopReason::ToolUse,
+        &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     assert!(s.record_tool_result(ToolMsg {
@@ -955,6 +1067,7 @@ fn verify_nudge_failed_test_outcome_does_not_verify() {
             args: serde_json::json!({"cmd": "pytest -q"}),
         }]),
         StopReason::ToolUse,
+        &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     let failing = outcome_to_result(ToolOutcome {
@@ -1017,9 +1130,30 @@ fn verify_nudge_silent_on_second_declare_without_write() {
 fn verify_nudge_silent_in_base_and_contract() {
     for level in [IncentivesLevel::Base, IncentivesLevel::Contract] {
         let mut s = LoopState::new();
-        s.incentives = level;
-        ok_round(&mut s, "e1", "edit", Value::Null);
-        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+        let cfg = RunConfig {
+            incentives: level,
+            ..RunConfig::default()
+        };
+        // One edit round under this level's config, mirroring `ok_round`.
+        let outcome = s.step_claim(
+            assistant(vec![ToolCallRef {
+                id: "e1".into(),
+                name: "edit".into(),
+                args: Value::Null,
+            }]),
+            StopReason::ToolUse,
+            &cfg,
+        );
+        assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
+        assert!(s.record_tool_result(ToolMsg {
+            call_id: "e1".into(),
+            result: result(),
+        }));
+        s.edits += 1;
+        assert!(matches!(
+            s.step_claim(assistant(vec![]), StopReason::Stop, &cfg),
+            ClaimOutcome::Done
+        ));
         assert_eq!(s.verify.nudges_used, 0);
         assert!(s.verify.hold.is_none());
     }
@@ -1105,7 +1239,11 @@ fn lessons_ride_the_tail_once_each() {
     s.push_lesson("vary the approach".into());
     s.turn = 1;
     assert!(matches!(
-        s.step_claim(assistant(vec![call("a")]), StopReason::ToolUse),
+        s.step_claim(
+            assistant(vec![call("a")]),
+            StopReason::ToolUse,
+            &RunConfig::default()
+        ),
         ClaimOutcome::Dispatch(_)
     ));
     assert!(s.record_tool_result(ToolMsg {
@@ -1140,7 +1278,7 @@ fn collapse_stub_preview_caps_at_120_chars() {
             },
         });
     }
-    let msgs = s.derived_messages();
+    let msgs = s.derived_messages(&RunConfig::default());
     let head = &msgs[0].content;
     let prefix = "[collapsed: 202b — re-open to edit] ";
     assert!(head.starts_with(prefix), "{head}");
@@ -1372,7 +1510,16 @@ async fn e2e_full_turn_tool_call_orders_log_before_events() {
     let registry = edit_registry();
 
     itx.send(Input::User("build it".into())).await.unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     s.admit_steering(); // pre-boundary: the only place steering enters the log
     let root = CancellationToken::new();
@@ -1383,7 +1530,16 @@ async fn e2e_full_turn_tool_call_orders_log_before_events() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     ptx.send(ProviderMsg::Settled {
         turn: 1,
@@ -1393,7 +1549,16 @@ async fn e2e_full_turn_tool_call_orders_log_before_events() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     // Pre-effect: the ToolCall row is durable before anything executes.
     let call_seq = s
@@ -1428,12 +1593,30 @@ async fn e2e_full_turn_tool_call_orders_log_before_events() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     // Batch done, results owed back to the model: the tick parks on.
     assert!(matches!(v, PhaseVerdict::Continue));
     // A hard stop drains the parked idle and closes the turn.
     itx.send(Input::StopHard).await.unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Return(Outcome::Cancelled)));
 
     // Events arrive ordered; every Start pairs with its End.
@@ -1524,7 +1707,16 @@ async fn e2e_truncation_halts_with_no_tool_start() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Return(Outcome::Halted(ref s)) if s == "max-tokens"));
     // Truncated batch: answered with errors, never dispatched.
     let order = event_order(emitter.history());
@@ -1570,27 +1762,44 @@ fn run_tmp(name: &str) -> std::path::PathBuf {
     dir
 }
 
-struct ScriptClient {
+/// One scripted provider reply: a response, a typed failure, or a hang
+/// (for the cancel races). A dry queue is a transport failure.
+enum Scripted {
+    Respond(Response),
+    Fail(LlmError),
+    Hang,
+}
+
+struct FakeLlm {
     order: Arc<Mutex<Vec<String>>>,
-    queue: Mutex<VecDeque<Response>>,
+    queue: Mutex<VecDeque<Scripted>>,
     /// Every outgoing request, for shape assertions.
     requests: Arc<Mutex<Vec<Request>>>,
 }
 
 #[async_trait::async_trait]
-impl LlmClient for ScriptClient {
+impl LlmClient for FakeLlm {
     async fn complete(&self, _model: &str, req: &Request) -> Result<Response, LlmError> {
         self.order.lock().unwrap().push("model".into());
         self.requests.lock().unwrap().push(req.clone());
-        self.queue
-            .lock()
-            .unwrap()
-            .pop_front()
-            .ok_or(LlmError::Transport("script empty".into()))
+        let next = self.queue.lock().unwrap().pop_front();
+        match next {
+            Some(Scripted::Respond(r)) => Ok(r),
+            Some(Scripted::Fail(e)) => Err(e),
+            Some(Scripted::Hang) => {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(text_response("never"))
+            }
+            None => Err(LlmError::Transport("script empty".into())),
+        }
     }
 }
 
-fn script_resp(calls: Vec<(&str, &str, serde_json::Value)>, stop: StopReason) -> Response {
+fn script_resp(calls: Vec<(&str, &str, serde_json::Value)>, stop: StopReason) -> Scripted {
+    Scripted::Respond(response(calls, stop))
+}
+
+fn response(calls: Vec<(&str, &str, serde_json::Value)>, stop: StopReason) -> Response {
     Response {
         message: AssistantMessage {
             content: "step".into(),
@@ -1620,7 +1829,11 @@ fn script_resp(calls: Vec<(&str, &str, serde_json::Value)>, stop: StopReason) ->
     }
 }
 
-fn text_resp(text: &str) -> Response {
+fn text_resp(text: &str) -> Scripted {
+    Scripted::Respond(text_response(text))
+}
+
+fn text_response(text: &str) -> Response {
     Response {
         message: AssistantMessage {
             content: text.into(),
@@ -1819,7 +2032,7 @@ async fn run_e2e_multi_turn_proven_prefix_kept_failed_batch_rolled_back() {
         RUN_N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
     let order = Arc::new(Mutex::new(Vec::new()));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: order.clone(),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -1954,9 +2167,10 @@ async fn run_e2e_multi_turn_proven_prefix_kept_failed_batch_rolled_back() {
 async fn settle_usage_rides_message_end_and_cumulates_on_turn_end() {
     let root = run_tmp("usage");
     std::fs::write(root.join("a.txt"), "hello\n").unwrap();
-    let mut settled = text_resp("done");
+    let mut settled = text_response("done");
     settled.usage.reasoning = Some(3);
-    let client = ScriptClient {
+    let settled = Scripted::Respond(settled);
+    let client = FakeLlm {
         order: Default::default(),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -2043,7 +2257,7 @@ async fn run_half_cap_zero_edits_directive_lands_on_a_tool_tail() {
     ));
     let requests = Arc::new(Mutex::new(Vec::new()));
     // 15 read-only actions (= cap/2) with zero edits: the directive fires.
-    let mut queue: VecDeque<Response> = VecDeque::new();
+    let mut queue: VecDeque<Scripted> = VecDeque::new();
     for i in 1..=15 {
         let id = format!("r{i}");
         queue.push_back(script_resp(
@@ -2052,7 +2266,7 @@ async fn run_half_cap_zero_edits_directive_lands_on_a_tool_tail() {
         ));
     }
     queue.push_back(text_resp("done"));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: requests.clone(),
         queue: Mutex::new(queue),
@@ -2131,7 +2345,7 @@ async fn run_failed_batch_records_rollback_notice_and_queues_it_for_the_model() 
     ));
     std::fs::write(root.join("a.rs"), "v1\n").unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: requests.clone(),
         queue: Mutex::new(VecDeque::from([
@@ -2230,7 +2444,7 @@ async fn run_bets_hook_fires_at_step_head_and_post_batch_in_order() {
     let root = run_tmp("bets");
     std::fs::write(root.join("f.txt"), "old\n").unwrap();
     let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: order.clone(),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -2286,10 +2500,9 @@ async fn run_bets_hook_fires_at_step_head_and_post_batch_in_order() {
 #[tokio::test]
 async fn run_halt_budget_steps_after_grace_with_budget_frame() {
     assert_eq!(RunConfig::default().drain_timeout, Duration::from_secs(30));
-    assert_eq!(LoopState::new().drain_timeout, Duration::from_secs(30));
     let root = run_tmp("halt");
     let order = Arc::new(Mutex::new(Vec::new()));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order,
         requests: Default::default(),
         queue: Mutex::new(VecDeque::new()),
@@ -2305,6 +2518,7 @@ async fn run_halt_budget_steps_after_grace_with_budget_frame() {
         drain_timeout: Duration::from_secs(5),
         ..RunConfig::default()
     };
+    assert_eq!(cfg.drain_timeout, Duration::from_secs(5));
     let outcome = run(
         &mut state,
         Run {
@@ -2325,7 +2539,6 @@ async fn run_halt_budget_steps_after_grace_with_budget_frame() {
         "got {outcome:?}"
     );
     assert!(state.budget.may_step().is_err()); // grace ran first, halt after
-    assert_eq!(state.drain_timeout, Duration::from_secs(5));
     match emitter.history().last().unwrap() {
         AgentEvent::RunEnd { outcome, .. } => {
             assert!(matches!(outcome, agent_event::RunOutcome::Failed(_)))
@@ -2363,7 +2576,7 @@ async fn run_halt_same_action_and_crash_input_source() {
             StopReason::ToolUse,
         )
     };
-    let client = ScriptClient {
+    let client = FakeLlm {
         order,
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([same(), same(), same(), same()])),
@@ -2396,7 +2609,7 @@ async fn run_halt_same_action_and_crash_input_source() {
     // Crash queues like User but keeps the Crash source in the log.
     let root = run_tmp("crash");
     let order = Arc::new(Mutex::new(Vec::new()));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order,
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([text_resp("recovered")])),
@@ -2449,7 +2662,16 @@ async fn e2e_budget_halt_after_grace_fires_once() {
     assert!(s.start_provider_call(&root).is_none());
     // A live inbox send drives the tick (a senders-dropped tick stalls here).
     itx.send(Input::User("too late".into())).await.unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Return(Outcome::Halted(ref s)) if s == "steps"));
     match emitter.history().last().unwrap() {
         AgentEvent::TurnEnd { reason, .. } => {
@@ -2467,13 +2689,13 @@ async fn run_request_shape_history_delivered_once_collapse_5() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     // 7 write rounds, then a finishing text: the 8th request carries 7 tool
     // results, so collapse-5 has older material to shrink.
-    let mut queue: VecDeque<Response> = VecDeque::new();
+    let mut queue: VecDeque<Scripted> = VecDeque::new();
     for i in 1..=7 {
         let id = format!("c{i}");
         let path = format!("f{i}.txt");
         // Unique marker: the generic "step" would substring-match the
         // "steps N/M" budget tail on every request.
-        let mut resp = script_resp(
+        let mut resp = response(
             vec![(
                 id.as_str(),
                 "write",
@@ -2483,13 +2705,13 @@ async fn run_request_shape_history_delivered_once_collapse_5() {
         );
         resp.message.content = format!("script-step-{i}");
         resp.message.thinking = Some(format!("reason-{i}"));
-        queue.push_back(resp);
+        queue.push_back(Scripted::Respond(resp));
     }
     queue.push_back(text_resp("all done"));
     // Held-declare round trip: the first done is held (unverified
     // writes), the second lands Done.
     queue.push_back(text_resp("done again"));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order,
         requests: requests.clone(),
         queue: Mutex::new(queue),
@@ -2602,19 +2824,19 @@ fn compaction(frac: f64, keep_tokens: usize) -> context::CompactionConfig {
 }
 
 /// A scripted summary response: `input` is what the totals read.
-fn summary_resp(text: &str, stop: StopReason, input: u64) -> Response {
-    let mut r = text_resp(text);
+fn summary_resp(text: &str, stop: StopReason, input: u64) -> Scripted {
+    let mut r = text_response(text);
     r.stop = stop;
     r.usage.input = input;
     r.usage.cost_usd = Some(0.02);
-    r
+    Scripted::Respond(r)
 }
 
 /// One scripted run; hands back everything the checkpoint assertions need.
 /// `followups` open later turns (a checkpoint is per turn).
 async fn run_script(
     name: &str,
-    queue: Vec<Response>,
+    queue: Vec<Scripted>,
     cfg: RunConfig,
     budget_tokens: u64,
     followups: Vec<&str>,
@@ -2622,7 +2844,7 @@ async fn run_script(
 ) -> (Outcome, Arc<Mutex<Vec<Request>>>, LoopState, Emitter) {
     let root = run_tmp(name);
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: requests.clone(),
         queue: Mutex::new(VecDeque::from(queue)),
@@ -2674,11 +2896,11 @@ fn last_totals(emitter: &Emitter) -> UsageReport {
 
 /// One write round billed `input` prompt tokens: the estimate (anchor +
 /// tail chars/4) crosses `budget_tokens * frac` at the next step head.
-fn write_round(calls: Vec<(&str, &str, serde_json::Value)>, content: &str, input: u64) -> Response {
-    let mut r = script_resp(calls, StopReason::ToolUse);
+fn write_round(calls: Vec<(&str, &str, serde_json::Value)>, content: &str, input: u64) -> Scripted {
+    let mut r = response(calls, StopReason::ToolUse);
     r.message.content = content.into();
     r.usage.input = input;
-    r
+    Scripted::Respond(r)
 }
 
 #[tokio::test]
@@ -2941,14 +3163,16 @@ async fn run_checkpoint_composes_on_a_new_turn() {
     // Turn 1 checkpoints rounds 1-2 (keep_from 3). The followup opens turn
     // 2, where a second checkpoint absorbs the first summary plus round 3:
     // `keep_from` must map the folded cut back onto raw history.
-    let mut turn_one_done = text_resp("turn one done");
+    let mut turn_one_done = text_response("turn one done");
     turn_one_done.usage.input = 1_000; // arms turn 2's estimate
                                        // Held-declare round trip: turn one done is held (unverified
                                        // writes); the repeat lands Done. input 1000 re-arms turn 2's
                                        // checkpoint estimate exactly like the held response did; the short
                                        // text keeps the keep_tokens cut on the same row.
-    let mut turn_one_again = text_resp("done again");
+    let turn_one_done = Scripted::Respond(turn_one_done);
+    let mut turn_one_again = text_response("done again");
     turn_one_again.usage.input = 1_000;
+    let turn_one_again = Scripted::Respond(turn_one_again);
     let queue = vec![
         write_round(
             vec![(
@@ -3037,7 +3261,7 @@ async fn run_compaction_off_is_byte_identical_to_collapse_5() {
     // Trigger-ready: budget 8000, frac 0.1 (threshold 800), keep_tokens 3
     // and every round billed 1000 prompt tokens — every knob but `enabled`
     // is set to fire. Default `enabled: false` is the only thing holding.
-    let mut queue: VecDeque<Response> = VecDeque::new();
+    let mut queue: VecDeque<Scripted> = VecDeque::new();
     for i in 1..=7 {
         let id = format!("c{i}");
         let path = format!("f{i}.txt");
@@ -3110,7 +3334,7 @@ async fn run_compaction_off_is_byte_identical_to_collapse_5() {
 async fn run_system_prefix_is_static_and_file_map_frozen() {
     let root = run_tmp("prefix");
     std::fs::write(root.join("a.rs"), "v1\n").unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Arc::new(Mutex::new(Vec::new())),
         queue: Mutex::new(VecDeque::from([
@@ -3208,7 +3432,7 @@ async fn run_multi_turn_request_echoes_assistant_thinking() {
     let root = run_tmp("think");
     std::fs::write(root.join("a.txt"), "hello\n").unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut first = script_resp(
+    let mut first = response(
         vec![(
             "c1",
             "write",
@@ -3217,7 +3441,8 @@ async fn run_multi_turn_request_echoes_assistant_thinking() {
         StopReason::ToolUse,
     );
     first.message.thinking = Some("must edit a.txt".into());
-    let client = ScriptClient {
+    let first = Scripted::Respond(first);
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: requests.clone(),
         queue: Mutex::new(VecDeque::from([
@@ -3275,7 +3500,7 @@ async fn run_provider_failure_emits_provider_failed_then_fails() {
     use agent_event::check_pairing;
     let root = run_tmp("provfail");
     // Empty script: every complete() call returns Err(Transport(...)).
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::new()),
@@ -3302,7 +3527,7 @@ async fn run_provider_failure_emits_provider_failed_then_fails() {
     // Production outcome path: retries exhaust, the gate closes, the
     // fatal error surfaces as Outcome::Failed.
     match &outcome {
-        Outcome::Failed(msg) => assert!(msg.contains("script empty"), "got {msg}"),
+        Outcome::Failed { message: msg, .. } => assert!(msg.contains("script empty"), "got {msg}"),
         other => panic!("expected Failed, got {other:?}"),
     }
     let history = emitter.history();
@@ -3334,34 +3559,26 @@ async fn run_provider_failure_emits_provider_failed_then_fails() {
 
 /// First call fails with a metered truncation, then succeeds: F1b through
 /// the real `run()` path (extraction + budget + retry).
-struct MeteredFailThenOk {
-    calls: Mutex<u32>,
-    usage: Usage,
-}
-
-#[async_trait::async_trait]
-impl LlmClient for MeteredFailThenOk {
-    async fn complete(&self, _model: &str, _req: &Request) -> Result<Response, LlmError> {
-        let mut n = self.calls.lock().unwrap();
-        *n += 1;
-        if *n == 1 {
-            return Err(LlmError::Metered {
+fn metered_fail_then_ok(usage: Usage, exhausted: bool) -> FakeLlm {
+    FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([
+            Scripted::Fail(LlmError::Metered {
                 source: Box::new(LlmError::Transport("output truncated at 64 tokens".into())),
-                usage: Some(self.usage.clone()),
-                exhausted: false,
-            });
-        }
-        drop(n);
-        Ok(text_resp("done"))
+                usage: Some(usage),
+                exhausted,
+            }),
+            text_resp("done"),
+        ])),
     }
 }
 
 #[tokio::test]
 async fn run_meters_failed_attempt_usage_then_retries() {
     let root = run_tmp("meteredfail");
-    let client = MeteredFailThenOk {
-        calls: Mutex::new(0),
-        usage: Usage {
+    let client = metered_fail_then_ok(
+        Usage {
             input: 100,
             output: 20,
             cache_read: 0,
@@ -3369,7 +3586,8 @@ async fn run_meters_failed_attempt_usage_then_retries() {
             reasoning: None,
             cost_usd: Some(0.02),
         },
-    };
+        false,
+    );
     let registry = run_registry(&root);
     let mut state = LoopState::new();
     let mut emitter = Emitter::new();
@@ -3412,6 +3630,67 @@ async fn run_meters_failed_attempt_usage_then_retries() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Worst case: an `exhausted` ladder must not be re-run in-step. One model
+/// call, one non-retryable Attempt, one Error frame, then fatal.
+#[tokio::test]
+async fn run_exhausted_ladder_is_never_retried_in_step() {
+    let root = run_tmp("exhausted");
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let client = FakeLlm {
+        order: order.clone(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([Scripted::Fail(LlmError::Metered {
+            source: Box::new(LlmError::Transport("output truncated at 64 tokens".into())),
+            usage: Some(Usage {
+                input: 100,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: None,
+                cost_usd: Some(0.02),
+            }),
+            exhausted: true,
+        })])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    // The billed attempt is still metered, but the ladder runs exactly once.
+    assert_eq!(order.lock().unwrap().len(), 1, "exhausted ladder re-ran");
+    assert_eq!(state.budget.counters().tokens, 120);
+    let attempts: Vec<bool> = state
+        .items
+        .iter()
+        .filter_map(|i| match &i.kind {
+            ItemKind::Attempt { will_retry, .. } => Some(*will_retry),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attempts, vec![false], "exhausted must not retry");
+    assert!(!state.call_model);
+    match run_end_of(emitter.history()) {
+        agent_event::RunOutcome::Failed(msg) => assert!(msg.contains("truncated"), "got {msg}"),
+        other => panic!("expected failed RunEnd, got {other:?}"),
+    }
+    drop(outcome);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // --- bets site 2: proof-gated post-batch verdicts ---
 
 #[test]
@@ -3426,8 +3705,7 @@ fn incentives_levels_gate_contract_and_directive_channel() {
     };
     let r = build_request(&mut state, &registry, &root, &cfg);
     assert!(!r.messages[0].content.contains("WORKFLOW CONTRACT"));
-    state.incentives = IncentivesLevel::Base;
-    state.push_directive("go".into());
+    state.push_directive("go".into(), &cfg);
     assert!(state.pending_directives.is_empty(), "Base drops directives");
     // Contract: contract on, directives still off.
     let cfg = RunConfig {
@@ -3436,15 +3714,14 @@ fn incentives_levels_gate_contract_and_directive_channel() {
     };
     let r = build_request(&mut state, &registry, &root, &cfg);
     assert!(r.messages[0].content.contains("WORKFLOW CONTRACT"));
-    state.incentives = IncentivesLevel::Contract;
-    state.push_directive("go".into());
+    state.push_directive("go".into(), &cfg);
     assert!(
         state.pending_directives.is_empty(),
         "Contract drops directives"
     );
     // Full (default = current behavior): both live.
-    state.incentives = IncentivesLevel::Full;
-    state.push_directive("go".into());
+    let cfg = RunConfig::default();
+    state.push_directive("go".into(), &cfg);
     assert_eq!(state.pending_directives.len(), 1);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -3470,7 +3747,7 @@ async fn incremental_proof_keeps_the_proven_leading_prefix() {
         "import pathlib, sys\nsys.exit(1 if 'BAD' in pathlib.Path('b.rs').read_text() else 0)\n",
     )
     .unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -3528,8 +3805,8 @@ async fn incremental_proof_keeps_the_proven_leading_prefix() {
         "two\n",
         "refuted hunk reverts"
     );
-    assert_eq!(state.ablation.proven_hunks, 1);
-    assert_eq!(state.ablation.rollbacks, 1);
+    assert_eq!(state.experiment.ablation.proven_hunks, 1);
+    assert_eq!(state.experiment.ablation.rollbacks, 1);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3537,7 +3814,7 @@ async fn incremental_proof_keeps_the_proven_leading_prefix() {
 async fn empty_hunk_batches_never_inflate_proven_hunks() {
     let root = run_tmp("nohunks");
     std::fs::write(root.join("a.rs"), "one\n").unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -3569,10 +3846,10 @@ async fn empty_hunk_batches_never_inflate_proven_hunks() {
     .await;
     assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
     assert_eq!(
-        state.ablation.proven_hunks, 0,
+        state.experiment.ablation.proven_hunks, 0,
         "read-only batch: nothing proven, nothing counted"
     );
-    assert_eq!(state.ablation.rollbacks, 0);
+    assert_eq!(state.experiment.ablation.rollbacks, 0);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3636,7 +3913,7 @@ async fn run_post_batch_partial_keeps_first_hunk_only_and_continues() {
     let root = run_tmp("partial");
     std::fs::write(root.join("a.rs"), "one\n").unwrap();
     std::fs::write(root.join("b.rs"), "two\n").unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -3692,7 +3969,7 @@ async fn run_post_batch_partial_keeps_first_hunk_only_and_continues() {
 async fn run_post_batch_aborted_rolls_back_the_whole_batch() {
     let root = run_tmp("aborted");
     std::fs::write(root.join("a.rs"), "one\n").unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -3785,7 +4062,7 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
 
     // --- leg 1: run() on real siblings ---
     let run_root = run_tmp("shared-run");
-    let run_client = ScriptClient {
+    let run_client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -3830,20 +4107,38 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
     let cancel = CancellationToken::new();
 
     itx.send(Input::User("go".into())).await.unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     s.admit_steering(); // pre-boundary: the only place steering enters the log
     let root = CancellationToken::new();
     assert!(s.start_provider_call(&root).is_some());
     ptx.send(ProviderMsg::Settled {
         turn: 1,
-        message: script_resp(vec![write_call("c1")], StopReason::ToolUse).message,
+        message: response(vec![write_call("c1")], StopReason::ToolUse).message,
         stop: StopReason::ToolUse,
         usage: None,
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     // The ToolCall row is durable (at claim) before the tool runs.
     let prepared = registry.prepare(
@@ -3873,32 +4168,59 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     // Shared `settle_tool_msg` already counted the write (`edits += 1`)
     // like `run`'s `note_tool_execution`: no manual increment here.
     assert!(s.start_provider_call(&root).is_some());
     ptx.send(ProviderMsg::Settled {
         turn: 1,
-        message: text_resp("done").message,
+        message: text_response("done").message,
         stop: StopReason::Stop,
         usage: None,
     })
     .await
     .unwrap();
     // Unverified declare held: the turn stays alive, no Done yet.
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     assert!(s.start_provider_call(&root).is_some());
     ptx.send(ProviderMsg::Settled {
         turn: 1,
-        message: text_resp("done").message,
+        message: text_response("done").message,
         stop: StopReason::Stop,
         usage: None,
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Return(Outcome::Done)));
     let _ = std::fs::remove_dir_all(&tick_root);
 
@@ -3977,7 +4299,16 @@ async fn drive_tick_verify_hold_matches_run() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     ttx.send(ToolMsg {
         call_id: "e1".into(),
@@ -3988,7 +4319,16 @@ async fn drive_tick_verify_hold_matches_run() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     assert_eq!(s.edits, 1);
     assert_eq!(s.budget.counters().actions_this_trial, 1);
@@ -4005,7 +4345,16 @@ async fn drive_tick_verify_hold_matches_run() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     assert!(s.call_model);
     assert_eq!(s.verify.hold.as_deref(), Some(VERIFY_NUDGE));
@@ -4038,6 +4387,7 @@ fn rollback_refunds_edits_actions_and_verified() {
             args: serde_json::json!({"path": "b"}),
         }]),
         StopReason::ToolUse,
+        &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     let (wname, wargs) = {
@@ -4110,18 +4460,6 @@ fn step_retries_resets_on_fresh_step_head_not_retry_continuation() {
     assert_eq!(s.step_retries, 2, "fresh step after success resets");
 }
 
-/// Hanging provider that never answers unless raced: without the
-/// parent-side `select!` the run would wait out the full sleep.
-struct HangingClient;
-
-#[async_trait::async_trait]
-impl LlmClient for HangingClient {
-    async fn complete(&self, _model: &str, _req: &Request) -> Result<Response, LlmError> {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        Ok(text_resp("never"))
-    }
-}
-
 /// Cancel during `provider.complete` aborts promptly: the step records a
 /// `Failed { cancelled: true }` (budget refunded, no `Attempt` row) and
 /// the run returns `Cancelled` in ~50ms instead of 30s. The per-turn
@@ -4130,7 +4468,13 @@ impl LlmClient for HangingClient {
 #[tokio::test]
 async fn cancel_during_provider_complete_aborts_promptly_as_cancelled() {
     let root = run_tmp("cancel-race");
-    let client = HangingClient;
+    // Hanging provider: without the parent-side `select!` the run would
+    // wait out the full sleep.
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([Scripted::Hang])),
+    };
     let registry = run_registry(&root);
     let mut state = LoopState::new();
     let mut emitter = Emitter::new();
@@ -4360,7 +4704,7 @@ fn verify_hold_persisted_as_attempt_for_replay() {
     // `derived_messages` still folds items only (Attempt is log-only),
     // so the durable row is the replay source, not a folded message.
     assert!(s
-        .derived_messages()
+        .derived_messages(&RunConfig::default())
         .iter()
         .all(|m| m.content != VERIFY_NUDGE));
 }
@@ -4378,7 +4722,10 @@ fn terminate_same_action_zero_disables_lesson() {
     s.budget = BudgetGuard::new(cfg, Instant::now());
     // Streak 0 >= cycles 0 would fire without the guard.
     assert_eq!(s.budget.counters().same_action_streak, 0);
-    assert!(matches!(s.terminate(), PhaseVerdict::Continue));
+    assert!(matches!(
+        s.terminate(&RunConfig::default()),
+        PhaseVerdict::Continue
+    ));
     assert!(s.lessons.is_empty(), "cycles=0 must not lesson");
 }
 
@@ -4387,7 +4734,7 @@ fn terminate_same_action_zero_disables_lesson() {
 #[tokio::test]
 async fn last_step_done_wins_over_steps_halt() {
     let root = run_tmp("last-done");
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Default::default(),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([text_resp("finished")])),
@@ -4450,7 +4797,7 @@ fn assistant_corrupt_row_is_explicit_marker_not_raw_json() {
                 interrupted: false,
             },
         });
-        let msgs = s.derived_messages();
+        let msgs = s.derived_messages(&RunConfig::default());
         assert_eq!(msgs.len(), 1);
         assert!(
             msgs[0].content.starts_with("[corrupt assistant row:"),
@@ -4538,7 +4885,7 @@ impl CoreTool for ProdCheck {
 async fn run_e2e_failing_test_does_not_verify_but_holds_declare() {
     let root = run_tmp("verify-e2e");
     std::fs::write(root.join("a.rs"), "v1\n").unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -4611,4 +4958,626 @@ async fn run_e2e_failing_test_does_not_verify_but_holds_declare() {
         )),
         "hold recorded as a retryable attempt"
     );
+}
+
+// --- S5 Step 0 characterization: event + log sequences pinned before refactor ---
+//
+// These pin the observable behavior (emitted event order, durable log order,
+// terminal outcome) for six scenarios. They assert through the event
+// vocabulary (`RunEnd`) and the log vocabulary (`ItemKind`), which the
+// refactor preserves, so they pass unchanged before and after.
+
+/// Full event order including the run/turn/error frames `event_order` filters out.
+fn full_event_order(history: &[AgentEvent]) -> Vec<&'static str> {
+    history
+        .iter()
+        .map(|e| match e {
+            AgentEvent::RunStart { .. } => "RunStart",
+            AgentEvent::RunEnd { .. } => "RunEnd",
+            AgentEvent::TurnStart { .. } => "TurnStart",
+            AgentEvent::TurnEnd { .. } => "TurnEnd",
+            AgentEvent::MessageStart { .. } => "MessageStart",
+            AgentEvent::MessageUpdate { .. } => "MessageUpdate",
+            AgentEvent::MessageEnd { .. } => "MessageEnd",
+            AgentEvent::ToolStart { .. } => "ToolStart",
+            AgentEvent::ToolEnd { .. } => "ToolEnd",
+            AgentEvent::Control(_) => "Control",
+            AgentEvent::Error { .. } => "Error",
+        })
+        .collect()
+}
+
+/// The terminal `RunEnd` outcome, cloned out for assertions that must survive
+/// the `Outcome` shape refactor (events are the stable vocabulary).
+fn run_end_of(history: &[AgentEvent]) -> agent_event::RunOutcome {
+    history
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            AgentEvent::RunEnd { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        })
+        .expect("run ends with RunEnd")
+}
+
+#[tokio::test]
+async fn char_done_event_and_log_sequence() {
+    use agent_event::check_pairing;
+    let root = run_tmp("char-done");
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([text_resp("finished")])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+    assert_eq!(
+        run_kinds(&state.items),
+        vec!["Header", "TurnStart", "Input", "Assistant", "TurnEnd"]
+    );
+    assert_eq!(
+        full_event_order(emitter.history()),
+        vec![
+            "RunStart",
+            "TurnStart",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "TurnEnd",
+            "RunEnd",
+        ]
+    );
+    assert!(matches!(
+        run_end_of(emitter.history()),
+        agent_event::RunOutcome::Passed
+    ));
+    assert!(check_pairing(emitter.history()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn char_verify_hold_event_and_log_sequence() {
+    use agent_event::check_pairing;
+    let root = run_tmp("char-hold");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: requests.clone(),
+        queue: Mutex::new(VecDeque::from([
+            script_resp(
+                vec![(
+                    "c1",
+                    "write",
+                    serde_json::json!({"path": "w.txt", "content": "x\n"}),
+                )],
+                StopReason::ToolUse,
+            ),
+            text_resp("done"),
+            text_resp("done"),
+        ])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+    // The held declare adds a durable Attempt row and a third round trip.
+    assert_eq!(
+        run_kinds(&state.items),
+        vec![
+            "Header",
+            "TurnStart",
+            "Input",
+            "Assistant",
+            "ToolCall",
+            "ToolResult",
+            "Assistant",
+            "Attempt",
+            "Assistant",
+            "TurnEnd",
+        ]
+    );
+    assert_eq!(
+        full_event_order(emitter.history()),
+        vec![
+            "RunStart",
+            "TurnStart",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "ToolStart",
+            "ToolEnd",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "TurnEnd",
+            "RunEnd",
+        ]
+    );
+    let reqs = requests.lock().unwrap();
+    assert_eq!(reqs.len(), 3, "held declare adds one round trip");
+    assert!(check_pairing(emitter.history()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn char_rollback_event_and_log_sequence() {
+    use agent_event::check_pairing;
+    let root = run_tmp("char-rollback");
+    std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([
+            script_resp(
+                vec![
+                    (
+                        "c1",
+                        "write",
+                        serde_json::json!({"path": "a.rs", "content": "v2\n"}),
+                    ),
+                    ("c2", "boom", serde_json::json!({})),
+                ],
+                StopReason::ToolUse,
+            ),
+            script_resp(
+                vec![(
+                    "c3",
+                    "write",
+                    serde_json::json!({"path": "a.rs", "content": "v3\n"}),
+                )],
+                StopReason::ToolUse,
+            ),
+            text_resp("done"),
+            text_resp("done"),
+        ])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+    assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "v3\n");
+    // Failed batch: rollback Attempt row, then retry, then held declare.
+    assert_eq!(
+        run_kinds(&state.items),
+        vec![
+            "Header",
+            "TurnStart",
+            "Input",
+            "Assistant",
+            "ToolCall",
+            "ToolCall",
+            "ToolResult",
+            "ToolResult",
+            "Attempt",
+            "Assistant",
+            "ToolCall",
+            "ToolResult",
+            "Assistant",
+            "Attempt",
+            "Assistant",
+            "TurnEnd",
+        ]
+    );
+    assert_eq!(
+        full_event_order(emitter.history()),
+        vec![
+            "RunStart",
+            "TurnStart",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "ToolStart",
+            "ToolStart",
+            "ToolEnd",
+            "ToolEnd",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "ToolStart",
+            "ToolEnd",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "TurnEnd",
+            "RunEnd",
+        ]
+    );
+    assert!(check_pairing(emitter.history()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Tool that never answers unless the cancel race drops it.
+struct HangingTool;
+
+#[async_trait::async_trait]
+impl CoreTool for HangingTool {
+    fn definition(&self) -> CoreToolDef {
+        CoreToolDef {
+            name: "hang".into(),
+            description: "sleeps past any test deadline".into(),
+            schema: serde_json::json!({}),
+        }
+    }
+    fn prepare(&self, call: &CoreToolCall) -> CoreCallStatus {
+        CoreCallStatus::Dispatch(CoreInvocation {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            args: call.args.clone(),
+        })
+    }
+    async fn execute(
+        &self,
+        _inv: CoreInvocation,
+        _cancel: CancellationToken,
+    ) -> Result<CoreToolOutcome, CoreToolError> {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(CoreToolOutcome {
+            content: "never".into(),
+            truncated: false,
+            success: true,
+        })
+    }
+}
+
+#[tokio::test]
+async fn char_mid_tool_cancel_aborts_as_cancelled() {
+    let root = run_tmp("char-toolcancel");
+    std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([script_resp(
+            vec![("c1", "hang", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )])),
+    };
+    let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+        [("agent".to_string(), vec!["hang".to_string()])].into(),
+    )));
+    registry.register(Arc::new(HangingTool));
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let cancel = CancellationToken::new();
+    let fired = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fired.cancel();
+    });
+    let started = Instant::now();
+    // Bounded drain: the cancelled tool refunds to Cancelled at the deadline.
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                drain_timeout: Duration::from_millis(100),
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("go".into())],
+        &cancel,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(matches!(outcome, Outcome::Cancelled), "got {outcome:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "must not wait out the 30s tool, took {elapsed:?}"
+    );
+    // The cancelled call is a durable error result; the failed batch's
+    // rollback notice follows before the terminal TurnEnd.
+    assert_eq!(
+        run_kinds(&state.items),
+        vec![
+            "Header",
+            "TurnStart",
+            "Input",
+            "Assistant",
+            "ToolCall",
+            "ToolResult",
+            "Attempt",
+            "TurnEnd",
+        ]
+    );
+    assert_eq!(
+        full_event_order(emitter.history()),
+        vec![
+            "RunStart",
+            "TurnStart",
+            "MessageStart",
+            "MessageUpdate",
+            "MessageEnd",
+            "ToolStart",
+            "ToolEnd",
+            "TurnEnd",
+            "RunEnd",
+        ]
+    );
+    assert!(matches!(
+        run_end_of(emitter.history()),
+        agent_event::RunOutcome::Aborted
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A log that opens but never persists: every append fails closed.
+#[cfg(unix)]
+#[tokio::test]
+async fn char_log_append_failure_fails_closed() {
+    let root = run_tmp("char-logfail");
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([text_resp("finished")])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let _outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                log_path: Some(std::path::PathBuf::from("/dev/full")),
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    // Asserted through the stable event vocabulary (see `run_end_of`).
+    match run_end_of(emitter.history()) {
+        agent_event::RunOutcome::Failed(msg) => assert!(msg.contains("log append"), "got {msg}"),
+        other => panic!("expected failed RunEnd, got {other:?}"),
+    }
+    // The failure lands before any model call: no Message frames, but the
+    // terminal TurnEnd + RunEnd still emit so live sees a close.
+    assert_eq!(
+        full_event_order(emitter.history()),
+        vec!["RunStart", "TurnEnd", "RunEnd"]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn char_provider_failure_event_and_log_sequence() {
+    use agent_event::check_pairing;
+    let root = run_tmp("char-provfail");
+    // Empty script: every complete() call returns Err(Transport(...)).
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::new()),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    match run_end_of(emitter.history()) {
+        agent_event::RunOutcome::Failed(msg) => assert!(msg.contains("script empty"), "got {msg}"),
+        other => panic!("expected failed RunEnd, got {other:?}"),
+    }
+    drop(outcome);
+    // Three provider-failed Errors (1 initial + 2 in-step retries), then close.
+    assert_eq!(
+        full_event_order(emitter.history()),
+        vec![
+            "RunStart",
+            "TurnStart",
+            "Error",
+            "Error",
+            "Error",
+            "TurnEnd",
+            "RunEnd"
+        ]
+    );
+    // Durable attempt trail: will_retry, will_retry, exhausted.
+    let attempts: Vec<bool> = state
+        .items
+        .iter()
+        .filter_map(|i| match &i.kind {
+            ItemKind::Attempt { will_retry, .. } => Some(*will_retry),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attempts, vec![true, true, false]);
+    assert!(check_pairing(emitter.history()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `FailureKind` pins: each run failure site reports its kind, so callers
+/// react without parsing message text.
+#[cfg(unix)]
+#[tokio::test]
+async fn failure_kinds_pin_log_open_and_no_input_sites() {
+    // Log-open failure: the parent dir does not exist.
+    let root = run_tmp("char-kindlog");
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([text_resp("finished")])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                log_path: Some(root.join("no-such-dir").join("run.jsonl")),
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    match outcome {
+        Outcome::Failed { kind, message } => {
+            assert_eq!(kind, FailureKind::Log);
+            assert!(message.contains("log open"), "got {message}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    // No input seeds no turn.
+    let root = run_tmp("char-kindinput");
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::new()),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        Vec::new(),
+        &CancellationToken::new(),
+    )
+    .await;
+    match outcome {
+        Outcome::Failed { kind, message } => {
+            assert_eq!(kind, FailureKind::Input);
+            assert!(message.contains("at least one input"), "got {message}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failure_kinds_pin_snapshot_ensure_site() {
+    // Read-only workdir: `git init` fails, so `ensure` fails Snapshot.
+    let root = run_tmp("char-kindensure");
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::new()),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let mut perms = std::fs::metadata(&root).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&root, perms).unwrap();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    match outcome {
+        Outcome::Failed { kind, message } => {
+            assert_eq!(kind, FailureKind::Snapshot);
+            assert!(message.contains("snapshot ensure"), "got {message}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }

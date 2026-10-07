@@ -1,8 +1,8 @@
-//! Budgeted prompt selection. Salvage of ~/rof-harness/src/context/assembler.rs
-//! (one budget, dedupe, windowing) + retriever.rs (file map, named files, windows).
-//! Rule: select what enters, never summarize the edit surface. Volatile named
-//! files are must_include and excluded from mid-layer double delivery: the
-//! caller keeps them out of the mid layer, this crate delivers them last.
+//! Budgeted prompt selection: one budget, dedupe, windowing for the file
+//! map and named files. Rule: select what enters, never summarize the edit
+//! surface. Volatile named files are must_include and excluded from mid-layer
+//! double delivery: the caller keeps them out of the mid layer, this crate
+//! delivers them last.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -20,21 +20,10 @@ pub const COLLAPSE_KEEP: usize = 5;
 /// verbatim window would reach `COLLAPSE_KEEP + H`, then it stubs the whole
 /// excess in one batch, so it moves once per H tool rows instead of once per
 /// row. `0` = the collapse-5 tail rule (byte-identical, the default). Every
-/// move rewrites history and invalidates the provider prefix-cache suffix
-/// (research/cost-decomposition.md: 82.1% of avoidable miss dollars).
+/// move rewrites history and invalidates the provider prefix-cache suffix.
+/// Default for the run config's `collapse_hysteresis` field; arms set that
+/// field directly, so nothing here reads the environment.
 pub const COLLAPSE_HYSTERESIS: usize = 0;
-
-/// Hysteresis knob: env `COLLAPSE_HYSTERESIS` overrides the default (A/B arm;
-/// the default stays [`COLLAPSE_HYSTERESIS`]). The env leg is deliberately not
-/// unit-tested (mutation races parallel tests; THINKING_KEEP precedent): the
-/// fold takes H as a plain parameter and tests drive [`collapse_boundary`]
-/// directly.
-pub fn collapse_hysteresis() -> usize {
-    std::env::var("COLLAPSE_HYSTERESIS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(COLLAPSE_HYSTERESIS)
-}
 
 /// Stub boundary over `tool_count` tool rows: rows before the returned index
 /// collapse, rows from it on stay verbatim. `hysteresis == 0` is the

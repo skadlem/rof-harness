@@ -1,26 +1,33 @@
 //! Multi-tick drivers: headless `run` and channel `drive_tick`.
 
+use crate::proof::BatchSnapshot;
+#[cfg(test)]
+use crate::settle_tool_msg;
+use crate::state::THINKING_KEEP;
+use crate::state::{ProviderMsg, ToolMsg};
 use crate::{
     append_to, batch_hunks, build_request, checkpoint, incremental_hunks, note_tool_execution,
-    outcome_log_reason, outcome_to_result, pin_snapshot, refund_batch, settle_tool_msg,
-    settle_tool_tail, snapshot_batch, turn_end_reason_to_event, turn_id, BetsHook, ClaimOutcome,
-    IncentivesLevel, Input, LoopState, Outcome, Phase, PhaseVerdict, ProviderMsg, ToolMsg,
-    ROLLBACK_NOTICE,
+    outcome_log_reason, outcome_to_result, pin_snapshot, refund_batch, settle_tool_tail,
+    snapshot_batch, turn_end_reason_to_event, turn_id, BetsHook, ClaimOutcome, FailureKind,
+    IncentivesLevel, Input, LoopState, Outcome, Phase, PhaseVerdict, ROLLBACK_NOTICE,
 };
 use agent_budget::BudgetHalt;
 use agent_event::{
-    AgentError, AgentEvent, ControlAck, ControlKind, ControlStatus, DeltaKind, Emitter, Message,
-    MessageDelta, Role, RunOutcome as EventRunOutcome, TurnEndReason as EventTurnEndReason,
-    UsageReport,
+    AgentError, AgentEvent, DeltaKind, Emitter, Message, MessageDelta, Role,
+    RunOutcome as EventRunOutcome, TurnEndReason as EventTurnEndReason, UsageReport,
 };
+#[cfg(test)]
+use agent_event::{ControlAck, ControlKind, ControlStatus};
 use agent_log::{Item, ItemKind, LogWriter, LOG_VERSION};
-use provider_core::{AssistantMessage, LlmClient, LlmError, Usage};
+use provider_core::{AssistantMessage, LlmClient, LlmError, Request, Response, Usage};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+#[cfg(test)]
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tool_core::ToolResult;
+use tool_core::{Invocation, ToolCall, ToolResult};
 
 /// Provider settle usage → the live-event payload. `cache_write` stays out:
 /// the live vocabulary names only what consumers read.
@@ -88,17 +95,11 @@ pub(crate) fn emit_message_frames(
 /// `observe_action`, and the `edits`/`actions` increments behave identically
 /// because both drivers call the same fns.
 ///
-/// `LoopState` field note: every field is live in `run` — single-flight
-/// `in_flight` (`start_provider_call`/`finish_provider_msg`) and `steering`
-/// (`admit_steering`) ARE used and kept; there is no dead machinery to
-/// annotate, and none may be removed under the frozen contract.
-///
 /// Ordering rule: the durable log append always
 /// precedes its terminal frame in code order — `step_claim` /
 /// `record_tool_result` / the TurnEnd append below run before the matching
 /// `emit`, so replay from the log agrees with replay from events.
-/// Starting the next provider call (should_call_model -> start_provider_call)
-/// stays the caller's job; the multi-tick run() is the shipped driver.
+#[cfg(test)]
 pub async fn drive_tick(
     state: &mut LoopState,
     inbox: &mut mpsc::Receiver<Input>,
@@ -106,6 +107,7 @@ pub async fn drive_tick(
     tool_rx: &mut mpsc::Receiver<ToolMsg>,
     cancel: &CancellationToken,
     emitter: &mut Emitter,
+    cfg: &RunConfig,
 ) -> PhaseVerdict {
     let turn_before = state.turn;
     tokio::select! {
@@ -140,81 +142,7 @@ pub async fn drive_tick(
             }
         }
         Some(pm) = provider_rx.recv() => {
-            if pm.turn() == state.turn {
-                let owned = pm.clone();
-                state.finish_provider_msg(pm); // usage metered + Attempt appended here...
-                match owned {
-                    ProviderMsg::Partial { text, .. } => {
-                        let id = match state.open_msg {
-                            Some(id) => id,
-                            None => {
-                                let id = state.next_emit_id();
-                                emitter.emit(AgentEvent::MessageStart {
-                                    id,
-                                    role: Role::Assistant,
-                                    partial: Message {
-                                        role: Role::Assistant,
-                                        content: String::new(),
-                                    },
-                                });
-                                state.open_msg = Some(id);
-                                id
-                            }
-                        };
-                        emitter.emit(AgentEvent::MessageUpdate {
-                            id,
-                            delta: MessageDelta {
-                                kind: DeltaKind::Text,
-                                text: Some(text.clone()),
-                            },
-                            partial: Message {
-                                role: Role::Assistant,
-                                content: text,
-                            },
-                        });
-                    }
-                    ProviderMsg::Settled {
-                        message,
-                        stop,
-                        usage,
-                        ..
-                    } => {
-                        // ...and Assistant + ToolCall appends inside step_claim...
-                        // Shared with `run`: the same `step_claim` + frames order.
-                        let outcome = state.step_claim(message.clone(), stop);
-                        emit_message_frames(state, &message, usage.as_ref(), emitter); // ...before these frames.
-                        match outcome {
-                            ClaimOutcome::Dispatch(calls) => {
-                                for c in &calls {
-                                    emitter.emit(AgentEvent::ToolStart {
-                                        id: c.call_id.clone(),
-                                        name: c.name.clone(),
-                                        args: c.args.clone(),
-                                    });
-                                }
-                            }
-                            ClaimOutcome::VerifyHold => {
-                                // Same as `run`'s `VerifyHold => continue`: the
-                                // turn stays alive (`call_model` latched in
-                                // `step_claim`) and the next request carries
-                                // `verify.hold` on its tail. No `ToolStart`.
-                            }
-                            ClaimOutcome::Done
-                            | ClaimOutcome::Truncated(_)
-                            | ClaimOutcome::Refused
-                            | ClaimOutcome::HardExit(_) => {}
-                        }
-                    }
-                    ProviderMsg::Failed { err, .. } => {
-                        emitter.emit(AgentEvent::Error {
-                            error: AgentError {
-                                code: "provider-failed".into(),
-                                message: err,
-                            },
-                        });
-                    }
-                }
-            }
+            settle_provider_tick(state, pm, emitter, cfg);
             // else: STALE GUARD, dropped without an event.
         }
         Some(tm) = tool_rx.recv() => {
@@ -223,7 +151,7 @@ pub async fn drive_tick(
             // `record_tool_result` + `settle_tool_tail`, the same order `run`
             // uses per executed call.
             let shadow = tm.clone();
-            if settle_tool_msg(state, tm) {
+            if settle_tool_msg(state, tm, cfg) {
                 // ToolResult appended above; terminal frame after.
                 emitter.emit(AgentEvent::ToolEnd {
                     id: shadow.call_id,
@@ -234,7 +162,7 @@ pub async fn drive_tick(
         }
         else => {}
     }
-    let verdict = state.terminate();
+    let verdict = state.terminate(cfg);
     // turn_before > 0: the 0 -> 1 opening has no prior turn to close.
     if state.turn != turn_before && turn_before > 0 && matches!(verdict, PhaseVerdict::Continue) {
         // Same hop as run(): closer is durable already, frames follow in order.
@@ -265,6 +193,95 @@ pub async fn drive_tick(
     verdict
 }
 
+/// Test-harness provider settle: the `drive_tick` provider arm, extracted so
+/// the harness stays under the size target. Same order as `run`'s settle
+/// (`finish_provider_msg`, then `step_claim` + frames). Stale turns drop
+/// without an event.
+#[cfg(test)]
+fn settle_provider_tick(
+    state: &mut LoopState,
+    pm: ProviderMsg,
+    emitter: &mut Emitter,
+    cfg: &RunConfig,
+) {
+    if pm.turn() == state.turn {
+        let owned = pm.clone();
+        state.finish_provider_msg(pm); // usage metered + Attempt appended here...
+        match owned {
+            ProviderMsg::Partial { text, .. } => {
+                let id = match state.open_msg {
+                    Some(id) => id,
+                    None => {
+                        let id = state.next_emit_id();
+                        emitter.emit(AgentEvent::MessageStart {
+                            id,
+                            role: Role::Assistant,
+                            partial: Message {
+                                role: Role::Assistant,
+                                content: String::new(),
+                            },
+                        });
+                        state.open_msg = Some(id);
+                        id
+                    }
+                };
+                emitter.emit(AgentEvent::MessageUpdate {
+                    id,
+                    delta: MessageDelta {
+                        kind: DeltaKind::Text,
+                        text: Some(text.clone()),
+                    },
+                    partial: Message {
+                        role: Role::Assistant,
+                        content: text,
+                    },
+                });
+            }
+            ProviderMsg::Settled {
+                message,
+                stop,
+                usage,
+                ..
+            } => {
+                // ...and Assistant + ToolCall appends inside step_claim...
+                // Shared with `run`: the same `step_claim` + frames order.
+                let outcome = state.step_claim(message.clone(), stop, cfg);
+                emit_message_frames(state, &message, usage.as_ref(), emitter); // ...before these frames.
+                match outcome {
+                    ClaimOutcome::Dispatch(calls) => {
+                        for c in &calls {
+                            emitter.emit(AgentEvent::ToolStart {
+                                id: c.call_id.clone(),
+                                name: c.name.clone(),
+                                args: c.args.clone(),
+                            });
+                        }
+                    }
+                    ClaimOutcome::VerifyHold => {
+                        // Same as `run`'s `VerifyHold => continue`: the
+                        // turn stays alive (`call_model` latched in
+                        // `step_claim`) and the next request carries
+                        // `verify.hold` on its tail. No `ToolStart`.
+                    }
+                    ClaimOutcome::Done
+                    | ClaimOutcome::Truncated(_)
+                    | ClaimOutcome::Refused
+                    | ClaimOutcome::HardExit(_) => {}
+                }
+            }
+            ProviderMsg::Failed { err, .. } => {
+                emitter.emit(AgentEvent::Error {
+                    error: AgentError {
+                        code: "provider-failed".into(),
+                        message: err,
+                    },
+                });
+            }
+        }
+    }
+    // else: STALE GUARD, dropped without an event.
+}
+
 /// Headless run knobs. `drain_timeout` defaults to 30s (unattended runs must
 /// not wedge on a stuck tool); the context budget reuses v1's 24k evidence
 /// window until the histogram retunes it.
@@ -285,6 +302,12 @@ pub struct RunConfig {
     pub proof_cmd: Option<String>,
     /// Compaction checkpoint knobs (default OFF: no summary call, no fold).
     pub compaction: context::CompactionConfig,
+    /// Transcript-fold knobs, the single source of truth: echoed-reasoning
+    /// keep-count (default [`THINKING_KEEP`]) and collapse-boundary
+    /// hysteresis (default [`context::COLLAPSE_HYSTERESIS`]). Arms set these
+    /// fields directly; the loop and `context` never read the environment.
+    pub thinking_keep: usize,
+    pub collapse_hysteresis: usize,
 }
 
 impl Default for RunConfig {
@@ -300,6 +323,8 @@ impl Default for RunConfig {
             incentives: IncentivesLevel::Full,
             proof_cmd: None,
             compaction: context::CompactionConfig::default(),
+            thinking_keep: THINKING_KEEP,
+            collapse_hysteresis: context::COLLAPSE_HYSTERESIS,
         }
     }
 }
@@ -317,61 +342,13 @@ pub struct Run<'a, P> {
     pub cfg: RunConfig,
 }
 
-/// Append-only tail sync: the vec is the mirror, the file is the record.
-/// A failed pre-effect append is a hard failure (never run from
-/// process-only state).
-pub(crate) fn sync_log(
-    items: &[Item],
-    writer: Option<&mut LogWriter>,
-    synced: &mut usize,
-) -> std::io::Result<()> {
-    let Some(w) = writer else { return Ok(()) };
-    while *synced < items.len() {
-        w.append(&items[*synced])?;
-        *synced += 1;
-    }
-    Ok(())
-}
-
 pub(crate) fn event_outcome(outcome: &Outcome) -> EventRunOutcome {
     match outcome {
         Outcome::Done => EventRunOutcome::Passed,
-        Outcome::Halted(s) | Outcome::Failed(s) => EventRunOutcome::Failed(s.clone()),
+        Outcome::Halted(s) => EventRunOutcome::Failed(s.clone()),
+        Outcome::Failed { message, .. } => EventRunOutcome::Failed(message.clone()),
         Outcome::Cancelled => EventRunOutcome::Aborted,
     }
-}
-
-/// Durable TurnEnd first, terminal frames second — never inverted. The emit
-/// still runs when the sync fails so live always sees a terminal frame.
-pub(crate) fn finish_run(
-    state: &mut LoopState,
-    writer: Option<&mut LogWriter>,
-    emitter: &mut Emitter,
-    run_id: u64,
-    synced: &mut usize,
-    outcome: Outcome,
-) -> Outcome {
-    let reason = outcome_log_reason(&outcome, state.turn_reason.as_ref());
-    state.stick_turn_reason(reason.clone());
-    append_to(
-        &mut state.items,
-        ItemKind::TurnEnd {
-            turn_id: turn_id(state.turn),
-            reason: reason.clone(),
-        },
-    );
-    let _ = sync_log(&state.items, writer, synced);
-    emitter.emit(AgentEvent::TurnEnd {
-        turn: state.turn,
-        reason: turn_end_reason_to_event(&reason),
-        usage_totals: state.usage_totals.clone(),
-    });
-    emitter.emit(AgentEvent::RunEnd {
-        outcome: event_outcome(&outcome),
-        messages: Vec::new(),
-    });
-    let _ = run_id;
-    outcome
 }
 
 /// The durable closer for a hopped turn, read back from the log so live and
@@ -391,29 +368,767 @@ pub(crate) fn hopped_turn_reason(state: &LoopState, before: u64) -> EventTurnEnd
         .unwrap_or(EventTurnEndReason::Completed)
 }
 
-/// Follow-up opened a new turn mid-`terminate` (closer already appended
-/// there): sync it, then emit its frame before the new TurnStart. False
-/// means the durable append failed and the caller must fail closed.
-pub(crate) fn close_hopped_turn(
-    state: &mut LoopState,
-    writer: Option<&mut LogWriter>,
-    emitter: &mut Emitter,
-    synced: &mut usize,
-    before: u64,
-) -> bool {
-    if state.turn == before || before == 0 {
-        return true;
+/// Blocking fs/git work off the async executor: snapshot, file-map, pins,
+/// and log IO all run here so a slow disk never stalls the executor. These
+/// complete fast and are not raced against cancel (abandoning a half-done
+/// rollback would leave the workdir unknown); the provider/tool races that
+/// must return promptly keep their own `select!`.
+pub(crate) async fn blocking<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .expect("blocking worker panicked")
+}
+
+/// Private run assembly: the loop state, the snapshot tree, the append-only
+/// log writer, the live emitter, and how much of the log is durable. Every
+/// phase below goes through [`RunCtx::record`] (append + sync + emit) and
+/// [`RunCtx::finish`], so the terminal sites share one fail-closed path and
+/// no function grows past ~150 lines.
+struct RunCtx<'s, 'r, P> {
+    state: &'s mut LoopState,
+    provider: &'r P,
+    registry: &'r tool_core::Registry,
+    agent: &'r str,
+    workdir: &'r Path,
+    emitter: &'r mut Emitter,
+    bets: &'r dyn BetsHook,
+    cfg: RunConfig,
+    tree: Arc<snapshot::TreeService>,
+    writer: Option<LogWriter>,
+    synced: usize,
+    run_id: u64,
+    root: CancellationToken,
+    cancel: &'r CancellationToken,
+}
+
+/// Step-head decision: a provider call was admitted (`Call`), the run parks
+/// (`Yield` lets the executor breathe, `Again` polls immediately), or the
+/// run is terminal (`Exit`, still unfinished until `finish` runs it).
+enum Head {
+    Call(CancellationToken),
+    Yield,
+    Again,
+    Exit(Outcome),
+}
+
+/// One executed tool batch: the proof gate's input plus the pre-batch
+/// counter snapshot a full rollback refunds to.
+struct BatchReport {
+    claim: bets::Claim,
+    hunks: Vec<(String, bool)>,
+    batch_failed: bool,
+    snap: BatchSnapshot,
+}
+
+impl<P> RunCtx<'_, '_, P> {
+    /// Tail sync on the blocking worker: the pending rows are cloned
+    /// (usually one or two small items; empty tails skip the thread hop
+    /// entirely) and appended + fsynced off the executor, preserving the old
+    /// append-only tail sync's stop-at-first-error progress (the vec is the
+    /// mirror, the file is the record; a failed pre-effect append is a hard
+    /// failure, never run from process-only state). `Err` is already the
+    /// terminal log-append failure; the caller finishes with it.
+    async fn sync(&mut self) -> Result<(), Outcome> {
+        if self.writer.is_none() || self.synced >= self.state.items.len() {
+            return Ok(());
+        }
+        let writer = self.writer.take().expect("writer checked above");
+        let pending: Vec<Item> = self.state.items[self.synced..].to_vec();
+        let base = self.synced;
+        let (writer, done, failed) = blocking(move || {
+            let mut writer = writer;
+            let mut done = base;
+            let mut failed = false;
+            for item in &pending {
+                match writer.append(item) {
+                    Ok(()) => done += 1,
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            (writer, done, failed)
+        })
+        .await;
+        self.writer = Some(writer);
+        self.synced = done;
+        if failed {
+            return Err(Outcome::Failed {
+                kind: FailureKind::Log,
+                message: "log append failed".into(),
+            });
+        }
+        Ok(())
     }
-    if sync_log(&state.items, writer, synced).is_err() {
-        return false;
+
+    /// Durable TurnEnd first, terminal frames second — never inverted. The
+    /// emit still runs when the sync fails so live always sees a terminal
+    /// frame.
+    async fn finish(&mut self, outcome: Outcome) -> Outcome {
+        let reason = outcome_log_reason(&outcome, self.state.turn_reason.as_ref());
+        self.state.stick_turn_reason(reason.clone());
+        let turn = self.state.turn;
+        let usage = self.state.usage_totals.clone();
+        append_to(
+            &mut self.state.items,
+            ItemKind::TurnEnd {
+                turn_id: turn_id(turn),
+                reason: reason.clone(),
+            },
+        );
+        // Best-effort durable close: the frames emit even when this fails.
+        let _ = self.sync().await;
+        self.emitter.emit(AgentEvent::TurnEnd {
+            turn,
+            reason: turn_end_reason_to_event(&reason),
+            usage_totals: usage,
+        });
+        self.emitter.emit(AgentEvent::RunEnd {
+            outcome: event_outcome(&outcome),
+            messages: Vec::new(),
+        });
+        outcome
     }
-    emitter.emit(AgentEvent::TurnEnd {
-        turn: before,
-        reason: hopped_turn_reason(state, before),
-        usage_totals: state.usage_totals.clone(),
-    });
-    emitter.emit(AgentEvent::TurnStart { turn: state.turn });
-    true
+
+    /// Log-before-event by construction: the durable row is appended and
+    /// synced before its live frame emits. Rows without a frame pass `None`.
+    /// State helpers shared with `drive_tick` (`step_claim`,
+    /// `record_tool_result`, `finish_provider_msg`) own their appends, so
+    /// their frames still emit after an explicit `sync` at the same site —
+    /// the same order, pinned by the characterization tests.
+    async fn record(&mut self, kind: ItemKind, frame: Option<AgentEvent>) -> Result<(), Outcome> {
+        append_to(&mut self.state.items, kind);
+        self.sync().await?;
+        if let Some(frame) = frame {
+            self.emitter.emit(frame);
+        }
+        Ok(())
+    }
+
+    /// Follow-up opened a new turn mid-`terminate` (closer already appended
+    /// there): sync it, then emit its frame before the new TurnStart.
+    async fn close_hop(&mut self, before: u64) -> Result<(), Outcome> {
+        if self.state.turn == before || before == 0 {
+            return Ok(());
+        }
+        self.sync().await?;
+        let reason = hopped_turn_reason(self.state, before);
+        let usage = self.state.usage_totals.clone();
+        self.emitter.emit(AgentEvent::TurnEnd {
+            turn: before,
+            reason,
+            usage_totals: usage,
+        });
+        self.emitter.emit(AgentEvent::TurnStart {
+            turn: self.state.turn,
+        });
+        Ok(())
+    }
+
+    /// Shared tail for terminal-ish claims (Done past its fast path,
+    /// Truncated, and the post-batch verdict): terminate, hop the turn, or
+    /// park Done when idle.
+    async fn settle_terminal(&mut self, before: u64) -> Result<(), Outcome> {
+        match self.state.terminate(&self.cfg) {
+            PhaseVerdict::Return(o) => Err(o),
+            _ => {
+                self.close_hop(before).await?;
+                if self.state.phase == Phase::Idle && self.state.is_idle() {
+                    return Err(Outcome::Done);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl<P: LlmClient> RunCtx<'_, '_, P> {
+    /// Run open: RunStart frame, log writer, Header row, snapshot `ensure`,
+    /// input seeding, and the prefix-cache freeze. `Some` is terminal (the
+    /// finish-closed cases are already finished inside; log-open and
+    /// no-input already emitted their own RunEnd).
+    async fn open_run(&mut self, inputs: Vec<Input>) -> Option<Outcome> {
+        self.run_id = self.state.next_emit_id();
+        self.emitter.emit(AgentEvent::RunStart {
+            run_id: self.run_id,
+            goal: self.cfg.goal.clone(),
+        });
+        if let Some(p) = self.cfg.log_path.clone() {
+            match blocking(move || LogWriter::open(&p)).await {
+                Ok(w) => self.writer = Some(w),
+                Err(e) => {
+                    let o = Outcome::Failed {
+                        kind: FailureKind::Log,
+                        message: format!("log open: {e}"),
+                    };
+                    self.emitter.emit(AgentEvent::RunEnd {
+                        outcome: event_outcome(&o),
+                        messages: Vec::new(),
+                    });
+                    return Some(o);
+                }
+            }
+        }
+        if self.state.items.is_empty() {
+            // ponytail: the Header row has no live frame, so `record` covers
+            // it with `None` instead of a bespoke append-then-sync.
+            if let Err(o) = self
+                .record(
+                    ItemKind::Header {
+                        version: LOG_VERSION,
+                        session_id: format!("run-{}", self.run_id),
+                        cwd: self.workdir.to_string_lossy().into_owned(),
+                        model: self.cfg.model.clone(),
+                    },
+                    None,
+                )
+                .await
+            {
+                return Some(self.finish(o).await);
+            }
+        }
+        let tree = self.tree.clone();
+        if let Err(e) = blocking(move || tree.ensure()).await {
+            let o = Outcome::Failed {
+                kind: FailureKind::Snapshot,
+                message: format!("snapshot ensure: {e}"),
+            };
+            return Some(self.finish(o).await);
+        }
+        if let Err(o) = self.sync().await {
+            return Some(self.finish(o).await);
+        }
+        for input in inputs {
+            let before = self.state.turn;
+            self.state.apply_input(input);
+            if let Err(o) = self.sync().await {
+                return Some(self.finish(o).await);
+            }
+            if self.state.turn != before {
+                self.emitter.emit(AgentEvent::TurnStart {
+                    turn: self.state.turn,
+                });
+            }
+        }
+        if self.state.turn == 0 {
+            let o = Outcome::Failed {
+                kind: FailureKind::Input,
+                message: "run needs at least one input".into(),
+            };
+            self.emitter.emit(AgentEvent::RunEnd {
+                outcome: event_outcome(&o),
+                messages: Vec::new(),
+            });
+            return Some(o);
+        }
+        // Prefix-cache head: freeze the file map once, before the first request;
+        // mid-run edits must not rotate the system message. Named-file pins freeze
+        // on the same beat (dropout rule in `build_request`).
+        // Prefix-cache freeze on the blocking worker: the directory walk
+        // and pin reads are fs IO, never executor work.
+        let root = self.workdir.to_path_buf();
+        self.state.file_map =
+            Some(blocking(move || context::file_map(&root, 200).join("\n")).await);
+        let root = self.workdir.to_path_buf();
+        let files = self.cfg.context_files.clone();
+        self.state.pins = Some(blocking(move || pin_snapshot(&files, &root)).await);
+        None
+    }
+
+    /// Loop head: cancel latch, steering admission, bets step head, then the
+    /// provider admission gate with `terminate` as the fallback.
+    /// Grace runs inside `start_provider_call`, the halt lands after.
+    async fn step_head(&mut self) -> Result<Head, Outcome> {
+        if self.cancel.is_cancelled() {
+            self.state.stop_hard = true;
+            self.state.gate.begin_abort();
+        }
+        self.state.admit_steering();
+        self.sync().await?;
+        // Bets site 1: step head.
+        if let PhaseVerdict::Return(o) = self.bets.on_step_head(self.state.step as u64) {
+            return Ok(Head::Exit(o));
+        }
+        // Grace runs here (may_step inside); terminate halts after.
+        match self.state.start_provider_call(&self.root) {
+            Some(t) => Ok(Head::Call(t)),
+            None => match self.state.terminate(&self.cfg) {
+                PhaseVerdict::Return(o) => Ok(Head::Exit(o)),
+                PhaseVerdict::Break => Ok(Head::Yield),
+                PhaseVerdict::Continue => {
+                    if self.state.phase == Phase::Idle && self.state.is_idle() {
+                        return Ok(Head::Exit(Outcome::Done));
+                    }
+                    Ok(Head::Again)
+                }
+            },
+        }
+    }
+
+    /// One provider round: checkpoint race, request build, cancel-raced
+    /// `complete`, then settle (failure or claim).
+    async fn provider_round(&mut self, turn_token: CancellationToken) -> Result<(), Outcome> {
+        // Checkpoint before the real request, after the budget admitted the
+        // step: the summary request is real spend and must never be paid for
+        // a step the guard would have refused. Raced against cancel so Ctrl-C
+        // during the summary call returns promptly (parent-side only; the
+        // race drops the summary future and cancels the per-turn child token).
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {}
+            _ = checkpoint(self.state, self.provider, &self.cfg, self.emitter) => {}
+        }
+        if self.cancel.is_cancelled() {
+            turn_token.cancel();
+            self.state.stop_hard = true;
+            self.state.gate.begin_abort();
+        }
+        let req = build_request(self.state, self.registry, self.workdir, &self.cfg);
+        // Parent-side cancel race: Ctrl-C during a model call returns promptly
+        // instead of waiting out the adapter's 8x60s ladder. The `LlmClient`
+        // trait is frozen (no token param), so the cancel branch drops the
+        // `complete` future and cancels the per-turn child token.
+        let completed = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => None,
+            res = self.provider.complete(&self.cfg.model, &req) => Some(res),
+        };
+        let completed = match completed {
+            None => {
+                turn_token.cancel();
+                self.state.stop_hard = true;
+                self.state.gate.begin_abort();
+                Err(LlmError::Metered {
+                    source: Box::new(LlmError::Cancelled),
+                    usage: None,
+                    exhausted: false,
+                })
+            }
+            Some(res) => res,
+        };
+        match completed {
+            Err(e) => self.settle_provider_error(e).await,
+            Ok(resp) => self.settle_success(resp, req, &turn_token).await,
+        }
+    }
+
+    /// Provider failure: meter the billed attempts, record the Attempt row,
+    /// emit the Error frame, then retry in-step or terminate.
+    async fn settle_provider_error(&mut self, e: LlmError) -> Result<(), Outcome> {
+        let cancelled = self.cancel.is_cancelled() || self.root.is_cancelled();
+        // Metered failures carry what the attempts were billed; every
+        // other error shape has no usage to report.
+        let (msg, usage) = match e {
+            LlmError::Metered {
+                source,
+                usage,
+                exhausted,
+            } => {
+                // An exhausted ladder already ran the adapter's full retry
+                // ladder inside one `complete`: an in-step retry would re-bill
+                // every rung for no new information, so the retry budget is
+                // spent and the failure goes fatal below.
+                if exhausted {
+                    self.state.step_retries = 0;
+                }
+                (format!("{source}"), usage)
+            }
+            other => (format!("{other:?}"), None),
+        };
+        let turn = self.state.turn;
+        self.state.finish_provider_msg(ProviderMsg::Failed {
+            turn,
+            err: msg.clone(),
+            cancelled,
+            usage,
+        });
+        self.sync().await?;
+        self.emitter.emit(AgentEvent::Error {
+            error: AgentError {
+                code: "provider-failed".into(),
+                message: msg,
+            },
+        });
+        if self.state.call_model {
+            return Ok(()); // in-step retry reuses the same assembly
+        }
+        match self.state.terminate(&self.cfg) {
+            PhaseVerdict::Return(o) => Err(o),
+            _ => {
+                // Never spin: parked-idle without input is Done.
+                if self.state.phase == Phase::Idle && self.state.is_idle() {
+                    return Err(Outcome::Done);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Settled response: anchor, meter the bill, claim, sync, frames, then
+    /// the claim dispatch.
+    async fn settle_success(
+        &mut self,
+        resp: Response,
+        req: Request,
+        turn_token: &CancellationToken,
+    ) -> Result<(), Outcome> {
+        // The request (including any peeked hold row) reached the
+        // provider: consume the hold now. A provider Err below keeps
+        // it armed for the in-step retry.
+        self.state.verify.hold.take();
+        let turn = self.state.turn;
+        // Checkpoint anchor: this request's history length and its
+        // provider-reported prompt tokens (the final attempt's, not
+        // the retry ladder's sum). History only (`len() - 1`: the one
+        // system head), so the next estimate walks exactly the
+        // messages appended after it.
+        self.state.anchor = Some(context::UsageAnchor {
+            messages: req.messages.len().saturating_sub(1),
+            input_tokens: resp.usage.input,
+        });
+        // Meter the BILL, not just the final attempt: a recovered
+        // retry ladder was billed every failed re-send too.
+        let billed = resp.billed_usage();
+        self.state.finish_provider_msg(ProviderMsg::Settled {
+            turn,
+            message: resp.message.clone(),
+            stop: resp.stop,
+            usage: Some(billed.clone()),
+        });
+        let outcome = self
+            .state
+            .step_claim(resp.message.clone(), resp.stop, &self.cfg);
+        self.sync().await?;
+        emit_message_frames(self.state, &resp.message, Some(&billed), self.emitter);
+        match outcome {
+            ClaimOutcome::VerifyHold => {
+                // Unverified declare held: the turn stays alive and
+                // the next request carries the directive on its own row.
+                // Durable hold record syncs at the next loop head before
+                // that request, so the file never lags the wire.
+                self.sync().await?;
+                Ok(())
+            }
+            ClaimOutcome::Done => {
+                // Already-started final step: `record_step` at the head
+                // may have hit max, so `terminate`'s `exceeded` would
+                // preempt this Done with Halted(steps). The admitted
+                // step's declare wins when drained with no followups.
+                if self.state.in_flight.is_none()
+                    && self.state.open_tools() == 0
+                    && !self.state.call_model
+                    && self.state.steering.is_empty()
+                    && self.state.followups.is_empty()
+                    && matches!(
+                        self.state.budget.exceeded().as_ref().map(|e| &e.halt),
+                        Some(BudgetHalt::Steps)
+                    )
+                {
+                    return Err(Outcome::Done);
+                }
+                let before = self.state.turn;
+                self.settle_terminal(before).await
+            }
+            ClaimOutcome::Truncated(_) | ClaimOutcome::Refused => {
+                let before = self.state.turn;
+                self.settle_terminal(before).await
+            }
+            ClaimOutcome::HardExit(label) => {
+                self.state.fatal_error = Some(label.clone());
+                self.state.gate.close(label);
+                match self.state.terminate(&self.cfg) {
+                    PhaseVerdict::Return(o) => Err(o),
+                    _ => Ok(()),
+                }
+            }
+            ClaimOutcome::Dispatch(calls) => {
+                for c in &calls {
+                    self.emitter.emit(AgentEvent::ToolStart {
+                        id: c.call_id.clone(),
+                        name: c.name.clone(),
+                        args: c.args.clone(),
+                    });
+                }
+                let report = self.tool_batch(calls, turn_token).await?;
+                self.proof_gate(report).await
+            }
+        }
+    }
+
+    /// One tool call through the registry with the parent-side cancel race:
+    /// Ctrl-C during a tool returns promptly instead of waiting it out. The
+    /// race drops the `execute` future and cancels the per-turn child token
+    /// (which owns each tool's child token) when it loses.
+    async fn execute_call(
+        &mut self,
+        inv: Invocation,
+        turn_token: &CancellationToken,
+    ) -> ToolResult {
+        let name = inv.name.clone();
+        match self.registry.resolve(&inv.name) {
+            Some(tool) => {
+                let tool_token = turn_token.child_token();
+                let raced = tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => None,
+                    r = tool.execute(inv, tool_token) => Some(r),
+                };
+                match raced {
+                    None => {
+                        turn_token.cancel();
+                        self.state.stop_hard = true;
+                        self.state.gate.begin_abort();
+                        ToolResult {
+                            content: "cancelled".into(),
+                            is_error: true,
+                        }
+                    }
+                    Some(Ok(o)) => outcome_to_result(o),
+                    Some(Err(e)) => ToolResult::from(e),
+                }
+            }
+            None => ToolResult {
+                content: format!("unknown tool: {name}"),
+                is_error: true,
+            },
+        }
+    }
+
+    /// One dispatched batch: snapshot baseline, per-call execute + record +
+    /// tail + sync + frame, then the hunk probe. A failed batch rolls back
+    /// here (batch scope: the baseline already committed the proven prefix).
+    async fn tool_batch(
+        &mut self,
+        calls: Vec<ToolCall>,
+        turn_token: &CancellationToken,
+    ) -> Result<BatchReport, Outcome> {
+        let tree = self.tree.clone();
+        if let Err(e) = blocking(move || tree.baseline()).await {
+            return Err(Outcome::Failed {
+                kind: FailureKind::Snapshot,
+                message: format!("snapshot baseline: {e}"),
+            });
+        }
+        let mut batch_failed = false;
+        // Pre-batch counters: a full rollback refunds `edits` /
+        // `actions` / `verify.verified_since_write` past the verdict.
+        let batch_snap = snapshot_batch(self.state);
+        for c in &calls {
+            if self.cancel.is_cancelled() {
+                let content = "aborted before dispatch".to_owned();
+                self.state.record_tool_result(ToolMsg {
+                    call_id: c.call_id.clone(),
+                    result: ToolResult {
+                        content: content.clone(),
+                        is_error: true,
+                    },
+                });
+                batch_failed = true;
+            } else {
+                let inv = match self.registry.prepare(self.agent, c.clone()) {
+                    tool_core::CallStatus::Dispatch(inv) => Some(inv),
+                    tool_core::CallStatus::Result(res) => {
+                        batch_failed |= res.is_error;
+                        self.state.record_tool_result(ToolMsg {
+                            call_id: c.call_id.clone(),
+                            result: res,
+                        });
+                        None
+                    }
+                };
+                if let Some(inv) = inv {
+                    let name = inv.name.clone();
+                    let args = inv.args.to_string();
+                    let res = self.execute_call(inv, turn_token).await;
+                    batch_failed |= res.is_error;
+                    // Shared with `drive_tick`: the same
+                    // `note_tool_execution` + `record` order.
+                    let _ = note_tool_execution(self.state, &name, &args, &res);
+                    self.state.record_tool_result(ToolMsg {
+                        call_id: c.call_id.clone(),
+                        result: res.clone(),
+                    });
+                }
+            }
+            // Directives and the nudge land on the fresh tail
+            // BEFORE the sync, so the file never holds a stale
+            // tail and the row keeps the exact model text.
+            // Shared with `drive_tick` (`settle_tool_tail`).
+            settle_tool_tail(self.state, &self.cfg);
+            self.sync().await?;
+            if let Some(done) = self
+                .state
+                .tool_calls
+                .get(&c.call_id)
+                .and_then(|s| s.result.clone())
+            {
+                self.emitter.emit(AgentEvent::ToolEnd {
+                    id: c.call_id.clone(),
+                    result: Value::String(done.content),
+                    is_error: done.is_error,
+                });
+            }
+        }
+        // Bets site 2: post-batch. The claim is built before
+        // the hunks are read (prediction precedes observation);
+        // no step-stored verdict exists yet, so the claim states
+        // the verifier verdict the gate checks. The batch's
+        // hunks are extracted BEFORE the tool-error rollback
+        // below — a failed batch would destroy its own evidence.
+        // Uniform proof flag: the batch's tool results all
+        // passed (test/check rides as any other result);
+        // per-hunk incremental proof is the later ablation.
+        let claim = bets::Claim {
+            predicted_verdict: "tool batch results all passed".to_owned(),
+            on_mismatch: "roll back the batch; keep only proven hunks".to_owned(),
+        };
+        let hunks = {
+            let probe = match &self.cfg.proof_cmd {
+                Some(cmd) => incremental_hunks(self.tree.clone(), self.workdir, cmd).await,
+                None => batch_hunks(self.tree.clone(), !batch_failed).await,
+            };
+            match probe {
+                Ok(h) => h,
+                Err(e) => {
+                    return Err(Outcome::Failed {
+                        kind: FailureKind::Snapshot,
+                        message: e,
+                    });
+                }
+            }
+        };
+        // Batch scope: only the failed batch rolls back; the
+        // baseline already committed the proven prefix.
+        if batch_failed {
+            // Pre-effect record: the rollback destroys the
+            // batch's successful edits, so the notice is
+            // durable before the tree moves. `Attempt` is the
+            // existing log-only vocabulary (no model row, no
+            // new event); the model-visible copy rides the
+            // directive channel on the next tool tail.
+            // ponytail: `record` with no frame keeps the row durable
+            // without inventing an event for it.
+            self.record(
+                ItemKind::Attempt {
+                    error: ROLLBACK_NOTICE.into(),
+                    will_retry: true,
+                },
+                None,
+            )
+            .await?;
+            self.state.push_directive(ROLLBACK_NOTICE.into(), &self.cfg);
+            let tree = self.tree.clone();
+            if let Err(e) = blocking(move || tree.rollback()).await {
+                return Err(Outcome::Failed {
+                    kind: FailureKind::Snapshot,
+                    message: format!("snapshot rollback: {e}"),
+                });
+            }
+            // Rolled-back edits must not linger in the
+            // counters: refund to the pre-batch snapshot.
+            refund_batch(self.state, &batch_snap);
+            // Not counted in AblationMetrics.rollbacks: this
+            // legacy rollback is pre-gate and identical in all
+            // ablation arms. rollbacks = GATE interventions
+            // (Partial/Aborted verdicts) only.
+        }
+        Ok(BatchReport {
+            claim,
+            hunks,
+            batch_failed,
+            snap: batch_snap,
+        })
+    }
+
+    /// Proof-gated post-batch verdict: Committed stands (the failed-batch
+    /// rollback above is the existing path either way), Partial restores the
+    /// kept prefix from baseline, Aborted runs the existing rollback path
+    /// again (idempotent). A restore error fails closed: restore_hunks leaves
+    /// the tree at baseline when any fragment does not apply.
+    async fn proof_gate(&mut self, report: BatchReport) -> Result<(), Outcome> {
+        let BatchReport {
+            claim,
+            hunks,
+            batch_failed,
+            snap,
+        } = report;
+        let observation = if batch_failed {
+            "tool batch results not all passed"
+        } else {
+            "tool batch results all passed"
+        };
+        self.state
+            .experiment
+            .ablation
+            .note_assessment(bets::assess_claim(&claim, observation));
+        let verdict = self.bets.on_post_batch(&claim, &hunks);
+        if !hunks.is_empty() {
+            // The gate's domain is patch batches: an empty
+            // batch has nothing proven, so its Committed must
+            // not inflate proven_hunks. rollbacks counts gate
+            // interventions (Partial/Aborted) only — the
+            // legacy failed-batch rollback above is pre-gate
+            // and identical across ablation arms.
+            self.state.experiment.ablation.note_commit(&verdict);
+        }
+        match verdict {
+            bets::CommitVerdict::Committed => {}
+            bets::CommitVerdict::Partial { savepoint } => {
+                let tree = self.tree.clone();
+                if let Err(e) = blocking(move || tree.restore_hunks(&savepoint.kept_hunks)).await {
+                    return Err(Outcome::Failed {
+                        kind: FailureKind::Snapshot,
+                        message: format!("snapshot restore: {e}"),
+                    });
+                }
+            }
+            bets::CommitVerdict::Aborted { .. } => {
+                let tree = self.tree.clone();
+                if let Err(e) = blocking(move || tree.rollback()).await {
+                    return Err(Outcome::Failed {
+                        kind: FailureKind::Snapshot,
+                        message: format!("snapshot rollback: {e}"),
+                    });
+                }
+                // Gate-aborted batch is a full rollback: the
+                // counters refund like the tool-error path.
+                // (`Partial` keeps its prefix, so its
+                // counters stand.)
+                refund_batch(self.state, &snap);
+            }
+        }
+        // Bets site 2 step hook (unchanged): Return ends the run.
+        if let PhaseVerdict::Return(o) = self.bets.on_step() {
+            return Err(o);
+        }
+        let before = self.state.turn;
+        self.settle_terminal(before).await
+    }
+
+    /// Headless drive: one step head + provider round per turn until a
+    /// phase returns terminal. Every `Err` is unfinished; `finish` runs it.
+    async fn drive(&mut self) -> Outcome {
+        loop {
+            let token = match self.step_head().await {
+                Err(o) => return self.finish(o).await,
+                Ok(Head::Exit(o)) => return self.finish(o).await,
+                Ok(Head::Yield) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Ok(Head::Again) => continue,
+                Ok(Head::Call(token)) => token,
+            };
+            if let Err(o) = self.provider_round(token).await {
+                return self.finish(o).await;
+            }
+        }
+    }
 }
 
 /// Headless multi-tick run on real siblings: [`LlmClient`] provider,
@@ -428,9 +1143,9 @@ pub(crate) fn close_hopped_turn(
 /// Inputs seed here (Crash queues like User, recorded with Crash source);
 /// followups ride `state.followups`. Parked-idle with empty queues is Done.
 ///
-/// Precedence — the single place this is stated (cfg-over-state): `cfg`
-/// wins over pre-set `LoopState` fields. `run` applies `cfg.incentives` over
-/// `state.incentives` and resolves the fold knobs from the environment;
+/// Single source of truth: `cfg` owns every run knob (incentives, drain
+/// deadline, fold knobs, compaction, proof command). `LoopState` holds no
+/// config mirror, so there is no precedence to document.
 /// `state.budget` arrives pre-seeded (rof builds it from the capability
 /// preset plus CLI overrides via the `agent_budget` constructors) and `run`
 /// never rebuilds it.
@@ -449,711 +1164,25 @@ pub async fn run<P: LlmClient>(
         bets,
         cfg,
     } = r;
-    // Cfg-over-state (precedence is documented on `run`): cfg wins over
-    // pre-set state; the fold knobs resolve from the env once, here.
-    state.drain_timeout = cfg.drain_timeout;
-    state.incentives = cfg.incentives;
-    state.resolve_fold_config();
-    let root = CancellationToken::new();
-    let run_id = state.next_emit_id();
-    emitter.emit(AgentEvent::RunStart {
-        run_id,
-        goal: cfg.goal.clone(),
-    });
-    let mut synced = 0usize;
-    let mut writer: Option<LogWriter> = None;
-    if let Some(p) = cfg.log_path.clone() {
-        match LogWriter::open(&p) {
-            Ok(w) => writer = Some(w),
-            Err(e) => {
-                let o = Outcome::Failed(format!("log open: {e}"));
-                emitter.emit(AgentEvent::RunEnd {
-                    outcome: event_outcome(&o),
-                    messages: Vec::new(),
-                });
-                return o;
-            }
-        }
-    }
-    if state.items.is_empty() {
-        append_to(
-            &mut state.items,
-            ItemKind::Header {
-                version: LOG_VERSION,
-                session_id: format!("run-{run_id}"),
-                cwd: workdir.to_string_lossy().into_owned(),
-                model: cfg.model.clone(),
-            },
-        );
-    }
-    let tree = snapshot::TreeService::new(workdir);
-    if let Err(e) = tree.ensure() {
-        return finish_run(
-            state,
-            writer.as_mut(),
-            emitter,
-            run_id,
-            &mut synced,
-            Outcome::Failed(format!("snapshot ensure: {e}")),
-        );
-    }
-    if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
-        return finish_run(
-            state,
-            None,
-            emitter,
-            run_id,
-            &mut synced,
-            Outcome::Failed("log append failed".into()),
-        );
-    }
-    for input in inputs {
-        let before = state.turn;
-        state.apply_input(input);
-        if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
-            return finish_run(
-                state,
-                None,
-                emitter,
-                run_id,
-                &mut synced,
-                Outcome::Failed("log append failed".into()),
-            );
-        }
-        if state.turn != before {
-            emitter.emit(AgentEvent::TurnStart { turn: state.turn });
-        }
-    }
-    if state.turn == 0 {
-        let o = Outcome::Failed("run needs at least one input".into());
-        emitter.emit(AgentEvent::RunEnd {
-            outcome: event_outcome(&o),
-            messages: Vec::new(),
-        });
+    let tree = Arc::new(snapshot::TreeService::new(workdir));
+    let mut ctx = RunCtx {
+        state,
+        provider,
+        registry,
+        agent,
+        workdir,
+        emitter,
+        bets,
+        cfg,
+        tree,
+        writer: None,
+        synced: 0,
+        run_id: 0,
+        root: CancellationToken::new(),
+        cancel,
+    };
+    if let Some(o) = ctx.open_run(inputs).await {
         return o;
     }
-    // Prefix-cache head: freeze the file map once, before the first request;
-    // mid-run edits must not rotate the system message. Named-file pins freeze
-    // on the same beat (dropout rule in `build_request`).
-    state.file_map = Some(context::file_map(workdir, 200).join("\n"));
-    state.pins = Some(pin_snapshot(&cfg.context_files, workdir));
-    loop {
-        if cancel.is_cancelled() {
-            state.stop_hard = true;
-            state.gate.begin_abort();
-        }
-        state.admit_steering();
-        if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
-            return finish_run(
-                state,
-                None,
-                emitter,
-                run_id,
-                &mut synced,
-                Outcome::Failed("log append failed".into()),
-            );
-        }
-        // Bets site 1: step head.
-        if let PhaseVerdict::Return(o) = bets.on_step_head(state.step as u64) {
-            return finish_run(state, writer.as_mut(), emitter, run_id, &mut synced, o);
-        }
-        // Grace runs here (may_step inside); terminate halts after.
-        let turn_token = match state.start_provider_call(&root) {
-            Some(t) => t,
-            None => match state.terminate() {
-                PhaseVerdict::Return(o) => {
-                    return finish_run(state, writer.as_mut(), emitter, run_id, &mut synced, o);
-                }
-                PhaseVerdict::Break => {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                PhaseVerdict::Continue => {
-                    if state.phase == Phase::Idle && state.is_idle() {
-                        return finish_run(
-                            state,
-                            writer.as_mut(),
-                            emitter,
-                            run_id,
-                            &mut synced,
-                            Outcome::Done,
-                        );
-                    }
-                    continue;
-                }
-            },
-        };
-        // Checkpoint before the real request, after the budget admitted the
-        // step: the summary request is real spend and must never be paid for
-        // a step the guard would have refused. Raced against cancel so Ctrl-C
-        // during the summary call returns promptly (parent-side only; the
-        // race drops the summary future and cancels the per-turn child token).
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {}
-            _ = checkpoint(state, provider, &cfg, emitter) => {}
-        }
-        if cancel.is_cancelled() {
-            turn_token.cancel();
-            state.stop_hard = true;
-            state.gate.begin_abort();
-        }
-        let req = build_request(state, registry, workdir, &cfg);
-        // Parent-side cancel race: Ctrl-C during a model call returns promptly
-        // instead of waiting out the adapter's 8x60s ladder. The `LlmClient`
-        // trait is frozen (no token param), so the cancel branch drops the
-        // `complete` future and cancels the per-turn child token.
-        let completed = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => None,
-            res = provider.complete(&cfg.model, &req) => Some(res),
-        };
-        let completed = match completed {
-            None => {
-                turn_token.cancel();
-                state.stop_hard = true;
-                state.gate.begin_abort();
-                Err(LlmError::Metered {
-                    source: Box::new(LlmError::Cancelled),
-                    usage: None,
-                    exhausted: false,
-                })
-            }
-            Some(res) => res,
-        };
-        match completed {
-            Err(e) => {
-                let cancelled = cancel.is_cancelled() || root.is_cancelled();
-                // Metered failures carry what the attempts were billed; every
-                // other error shape has no usage to report.
-                let (msg, usage) = match e {
-                    LlmError::Metered { source, usage, .. } => (format!("{source}"), usage),
-                    other => (format!("{other:?}"), None),
-                };
-                let turn = state.turn;
-                state.finish_provider_msg(ProviderMsg::Failed {
-                    turn,
-                    err: msg.clone(),
-                    cancelled,
-                    usage,
-                });
-                if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
-                    return finish_run(
-                        state,
-                        None,
-                        emitter,
-                        run_id,
-                        &mut synced,
-                        Outcome::Failed("log append failed".into()),
-                    );
-                }
-                emitter.emit(AgentEvent::Error {
-                    error: AgentError {
-                        code: "provider-failed".into(),
-                        message: msg,
-                    },
-                });
-                if state.call_model {
-                    continue; // in-step retry reuses the same assembly
-                }
-                match state.terminate() {
-                    PhaseVerdict::Return(o) => {
-                        return finish_run(state, writer.as_mut(), emitter, run_id, &mut synced, o);
-                    }
-                    _ => {
-                        // Never spin: parked-idle without input is Done.
-                        if state.phase == Phase::Idle && state.is_idle() {
-                            return finish_run(
-                                state,
-                                writer.as_mut(),
-                                emitter,
-                                run_id,
-                                &mut synced,
-                                Outcome::Done,
-                            );
-                        }
-                        continue;
-                    }
-                }
-            }
-            Ok(resp) => {
-                // The request (including any peeked hold row) reached the
-                // provider: consume the hold now. A provider Err below keeps
-                // it armed for the in-step retry.
-                state.verify.hold.take();
-                let turn = state.turn;
-                // Checkpoint anchor: this request's history length and its
-                // provider-reported prompt tokens (the final attempt's, not
-                // the retry ladder's sum). History only (`len() - 1`: the one
-                // system head), so the next estimate walks exactly the
-                // messages appended after it.
-                state.anchor = Some(context::UsageAnchor {
-                    messages: req.messages.len().saturating_sub(1),
-                    input_tokens: resp.usage.input,
-                });
-                // Meter the BILL, not just the final attempt: a recovered
-                // retry ladder was billed every failed re-send too.
-                let billed = resp.billed_usage();
-                state.finish_provider_msg(ProviderMsg::Settled {
-                    turn,
-                    message: resp.message.clone(),
-                    stop: resp.stop,
-                    usage: Some(billed.clone()),
-                });
-                let outcome = state.step_claim(resp.message.clone(), resp.stop);
-                if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
-                    return finish_run(
-                        state,
-                        None,
-                        emitter,
-                        run_id,
-                        &mut synced,
-                        Outcome::Failed("log append failed".into()),
-                    );
-                }
-                emit_message_frames(state, &resp.message, Some(&billed), emitter);
-                match outcome {
-                    ClaimOutcome::VerifyHold => {
-                        // Unverified declare held: the turn stays alive and
-                        // the next request carries the directive on its own row.
-                        // Durable hold record syncs at the next loop head before
-                        // that request, so the file never lags the wire.
-                        if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
-                            return finish_run(
-                                state,
-                                None,
-                                emitter,
-                                run_id,
-                                &mut synced,
-                                Outcome::Failed("log append failed".into()),
-                            );
-                        }
-                        continue;
-                    }
-                    ClaimOutcome::Done => {
-                        // Already-started final step: `record_step` at the head
-                        // may have hit max, so `terminate`'s `exceeded` would
-                        // preempt this Done with Halted(steps). The admitted
-                        // step's declare wins when drained with no followups.
-                        if state.in_flight.is_none()
-                            && state.open_tools() == 0
-                            && !state.call_model
-                            && state.steering.is_empty()
-                            && state.followups.is_empty()
-                            && matches!(
-                                state.budget.exceeded().as_ref().map(|e| &e.halt),
-                                Some(BudgetHalt::Steps)
-                            )
-                        {
-                            return finish_run(
-                                state,
-                                writer.as_mut(),
-                                emitter,
-                                run_id,
-                                &mut synced,
-                                Outcome::Done,
-                            );
-                        }
-                        let before = state.turn;
-                        match state.terminate() {
-                            PhaseVerdict::Return(o) => {
-                                return finish_run(
-                                    state,
-                                    writer.as_mut(),
-                                    emitter,
-                                    run_id,
-                                    &mut synced,
-                                    o,
-                                );
-                            }
-                            _ => {
-                                if !close_hopped_turn(
-                                    state,
-                                    writer.as_mut(),
-                                    emitter,
-                                    &mut synced,
-                                    before,
-                                ) {
-                                    return finish_run(
-                                        state,
-                                        None,
-                                        emitter,
-                                        run_id,
-                                        &mut synced,
-                                        Outcome::Failed("log append failed".into()),
-                                    );
-                                }
-                                if state.phase == Phase::Idle && state.is_idle() {
-                                    return finish_run(
-                                        state,
-                                        writer.as_mut(),
-                                        emitter,
-                                        run_id,
-                                        &mut synced,
-                                        Outcome::Done,
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    ClaimOutcome::Truncated(_) | ClaimOutcome::Refused => {
-                        let before = state.turn;
-                        match state.terminate() {
-                            PhaseVerdict::Return(o) => {
-                                return finish_run(
-                                    state,
-                                    writer.as_mut(),
-                                    emitter,
-                                    run_id,
-                                    &mut synced,
-                                    o,
-                                );
-                            }
-                            _ => {
-                                if !close_hopped_turn(
-                                    state,
-                                    writer.as_mut(),
-                                    emitter,
-                                    &mut synced,
-                                    before,
-                                ) {
-                                    return finish_run(
-                                        state,
-                                        None,
-                                        emitter,
-                                        run_id,
-                                        &mut synced,
-                                        Outcome::Failed("log append failed".into()),
-                                    );
-                                }
-                                if state.phase == Phase::Idle && state.is_idle() {
-                                    return finish_run(
-                                        state,
-                                        writer.as_mut(),
-                                        emitter,
-                                        run_id,
-                                        &mut synced,
-                                        Outcome::Done,
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    ClaimOutcome::HardExit(label) => {
-                        state.fatal_error = Some(label.clone());
-                        state.gate.close(label);
-                        match state.terminate() {
-                            PhaseVerdict::Return(o) => {
-                                return finish_run(
-                                    state,
-                                    writer.as_mut(),
-                                    emitter,
-                                    run_id,
-                                    &mut synced,
-                                    o,
-                                );
-                            }
-                            _ => continue,
-                        }
-                    }
-                    ClaimOutcome::Dispatch(calls) => {
-                        for c in &calls {
-                            emitter.emit(AgentEvent::ToolStart {
-                                id: c.call_id.clone(),
-                                name: c.name.clone(),
-                                args: c.args.clone(),
-                            });
-                        }
-                        if let Err(e) = tree.baseline() {
-                            return finish_run(
-                                state,
-                                writer.as_mut(),
-                                emitter,
-                                run_id,
-                                &mut synced,
-                                Outcome::Failed(format!("snapshot baseline: {e}")),
-                            );
-                        }
-                        let mut batch_failed = false;
-                        // Pre-batch counters: a full rollback refunds `edits` /
-                        // `actions` / `verify.verified_since_write` past the verdict.
-                        let batch_snap = snapshot_batch(state);
-                        for c in &calls {
-                            if cancel.is_cancelled() {
-                                let content = "aborted before dispatch".to_owned();
-                                state.record_tool_result(ToolMsg {
-                                    call_id: c.call_id.clone(),
-                                    result: ToolResult {
-                                        content: content.clone(),
-                                        is_error: true,
-                                    },
-                                });
-                                batch_failed = true;
-                            } else {
-                                let inv = match registry.prepare(agent, c.clone()) {
-                                    tool_core::CallStatus::Dispatch(inv) => Some(inv),
-                                    tool_core::CallStatus::Result(res) => {
-                                        batch_failed |= res.is_error;
-                                        state.record_tool_result(ToolMsg {
-                                            call_id: c.call_id.clone(),
-                                            result: res,
-                                        });
-                                        None
-                                    }
-                                };
-                                if let Some(inv) = inv {
-                                    let name = inv.name.clone();
-                                    let args = inv.args.to_string();
-                                    // Parent-side cancel race: Ctrl-C during a tool
-                                    // returns promptly instead of waiting it out.
-                                    // The race drops the `execute` future and
-                                    // cancels the per-turn child token (which
-                                    // owns each tool's child token) when it loses.
-                                    let res = match registry.resolve(&inv.name) {
-                                        Some(tool) => {
-                                            let tool_token = turn_token.child_token();
-                                            let raced = tokio::select! {
-                                                biased;
-                                                _ = cancel.cancelled() => None,
-                                                r = tool.execute(inv, tool_token) => Some(r),
-                                            };
-                                            match raced {
-                                                None => {
-                                                    turn_token.cancel();
-                                                    state.stop_hard = true;
-                                                    state.gate.begin_abort();
-                                                    ToolResult {
-                                                        content: "cancelled".into(),
-                                                        is_error: true,
-                                                    }
-                                                }
-                                                Some(Ok(o)) => outcome_to_result(o),
-                                                Some(Err(e)) => ToolResult::from(e),
-                                            }
-                                        }
-                                        None => ToolResult {
-                                            content: format!("unknown tool: {name}"),
-                                            is_error: true,
-                                        },
-                                    };
-                                    batch_failed |= res.is_error;
-                                    // Shared with `drive_tick`: the same
-                                    // `note_tool_execution` + `record` order.
-                                    let _ = note_tool_execution(state, &name, &args, &res);
-                                    state.record_tool_result(ToolMsg {
-                                        call_id: c.call_id.clone(),
-                                        result: res.clone(),
-                                    });
-                                }
-                            }
-                            // Directives and the nudge land on the fresh tail
-                            // BEFORE the sync, so the file never holds a stale
-                            // tail and the row keeps the exact model text.
-                            // Shared with `drive_tick` (`settle_tool_tail`).
-                            settle_tool_tail(state);
-                            if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
-                                return finish_run(
-                                    state,
-                                    None,
-                                    emitter,
-                                    run_id,
-                                    &mut synced,
-                                    Outcome::Failed("log append failed".into()),
-                                );
-                            }
-                            if let Some(done) = state
-                                .tool_calls
-                                .get(&c.call_id)
-                                .and_then(|s| s.result.clone())
-                            {
-                                emitter.emit(AgentEvent::ToolEnd {
-                                    id: c.call_id.clone(),
-                                    result: Value::String(done.content),
-                                    is_error: done.is_error,
-                                });
-                            }
-                        }
-                        // Bets site 2: post-batch. The claim is built before
-                        // the hunks are read (prediction precedes observation);
-                        // no step-stored verdict exists yet, so the claim states
-                        // the verifier verdict the gate checks. The batch's
-                        // hunks are extracted BEFORE the tool-error rollback
-                        // below — a failed batch would destroy its own evidence.
-                        // Uniform proof flag: the batch's tool results all
-                        // passed (test/check rides as any other result);
-                        // per-hunk incremental proof is the later ablation.
-                        let claim = bets::Claim {
-                            predicted_verdict: "tool batch results all passed".to_owned(),
-                            on_mismatch: "roll back the batch; keep only proven hunks".to_owned(),
-                        };
-                        let hunks = {
-                            let probe = match &cfg.proof_cmd {
-                                Some(cmd) => incremental_hunks(&tree, workdir, cmd).await,
-                                None => batch_hunks(&tree, !batch_failed),
-                            };
-                            match probe {
-                                Ok(h) => h,
-                                Err(e) => {
-                                    return finish_run(
-                                        state,
-                                        writer.as_mut(),
-                                        emitter,
-                                        run_id,
-                                        &mut synced,
-                                        Outcome::Failed(e),
-                                    )
-                                }
-                            }
-                        };
-                        // Batch scope: only the failed batch rolls back; the
-                        // baseline already committed the proven prefix.
-                        if batch_failed {
-                            // Pre-effect record: the rollback destroys the
-                            // batch's successful edits, so the notice is
-                            // durable before the tree moves. `Attempt` is the
-                            // existing log-only vocabulary (no model row, no
-                            // new event); the model-visible copy rides the
-                            // directive channel on the next tool tail.
-                            append_to(
-                                &mut state.items,
-                                ItemKind::Attempt {
-                                    error: ROLLBACK_NOTICE.into(),
-                                    will_retry: true,
-                                },
-                            );
-                            state.push_directive(ROLLBACK_NOTICE.into());
-                            if sync_log(&state.items, writer.as_mut(), &mut synced).is_err() {
-                                return finish_run(
-                                    state,
-                                    None,
-                                    emitter,
-                                    run_id,
-                                    &mut synced,
-                                    Outcome::Failed("log append failed".into()),
-                                );
-                            }
-                            if let Err(e) = tree.rollback() {
-                                return finish_run(
-                                    state,
-                                    writer.as_mut(),
-                                    emitter,
-                                    run_id,
-                                    &mut synced,
-                                    Outcome::Failed(format!("snapshot rollback: {e}")),
-                                );
-                            }
-                            // Rolled-back edits must not linger in the
-                            // counters: refund to the pre-batch snapshot.
-                            refund_batch(state, &batch_snap);
-                            // Not counted in AblationMetrics.rollbacks: this
-                            // legacy rollback is pre-gate and identical in all
-                            // ablation arms. rollbacks = GATE interventions
-                            // (Partial/Aborted verdicts) only.
-                        }
-                        // Verdict→tree mapping: Committed stands (the failed-
-                        // batch rollback above is the existing path either way),
-                        // Partial restores the kept prefix from baseline, Aborted
-                        // runs the existing rollback path again (idempotent).
-                        // A restore error fails closed: restore_hunks leaves the
-                        // tree at baseline when any fragment does not apply.
-                        let observation = if batch_failed {
-                            "tool batch results not all passed"
-                        } else {
-                            "tool batch results all passed"
-                        };
-                        state
-                            .ablation
-                            .note_assessment(bets::assess_claim(&claim, observation));
-                        let verdict = bets.on_post_batch(&claim, &hunks);
-                        if !hunks.is_empty() {
-                            // The gate's domain is patch batches: an empty
-                            // batch has nothing proven, so its Committed must
-                            // not inflate proven_hunks. rollbacks counts gate
-                            // interventions (Partial/Aborted) only — the
-                            // legacy failed-batch rollback above is pre-gate
-                            // and identical across ablation arms.
-                            state.ablation.note_commit(&verdict);
-                        }
-                        match verdict {
-                            bets::CommitVerdict::Committed => {}
-                            bets::CommitVerdict::Partial { savepoint } => {
-                                if let Err(e) = tree.restore_hunks(&savepoint.kept_hunks) {
-                                    return finish_run(
-                                        state,
-                                        writer.as_mut(),
-                                        emitter,
-                                        run_id,
-                                        &mut synced,
-                                        Outcome::Failed(format!("snapshot restore: {e}")),
-                                    );
-                                }
-                            }
-                            bets::CommitVerdict::Aborted { .. } => {
-                                if let Err(e) = tree.rollback() {
-                                    return finish_run(
-                                        state,
-                                        writer.as_mut(),
-                                        emitter,
-                                        run_id,
-                                        &mut synced,
-                                        Outcome::Failed(format!("snapshot rollback: {e}")),
-                                    );
-                                }
-                                // Gate-aborted batch is a full rollback: the
-                                // counters refund like the tool-error path.
-                                // (`Partial` keeps its prefix, so its
-                                // counters stand.)
-                                refund_batch(state, &batch_snap);
-                            }
-                        }
-                        // Bets site 2 step hook (unchanged): Return ends the run.
-                        if let PhaseVerdict::Return(o) = bets.on_step() {
-                            return finish_run(
-                                state,
-                                writer.as_mut(),
-                                emitter,
-                                run_id,
-                                &mut synced,
-                                o,
-                            );
-                        }
-                        let before = state.turn;
-                        match state.terminate() {
-                            PhaseVerdict::Return(o) => {
-                                return finish_run(
-                                    state,
-                                    writer.as_mut(),
-                                    emitter,
-                                    run_id,
-                                    &mut synced,
-                                    o,
-                                );
-                            }
-                            _ => {
-                                if !close_hopped_turn(
-                                    state,
-                                    writer.as_mut(),
-                                    emitter,
-                                    &mut synced,
-                                    before,
-                                ) {
-                                    return finish_run(
-                                        state,
-                                        None,
-                                        emitter,
-                                        run_id,
-                                        &mut synced,
-                                        Outcome::Failed("log append failed".into()),
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    ctx.drive().await
 }
