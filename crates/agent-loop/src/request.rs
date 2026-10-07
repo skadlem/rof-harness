@@ -156,8 +156,11 @@ pub(crate) const WORKFLOW_CONTRACT: &str = "WORKFLOW CONTRACT\n\
     work file-by-file: view -> edit immediately -> next file. `edit` and `write` are the ONLY patch mechanisms — never write files via exec; exec/test are for checks only.\n\
     when your patch is complete, reply with a text message and NO tool calls — that finishes the run.";
 
-/// Live counters, request-scoped: appended to the final outgoing message after
-/// the transcript is derived, so they are never persisted.
+/// Live counters, request-scoped by design: appended to the final outgoing
+/// message after the transcript is derived, so they are never persisted.
+/// Durability lives in `BudgetGuard` counters + `TurnEnd.usage_totals`;
+/// persisting these digits into the transcript would rotate the cached-prefix
+/// head every request. Pinned by `build_request_system_is_static...` tests.
 pub(crate) fn budget_line(state: &LoopState) -> String {
     let cfg = state.budget.config();
     let counters = state.budget.counters();
@@ -196,7 +199,9 @@ pub(crate) fn pin_snapshot(files: &[String], workdir: &Path) -> Vec<(String, Str
 /// frozen for the run — DeepSeek-style prefix caching only fires on
 /// byte-identical prefixes. Named files freeze the same way ([`LoopState::pins`])
 /// and drop out of the request if their file changed since run start. The live
-/// budget line is the sole per-request variation: it is appended to the last
+/// budget line is the sole per-request variation
+/// (wire-only clone of `Request.messages`, never `state.items`; the empty-history
+/// edge makes it the sole `user` message): it is appended to the last
 /// outgoing message only and never to the transcript, so the durable log stays
 /// exactly what was recorded. History is delivered exactly once, raw, as
 /// messages (collapse-5 rides [`LoopState::derived_messages`]) — never fitted
