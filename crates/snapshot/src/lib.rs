@@ -343,12 +343,8 @@ impl TreeService {
         if !patch.ends_with('\n') {
             patch.push('\n');
         }
-        let mut cmd = std::process::Command::new("git");
-        cmd.arg("-C")
-            .arg(&self.root)
-            .args(["apply", "-"])
-            .env("LC_ALL", "C")
-            .env("LANG", "C")
+        let mut cmd = hermetic_git(&self.root);
+        cmd.args(["apply", "-"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -427,22 +423,67 @@ impl TreeService {
     }
 
     fn git_status<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Result<Output> {
-        let mut cmd = std::process::Command::new("git");
-        cmd.arg("-C")
-            .arg(&self.root)
-            .args(["-c", "core.hooksPath=/dev/null"]) // copied-in hooks must not block the baseline
-            .args(args)
-            // Fixed identity: reproducible on machines with empty git config.
-            .env("GIT_AUTHOR_NAME", "rof")
-            .env("GIT_AUTHOR_EMAIL", "rof@local")
-            .env("GIT_COMMITTER_NAME", "rof")
-            .env("GIT_COMMITTER_EMAIL", "rof@local")
-            // Fixed locale: `commit_all` matches the English
-            // "nothing to commit" text, so every git child runs under C.
-            .env("LC_ALL", "C")
-            .env("LANG", "C");
+        let mut cmd = hermetic_git(&self.root);
+        cmd.args(args);
         cmd.output().map_err(|e| other(format!("spawn git: {e}")))
     }
+}
+
+/// Every git child the overlay spawns: the copy's baseline must not depend
+/// on the host's git setup. Parent-inherited `GIT_DIR` (and friends) would
+/// redirect commands into the wrong repo; system/global config could turn
+/// on signing, hooks, fsmonitor, or an external diff. Command-line `-c`
+/// flags outrank any config file git still reads.
+///
+/// // ponytail: hand-rolled `Command` setup instead of a git library to keep
+/// the dependency list at serde only.
+fn hermetic_git(root: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(root)
+        // Copied-in hooks must not block the baseline; a host opt-in to
+        // signing must not break overlay commits; fsmonitor would leak host
+        // state into evidence. (No `diff.external` override: an empty value
+        // does NOT disable it — git execs "" and every diff dies with
+        // "cannot run". System/global config, the realistic leak vectors,
+        // are nulled via env below; a fresh `init` writes no local driver.)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.fsmonitor=false",
+        ])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_NAMESPACE")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_config())
+        // Fixed identity: reproducible on machines with empty git config.
+        .env("GIT_AUTHOR_NAME", "rof")
+        .env("GIT_AUTHOR_EMAIL", "rof@local")
+        .env("GIT_COMMITTER_NAME", "rof")
+        .env("GIT_COMMITTER_EMAIL", "rof@local")
+        // Fixed locale: deterministic git diagnostics in errors.
+        .env("LC_ALL", "C")
+        .env("LANG", "C");
+    cmd
+}
+
+/// Config-file sink for `GIT_CONFIG_GLOBAL`: the null device, so no user or
+/// host global config is read. Unix primary; `NUL` elsewhere.
+#[cfg(unix)]
+fn null_config() -> &'static str {
+    "/dev/null"
+}
+
+#[cfg(not(unix))]
+fn null_config() -> &'static str {
+    "NUL"
 }
 
 fn other(msg: String) -> Error {
@@ -548,11 +589,21 @@ mod tests {
         dir
     }
 
+    /// Process env is process-wide: a test that mutates it would break a
+    /// parallel test's raw `git` spawn mid-flight. Hold the guard in every
+    /// test that sets process env AND in every test that spawns raw git.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn embedded_repo_dirt_is_a_benign_no_op_baseline() {
         // Regression: modified content inside a nested git repo stages as an
         // unchanged gitlink, so the baseline commit reports "no changes added
         // to commit" and (before this gate) killed the whole run.
+        let _guard = env_guard(); // spawns raw git: serialize vs env-mutating tests
         let dir = scratch("embed");
         let tree = TreeService::new(&dir);
         std::fs::write(dir.join("a.rs"), "one\n").unwrap();
@@ -716,6 +767,7 @@ mod tests {
 
     #[test]
     fn baseline_stable_under_hostile_locale_env() {
+        let _guard = env_guard();
         let dir = scratch("locale");
         let tree = TreeService::new(&dir);
         std::fs::write(dir.join("a.rs"), "one\n").unwrap();
@@ -737,6 +789,57 @@ mod tests {
             None => std::env::remove_var("LANG"),
         }
         assert!(tree.diff().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parent_git_dir_env_is_ignored() {
+        let _guard = env_guard();
+        let dir = scratch("gitdir-env");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        // Hostile parent env: every overlay child strips GIT_DIR, so the
+        // copy still baselines, diffs, and rolls back in place.
+        let old = std::env::var("GIT_DIR").ok();
+        std::env::set_var("GIT_DIR", "/nonexistent-git-dir");
+        let outcome = (|| -> Result<()> {
+            tree.ensure()?;
+            tree.baseline()?;
+            std::fs::write(dir.join("a.rs"), "two\n").unwrap();
+            assert!(!tree.diff()?.is_empty());
+            tree.rollback()?;
+            assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), "one\n");
+            Ok(())
+        })();
+        match old {
+            Some(v) => std::env::set_var("GIT_DIR", v),
+            None => std::env::remove_var("GIT_DIR"),
+        }
+        outcome.unwrap();
+    }
+
+    #[test]
+    fn global_gpgsign_true_does_not_break_baseline() {
+        let _guard = env_guard();
+        let dir = scratch("gpgsign");
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        std::fs::write(dir.join("signing.config"), "[commit]\n\tgpgsign = true\n").unwrap();
+        // Hostile parent global config: without the hermetic `-c
+        // commit.gpgsign=false` the baseline commit dies in gpg ("No secret
+        // key"); the overlay must not depend on host signing setup.
+        let old = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        std::env::set_var("GIT_CONFIG_GLOBAL", dir.join("signing.config"));
+        let tree = TreeService::new(&dir);
+        let outcome = (|| -> Result<()> {
+            tree.ensure()?;
+            tree.baseline()?;
+            tree.baseline()?;
+            Ok(())
+        })();
+        match old {
+            Some(v) => std::env::set_var("GIT_CONFIG_GLOBAL", v),
+            None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+        }
+        outcome.unwrap();
     }
 
     #[test]
