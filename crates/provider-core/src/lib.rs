@@ -147,6 +147,8 @@ impl Response {
     }
 }
 
+/// Empty capability set: no callers read it today (reserved for future
+/// per-model request shaping). All impls return `Capabilities{}`.
 #[derive(Debug, Clone)]
 pub struct Capabilities {}
 
@@ -190,7 +192,7 @@ pub trait LlmClient: Send + Sync {
             "default LlmClient::complete cannot report usage: override it with a metered implementation".into(),
         ))
     }
-    /// Capabilities negotiated per call; shapes the request from the answer.
+    /// Reserved: negotiated per call once request shaping reads it; today the answer is always empty and unread.
     fn capabilities(&self, model: &str) -> Capabilities;
     /// Per-call credential resolve, not once-at-startup: tokens expire mid-run.
     /// Err only on fatal auth misconfiguration; staleness is retryable.

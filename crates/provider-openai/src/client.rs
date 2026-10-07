@@ -139,6 +139,7 @@ impl LlmClient for OpenAiCompat {
         })
     }
 
+    /// Reserved: always empty, ignores `model` (see `provider-core::Capabilities`).
     fn capabilities(&self, _model: &str) -> Capabilities {
         Capabilities {}
     }
