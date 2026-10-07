@@ -3,6 +3,11 @@
 use agent_event::AgentEvent;
 use agent_loop::Outcome;
 
+/// Startup credential-gate exit: 4, distinct from 2 (usage/parse) and 3
+/// (run failure). Missing credentials are an auth-setup problem before any
+/// spend — wrappers fix the env and retry instead of reading a run failure.
+pub(crate) const EXIT_NO_CREDENTIALS: i32 = 4;
+
 pub(crate) fn exit_code(outcome: &Outcome) -> i32 {
     match outcome {
         Outcome::Done => 0,

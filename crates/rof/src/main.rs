@@ -25,7 +25,7 @@ use tool_core::GrantGate;
 use cli::{apply_env_defaults, budget_for, parse_args, resolve_endpoint, run_config, Args};
 use dump::{attach_dump, finalize_dump};
 use eval_cmd::{parse_eval, run_eval};
-use exit::{exit_code, summarize};
+use exit::{exit_code, summarize, EXIT_NO_CREDENTIALS};
 use workdir::{exclude_sidecar, resolve_log_path, validate_workdir};
 
 /// Deliverable patch: `Ok` is the full uncut run patch for stdout (never the
@@ -169,6 +169,12 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     }
 }
 
+/// Startup credential-gate message: names the env var the provider read so
+/// the fix (export it, or point `--api-key-env` elsewhere) is on the line.
+fn missing_credentials_message(api_key_env: &str, err: &str) -> String {
+    format!("rof: {err}; set ${api_key_env} or pass --api-key-env NAME")
+}
+
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().collect();
@@ -220,6 +226,14 @@ async fn main() {
             std::process::exit(2);
         }
     }
+    // Fail fast before any spend: S3's key-presence check, auth-setup exit.
+    if let Err(e) = provider.check_credentials() {
+        eprintln!(
+            "{}",
+            missing_credentials_message(&args.api_key_env, &e.to_string())
+        );
+        std::process::exit(EXIT_NO_CREDENTIALS);
+    }
     let r = execute(&provider, &args).await;
     if let Some(path) = args.dump_events.as_deref() {
         if let Err(e) = finalize_dump(path, &r.events) {
@@ -239,6 +253,28 @@ async fn main() {
 mod tests {
     use super::*;
     use fixtures::{args_for, edit_resp, text_resp, tmp, tool_resp, write_resp, ScriptClient};
+
+    #[test]
+    fn startup_credential_gate_names_the_var() {
+        // Unique env var, set-then-removed in this test only, so parallel
+        // tests cannot observe it.
+        std::env::remove_var("ROF_TEST_CRED_GATE_KEY");
+        let p = OpenAiCompat::new("http://127.0.0.1:1", EndpointProfile::default())
+            .with_key_env("ROF_TEST_CRED_GATE_KEY");
+        let err = p.check_credentials().unwrap_err().to_string();
+        let msg = missing_credentials_message("ROF_TEST_CRED_GATE_KEY", &err);
+        assert!(
+            msg.contains("ROF_TEST_CRED_GATE_KEY") && msg.contains("--api-key-env"),
+            "the stderr line says how to fix it: {msg}"
+        );
+        assert_eq!(
+            EXIT_NO_CREDENTIALS, 4,
+            "distinct from 2 (usage) and 3 (run)"
+        );
+        std::env::set_var("ROF_TEST_CRED_GATE_KEY", "k");
+        assert!(p.check_credentials().is_ok());
+        std::env::remove_var("ROF_TEST_CRED_GATE_KEY");
+    }
 
     #[tokio::test]
     async fn headless_run_edits_then_done() {
