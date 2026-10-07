@@ -10,14 +10,15 @@ use agent_loop::RunConfig;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--thinking-keep N] [--collapse-hysteresis N]
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir]
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget
 --compaction FRAC: checkpoint the older context once the estimate crosses FRAC of the token budget (0 < FRAC <= 1). OFF-BY-DEFAULT and UNVALIDATED: the S-1 compaction experiment has not run yet, so leave it unset unless running that experiment.
 --thinking-keep N: echoed-reasoning rows kept per assistant message (flag wins over THINKING_KEEP; unset leaves the loop default)
---collapse-hysteresis N: collapse-boundary hysteresis rows (flag wins over COLLAPSE_HYSTERESIS; unset leaves the loop default)";
+--collapse-hysteresis N: collapse-boundary hysteresis rows (flag wins over COLLAPSE_HYSTERESIS; unset leaves the loop default)
+--allow-dirty-workdir: run inside a dirty git workdir (default: refuse; allowed dirt appears in the reported patch)";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Args {
@@ -51,6 +52,9 @@ pub(crate) struct Args {
     /// at the edge by [`apply_env_defaults`]; the loop never reads the env.
     pub thinking_keep: Option<usize>,
     pub collapse_hysteresis: Option<usize>,
+    /// Opt in to running inside a dirty git workdir (pre-existing changes
+    /// then appear in the reported patch).
+    pub allow_dirty_workdir: bool,
 }
 
 /// One flag definition: the long name, whether it takes a value, and the
@@ -129,6 +133,7 @@ struct RunBuilder {
     compaction: Option<f64>,
     thinking_keep: Option<usize>,
     collapse_hysteresis: Option<usize>,
+    allow_dirty_workdir: bool,
 }
 
 fn set_goal(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
@@ -291,6 +296,11 @@ fn set_collapse_hysteresis(b: &mut RunBuilder, v: Option<String>) -> Result<(), 
     Ok(())
 }
 
+fn set_allow_dirty_workdir(b: &mut RunBuilder, _: Option<String>) -> Result<(), String> {
+    b.allow_dirty_workdir = true;
+    Ok(())
+}
+
 const RUN_FLAGS: &[Flag<RunBuilder>] = &[
     Flag {
         name: "--goal",
@@ -397,6 +407,11 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         takes_value: true,
         set: set_collapse_hysteresis,
     },
+    Flag {
+        name: "--allow-dirty-workdir",
+        takes_value: false,
+        set: set_allow_dirty_workdir,
+    },
 ];
 
 pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -430,6 +445,7 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         compaction: b.compaction,
         thinking_keep: b.thinking_keep,
         collapse_hysteresis: b.collapse_hysteresis,
+        allow_dirty_workdir: b.allow_dirty_workdir,
     })
 }
 
@@ -581,6 +597,7 @@ mod tests {
                 compaction: Some(0.6),
                 thinking_keep: None,
                 collapse_hysteresis: None,
+                allow_dirty_workdir: false,
             }
         );
         let b = parse_args(&argv(&[
@@ -916,5 +933,13 @@ mod tests {
         a.collapse_hysteresis = Some(6);
         let cfg = run_config(&a);
         assert_eq!((cfg.thinking_keep, cfg.collapse_hysteresis), (9, 6));
+    }
+
+    #[test]
+    fn allow_dirty_workdir_parses_opt_in() {
+        let a = parse_args(&run_min(&["--allow-dirty-workdir"])).unwrap();
+        assert!(a.allow_dirty_workdir);
+        let b = parse_args(&run_min(&[])).unwrap();
+        assert!(!b.allow_dirty_workdir, "dirty repos refused by default");
     }
 }

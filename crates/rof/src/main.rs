@@ -199,7 +199,7 @@ async fn main() {
         eprintln!("{e}");
         std::process::exit(2);
     }
-    let _workdir = match validate_workdir(&args.workdir) {
+    let _workdir = match validate_workdir(&args.workdir, args.allow_dirty_workdir) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");

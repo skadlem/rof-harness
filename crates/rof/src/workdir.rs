@@ -7,7 +7,10 @@ use crate::cli::Args;
 /// Disposable-workdir guard: `--workdir` is mutated in place (`git init`,
 /// `git add -A`, tool exec). Refuse values that would destroy the machine
 /// or the harness checkout itself. Non-empty task dirs stay allowed.
-pub(crate) fn validate_workdir(path: &Path) -> Result<PathBuf, String> {
+/// An existing repo with uncommitted changes is refused unless `allow_dirty`
+/// (`--allow-dirty-workdir`): pre-existing dirt would otherwise leak into
+/// the reported patch, so running there is an explicit opt-in.
+pub(crate) fn validate_workdir(path: &Path, allow_dirty: bool) -> Result<PathBuf, String> {
     if !path.is_dir() {
         return Err(format!("workdir is not a directory: {}", path.display()));
     }
@@ -24,6 +27,12 @@ pub(crate) fn validate_workdir(path: &Path) -> Result<PathBuf, String> {
     }
     if canon.join("crates/rof/Cargo.toml").is_file() {
         return Err("workdir must not be the harness checkout itself".into());
+    }
+    if !allow_dirty && snapshot::workdir_state(&canon) == snapshot::WorkdirState::Dirty {
+        return Err(format!(
+            "workdir has uncommitted changes: {} (pass --allow-dirty-workdir to run here anyway)",
+            canon.display()
+        ));
     }
     Ok(canon)
 }
@@ -100,19 +109,77 @@ mod tests {
 
     #[test]
     fn workdir_guard_rejects_root_home_and_self_repo() {
-        assert!(validate_workdir(Path::new("/")).is_err());
+        assert!(validate_workdir(Path::new("/"), false).is_err());
         if let Ok(home) = std::env::var("HOME") {
-            assert!(validate_workdir(Path::new(&home)).is_err());
+            assert!(validate_workdir(Path::new(&home), false).is_err());
         }
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = manifest.parent().unwrap().parent().unwrap();
-        assert!(validate_workdir(workspace_root).is_err());
+        assert!(validate_workdir(workspace_root, false).is_err());
     }
 
     #[test]
     fn workdir_guard_accepts_tmp() {
         let tmp = std::env::temp_dir();
-        assert!(validate_workdir(&tmp).is_ok());
+        assert!(validate_workdir(&tmp, false).is_ok());
+    }
+
+    /// Raw-git repo builder for the dirt tests (identity via `-c`, never the
+    /// host config).
+    fn git_repo_with_commit(dir: &Path) {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {:?}", out);
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ]);
+    }
+
+    #[test]
+    fn workdir_guard_refuses_dirty_repo_without_opt_in() {
+        let dir = std::env::temp_dir().join(format!("rof-dirty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_repo_with_commit(&dir);
+        assert!(validate_workdir(&dir, false).is_ok(), "clean repo runs");
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        let err = validate_workdir(&dir, false).unwrap_err();
+        assert!(
+            err.contains("--allow-dirty-workdir"),
+            "refusal names the opt-in: {err}"
+        );
+        assert!(
+            validate_workdir(&dir, true).is_ok(),
+            "opt-in runs in the dirty repo"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workdir_guard_untracked_file_is_dirty() {
+        let dir = std::env::temp_dir().join(format!("rof-untracked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_repo_with_commit(&dir);
+        std::fs::write(dir.join("new.txt"), "x\n").unwrap();
+        assert!(validate_workdir(&dir, false).is_err());
+        assert!(validate_workdir(&dir, true).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
