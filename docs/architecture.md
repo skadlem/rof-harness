@@ -23,7 +23,13 @@ directory.
 `rof eval --tasks-dir DIR` (`eval_cmd.rs`) grades a frozen task slice:
 load instances, run the official-container verdict per task, aggregate
 gate stats into a JSON report. Default patch-apply provenance is Strict;
-`--lenient-apply` records Lenient instead.
+`--lenient-apply` records Lenient instead. With `--agent` the per-instance
+engine is the agent leg instead (`eval_agent.rs`): fresh seeded workdir,
+the loop executed in-process through the same `execute()` wiring as
+`rof run`, then the harbor CLI as the grading seam (job yaml +
+`harbor run -c <job> -y -q`; spawn failure, grading timeout, workdir
+refusal, and a run with no RunEnd in the events dump are infra failures,
+never capability). The container default is unchanged.
 
 ## Crate map
 

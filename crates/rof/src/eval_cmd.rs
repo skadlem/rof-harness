@@ -3,10 +3,11 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::cli::{parse_table, Flag};
+use crate::cli::{parse_table, resolve_endpoint, Flag};
 
-pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply]
---lenient-apply: record Lenient patch-apply provenance in the report (default Strict; Strict grades are not comparable with earlier fuzz-lenient numbers)";
+pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N]
+--lenient-apply: record Lenient patch-apply provenance in the report (default Strict; Strict grades are not comparable with earlier fuzz-lenient numbers)
+--agent: run the agent leg per instance instead of the oracle-container leg (fresh workdir, in-process rof-run wiring, harbor-CLI grading). Requires --model ID and --endpoint URL (or OPENAI_BASE_URL); mutually exclusive with --winnability-only. Agent budgets default to the frozen pilot recipe: 300000 tokens / 60 steps / 120 actions; explicit flags win.";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct EvalArgs {
@@ -19,6 +20,19 @@ pub(crate) struct EvalArgs {
     /// `patch --fuzz=5` fallback). Strict by default, so reports are
     /// byte-identical to before the flag existed.
     pub lenient_apply: bool,
+    /// Agent leg: per-instance in-process run + harbor grading.
+    pub agent: bool,
+    /// Agent endpoint URL, resolved at parse (`--endpoint` wins over
+    /// `OPENAI_BASE_URL`; absent both is a parse error when `--agent`).
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    pub api_key_env: Option<String>,
+    pub headers: Vec<String>,
+    pub allow_cmd: Vec<String>,
+    pub budget_steps: Option<u32>,
+    pub budget_actions: Option<u32>,
+    pub budget_tokens: Option<u64>,
+    pub max_tokens: Option<usize>,
 }
 
 #[derive(Default)]
@@ -29,6 +43,16 @@ struct EvalBuilder {
     report: Option<String>,
     winnability_only: bool,
     lenient_apply: bool,
+    agent: bool,
+    model: Option<String>,
+    endpoint: Option<String>,
+    api_key_env: Option<String>,
+    headers: Vec<String>,
+    allow_cmd: Vec<String>,
+    budget_steps: Option<u32>,
+    budget_actions: Option<u32>,
+    budget_tokens: Option<u64>,
+    max_tokens: Option<usize>,
 }
 
 fn set_tasks_dir(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
@@ -66,6 +90,90 @@ fn set_lenient_apply(b: &mut EvalBuilder, _: Option<String>) -> Result<(), Strin
     Ok(())
 }
 
+fn set_agent(b: &mut EvalBuilder, _: Option<String>) -> Result<(), String> {
+    b.agent = true;
+    Ok(())
+}
+
+fn set_model(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.model = v;
+    Ok(())
+}
+
+fn set_endpoint(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.endpoint = v;
+    Ok(())
+}
+
+fn set_api_key_env(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.api_key_env = v;
+    Ok(())
+}
+
+fn set_header(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    // Parse-time rejection of a colon-less header (`rof run` fails later in
+    // main; the eval agent leg gates at parse so a bad flag never starts a
+    // slice spend).
+    if v.as_deref().and_then(|h| h.split_once(':')).is_some() {
+        b.headers.push(v.expect("colon check passed above"));
+        Ok(())
+    } else {
+        Err(match v {
+            Some(v) => format!("--header needs NAME:VALUE, got {v:?}"),
+            None => "--header needs a value".into(),
+        })
+    }
+}
+
+fn set_allow_cmd(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    if let Some(v) = v {
+        b.allow_cmd.push(v);
+    }
+    Ok(())
+}
+
+fn set_budget_tokens(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    b.budget_tokens = Some(
+        s.parse()
+            .map_err(|_| format!("--budget-tokens needs a positive integer, got {s:?}"))?,
+    );
+    Ok(())
+}
+
+fn set_budget_steps(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    let n: u32 = s
+        .parse()
+        .map_err(|_| format!("--budget-steps needs a positive integer, got {s:?}"))?;
+    if n == 0 {
+        return Err("--budget-steps must be > 0".into());
+    }
+    b.budget_steps = Some(n);
+    Ok(())
+}
+
+fn set_budget_actions(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    let n: u32 = s
+        .parse()
+        .map_err(|_| format!("--budget-actions needs a positive integer, got {s:?}"))?;
+    if n == 0 {
+        return Err("--budget-actions must be > 0".into());
+    }
+    b.budget_actions = Some(n);
+    Ok(())
+}
+
+fn set_max_tokens(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    b.max_tokens = Some(
+        s.parse()
+            .map_err(|_| format!("--max-tokens needs a positive integer, got {s:?}"))?,
+    );
+    Ok(())
+}
+
 const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
     Flag {
         name: "--tasks-dir",
@@ -97,6 +205,56 @@ const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
         takes_value: false,
         set: set_lenient_apply,
     },
+    Flag {
+        name: "--agent",
+        takes_value: false,
+        set: set_agent,
+    },
+    Flag {
+        name: "--model",
+        takes_value: true,
+        set: set_model,
+    },
+    Flag {
+        name: "--endpoint",
+        takes_value: true,
+        set: set_endpoint,
+    },
+    Flag {
+        name: "--api-key-env",
+        takes_value: true,
+        set: set_api_key_env,
+    },
+    Flag {
+        name: "--header",
+        takes_value: true,
+        set: set_header,
+    },
+    Flag {
+        name: "--allow-cmd",
+        takes_value: true,
+        set: set_allow_cmd,
+    },
+    Flag {
+        name: "--budget-steps",
+        takes_value: true,
+        set: set_budget_steps,
+    },
+    Flag {
+        name: "--budget-actions",
+        takes_value: true,
+        set: set_budget_actions,
+    },
+    Flag {
+        name: "--budget-tokens",
+        takes_value: true,
+        set: set_budget_tokens,
+    },
+    Flag {
+        name: "--max-tokens",
+        takes_value: true,
+        set: set_max_tokens,
+    },
 ];
 
 pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
@@ -108,6 +266,26 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
         EVAL_FLAGS,
         EvalBuilder::default(),
     )?;
+    if b.agent && b.winnability_only {
+        return Err("--agent and --winnability-only are mutually exclusive".into());
+    }
+    // Agent mode requires --model; the Option stays for the default path.
+    let model = if b.agent {
+        Some(b.model.ok_or("--agent requires --model ID")?)
+    } else {
+        b.model
+    };
+    // Agent endpoint resolution reuses the run semantics exactly
+    // (`cli::resolve_endpoint`: flag wins, then OPENAI_BASE_URL, then a
+    // parse error naming both).
+    let endpoint = if b.agent {
+        Some(resolve_endpoint(
+            b.endpoint.as_deref(),
+            std::env::var("OPENAI_BASE_URL").ok().as_deref(),
+        )?)
+    } else {
+        b.endpoint
+    };
     Ok(EvalArgs {
         tasks_dir: PathBuf::from(b.tasks_dir.ok_or("missing --tasks-dir")?),
         ids: b.ids,
@@ -115,12 +293,22 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
         report: b.report.map(PathBuf::from),
         winnability_only: b.winnability_only,
         lenient_apply: b.lenient_apply,
+        agent: b.agent,
+        model,
+        endpoint,
+        api_key_env: b.api_key_env,
+        headers: b.headers,
+        allow_cmd: b.allow_cmd,
+        budget_steps: b.budget_steps,
+        budget_actions: b.budget_actions,
+        budget_tokens: b.budget_tokens,
+        max_tokens: b.max_tokens,
     })
 }
 
 /// Which patch applier grades this eval: Strict by default (byte-identical
 /// reports to before the flag existed), Lenient with `--lenient-apply`.
-fn apply_mode_for(args: &EvalArgs) -> eval::ApplyMode {
+pub(crate) fn apply_mode_for(args: &EvalArgs) -> eval::ApplyMode {
     if args.lenient_apply {
         eval::ApplyMode::Lenient
     } else {
@@ -158,6 +346,9 @@ pub(crate) async fn run_eval(args: &EvalArgs) -> i32 {
     };
     let _excluded = eval::preflight(&instances);
     let caps = eval_winnability_caps();
+    if args.agent {
+        return crate::eval_agent::run_agent_leg(args, &instances, &caps).await;
+    }
     let engine = eval::DockerEngine::new();
     let mut reports = Vec::new();
     for inst in &instances {
@@ -210,6 +401,12 @@ pub(crate) async fn run_eval(args: &EvalArgs) -> i32 {
             }
         }
     }
+    finish_report(args, reports)
+}
+
+/// Shared report tail: JSON to `--report` (prettied) or stdout. Extracted so
+/// the agent leg writes the exact same bytes through the same code.
+pub(crate) fn finish_report(args: &EvalArgs, reports: Vec<eval::InstanceReport>) -> i32 {
     let report = eval::RunReport { instances: reports };
     if let Some(path) = args.report.as_deref() {
         if let Some(dir) = path.parent() {
@@ -332,6 +529,16 @@ mod tests {
             report: Some(root.join("out").join("report.json")),
             winnability_only: true,
             lenient_apply: false,
+            agent: false,
+            endpoint: None,
+            model: None,
+            api_key_env: None,
+            headers: Vec::new(),
+            allow_cmd: Vec::new(),
+            budget_steps: None,
+            budget_actions: None,
+            budget_tokens: None,
+            max_tokens: None,
         };
         let code = run_eval(&args).await;
         assert_eq!(code, 0);
@@ -339,5 +546,168 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(v.get("instances").and_then(|x| x.as_array()).is_some());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Process env is process-wide: serialize the OPENAI_BASE_URL tests.
+    static EVAL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn eval_min_agent() -> Vec<String> {
+        argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--agent",
+            "--model",
+            "m",
+        ])
+    }
+
+    #[test]
+    fn eval_agent_flags_parse() {
+        let a = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--agent",
+            "--model",
+            "m",
+            "--endpoint",
+            "https://e/v1",
+            "--api-key-env",
+            "K_ENV",
+            "--header",
+            "A:b",
+            "--allow-cmd",
+            "cargo test",
+        ]))
+        .unwrap();
+        assert!(a.agent);
+        assert_eq!(a.model.as_deref(), Some("m"));
+        assert_eq!(a.endpoint.as_deref(), Some("https://e/v1"));
+        assert_eq!(a.api_key_env.as_deref(), Some("K_ENV"));
+        assert_eq!(a.headers, vec!["A:b".to_string()]);
+        assert_eq!(a.allow_cmd, vec!["cargo test".to_string()]);
+        // --endpoint=eq form parses identically.
+        let b = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir=/tmp/t",
+            "--agent",
+            "--model=m2",
+            "--endpoint=http://x",
+        ]))
+        .unwrap();
+        assert_eq!(b.model.as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn eval_agent_parse_errors() {
+        let _guard = EVAL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("OPENAI_BASE_URL").ok();
+        std::env::remove_var("OPENAI_BASE_URL");
+
+        // --agent without --model is a parse error (exit 2 shape).
+        assert!(parse_eval(&argv(&["rof", "eval", "--tasks-dir", "/tmp/t", "--agent",])).is_err());
+        // --agent and --winnability-only are exclusive.
+        assert!(parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--agent",
+            "--winnability-only",
+        ]))
+        .is_err());
+        // Endpoint: neither flag nor env is a parse error naming both.
+        let missing_endpoint = parse_eval(&eval_min_agent()).err().map(|e| e.to_string());
+        let names_both = missing_endpoint
+            .as_deref()
+            .map(|e| e.contains("--endpoint") && e.contains("OPENAI_BASE_URL"))
+            .unwrap_or(false);
+        assert!(
+            names_both,
+            "error names both resolutions: {missing_endpoint:?}"
+        );
+        // Env fills an absent flag; an explicit flag wins.
+        std::env::set_var("OPENAI_BASE_URL", "http://envbase/v1");
+        assert_eq!(
+            parse_eval(&eval_min_agent()).unwrap().endpoint.as_deref(),
+            Some("http://envbase/v1")
+        );
+        let flag_wins = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--agent",
+            "--model=m",
+            "--endpoint=http://flag/v1",
+        ]))
+        .unwrap();
+        assert_eq!(flag_wins.endpoint.as_deref(), Some("http://flag/v1"));
+
+        // A colon-less header is rejected at parse (`rof run` fails later;
+        // the agent leg gates first so bad flags never start a spend).
+        assert!(parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--agent",
+            "--model=m",
+            "--endpoint=http://x",
+            "--header",
+            "NO-COLON",
+        ]))
+        .is_err());
+
+        // Budget flags parse as integers and reject 0/garbage like rof run.
+        let budgets = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--agent",
+            "--model=m",
+            "--endpoint=http://x",
+            "--budget-steps",
+            "9",
+            "--budget-actions",
+            "11",
+            "--budget-tokens",
+            "42",
+            "--max-tokens",
+            "77",
+        ]))
+        .unwrap();
+        assert_eq!(
+            (
+                budgets.budget_steps,
+                budgets.budget_actions,
+                budgets.budget_tokens,
+                budgets.max_tokens
+            ),
+            (Some(9), Some(11), Some(42), Some(77))
+        );
+        for bad in [
+            vec!["--budget-steps", "0"],
+            vec!["--budget-steps", "lots"],
+            vec!["--budget-actions", "0"],
+            vec!["--budget-actions", "lots"],
+            vec!["--budget-tokens", "lots"],
+        ] {
+            let mut words = eval_min_agent();
+            words.push("--endpoint=http://x".into());
+            words.extend(bad.iter().map(|s| s.to_string()));
+            assert!(parse_eval(&words).is_err(), "bad budget must fail: {bad:?}");
+        }
+
+        // Restore caller env.
+        match saved {
+            Some(v) => std::env::set_var("OPENAI_BASE_URL", v),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
     }
 }

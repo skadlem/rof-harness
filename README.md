@@ -10,7 +10,19 @@ against a scratch `--workdir`, with budgets, a snapshot tree, and the full
   stdout, exit code reflects the outcome. `--dump-events PATH` writes one
   JSON line per event (one run, one dump file); the WAL defaults to
   `<workdir>/.rof-events.jsonl` (`--log-path` overrides, `--no-log` opts out).
-  `rof eval` grades a frozen task slice into a JSON report.
+  `rof eval` grades a frozen task slice into a JSON report; with `--agent`
+  each instance instead runs the agent leg: a fresh workdir
+  `<out-dir>/<id>/work` seeded from `<tasks-dir>/<id>/environment`
+  (or left empty for can_create tasks), the goal built from the instruction
+  (`/app/` stripped, bare `/app` → "the workdir") plus the frozen pilot
+  rules tail, the run executed in-process with the same wiring as
+  `rof run`, then graded via the harbor CLI (`harbor run -c <job> -y -q`):
+  reward 1.0 → Resolved, 0 → Unresolved, missing → ErrorNoReport. Agent
+  infra failures (workdir refusal, missing harbor, grading timeout, a run
+  with no RunEnd in the events dump) never score as capability;
+  packaged files exclude top-level `.git`/`__pycache__`/`.pytest_cache`,
+  any-depth `*.pyc`, and the WAL sidecar (driver parity: first component
+  only, so a nested repo a task builds still reaches the container).
 - `crates/agent-loop` — the loop: `run()` is the shipped sequential driver
   (`drive_tick` is a test harness over the same step helpers). State,
   verification nudge, request building, proof gating, cancellation.
@@ -57,13 +69,25 @@ Useful flags: `--budget-actions/--budget-tokens/--max-tokens`,
 grades the slice; `--lenient-apply` records Lenient patch-apply provenance
 in the report (default Strict).
 
+`rof eval --agent` runs the agent leg instead of the oracle-container leg.
+Required: `--model ID`, `--endpoint URL` (or `OPENAI_BASE_URL`; flag wins).
+Optional: `--api-key-env NAME` (default `OPENAI_API_KEY`), repeatable
+`--header NAME:VALUE` (a colon-less value is a parse error), repeatable
+`--allow-cmd CMD` (same binary-prefix semantics as `rof run`),
+`--budget-steps/--budget-actions/--budget-tokens/--max-tokens` (agent
+budgets default to the frozen pilot recipe: 300000 tokens / 60 steps /
+120 actions). Mutually exclusive with `--winnability-only`.
+
 Missing credentials fail fast before any spend: exit 4, naming the env var
 (`--api-key-env NAME` selects which var holds the key).
 
 ## Workdir contract
 
-`--workdir` must be a disposable scratch dir: the run mutates it in place
-(`git init`, `git add -A`, tool exec). These are refused with exit 2:
+`rof run` mutates `--workdir` in place (`git init`, `git add -A`, tool
+exec). The guard enforces exactly the four refusals below (exit 2); every
+other directory — however valuable it looks — is run today under the
+operator's responsibility (see Threat model: the tools build no sandbox).
+Refused with exit 2:
 
 - the filesystem root (`/`),
 - `$HOME`,

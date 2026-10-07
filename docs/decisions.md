@@ -26,6 +26,21 @@ says so explicitly.
   checkout, and repos with uncommitted changes are refused (exit 2)
   unless `--allow-dirty-workdir` is passed; pre-existing dirt then
   appears in the reported patch, so dirt never leaks in silently.
+- **Agent-leg eval budgets default to the frozen pilot recipe.** `rof eval
+  --agent` fills 300000 tokens / 60 steps / 120 actions when the user
+  omits the budget flags (chosen: copied from the frozen pilot recipe in
+  NEXT.md; validated when the agent-leg slice runs). Explicit flags win,
+  and `cli::budget_for` stays the single resolver.
+- **The harbor CLI is the agent-leg grading seam.** `rof eval --agent`
+  ports the bash pilot driver's mk_goal/verdict verbatim: job yaml (JSON)
+  plus `harbor run -c <job> -y -q`; harbor spawn failure, grading timeout
+  without result.json, workdir refusal, or a run with no RunEnd in the
+  events dump is InfraFailure — infra is never capability. The harbor
+  invocation itself is untested (stays env-gated, like live_smoke).
+- **The workdir guard enforces exactly the four refusals.** Root, `$HOME`,
+  the harness checkout, and dirty-without-opt-in; disposability of every
+  other directory is documented operator responsibility (threat model),
+  not an enforced property.
 - **Exit codes.** 0 done; 2 usage/parse/workdir refusal; 3 run failure
   (halted, cancelled, provider error — Provider keeps the historical 3);
   4 missing credentials; 5 log failure; 6 snapshot failure; 7 input

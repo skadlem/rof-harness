@@ -4,6 +4,7 @@
 
 mod cli;
 mod dump;
+mod eval_agent;
 mod eval_cmd;
 mod exit;
 #[cfg(test)]
@@ -31,10 +32,10 @@ use workdir::{exclude_sidecar, resolve_log_path, validate_workdir};
 /// Deliverable patch: `Ok` is the full uncut run patch for stdout (never the
 /// 8KiB/200-line evidence bound); `Err` means no start HEAD was recorded
 /// (unborn HEAD / empty workdir) and the run must not exit 0.
-struct RunResult {
-    outcome: Outcome,
-    patch: Result<String, String>,
-    events: Vec<AgentEvent>,
+pub(crate) struct RunResult {
+    pub outcome: Outcome,
+    pub patch: Result<String, String>,
+    pub events: Vec<AgentEvent>,
 }
 
 /// Opt-in Bet B/A gate (`--bets`): uniform all-or-nothing verdict on the
@@ -179,7 +180,7 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
 
 /// Startup credential-gate message: names the env var the provider read so
 /// the fix (export it, or point `--api-key-env` elsewhere) is on the line.
-fn missing_credentials_message(api_key_env: &str, err: &str) -> String {
+pub(crate) fn missing_credentials_message(api_key_env: &str, err: &str) -> String {
     format!("rof: {err}; set ${api_key_env} or pass --api-key-env NAME")
 }
 
