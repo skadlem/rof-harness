@@ -2,543 +2,31 @@
 //! Prompt shape (goal + file map + named files via the context assembler)
 //! lives in `agent_loop::run`; this crate only feeds it `RunConfig` + input.
 
-use std::collections::HashMap;
-use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+mod cli;
+mod dump;
+mod eval_cmd;
+mod exit;
+#[cfg(test)]
+mod fixtures;
+mod workdir;
 
-use agent_budget::{config_for, with_steps, BudgetGuard, Capability};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
 use agent_event::{AgentEvent, Emitter};
-use agent_loop::{FailureKind, Input, LoopState, NoBets, Outcome, Run, RunConfig};
+use agent_loop::{FailureKind, Input, LoopState, NoBets, Outcome, Run};
 use provider_core::LlmClient;
 use provider_openai::{EndpointProfile, OpenAiCompat};
 use snapshot::TreeService;
 use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
-const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log]
---dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
---log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
---no-log: disable the WAL (run without a durable log)
---context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget
---compaction FRAC: checkpoint the older context once the estimate crosses FRAC of the token budget (0 < FRAC <= 1). OFF-BY-DEFAULT and UNVALIDATED: the S-1 compaction experiment has not run yet, so leave it unset unless running that experiment.";
-
-#[derive(Debug, PartialEq)]
-struct Args {
-    goal: String,
-    workdir: PathBuf,
-    model: String,
-    endpoint: Option<String>,
-    /// Env var holding the API key (default OPENAI_API_KEY; opencode-go uses
-    /// GO_KEY). The key itself never appears in argv or logs.
-    api_key_env: String,
-    /// Extra request headers as NAME:VALUE (e.g. x-opencode-session:<id>).
-    headers: Vec<String>,
-    allow_cmd: Vec<String>,
-    budget_steps: Option<u32>,
-    budget_actions: Option<u32>,
-    budget_tokens: Option<u64>,
-    max_tokens: Option<usize>,
-    context_files: Vec<String>,
-    dump_events: Option<String>,
-    /// WAL override (`None` = default inside `--workdir`); `--no-log` wins.
-    log_path: Option<String>,
-    /// Opt out of the fail-closed WAL.
-    no_log: bool,
-    proof_cmd: Option<String>,
-    incentives: agent_loop::IncentivesLevel,
-    bets: bool,
-    /// Compaction trigger fraction; `None` = checkpoint off (default).
-    compaction: Option<f64>,
-}
-
-const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only]";
-
-#[derive(Debug, PartialEq)]
-struct EvalArgs {
-    tasks_dir: PathBuf,
-    ids: Vec<String>,
-    out_dir: PathBuf,
-    report: Option<PathBuf>,
-    winnability_only: bool,
-}
-
-fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
-    let a: Vec<&str> = argv.iter().map(String::as_str).collect();
-    if a.len() < 2 || a[1] != "eval" {
-        return Err(EVAL_USAGE.into());
-    }
-    let (mut tasks_dir, mut ids, mut out_dir, mut report) = (None, Vec::new(), None, None);
-    let mut winnability_only = false;
-    let mut i = 2;
-    while i < a.len() {
-        let flag = a[i];
-        let (k, inline) = match flag.split_once('=') {
-            Some((k, v)) => (k, Some(v.to_string())),
-            None => (flag, None),
-        };
-        let take = |i: &mut usize, inline: Option<String>| -> Result<String, String> {
-            if let Some(v) = inline {
-                return Ok(v);
-            }
-            *i += 1;
-            a.get(*i)
-                .map(|s| (*s).to_string())
-                .ok_or_else(|| format!("{k} needs a value"))
-        };
-        match k {
-            "--tasks-dir" => tasks_dir = Some(take(&mut i, inline)?),
-            "--ids" => {
-                ids = take(&mut i, inline)?
-                    .split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            }
-            "--out-dir" => out_dir = Some(take(&mut i, inline)?),
-            "--report" => report = Some(take(&mut i, inline)?),
-            "--winnability-only" => {
-                winnability_only = true;
-            }
-            _ => return Err(EVAL_USAGE.into()),
-        }
-        i += 1;
-    }
-    Ok(EvalArgs {
-        tasks_dir: PathBuf::from(tasks_dir.ok_or("missing --tasks-dir")?),
-        ids,
-        out_dir: PathBuf::from(out_dir.unwrap_or_else(|| "/tmp/rof-eval-out".into())),
-        report: report.map(PathBuf::from),
-        winnability_only,
-    })
-}
-
-fn eval_winnability_caps() -> eval::ToolCaps {
-    eval::ToolCaps {
-        can_create: true,
-        can_patch: true,
-        exec_prefixes: Vec::new(),
-    }
-}
-
-fn eval_verdict_from_workdir(workdir: &Path) -> eval::Verdict {
-    for name in ["reward.txt", "reward.json"] {
-        let p = workdir.join(name);
-        if p.is_file() {
-            if let Ok(v) = eval::check_tb_reward(&p) {
-                return v;
-            }
-        }
-    }
-    eval::Verdict::ErrorNoReport
-}
-
-async fn run_eval(args: &EvalArgs) -> i32 {
-    let instances = match eval::load_tb_slice(&args.tasks_dir, &args.ids) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("cannot load slice: {e}");
-            return 2;
-        }
-    };
-    let _excluded = eval::preflight(&instances);
-    let caps = eval_winnability_caps();
-    let engine = eval::DockerEngine::new();
-    let mut reports = Vec::new();
-    for inst in &instances {
-        let task_dir = args.tasks_dir.join(&inst.id);
-        for bad in eval::check_winnability(&task_dir, &caps) {
-            eprintln!("unwinnable {}: {bad}", inst.id);
-        }
-        if args.winnability_only {
-            continue;
-        }
-        let work = args.out_dir.join(&inst.id);
-        if std::fs::create_dir_all(&work).is_err() {
-            eprintln!("cannot create {}", work.display());
-            return 2;
-        }
-        let start = std::time::Instant::now();
-        let verdict = match eval::Engine::run_instance(&engine, inst, &work) {
-            Ok(outcome) => {
-                if let Some(hit) = outcome.reward {
-                    if hit {
-                        eval::Verdict::Resolved
-                    } else {
-                        eval::Verdict::Unresolved
-                    }
-                } else {
-                    eval_verdict_from_workdir(&work)
-                }
-            }
-            Err(e) => {
-                eprintln!("infra {}: {e}", inst.id);
-                eval::Verdict::InfraFailure
-            }
-        };
-        let wall = start.elapsed().as_secs();
-        let events_path = work.join("events.jsonl");
-        let _ = std::fs::write(&events_path, "");
-        match eval::instance_report(&inst.id, verdict, &events_path, wall, "") {
-            Ok(r) => reports.push(r),
-            Err(e) => {
-                eprintln!("cannot report {}: {e}", inst.id);
-                return 2;
-            }
-        }
-    }
-    let report = eval::RunReport { instances: reports };
-    if let Some(path) = args.report.as_deref() {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        match std::fs::write(path, serde_json::to_string_pretty(&report).unwrap()) {
-            Ok(()) => {}
-            Err(e) => {
-                eprintln!("cannot write {}: {e}", path.display());
-                return 2;
-            }
-        }
-    } else {
-        println!("{}", serde_json::to_string_pretty(&report).unwrap());
-    }
-    0
-}
-
-fn parse_args(argv: &[String]) -> Result<Args, String> {
-    let a: Vec<&str> = argv.iter().map(String::as_str).collect();
-    if a.len() < 2 || a[1] != "run" {
-        return Err(USAGE.into());
-    }
-    let (mut goal, mut workdir, mut model, mut endpoint, mut steps, mut dump) =
-        (None, None, None, None, None, None);
-    let mut log_path: Option<String> = None;
-    let mut no_log = false;
-    let mut api_key_env = "OPENAI_API_KEY".to_string();
-    let mut headers: Vec<String> = Vec::new();
-    let mut actions: Option<u32> = None;
-    let mut allow = Vec::new();
-    let mut context_files = Vec::new();
-    let mut max_tokens: Option<usize> = None;
-    let mut budget_tokens: Option<u64> = None;
-    let mut proof_cmd: Option<String> = None;
-    let mut incentives = agent_loop::IncentivesLevel::Full;
-    let mut bets = false;
-    let mut compaction: Option<f64> = None;
-    let mut i = 2;
-    while i < a.len() {
-        let flag = a[i];
-        let (k, inline) = match flag.split_once('=') {
-            Some((k, v)) => (k, Some(v.to_string())),
-            None => (flag, None),
-        };
-        let take = |i: &mut usize, inline: Option<String>| -> Result<String, String> {
-            if let Some(v) = inline {
-                return Ok(v);
-            }
-            *i += 1;
-            a.get(*i)
-                .map(|s| (*s).to_string())
-                .ok_or_else(|| format!("{k} needs a value"))
-        };
-        match k {
-            "--goal" => goal = Some(take(&mut i, inline)?),
-            "--workdir" => workdir = Some(take(&mut i, inline)?),
-            "--model" => model = Some(take(&mut i, inline)?),
-            "--endpoint" => endpoint = Some(take(&mut i, inline)?),
-            "--dump-events" => dump = Some(take(&mut i, inline)?),
-            "--log-path" => log_path = Some(take(&mut i, inline)?),
-            "--no-log" => {
-                no_log = true;
-            }
-            "--allow-cmd" => allow.push(take(&mut i, inline)?),
-            "--context-file" => context_files.push(take(&mut i, inline)?),
-            "--max-tokens" => {
-                let s = take(&mut i, inline)?;
-                max_tokens =
-                    Some(s.parse().map_err(|_| {
-                        format!("--max-tokens needs a positive integer, got {s:?}")
-                    })?);
-            }
-            "--budget-tokens" => {
-                let s = take(&mut i, inline)?;
-                budget_tokens =
-                    Some(s.parse().map_err(|_| {
-                        format!("--budget-tokens needs a positive integer, got {s:?}")
-                    })?);
-            }
-            "--budget-steps" => {
-                let s = take(&mut i, inline)?;
-                let n: u32 = s
-                    .parse()
-                    .map_err(|_| format!("--budget-steps needs a positive integer, got {s:?}"))?;
-                if n == 0 {
-                    return Err("--budget-steps must be > 0".into());
-                }
-                steps = Some(n);
-            }
-            "--budget-actions" => {
-                let s = take(&mut i, inline)?;
-                let n: u32 = s
-                    .parse()
-                    .map_err(|_| format!("--budget-actions needs a positive integer, got {s:?}"))?;
-                if n == 0 {
-                    return Err("--budget-actions must be > 0".into());
-                }
-                actions = Some(n);
-            }
-            "--proof-cmd" => {
-                proof_cmd = Some(take(&mut i, inline)?);
-            }
-            "--api-key-env" => {
-                api_key_env = take(&mut i, inline)?;
-            }
-            "--header" => {
-                headers.push(take(&mut i, inline)?);
-            }
-            "--incentives" => {
-                incentives = match take(&mut i, inline)?.as_str() {
-                    "base" => agent_loop::IncentivesLevel::Base,
-                    "contract" => agent_loop::IncentivesLevel::Contract,
-                    "full" => agent_loop::IncentivesLevel::Full,
-                    other => {
-                        return Err(format!(
-                            "--incentives needs base|contract|full, got {other:?}"
-                        ))
-                    }
-                };
-            }
-            "--bets" => {
-                bets = true;
-            }
-            "--compaction" => {
-                let s = take(&mut i, inline)?;
-                let f: f64 = s
-                    .parse()
-                    .map_err(|_| format!("--compaction needs a fraction in (0, 1], got {s:?}"))?;
-                if !f.is_finite() || f <= 0.0 || f > 1.0 {
-                    return Err(format!(
-                        "--compaction needs a fraction in (0, 1], got {s:?}"
-                    ));
-                }
-                compaction = Some(f);
-            }
-            other => return Err(format!("unknown flag {other:?}\n{USAGE}")),
-        }
-        i += 1;
-    }
-    Ok(Args {
-        goal: goal.ok_or("missing --goal")?,
-        context_files,
-        max_tokens,
-        workdir: PathBuf::from(workdir.ok_or("missing --workdir")?),
-        model: model.ok_or("missing --model")?,
-        endpoint,
-        api_key_env,
-        headers,
-        allow_cmd: allow,
-        budget_steps: steps,
-        budget_actions: actions,
-        budget_tokens,
-        dump_events: dump,
-        log_path,
-        no_log,
-        proof_cmd,
-        incentives,
-        bets,
-        compaction,
-    })
-}
-
-/// Budget for one run: explicit flags win; context-pinned runs without a
-/// token flag get the pilot default; otherwise the library UnattendedBatch
-/// config (50k tokens). The step override is `agent_budget::with_steps`
-/// (warn clamp + refund re-derive live there, never here); precedence
-/// (cfg-over-state) is documented on `agent_loop::run`.
-fn budget_for(args: &Args) -> BudgetGuard {
-    let mut b = config_for(Capability::UnattendedBatch);
-    if let Some(n) = args.budget_steps {
-        b = with_steps(b, NonZeroU32::new(n).expect("parse rejects 0"));
-    }
-    if let Some(n) = args.budget_actions {
-        b.actions_per_trial = n;
-    }
-    match args.budget_tokens {
-        Some(t) => b.max_tokens = t,
-        // chosen-to-validate: pinned-prefix floor ~4-5k tok/req x 20-30
-        // requests + reasoning completions; validated-or-revised at next pilot.
-        None if args.budget_steps.is_none() && !args.context_files.is_empty() => {
-            b.max_tokens = 200_000
-        }
-        None => {}
-    }
-    BudgetGuard::new(b, Instant::now())
-}
-
-/// Disposable-workdir guard: `--workdir` is mutated in place (`git init`,
-/// `git add -A`, tool exec). Refuse values that would destroy the machine
-/// or the harness checkout itself. Non-empty task dirs stay allowed.
-fn validate_workdir(path: &Path) -> Result<PathBuf, String> {
-    if !path.is_dir() {
-        return Err(format!("workdir is not a directory: {}", path.display()));
-    }
-    let canon = path
-        .canonicalize()
-        .map_err(|e| format!("workdir cannot be canonicalized: {e}"))?;
-    if canon.parent().is_none() {
-        return Err("workdir must not be the filesystem root".into());
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() && canon == Path::new(&home) {
-            return Err("workdir must not be $HOME".into());
-        }
-    }
-    if canon.join("crates/rof/Cargo.toml").is_file() {
-        return Err("workdir must not be the harness checkout itself".into());
-    }
-    Ok(canon)
-}
-
-/// WAL filename for the shipped path: the fail-closed log lives inside
-/// `--workdir` so a real run is durable without extra flags.
-const DEFAULT_LOG_NAME: &str = ".rof-events.jsonl";
-
-/// Default WAL path for one run: inside `--workdir` (which `main` already
-/// verified is a directory, so the open cannot fail on a missing parent).
-fn default_log_path(workdir: &Path) -> PathBuf {
-    workdir.join(DEFAULT_LOG_NAME)
-}
-
-/// Shipped-path WAL wiring: default on (inside `--workdir`), `--log-path`
-/// overrides the location, `--no-log` disables it (wins over the override).
-fn resolve_log_path(args: &Args) -> Option<PathBuf> {
-    if args.no_log {
-        return None;
-    }
-    if let Some(p) = args.log_path.as_deref() {
-        return Some(PathBuf::from(p));
-    }
-    Some(default_log_path(&args.workdir))
-}
-
-/// Keep run-record sidecars (WAL + incremental dump) out of the reported
-/// patch: `snapshot` baselines `git add -A` mid-run, so a sidecar under
-/// `--workdir` would otherwise be committed and diffed into stdout.
-/// Appends the workdir-relative path to the copy-local `.git/info/exclude`
-/// (never a tracked file); paths outside the workdir cannot be staged.
-/// Runs after `ensure()` (stale sidecars are removed before its commit), so
-/// the mid-run baselines — not the initial commit — are what this excludes.
-fn exclude_sidecar(workdir: &Path, path: &Path) {
-    // Never create `.git` here: `snapshot::is_repo` is existence-based, so a
-    // bare `.git/info/exclude` would fake a repo and skip `git init`.
-    // Callers run this after `ensure()`; a missing `.git` means ensure
-    // failed and the loop reports it — exclusion then stays a no-op.
-    let git = workdir.join(".git");
-    if !git.is_dir() {
-        return;
-    }
-    let Ok(rel) = path.strip_prefix(workdir) else {
-        return;
-    };
-    let rel = rel.to_string_lossy().replace('\\', "/");
-    if rel.is_empty() {
-        return;
-    }
-    let exclude = git.join("info/exclude");
-    if let Some(dir) = exclude.parent() {
-        if std::fs::create_dir_all(dir).is_err() {
-            return;
-        }
-    }
-    let text = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if text.lines().any(|l| l == rel) {
-        return;
-    }
-    let mut out = text;
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(&rel);
-    out.push('\n');
-    let _ = std::fs::write(&exclude, out);
-}
-
-/// One run's loop config from the parsed flags. The compaction checkpoint is
-/// opt-in: absent `--compaction` leaves the default disabled config, so the
-/// run stays byte-identical. The WAL is the opposite: default on inside
-/// `--workdir` (fail-closed on real runs, not only tests).
-fn run_config(args: &Args) -> RunConfig {
-    let mut cfg = RunConfig {
-        goal: args.goal.clone(),
-        model: args.model.clone(),
-        context_files: args.context_files.clone(),
-        max_tokens: args.max_tokens.unwrap_or(8_000),
-        incentives: args.incentives,
-        proof_cmd: args.proof_cmd.clone(),
-        ..RunConfig::default()
-    };
-    cfg.log_path = resolve_log_path(args);
-    if let Some(frac) = args.compaction {
-        cfg.compaction.enabled = true;
-        cfg.compaction.frac = frac;
-    }
-    cfg
-}
-
-fn resolve_endpoint(flag: Option<&str>, env: Option<&str>) -> Result<String, String> {
-    flag.or(env)
-        .map(str::to_string)
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| "no endpoint: pass --endpoint URL or set OPENAI_BASE_URL".into())
-}
-
-fn exit_code(outcome: &Outcome) -> i32 {
-    match outcome {
-        Outcome::Done => 0,
-        _ => 3,
-    }
-}
-
-const NAMES: [&str; 11] = [
-    "RunStart",
-    "RunEnd",
-    "TurnStart",
-    "TurnEnd",
-    "MessageStart",
-    "MessageUpdate",
-    "MessageEnd",
-    "ToolStart",
-    "ToolEnd",
-    "Control",
-    "Error",
-];
-
-fn summarize(events: &[AgentEvent]) -> String {
-    let mut counts = [0usize; 11];
-    for e in events {
-        counts[match e {
-            AgentEvent::RunStart { .. } => 0,
-            AgentEvent::RunEnd { .. } => 1,
-            AgentEvent::TurnStart { .. } => 2,
-            AgentEvent::TurnEnd { .. } => 3,
-            AgentEvent::MessageStart { .. } => 4,
-            AgentEvent::MessageUpdate { .. } => 5,
-            AgentEvent::MessageEnd { .. } => 6,
-            AgentEvent::ToolStart { .. } => 7,
-            AgentEvent::ToolEnd { .. } => 8,
-            AgentEvent::Control(_) => 9,
-            AgentEvent::Error { .. } => 10,
-        }] += 1;
-    }
-    NAMES
-        .iter()
-        .zip(counts)
-        .filter(|(_, n)| *n > 0)
-        .map(|(name, n)| format!("{name}={n}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+use cli::{apply_env_defaults, budget_for, parse_args, resolve_endpoint, run_config, Args};
+use dump::{attach_dump, finalize_dump};
+use eval_cmd::{parse_eval, run_eval};
+use exit::{exit_code, summarize, EXIT_NO_CREDENTIALS};
+use workdir::{exclude_sidecar, resolve_log_path, validate_workdir};
 
 /// Deliverable patch: `Ok` is the full uncut run patch for stdout (never the
 /// 8KiB/200-line evidence bound); `Err` means no start HEAD was recorded
@@ -571,8 +59,12 @@ impl agent_loop::BetsHook for Gate {
     }
 }
 
-async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
-    let policy = Arc::new(tools_std::Policy {
+/// Tool policy for one run: `--allow-cmd` binary prefixes plus the
+/// repeatable `--pass-env` allowlist. Provider-key-shaped names stay
+/// withheld at spawn (the runner drops them), so listing a var forwards it
+/// to `exec`/`test` children without ever leaking the provider key.
+fn policy_for(args: &Args) -> tools_std::Policy {
+    tools_std::Policy {
         root: args.workdir.clone(),
         // --allow-cmd entries are binary prefixes (no shell: `&&`/`|` are
         // literal args, so exact-string matching would allow nothing useful).
@@ -580,8 +72,12 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
         allowed_prefixes: args.allow_cmd.clone(),
         syntax_cmd: None,
         denied_globs: tools_std::default_denied_globs(),
-        pass_env: Vec::new(),
-    });
+        pass_env: args.pass_env.clone(),
+    }
+}
+
+async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
+    let policy = Arc::new(policy_for(args));
     let mut reg = tool_core::Registry::new(Arc::new(GrantGate::new(HashMap::from([(
         "agent".to_string(),
         ["view", "search", "edit", "write", "exec", "test"]
@@ -681,65 +177,10 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     }
 }
 
-/// Incremental `--dump-events` mirror: truncate the previous dump (one run,
-/// one dump, same as before), then append each emitted event as one JSON
-/// line with flush + fsync before returning, so a kill leaves a valid
-/// prefix on disk instead of no file at all. The listener is sync and
-/// infallible by construction (every failure is skipped, never panics), so
-/// a slow disk cannot hang or break the run; the WAL stays the fail-closed
-/// record, this file its best-effort mirror.
-fn attach_dump(emitter: &mut Emitter, path: &str) -> Result<(), String> {
-    let _ = std::fs::remove_file(path);
-    if let Some(dir) = Path::new(path).parent() {
-        if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    let shared = Arc::new(Mutex::new(file));
-    emitter.on(move |event| {
-        if let Ok(line) = serde_json::to_string(event) {
-            if let Ok(mut f) = shared.lock() {
-                use std::io::Write as _;
-                let mut buf = line.into_bytes();
-                buf.push(b'\n');
-                let _ = f.write_all(&buf);
-                let _ = f.flush();
-                let _ = f.sync_all();
-            }
-        }
-    });
-    Ok(())
-}
-
-/// One run's events as JSONL (one object per line, LF) via `trace::TraceSink`.
-/// The sink only appends, so a dump replaces the previous file: one run, one dump.
-fn write_dump(path: &str, events: &[AgentEvent]) -> Result<(), String> {
-    let _ = std::fs::remove_file(path);
-    let sink = trace::TraceSink::with_file(Path::new(path)).map_err(|e| e.to_string())?;
-    for e in events {
-        sink.emit(e.clone());
-    }
-    Ok(())
-}
-
-/// Post-run `--dump-events` close-out: the incremental listener is the
-/// record, so when its line count already equals the lossless history the
-/// kill-resilient prefix stands as-is (no truncating rewrite). Any
-/// shortfall (attach failed, writes lost) falls back to the full replace
-/// write, preserving the old path/flag/error behavior.
-fn finalize_dump(path: &str, events: &[AgentEvent]) -> Result<(), String> {
-    let complete = std::fs::read_to_string(path)
-        .map(|t| t.lines().count() == events.len())
-        .unwrap_or(false);
-    if complete {
-        return Ok(());
-    }
-    write_dump(path, events)
+/// Startup credential-gate message: names the env var the provider read so
+/// the fix (export it, or point `--api-key-env` elsewhere) is on the line.
+fn missing_credentials_message(api_key_env: &str, err: &str) -> String {
+    format!("rof: {err}; set ${api_key_env} or pass --api-key-env NAME")
 }
 
 #[tokio::main]
@@ -755,14 +196,18 @@ async fn main() {
         };
         std::process::exit(run_eval(&eargs).await);
     }
-    let args = match parse_args(&argv) {
+    let mut args = match parse_args(&argv) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(2);
         }
     };
-    let _workdir = match validate_workdir(&args.workdir) {
+    if let Err(e) = apply_env_defaults(&mut args) {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
+    let _workdir = match validate_workdir(&args.workdir, args.allow_dirty_workdir) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");
@@ -789,6 +234,14 @@ async fn main() {
             std::process::exit(2);
         }
     }
+    // Fail fast before any spend: S3's key-presence check, auth-setup exit.
+    if let Err(e) = provider.check_credentials() {
+        eprintln!(
+            "{}",
+            missing_credentials_message(&args.api_key_env, &e.to_string())
+        );
+        std::process::exit(EXIT_NO_CREDENTIALS);
+    }
     let r = execute(&provider, &args).await;
     if let Some(path) = args.dump_events.as_deref() {
         if let Err(e) = finalize_dump(path, &r.events) {
@@ -807,634 +260,46 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use provider_core::{AssistantMessage, Response, StopReason, ToolCallRef, Usage};
-    use std::collections::VecDeque;
-    use std::path::Path;
-
-    fn argv(words: &[&str]) -> Vec<String> {
-        words.iter().map(|s| (*s).to_string()).collect()
-    }
+    use fixtures::{args_for, edit_resp, text_resp, tmp, tool_resp, write_resp, ScriptClient};
 
     #[test]
-    fn cli_full_and_eq_forms() {
-        let a = parse_args(&argv(&[
-            "rof",
-            "run",
-            "--goal",
-            "ship it",
-            "--workdir",
-            "/tmp/w",
-            "--model",
-            "m",
-            "--endpoint",
-            "http://x",
-            "--allow-cmd",
-            "cargo test",
-            "--allow-cmd",
-            "true",
-            "--budget-steps",
-            "7",
-            "--budget-actions",
-            "9",
-            "--context-file",
-            "app/a.py",
-            "--dump-events",
-            "/tmp/ev.json",
-            "--log-path",
-            "/tmp/w.log",
-            "--compaction",
-            "0.6",
-        ]))
-        .unwrap();
-        assert_eq!(
-            a,
-            Args {
-                goal: "ship it".into(),
-                workdir: PathBuf::from("/tmp/w"),
-                model: "m".into(),
-                endpoint: Some("http://x".into()),
-                api_key_env: "OPENAI_API_KEY".into(),
-                headers: Vec::new(),
-                allow_cmd: vec!["cargo test".into(), "true".into()],
-                budget_steps: Some(7),
-                budget_actions: Some(9),
-                budget_tokens: None,
-                context_files: vec!["app/a.py".into()],
-                max_tokens: None,
-                dump_events: Some("/tmp/ev.json".into()),
-                log_path: Some("/tmp/w.log".into()),
-                no_log: false,
-                bets: false,
-                incentives: agent_loop::IncentivesLevel::Full,
-                proof_cmd: None,
-                compaction: Some(0.6),
-            }
-        );
-        let b = parse_args(&argv(&[
-            "rof",
-            "run",
-            "--goal=ship it",
-            "--workdir=/tmp/w",
-            "--model=m",
-        ]))
-        .unwrap();
-        assert_eq!(b.allow_cmd, Vec::<String>::new());
-        assert_eq!(
-            (b.endpoint, b.budget_steps, b.budget_actions, b.dump_events),
-            (None, None, None, None)
-        );
-        assert_eq!((b.log_path, b.no_log), (None, false));
-        assert_eq!(b.compaction, None, "absent --compaction stays off");
-    }
-
-    #[test]
-    fn cli_rejects() {
-        for words in [
-            vec!["rof"],
-            vec!["rof", "eval"],
-            vec!["rof", "run", "--goal", "g", "--workdir", "/w"],
-            vec!["rof", "run", "--goal", "g", "--model", "m"],
-            vec!["rof", "run", "--workdir", "/w", "--model", "m"],
-            vec![
-                "rof",
-                "run",
-                "--goal",
-                "g",
-                "--workdir",
-                "/w",
-                "--model",
-                "m",
-                "--bogus",
-            ],
-            vec![
-                "rof",
-                "run",
-                "--goal",
-                "g",
-                "--workdir",
-                "/w",
-                "--model",
-                "m",
-                "--budget-steps",
-                "0",
-            ],
-            vec![
-                "rof",
-                "run",
-                "--goal",
-                "g",
-                "--workdir",
-                "/w",
-                "--model",
-                "m",
-                "--budget-steps",
-                "many",
-            ],
-            vec![
-                "rof",
-                "run",
-                "--goal",
-                "g",
-                "--workdir",
-                "/w",
-                "--model",
-                "m",
-                "--budget-actions",
-                "0",
-            ],
-            vec![
-                "rof",
-                "run",
-                "--goal",
-                "g",
-                "--workdir",
-                "/w",
-                "--model",
-                "m",
-                "--budget-actions",
-                "many",
-            ],
-            vec![
-                "rof",
-                "run",
-                "--goal",
-                "g",
-                "--workdir",
-                "/w",
-                "--model",
-                "m",
-                "--compaction",
-            ],
-            vec![
-                "rof",
-                "run",
-                "--goal",
-                "g",
-                "--workdir",
-                "/w",
-                "--model",
-                "m",
-                "--compaction",
-                "many",
-            ],
-            vec![
-                "rof",
-                "run",
-                "--goal",
-                "g",
-                "--workdir",
-                "/w",
-                "--model",
-                "m",
-                "--compaction",
-                "0",
-            ],
-            vec![
-                "rof",
-                "run",
-                "--goal",
-                "g",
-                "--workdir",
-                "/w",
-                "--model",
-                "m",
-                "--compaction",
-                "1.5",
-            ],
-            vec!["rof", "run", "--goal"],
-        ] {
-            assert!(parse_args(&argv(&words)).is_err(), "{words:?}");
-        }
-    }
-
-    #[test]
-    fn cli_eval_parses_tasks_dir_and_report() {
-        let a = parse_eval(&argv(&[
-            "rof",
-            "eval",
-            "--tasks-dir",
-            "/tmp/tasks",
-            "--ids",
-            "aaa,bbb",
-            "--out-dir",
-            "/tmp/eval-out",
-            "--report",
-            "/tmp/eval-out/report.json",
-        ]))
-        .unwrap();
-        assert_eq!(a.tasks_dir, PathBuf::from("/tmp/tasks"));
-        assert_eq!(a.ids, vec!["aaa".to_string(), "bbb".to_string()]);
-        assert_eq!(a.report, Some(PathBuf::from("/tmp/eval-out/report.json")));
-        assert!(!a.winnability_only);
-    }
-
-    #[tokio::test]
-    async fn eval_winnability_only_reports_violations_without_docker() {
-        let root = std::env::temp_dir().join(format!("rof-eval-test-{}", std::process::id()));
-        let tasks = root.join("tasks");
-        std::fs::create_dir_all(tasks.join("aaa").join("solution")).unwrap();
-        std::fs::create_dir_all(tasks.join("aaa").join("tests")).unwrap();
-        std::fs::write(
-            tasks.join("aaa").join("task.toml"),
-            "image = \"img\"\ntimeout = 60\n",
-        )
-        .unwrap();
-        std::fs::write(tasks.join("aaa").join("instruction.md"), "# aaa\nDo it.\n").unwrap();
-        std::fs::write(
-            tasks.join("aaa").join("solution").join("solve.sh"),
-            "#!/bin/sh\necho ok\n",
-        )
-        .unwrap();
-        std::fs::write(
-            tasks.join("aaa").join("tests").join("test.sh"),
-            "#!/bin/sh\nexit 0\n",
-        )
-        .unwrap();
-        let args = EvalArgs {
-            tasks_dir: tasks.clone(),
-            ids: vec![],
-            out_dir: root.join("out"),
-            report: Some(root.join("out").join("report.json")),
-            winnability_only: true,
-        };
-        let code = run_eval(&args).await;
-        assert_eq!(code, 0);
-        let raw = std::fs::read_to_string(args.report.unwrap()).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert!(v.get("instances").and_then(|x| x.as_array()).is_some());
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn endpoint_flag_wins_empty_is_missing() {
-        assert_eq!(
-            resolve_endpoint(Some("http://flag"), Some("http://env")).as_deref(),
-            Ok("http://flag")
-        );
-        assert_eq!(
-            resolve_endpoint(None, Some("http://env")).as_deref(),
-            Ok("http://env")
-        );
-        assert!(resolve_endpoint(None, None).is_err());
-        assert!(resolve_endpoint(Some("  "), None).is_err());
-    }
-
-    #[test]
-    fn exit_and_summary_pinned() {
-        assert_eq!(exit_code(&Outcome::Done), 0);
-        for o in [
-            Outcome::Halted("steps".into()),
-            Outcome::Cancelled,
-            Outcome::Failed {
-                kind: FailureKind::Provider,
-                message: "e".into(),
-            },
-        ] {
-            assert_eq!(exit_code(&o), 3);
-        }
-        let evs = vec![
-            AgentEvent::RunStart {
-                run_id: 0,
-                goal: "g".into(),
-            },
-            AgentEvent::TurnStart { turn: 1 },
-            AgentEvent::TurnStart { turn: 1 },
-            AgentEvent::Error {
-                error: agent_event::AgentError {
-                    code: "E".into(),
-                    message: "m".into(),
-                },
-            },
-        ];
-        assert_eq!(summarize(&evs), "RunStart=1 TurnStart=2 Error=1");
-        assert_eq!(summarize(&[]), "");
-    }
-
-    struct ScriptClient {
-        queue: std::sync::Mutex<VecDeque<Response>>,
-        /// Mid-run probe: when set, the first `complete` records whether the
-        /// dump file already holds JSON lines — proving the dump is
-        /// incremental, not a post-run write.
-        probe_dump: Option<PathBuf>,
-        probe_hit: std::sync::Mutex<bool>,
-    }
-
-    impl ScriptClient {
-        fn new(resps: Vec<Response>) -> Self {
-            Self {
-                queue: std::sync::Mutex::new(resps.into()),
-                probe_dump: None,
-                probe_hit: std::sync::Mutex::new(false),
-            }
-        }
-
-        fn with_dump_probe(resps: Vec<Response>, dump: PathBuf) -> Self {
-            Self {
-                queue: std::sync::Mutex::new(resps.into()),
-                probe_dump: Some(dump),
-                probe_hit: std::sync::Mutex::new(false),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl LlmClient for ScriptClient {
-        async fn complete(
-            &self,
-            _model: &str,
-            _req: &provider_core::Request,
-        ) -> Result<Response, provider_core::LlmError> {
-            if let Some(dump) = &self.probe_dump {
-                if let Ok(text) = std::fs::read_to_string(dump) {
-                    if text.lines().count() >= 1
-                        && text
-                            .lines()
-                            .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok())
-                    {
-                        *self.probe_hit.lock().unwrap() = true;
-                    }
-                }
-            }
-            self.queue
-                .lock()
-                .unwrap()
-                .pop_front()
-                .ok_or(provider_core::LlmError::Transport("script empty".into()))
-        }
-    }
-
-    fn usage() -> Usage {
-        Usage {
-            input: 1,
-            output: 1,
-            cache_read: 0,
-            cache_write: 0,
-            reasoning: None,
-            cost_usd: None,
-        }
-    }
-
-    fn tool_resp() -> Response {
-        Response {
-            message: AssistantMessage {
-                content: "editing".into(),
-                tool_calls: vec![ToolCallRef {
-                    id: "c1".into(),
-                    name: "edit".into(),
-                    args: serde_json::json!({
-                        "path": "note.txt",
-                        "search": "hello",
-                        "replace": "bye",
-                    }),
-                }],
-                thinking: None,
-            },
-            stop: StopReason::ToolUse,
-            usage: usage(),
-            latency_ms: 0,
-            attempts: 1,
-            raw_stop_reason: None,
-            retry_usage: None,
-        }
-    }
-
-    fn text_resp() -> Response {
-        Response {
-            message: AssistantMessage {
-                content: "all good".into(),
-                tool_calls: vec![],
-                thinking: None,
-            },
-            stop: StopReason::Stop,
-            usage: usage(),
-            latency_ms: 0,
-            attempts: 1,
-            raw_stop_reason: None,
-            retry_usage: None,
-        }
-    }
-
-    /// One edit call with caller-chosen search/replace (large-fix fixtures).
-    fn edit_resp(path: &str, search: &str, replace: &str) -> Response {
-        Response {
-            message: AssistantMessage {
-                content: "editing".into(),
-                tool_calls: vec![ToolCallRef {
-                    id: "c1".into(),
-                    name: "edit".into(),
-                    args: serde_json::json!({
-                        "path": path,
-                        "search": search,
-                        "replace": replace,
-                    }),
-                }],
-                thinking: None,
-            },
-            stop: StopReason::ToolUse,
-            usage: usage(),
-            latency_ms: 0,
-            attempts: 1,
-            raw_stop_reason: None,
-            retry_usage: None,
-        }
-    }
-
-    /// One whole-file write call (new-file deliverable fixtures).
-    fn write_resp(path: &str, content: &str) -> Response {
-        Response {
-            message: AssistantMessage {
-                content: "writing".into(),
-                tool_calls: vec![ToolCallRef {
-                    id: "c1".into(),
-                    name: "write".into(),
-                    args: serde_json::json!({
-                        "path": path,
-                        "content": content,
-                    }),
-                }],
-                thinking: None,
-            },
-            stop: StopReason::ToolUse,
-            usage: usage(),
-            latency_ms: 0,
-            attempts: 1,
-            raw_stop_reason: None,
-            retry_usage: None,
-        }
-    }
-
-    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-    fn tmp() -> PathBuf {
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let d = std::env::temp_dir().join(format!("rof-test-{n}-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    fn args_for(dir: &Path, steps: Option<u32>) -> Args {
-        Args {
-            goal: "update the note".into(),
-            workdir: dir.to_path_buf(),
-            model: "fake".into(),
-            endpoint: None,
-            api_key_env: "OPENAI_API_KEY".into(),
-            headers: Vec::new(),
-            allow_cmd: vec![],
-            budget_steps: steps,
-            budget_actions: None,
-            budget_tokens: None,
-            context_files: Vec::new(),
-            max_tokens: None,
-            dump_events: None,
-            log_path: None,
-            no_log: false,
-            bets: false,
-            incentives: agent_loop::IncentivesLevel::Full,
-            proof_cmd: None,
-            compaction: None,
-        }
-    }
-
-    #[test]
-    fn workdir_guard_rejects_root_home_and_self_repo() {
-        assert!(validate_workdir(Path::new("/")).is_err());
-        if let Ok(home) = std::env::var("HOME") {
-            assert!(validate_workdir(Path::new(&home)).is_err());
-        }
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let workspace_root = manifest.parent().unwrap().parent().unwrap();
-        assert!(validate_workdir(workspace_root).is_err());
-    }
-
-    #[test]
-    fn workdir_guard_accepts_tmp() {
-        let tmp = std::env::temp_dir();
-        assert!(validate_workdir(&tmp).is_ok());
-    }
-
-    #[test]
-    fn compaction_flag_reaches_run_config_off_by_default() {
-        let dir = Path::new("/tmp/w");
-        let off = run_config(&args_for(dir, None));
-        assert!(!off.compaction.enabled, "absent flag leaves compaction off");
-        assert_eq!(off.compaction.frac, 0.7, "default frac untouched");
-        assert_eq!(off.compaction.keep_tokens, 20_000, "keep stays the default");
-
-        let mut on = args_for(dir, None);
-        on.compaction = Some(0.5);
-        let cfg = run_config(&on);
+    fn startup_credential_gate_names_the_var() {
+        // Unique env var, set-then-removed in this test only, so parallel
+        // tests cannot observe it.
+        std::env::remove_var("ROF_TEST_CRED_GATE_KEY");
+        let p = OpenAiCompat::new("http://127.0.0.1:1", EndpointProfile::default())
+            .with_key_env("ROF_TEST_CRED_GATE_KEY");
+        let err = p.check_credentials().unwrap_err().to_string();
+        let msg = missing_credentials_message("ROF_TEST_CRED_GATE_KEY", &err);
         assert!(
-            cfg.compaction.enabled,
-            "--compaction enables the checkpoint"
+            msg.contains("ROF_TEST_CRED_GATE_KEY") && msg.contains("--api-key-env"),
+            "the stderr line says how to fix it: {msg}"
         );
-        assert_eq!(cfg.compaction.frac, 0.5);
-        assert_eq!(cfg.compaction.keep_tokens, 20_000, "keep stays the default");
+        assert_eq!(
+            EXIT_NO_CREDENTIALS, 4,
+            "distinct from 2 (usage) and 3 (run)"
+        );
+        std::env::set_var("ROF_TEST_CRED_GATE_KEY", "k");
+        assert!(p.check_credentials().is_ok());
+        std::env::remove_var("ROF_TEST_CRED_GATE_KEY");
     }
 
     #[test]
-    fn log_path_defaults_inside_workdir_with_opt_out_and_override() {
-        let dir = Path::new("/tmp/w");
+    fn pass_env_flag_reaches_policy() {
+        let mut a = args_for(Path::new("/tmp/w"), None);
+        assert!(
+            policy_for(&a).pass_env.is_empty(),
+            "absent flag forwards nothing extra"
+        );
+        a.pass_env = vec!["FOO".into(), "BAR".into()];
         assert_eq!(
-            resolve_log_path(&args_for(dir, None)),
-            Some(dir.join(".rof-events.jsonl")),
-            "shipped path defaults the WAL inside --workdir"
+            policy_for(&a).pass_env,
+            vec!["FOO".to_string(), "BAR".to_string()]
         );
         assert_eq!(
-            run_config(&args_for(dir, None)).log_path,
-            Some(dir.join(".rof-events.jsonl")),
-            "real config carries the default (not RunConfig::default None)"
-        );
-        let mut over = args_for(dir, None);
-        over.log_path = Some("/tmp/custom.jsonl".into());
-        assert_eq!(
-            run_config(&over).log_path,
-            Some(PathBuf::from("/tmp/custom.jsonl"))
-        );
-        let mut off = args_for(dir, None);
-        off.no_log = true;
-        assert_eq!(run_config(&off).log_path, None);
-        // Opt-out wins over an explicit override.
-        off.log_path = Some("/tmp/custom.jsonl".into());
-        assert_eq!(run_config(&off).log_path, None);
-    }
-
-    #[test]
-    fn log_flags_parse_plain_and_eq_forms() {
-        let a = parse_args(&argv(&[
-            "rof",
-            "run",
-            "--goal",
-            "g",
-            "--workdir",
-            "/w",
-            "--model",
-            "m",
-            "--log-path",
-            "/tmp/w.log",
-        ]))
-        .unwrap();
-        assert_eq!(a.log_path.as_deref(), Some("/tmp/w.log"));
-        assert!(!a.no_log);
-        let b = parse_args(&argv(&[
-            "rof",
-            "run",
-            "--goal",
-            "g",
-            "--workdir",
-            "/w",
-            "--model",
-            "m",
-            "--no-log",
-        ]))
-        .unwrap();
-        assert!(b.no_log);
-        assert_eq!(b.log_path, None);
-        let c = parse_args(&argv(&[
-            "rof",
-            "run",
-            "--goal=g",
-            "--workdir=/w",
-            "--model=m",
-            "--log-path=/tmp/eq.log",
-        ]))
-        .unwrap();
-        assert_eq!(c.log_path.as_deref(), Some("/tmp/eq.log"));
-    }
-
-    #[test]
-    fn context_pins_default_budget_and_flags_override() {
-        let dir = Path::new("/tmp/w");
-        assert_eq!(budget_for(&args_for(dir, None)).config().max_tokens, 50_000);
-        let mut pinned = args_for(dir, None);
-        pinned.context_files = vec!["a.py".into()];
-        assert_eq!(budget_for(&pinned).config().max_tokens, 200_000);
-        // Explicit flags win over the pilot default.
-        pinned.budget_tokens = Some(7);
-        assert_eq!(budget_for(&pinned).config().max_tokens, 7);
-        // A step budget also suppresses the token default.
-        pinned.budget_tokens = None;
-        pinned.budget_steps = Some(5);
-        assert_eq!(budget_for(&pinned).config().max_tokens, 50_000);
-        assert_eq!(budget_for(&pinned).config().max_steps.get(), 5);
-        // The step override is the single `agent_budget::with_steps`
-        // implementation: warn clamps to min(warn, max-1), refunds re-derive.
-        assert_eq!(budget_for(&pinned).config().warn_steps.get(), 4);
-        assert_eq!(budget_for(&pinned).config().max_refunds, 1);
-        assert_eq!(
-            budget_for(&pinned).config().warn_steps,
-            agent_budget::with_steps(
-                agent_budget::config_for(agent_budget::Capability::UnattendedBatch),
-                NonZeroU32::new(5).unwrap()
-            )
-            .warn_steps
-        );
-        // --budget-actions overrides the trial action cap.
-        pinned.budget_actions = Some(9);
-        assert_eq!(budget_for(&pinned).config().actions_per_trial, 9);
-        assert_eq!(
-            budget_for(&args_for(dir, None)).config().actions_per_trial,
-            30
+            policy_for(&a).root,
+            Path::new("/tmp/w"),
+            "policy root still the workdir"
         );
     }
 
@@ -1548,61 +413,9 @@ mod tests {
             "failure outcome carries the stderr hint: {:?}",
             r.outcome
         );
-        assert_eq!(exit_code(&r.outcome), 3);
-    }
-
-    #[tokio::test]
-    async fn dump_events_is_one_json_object_per_line() {
-        let dir = tmp();
-        std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
-        let client = ScriptClient::new(vec![tool_resp(), text_resp()]);
-        let r = execute(&client, &args_for(&dir, None)).await;
-        assert!(!r.events.is_empty(), "fake run must produce events");
-        let path = dir.join("dump.jsonl");
-        let p = path.to_str().unwrap();
-        write_dump(p, &r.events).unwrap();
-        // Second dump to the same path replaces, never appends.
-        write_dump(p, &r.events).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.ends_with('\n'), "file ends with LF");
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), r.events.len(), "N events, N lines");
-        for line in &lines {
-            let v: serde_json::Value =
-                serde_json::from_str(line).expect("every line incl. the last parses alone");
-            assert!(v.is_object(), "line is a JSON object: {line}");
-        }
-    }
-
-    #[tokio::test]
-    async fn dump_events_exists_mid_run_and_wal_live() {
-        let dir = tmp();
-        std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
-        let dump = dir.join("dump.jsonl");
-        let client = ScriptClient::with_dump_probe(vec![tool_resp(), text_resp()], dump.clone());
-        let mut args = args_for(&dir, None);
-        args.dump_events = Some(dump.to_str().unwrap().into());
-        let r = execute(&client, &args).await;
-        assert!(
-            *client.probe_hit.lock().unwrap(),
-            "dump file holds JSON lines before the first provider call returns"
-        );
-        assert!(!r.events.is_empty(), "fake run must produce events");
-        let text = std::fs::read_to_string(&dump).unwrap();
-        assert_eq!(
-            text.lines().count(),
-            r.events.len(),
-            "incremental prefix is the complete record post-run"
-        );
-        assert!(
-            dir.join(".rof-events.jsonl").is_file(),
-            "default WAL is live on the shipped path"
-        );
-        let patch = r.patch.unwrap();
-        assert!(
-            !patch.contains("dump.jsonl") && !patch.contains(".rof-events.jsonl"),
-            "sidecars stay out of the reported patch: {patch}",
-        );
+        // Snapshot-kind failure: exit 6 (stream S6 item 5 changed this from
+        // the old blanket 3 so wrappers can tell workdir failures apart).
+        assert_eq!(exit_code(&r.outcome), 6);
     }
 
     #[tokio::test]
