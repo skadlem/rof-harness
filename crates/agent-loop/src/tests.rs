@@ -1551,7 +1551,7 @@ async fn e2e_truncation_halts_with_no_tool_start() {
 
 // --- multi-tick run() assembly: fakes + tempdir git repo ---
 
-use provider_core::{Capabilities, Credentials, LlmClient, LlmError, Request, Response};
+use provider_core::{LlmClient, LlmError, Request, Response};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tool_core::{
@@ -1587,14 +1587,6 @@ impl LlmClient for ScriptClient {
             .unwrap()
             .pop_front()
             .ok_or(LlmError::Transport("script empty".into()))
-    }
-    fn capabilities(&self, _model: &str) -> Capabilities {
-        Capabilities {}
-    }
-    async fn resolve_key(&self, _provider: &str) -> Result<Credentials, LlmError> {
-        Ok(Credentials {
-            api_key: String::new(),
-        })
     }
 }
 
@@ -3354,20 +3346,13 @@ impl LlmClient for MeteredFailThenOk {
         *n += 1;
         if *n == 1 {
             return Err(LlmError::Metered {
-                source: "output truncated at 64 tokens".into(),
+                source: Box::new(LlmError::Transport("output truncated at 64 tokens".into())),
                 usage: Some(self.usage.clone()),
+                exhausted: false,
             });
         }
         drop(n);
         Ok(text_resp("done"))
-    }
-    fn capabilities(&self, _model: &str) -> Capabilities {
-        Capabilities {}
-    }
-    async fn resolve_key(&self, _provider: &str) -> Result<Credentials, LlmError> {
-        Ok(Credentials {
-            api_key: String::new(),
-        })
     }
 }
 
@@ -4134,14 +4119,6 @@ impl LlmClient for HangingClient {
     async fn complete(&self, _model: &str, _req: &Request) -> Result<Response, LlmError> {
         tokio::time::sleep(Duration::from_secs(30)).await;
         Ok(text_resp("never"))
-    }
-    fn capabilities(&self, _model: &str) -> Capabilities {
-        Capabilities {}
-    }
-    async fn resolve_key(&self, _provider: &str) -> Result<Credentials, LlmError> {
-        Ok(Credentials {
-            api_key: String::new(),
-        })
     }
 }
 

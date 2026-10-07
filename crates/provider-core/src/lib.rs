@@ -1,4 +1,4 @@
-//! LLM boundary vocabulary. See research/crate-provider-core.md.
+//! LLM boundary vocabulary: shared request/response/error types.
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -147,17 +147,12 @@ impl Response {
     }
 }
 
-/// Empty capability set: no callers read it today (reserved for future
-/// per-model request shaping). All impls return `Capabilities{}`.
-#[derive(Debug, Clone)]
-pub struct Capabilities {}
-
 #[derive(Debug, Clone)]
 pub struct Credentials {
     pub api_key: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorClass {
     Retryable,
     Overload,
@@ -169,16 +164,43 @@ pub enum ErrorClass {
 #[derive(Debug, Clone)]
 pub enum LlmError {
     Transport(String),
+    /// Fatal auth misconfiguration: missing/empty key, or a 401/403 the
+    /// credential source cannot refresh. Never retried.
+    Auth(String),
+    /// One non-2xx HTTP round trip, with the server's retry hint and a
+    /// truncated body for classification.
+    Http {
+        status: u16,
+        retry_after: Option<Duration>,
+        body: String,
+    },
+    Cancelled,
     AllFailed(String),
     /// A failure that still carried billed usage (truncated 200 body,
-    /// parseable non-2xx body). `source` is the message `Transport` would
-    /// carry; `usage` sums every failed attempt inside one `complete` call.
-    /// None = the failure reported nothing: never a fabricated zero, so the
-    /// metering loop can tell "unreported" from "free".
+    /// parseable non-2xx body). `source` is the typed failure the ladder
+    /// gave up on; `usage` sums every failed attempt inside one `complete`
+    /// call. None = the failure reported nothing: never a fabricated zero,
+    /// so the metering loop can tell "unreported" from "free".
+    /// `exhausted` marks a retryable ladder that ran out of rungs: the
+    /// outer loop must not re-run it. Non-retryable failures report false.
     Metered {
-        source: String,
+        source: Box<LlmError>,
         usage: Option<Usage>,
+        exhausted: bool,
     },
+}
+
+impl std::fmt::Display for LlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LlmError::Transport(m) | LlmError::Auth(m) | LlmError::AllFailed(m) => {
+                write!(f, "{m}")
+            }
+            LlmError::Http { status, body, .. } => write!(f, "{status}: {body}"),
+            LlmError::Cancelled => write!(f, "cancelled"),
+            LlmError::Metered { source, .. } => write!(f, "{source}"),
+        }
+    }
 }
 
 #[async_trait]
@@ -187,16 +209,14 @@ pub trait LlmClient: Send + Sync {
     /// implementor. The default fails loudly instead of fabricating zeros
     /// (the budget meters from `Usage`; zeros would be unlimited free
     /// tokens). Adapters must override with a metered implementation.
+    /// Cancellation is drop-based: dropping the returned future aborts the
+    /// call. There is no cancel token parameter by design; callers race
+    /// `complete` against their own cancellation and drop the loser.
     async fn complete(&self, _model: &str, _req: &Request) -> Result<Response, LlmError> {
         Err(LlmError::Transport(
             "default LlmClient::complete cannot report usage: override it with a metered implementation".into(),
         ))
     }
-    /// Reserved: negotiated per call once request shaping reads it; today the answer is always empty and unread.
-    fn capabilities(&self, model: &str) -> Capabilities;
-    /// Per-call credential resolve, not once-at-startup: tokens expire mid-run.
-    /// Err only on fatal auth misconfiguration; staleness is retryable.
-    async fn resolve_key(&self, provider: &str) -> Result<Credentials, LlmError>;
 }
 
 /// Map a provider finish reason to `StopReason`. `None`/empty/unknown means
@@ -238,10 +258,60 @@ pub fn infer_stop(raw: Option<&str>, message: &AssistantMessage) -> StopReason {
     }
 }
 
-/// Fails-open classification (blacklist, not allowlist): unknown errors retry.
+/// Typed-first classification: an HTTP status decides before any body
+/// text. The string table below runs only for errors that carry no status
+/// (transport failures and gateways that ship none).
+pub fn classify_error(e: &LlmError) -> ErrorClass {
+    match e {
+        LlmError::Cancelled | LlmError::Auth(_) => ErrorClass::Fatal,
+        LlmError::AllFailed(_) => ErrorClass::Retryable,
+        LlmError::Transport(msg) => classify_message(msg),
+        LlmError::Http { status, body, .. } => classify_http(*status, body),
+        LlmError::Metered { source, .. } => classify_error(source),
+    }
+}
+
+/// Status-first table: overflow text wins (a 400 can carry it), 401/403 are
+/// fatal even when the body cries stale (staleness retries only via a
+/// refreshable source, which never surfaces as `Http`), overload text wins
+/// over a bare 429, then the retryable statuses, then the body table.
+fn classify_http(status: u16, body: &str) -> ErrorClass {
+    let t = body.to_lowercase();
+    let has = |p: &[&str]| p.iter().any(|k| t.contains(k));
+    if has(&[
+        "context_length_exceeded",
+        "context_overflow",
+        "context overflow",
+        "context window",
+        "prompt too long",
+        "input too long",
+        "too many tokens",
+        "out of context",
+        "token limit",
+    ]) {
+        return ErrorClass::ContextOverflow;
+    }
+    if status == 401 || status == 403 {
+        return ErrorClass::Fatal;
+    }
+    if has(&[
+        "server_is_overloaded",
+        "slow_down",
+        "server overloaded",
+        "overloaded",
+    ]) {
+        return ErrorClass::Overload;
+    }
+    if status == 429 || status == 402 || (500..=599).contains(&status) {
+        return ErrorClass::Retryable;
+    }
+    classify_message(body)
+}
+
+/// Fails-open string table (blacklist, not allowlist): unknown errors retry.
 /// ContextOverflow never retries at the same shape; 402 retries (OpenRouter
 /// sends it on transient credit/queue states).
-pub fn classify_error(s: &str) -> ErrorClass {
+fn classify_message(s: &str) -> ErrorClass {
     let t = s.to_lowercase();
     let has = |p: &[&str]| p.iter().any(|k| t.contains(k));
     if has(&[
@@ -601,14 +671,17 @@ mod tests {
         }
     }
 
-    fn class_of(s: &str) -> &'static str {
-        match classify_error(s) {
+    fn class_of(e: &LlmError) -> &'static str {
+        match classify_error(e) {
             ErrorClass::Retryable => "retry",
             ErrorClass::Overload => "overload",
             ErrorClass::AuthStale => "stale",
             ErrorClass::ContextOverflow => "overflow",
             ErrorClass::Fatal => "fatal",
         }
+    }
+    fn class_of_str(s: &str) -> &'static str {
+        class_of(&LlmError::Transport(s.into()))
     }
     #[test]
     fn classifier_table() {
@@ -626,12 +699,46 @@ mod tests {
             ("insufficient_quota: billing hard limit", "fatal"),
         ];
         for (input, want) in cases {
-            assert_eq!(class_of(input), want, "input: {input}");
+            assert_eq!(class_of_str(input), want, "input: {input}");
         }
     }
     #[test]
     fn classifier_402_is_retryable() {
-        assert_eq!(class_of("402 Payment Required: queue full"), "retry");
+        assert_eq!(class_of_str("402 Payment Required: queue full"), "retry");
+    }
+    #[test]
+    fn classifier_status_first_then_string_fallback() {
+        let http = |status: u16, body: &str| LlmError::Http {
+            status,
+            retry_after: None,
+            body: body.into(),
+        };
+        // 429 with a Retry-After hint and the 503 cold-start shape retry.
+        assert_eq!(class_of(&http(429, "rate limited")), "retry");
+        assert_eq!(class_of(&http(503, "Service Unavailable")), "retry");
+        // Status wins over stale text: a 401 that cries expired is still fatal.
+        assert_eq!(
+            class_of(&http(401, "token expired, refresh needed")),
+            "fatal"
+        );
+        assert_eq!(class_of(&http(403, "forbidden")), "fatal");
+        // Overflow text wins over a bare status.
+        assert_eq!(
+            class_of(&http(400, "context_length_exceeded: too many tokens")),
+            "overflow"
+        );
+        // Auth and Cancelled are always fatal.
+        assert_eq!(class_of(&LlmError::Auth("missing key".into())), "fatal");
+        assert_eq!(class_of(&LlmError::Cancelled), "fatal");
+        // Metered unwraps to its typed source.
+        assert_eq!(
+            class_of(&LlmError::Metered {
+                source: Box::new(http(429, "slow down")),
+                usage: None,
+                exhausted: true,
+            }),
+            "retry"
+        );
     }
 
     #[test]
@@ -680,18 +787,11 @@ mod tests {
         assert!(!StopReason::Pending.is_terminal());
     }
 
-    /// Adapter that implements no methods but the keys: exactly who would
-    /// inherit the default `complete`.
+    /// Adapter that implements nothing: exactly who would inherit the
+    /// default `complete`.
     struct KeyOnlyClient;
     #[async_trait]
-    impl LlmClient for KeyOnlyClient {
-        fn capabilities(&self, _model: &str) -> Capabilities {
-            Capabilities {}
-        }
-        async fn resolve_key(&self, _provider: &str) -> Result<Credentials, LlmError> {
-            Err(LlmError::Transport("no key in test".into()))
-        }
-    }
+    impl LlmClient for KeyOnlyClient {}
 
     #[test]
     fn default_complete_fails_loud_instead_of_zero_usage_success() {

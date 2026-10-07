@@ -1154,17 +1154,6 @@ mod tests {
                 .pop_front()
                 .ok_or(provider_core::LlmError::Transport("script empty".into()))
         }
-        fn capabilities(&self, _model: &str) -> provider_core::Capabilities {
-            provider_core::Capabilities {}
-        }
-        async fn resolve_key(
-            &self,
-            _provider: &str,
-        ) -> Result<provider_core::Credentials, provider_core::LlmError> {
-            Ok(provider_core::Credentials {
-                api_key: String::new(),
-            })
-        }
     }
 
     fn usage() -> Usage {

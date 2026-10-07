@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use provider_core::{
-    parse_retry_after, Capabilities, Credentials, LlmClient, LlmError, Request, Response, Usage,
+    classify_error, parse_retry_after, Credentials, LlmClient, LlmError, Request, Response, Usage,
 };
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -33,11 +33,50 @@ impl Default for EndpointProfile {
     }
 }
 
+/// Adapter-internal credential handle: per-call env resolve, never cached
+/// past expiry. A static env key cannot recover from 401/403 (fatal); only a
+/// refreshable source retries stale credentials.
+#[derive(Debug, Clone)]
+pub struct CredentialSource {
+    env_var: String,
+    refreshable: bool,
+}
+
+impl CredentialSource {
+    pub fn env(var: &str) -> Self {
+        Self {
+            env_var: var.to_string(),
+            refreshable: false,
+        }
+    }
+
+    pub fn is_refreshable(&self) -> bool {
+        self.refreshable
+    }
+
+    /// Per-call resolve. Empty or missing is a fatal Auth error, never an
+    /// empty bearer token.
+    pub fn resolve(&self) -> Result<Credentials, LlmError> {
+        let key = std::env::var(&self.env_var).unwrap_or_default();
+        if key.trim().is_empty() {
+            return Err(LlmError::Auth(format!(
+                "missing API key: {} is unset or empty",
+                self.env_var
+            )));
+        }
+        Ok(Credentials { api_key: key })
+    }
+
+    pub fn check(&self) -> Result<(), LlmError> {
+        self.resolve().map(|_| ())
+    }
+}
+
 pub struct OpenAiCompat {
     endpoint: String,
     profile: EndpointProfile,
     http: reqwest::Client,
-    key_env: String,
+    creds: CredentialSource,
     /// Extra per-request headers (e.g. opencode-go's `x-opencode-session`:
     /// a stable per-conversation id for routing + prompt caching).
     headers: Vec<(String, String)>,
@@ -52,14 +91,30 @@ impl OpenAiCompat {
                 .user_agent(format!("rof/{}", env!("CARGO_PKG_VERSION")))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
-            key_env: "OPENAI_API_KEY".to_string(),
+            creds: CredentialSource::env("OPENAI_API_KEY"),
             headers: Vec::new(),
         }
     }
 
     pub fn with_key_env(mut self, env: &str) -> Self {
-        self.key_env = env.to_string();
+        let refreshable = self.creds.refreshable;
+        self.creds = CredentialSource {
+            env_var: env.to_string(),
+            refreshable,
+        };
         self
+    }
+
+    /// Mark the credential source refreshable: stale 401/403 bodies retry as
+    /// `AuthStale` instead of failing as fatal Auth.
+    pub fn with_refreshable(mut self, refreshable: bool) -> Self {
+        self.creds.refreshable = refreshable;
+        self
+    }
+
+    /// Fail fast at startup when the key is missing or empty.
+    pub fn check_credentials(&self) -> Result<(), LlmError> {
+        self.creds.check()
     }
 
     pub fn with_header(mut self, name: &str, value: &str) -> Self {
@@ -84,18 +139,19 @@ impl LlmClient for OpenAiCompat {
         // A server `Retry-After` above `RETRY_AFTER_CAP` is terminal instead,
         // and the computed 2^attempt backoff carries 0–25% jitter so locked-
         // step workers do not stampede (pi provider-retry.ts:44-58,66).
-        let mut last_err = "no attempts".to_string();
+        let mut last_err = LlmError::Transport("no attempts".into());
+        let mut last_label = "no attempts".to_string();
         let mut last_after: Option<Duration> = None;
         // Billed attempts are metered: sum what each carried so the error
         // path never loses a re-send's usage. Only attempts that RETURNED
         // usage are billed (completed, or truncated then rejected);
-        // pre-generation HTTP failures carry no usage and are not charged
-        // (research/decision-audit-provider-economics.md C10).
+        // pre-generation HTTP failures carry no usage and are not charged.
         let mut usage_acc: Option<Usage> = None;
+        let mut last_retryable = false;
         let mut attempt = 0u32;
         loop {
             if attempt > 0 {
-                let Some(d) = schedule_delay(last_after.take(), &last_err, attempt) else {
+                let Some(d) = schedule_delay(last_after.take(), &last_label, attempt) else {
                     break;
                 };
                 tokio::time::sleep(d).await;
@@ -110,7 +166,9 @@ impl LlmClient for OpenAiCompat {
                     return Ok(r);
                 }
                 Err(f) => {
-                    last_err = f.msg.clone();
+                    last_label = f.msg.clone();
+                    last_err = *f.error;
+                    last_retryable = f.retryable;
                     usage_acc = merge_usage(usage_acc, f.usage.map(|u| *u));
                     if !f.retryable {
                         break;
@@ -134,25 +192,20 @@ impl LlmClient for OpenAiCompat {
             attempt += 1;
         }
         Err(LlmError::Metered {
-            source: last_err,
+            source: Box::new(last_err),
             usage: usage_acc,
-        })
-    }
-
-    /// Reserved: always empty, ignores `model` (see `provider-core::Capabilities`).
-    fn capabilities(&self, _model: &str) -> Capabilities {
-        Capabilities {}
-    }
-
-    async fn resolve_key(&self, _provider: &str) -> Result<Credentials, LlmError> {
-        // Per-call resolve, never cached: tokens expire mid-run.
-        Ok(Credentials {
-            api_key: std::env::var(&self.key_env).unwrap_or_default(),
+            // The retryable ladder ran out of rungs: the outer loop must not
+            // re-run it. Non-retryable failures report false.
+            exhausted: last_retryable,
         })
     }
 }
 
 struct OnceFail {
+    /// Typed failure for the final `Metered` source. Boxed: keeps the
+    /// `Result` small (the failure path is cold).
+    error: Box<LlmError>,
+    /// Short label (`CODE: body-head`) driving delay and cold-start checks.
     msg: String,
     after: Option<Duration>,
     retryable: bool,
@@ -164,37 +217,41 @@ struct OnceFail {
     usage: Option<Box<Usage>>,
 }
 
+/// Stale-credential text. Only a refreshable source may retry it; a static
+/// env key treats the same body as fatal Auth.
+fn is_stale_msg(s: &str) -> bool {
+    let t = s.to_lowercase();
+    t.contains("expired") || t.contains("stale")
+}
+
 impl OpenAiCompat {
     async fn once(&self, model: &str, req: &Request, k: &WireKnobs) -> Result<Response, OnceFail> {
-        // Env resolve per attempt, never cached past expiry.
-        let key = self
-            .resolve_key("openai")
-            .await
-            .map_err(|e| OnceFail {
-                msg: format!("{e:?}"),
-                after: None,
-                retryable: false,
-                truncated: false,
-                content_chars: 0,
-                reasoning_chars: 0,
-                usage: None,
-            })?
-            .api_key;
+        // Env resolve per attempt, never cached past expiry. Empty is fatal
+        // before any HTTP round trip.
+        let key = self.creds.resolve().map_err(|e| OnceFail {
+            msg: format!("{e:?}"),
+            error: Box::new(e),
+            after: None,
+            retryable: false,
+            truncated: false,
+            content_chars: 0,
+            reasoning_chars: 0,
+            usage: None,
+        })?;
         let mut call = self
             .http
             .post(format!("{}/chat/completions", self.endpoint));
         for (name, value) in &self.headers {
             call = call.header(name.as_str(), value.as_str());
         }
-        if !key.trim().is_empty() {
-            call = call.bearer_auth(key);
-        }
+        call = call.bearer_auth(key.api_key);
         let resp = call
             .json(&wire_body(model, req, k))
             .send()
             .await
             .map_err(|e| OnceFail {
                 msg: e.to_string(),
+                error: Box::new(LlmError::Transport(e.to_string())),
                 after: None,
                 retryable: true,
                 truncated: false,
@@ -212,19 +269,54 @@ impl OpenAiCompat {
             let text = resp.text().await.unwrap_or_default();
             let short: String = text.chars().take(300).collect();
             let msg = format!("{code}: {short}");
-            let retryable = matches!(
-                provider_core::classify_error(&msg),
-                provider_core::ErrorClass::Retryable
-                    | provider_core::ErrorClass::Overload
-                    | provider_core::ErrorClass::AuthStale
-            );
+            let status = code.as_u16();
             // Some gateways bill and report usage on an error body; carry it.
             let usage = serde_json::from_str::<ChatResp>(&text)
                 .ok()
                 .and_then(|r| wire_usage(r.usage, model))
                 .map(Box::new);
+            // 401/403 on a static env key is fatal Auth, never retried. Only
+            // a refreshable source retries stale bodies as AuthStale.
+            if status == 401 || status == 403 {
+                if self.creds.is_refreshable() && is_stale_msg(&text) {
+                    let error = Box::new(LlmError::Transport(msg.clone()));
+                    return Err(OnceFail {
+                        msg,
+                        error,
+                        after,
+                        retryable: true,
+                        truncated: false,
+                        content_chars: 0,
+                        reasoning_chars: 0,
+                        usage,
+                    });
+                }
+                let error = Box::new(LlmError::Auth(msg.clone()));
+                return Err(OnceFail {
+                    msg,
+                    error,
+                    after: None,
+                    retryable: false,
+                    truncated: false,
+                    content_chars: 0,
+                    reasoning_chars: 0,
+                    usage,
+                });
+            }
+            let error = Box::new(LlmError::Http {
+                status,
+                retry_after: after,
+                body: short,
+            });
+            let retryable = matches!(
+                classify_error(&error),
+                provider_core::ErrorClass::Retryable
+                    | provider_core::ErrorClass::Overload
+                    | provider_core::ErrorClass::AuthStale
+            );
             return Err(OnceFail {
                 msg,
+                error,
                 after,
                 retryable,
                 truncated: false,
@@ -235,6 +327,7 @@ impl OpenAiCompat {
         }
         let v: serde_json::Value = resp.json().await.map_err(|e| OnceFail {
             msg: e.to_string(),
+            error: Box::new(LlmError::Transport(e.to_string())),
             after: None,
             retryable: true,
             truncated: false,
@@ -244,11 +337,12 @@ impl OpenAiCompat {
         })?;
         parse_body(&v, model, k.max_tokens).map_err(|BodyFail { msg, usage }| {
             let truncated = msg.contains("finish_reason=length");
+            let error = Box::new(LlmError::Transport(msg.clone()));
             let retryable = if truncated {
                 true
             } else {
                 matches!(
-                    provider_core::classify_error(&msg),
+                    classify_error(&error),
                     provider_core::ErrorClass::Retryable
                         | provider_core::ErrorClass::Overload
                         | provider_core::ErrorClass::AuthStale
@@ -258,6 +352,7 @@ impl OpenAiCompat {
                 content_chars: chars_after(&msg, "; content="),
                 reasoning_chars: chars_after(&msg, "; reasoning_content="),
                 msg,
+                error,
                 after: None,
                 retryable,
                 truncated,
@@ -417,7 +512,10 @@ mod tests {
             .expect("Retry-After above the cap must fail fast, not sleep")
             .unwrap_err();
         match err {
-            LlmError::Metered { source, .. } => assert!(source.contains("429"), "{source}"),
+            LlmError::Metered { source, .. } => {
+                let s = format!("{source:?}");
+                assert!(s.contains("429"), "{s}");
+            }
             other => panic!("expected Metered, got {other:?}"),
         }
         assert_eq!(bodies.lock().unwrap().len(), 1, "terminal: no re-send");
@@ -473,12 +571,168 @@ mod tests {
             LlmError::Metered {
                 source,
                 usage: Some(u),
+                ..
             } => {
-                assert!(source.contains("finish_reason=length"), "{source}");
+                let s = format!("{source:?}");
+                assert!(s.contains("finish_reason=length"), "{s}");
                 assert_eq!((u.input, u.output), (5, 64));
             }
             other => panic!("expected Metered with usage, got {other:?}"),
         }
+    }
+    #[tokio::test]
+    async fn unauthorized_is_fatal_without_retry() {
+        std::env::set_var("TEST_OAI_KEY_401", "k");
+        let (ep, bodies) = serve(vec![Canned {
+            status: 401,
+            headers: vec![],
+            body: r#"{"error": {"message": "invalid_api_key"}}"#.into(),
+        }]);
+        let c = client_on(&ep, "TEST_OAI_KEY_401");
+        let mut req = req_with_tool();
+        req.tools.clear();
+        let err = c.complete("m", &req).await.unwrap_err();
+        assert_eq!(bodies.lock().unwrap().len(), 1, "401: no re-send");
+        match err {
+            LlmError::Metered {
+                source, exhausted, ..
+            } => {
+                assert!(
+                    matches!(&*source, LlmError::Auth(_)),
+                    "static 401 is Auth, got {source:?}"
+                );
+                assert!(!exhausted, "fatal: the ladder never ran");
+                assert_eq!(classify_error(&source), provider_core::ErrorClass::Fatal);
+            }
+            other => panic!("expected Metered, got {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn missing_key_fails_fast_with_zero_http_calls() {
+        std::env::remove_var("TEST_OAI_KEY_ABSENT");
+        let (ep, bodies) = serve(vec![Canned {
+            status: 200,
+            headers: vec![],
+            body: ok_body("never"),
+        }]);
+        let c = client_on(&ep, "TEST_OAI_KEY_ABSENT");
+        assert!(
+            matches!(c.check_credentials(), Err(LlmError::Auth(_))),
+            "startup check fails fast"
+        );
+        let mut req = req_with_tool();
+        req.tools.clear();
+        let err = c.complete("m", &req).await.unwrap_err();
+        assert_eq!(bodies.lock().unwrap().len(), 0, "no HTTP without a key");
+        match err {
+            LlmError::Metered {
+                source, exhausted, ..
+            } => {
+                assert!(matches!(&*source, LlmError::Auth(_)), "got {source:?}");
+                assert!(!exhausted);
+            }
+            other => panic!("expected Metered, got {other:?}"),
+        }
+        std::env::set_var("TEST_OAI_KEY_ABSENT", "k");
+        assert!(c.check_credentials().is_ok());
+        std::env::remove_var("TEST_OAI_KEY_ABSENT");
+    }
+    #[tokio::test]
+    async fn stale_body_retries_only_for_refreshable_source() {
+        std::env::set_var("TEST_OAI_KEY_STALE", "k");
+        let stale = || Canned {
+            status: 401,
+            headers: vec![("Retry-After".into(), "0".into())],
+            body: "token expired, refresh needed".into(),
+        };
+        // Static env key: fatal, one send.
+        let (ep, bodies) = serve(vec![stale()]);
+        let c = client_on(&ep, "TEST_OAI_KEY_STALE");
+        let mut req = req_with_tool();
+        req.tools.clear();
+        let err = c.complete("m", &req).await.unwrap_err();
+        assert_eq!(bodies.lock().unwrap().len(), 1);
+        match err {
+            LlmError::Metered { source, .. } => {
+                assert_eq!(classify_error(&source), provider_core::ErrorClass::Fatal)
+            }
+            other => panic!("expected Metered, got {other:?}"),
+        }
+        // Refreshable source: the same body retries and recovers.
+        let (ep2, bodies2) = serve(vec![
+            stale(),
+            Canned {
+                status: 200,
+                headers: vec![],
+                body: ok_body("back"),
+            },
+        ]);
+        let c2 = client_on(&ep2, "TEST_OAI_KEY_STALE").with_refreshable(true);
+        let r = c2.complete("m", &req).await.unwrap();
+        assert_eq!(r.message.content, "back");
+        assert_eq!(r.attempts, 2);
+        assert_eq!(bodies2.lock().unwrap().len(), 2);
+    }
+    #[tokio::test]
+    async fn rate_limited_source_carries_status_and_exhausted() {
+        std::env::set_var("TEST_OAI_KEY_429X", "k");
+        let canned: Vec<Canned> = (0..5)
+            .map(|_| Canned {
+                status: 429,
+                headers: vec![("Retry-After".into(), "0".into())],
+                body: "rate limited".into(),
+            })
+            .collect();
+        let (ep, bodies) = serve(canned);
+        let c = client_on(&ep, "TEST_OAI_KEY_429X");
+        let mut req = req_with_tool();
+        req.tools.clear();
+        let err = c.complete("m", &req).await.unwrap_err();
+        assert_eq!(bodies.lock().unwrap().len(), 5, "1 + 4 retries");
+        match err {
+            LlmError::Metered {
+                source, exhausted, ..
+            } => match &*source {
+                LlmError::Http {
+                    status,
+                    retry_after,
+                    ..
+                } => {
+                    assert_eq!(*status, 429);
+                    assert_eq!(*retry_after, Some(Duration::from_secs(0)));
+                    assert!(exhausted, "the ladder ran out of rungs");
+                    assert_eq!(
+                        classify_error(&source),
+                        provider_core::ErrorClass::Retryable
+                    );
+                }
+                other => panic!("expected Http source, got {other:?}"),
+            },
+            other => panic!("expected Metered, got {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn cold_start_503_retries_and_recovers() {
+        std::env::set_var("TEST_OAI_KEY_503", "k");
+        let (ep, bodies) = serve(vec![
+            Canned {
+                status: 503,
+                headers: vec![("Retry-After".into(), "0".into())],
+                body: "Service Unavailable".into(),
+            },
+            Canned {
+                status: 200,
+                headers: vec![],
+                body: ok_body("warm"),
+            },
+        ]);
+        let c = client_on(&ep, "TEST_OAI_KEY_503");
+        let mut req = req_with_tool();
+        req.tools.clear();
+        let r = c.complete("m", &req).await.unwrap();
+        assert_eq!(r.message.content, "warm");
+        assert_eq!(r.attempts, 2);
+        assert_eq!(bodies.lock().unwrap().len(), 2);
     }
     #[tokio::test]
     async fn non_2xx_parseable_usage_is_carried_and_summed_across_retries() {
@@ -507,8 +761,11 @@ mod tests {
             LlmError::Metered {
                 source,
                 usage: Some(u),
+                exhausted,
             } => {
-                assert!(source.contains("429"), "{source}");
+                let s = format!("{source:?}");
+                assert!(s.contains("429"), "{s}");
+                assert!(exhausted, "the 1+4 ladder ran out of rungs");
                 // Every failed attempt was billed the prompt: the error sums them.
                 assert_eq!(u.input, 35);
             }
