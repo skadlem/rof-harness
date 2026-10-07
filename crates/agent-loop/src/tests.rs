@@ -1570,27 +1570,44 @@ fn run_tmp(name: &str) -> std::path::PathBuf {
     dir
 }
 
-struct ScriptClient {
+/// One scripted provider reply: a response, a typed failure, or a hang
+/// (for the cancel races). A dry queue is a transport failure.
+enum Scripted {
+    Respond(Response),
+    Fail(LlmError),
+    Hang,
+}
+
+struct FakeLlm {
     order: Arc<Mutex<Vec<String>>>,
-    queue: Mutex<VecDeque<Response>>,
+    queue: Mutex<VecDeque<Scripted>>,
     /// Every outgoing request, for shape assertions.
     requests: Arc<Mutex<Vec<Request>>>,
 }
 
 #[async_trait::async_trait]
-impl LlmClient for ScriptClient {
+impl LlmClient for FakeLlm {
     async fn complete(&self, _model: &str, req: &Request) -> Result<Response, LlmError> {
         self.order.lock().unwrap().push("model".into());
         self.requests.lock().unwrap().push(req.clone());
-        self.queue
-            .lock()
-            .unwrap()
-            .pop_front()
-            .ok_or(LlmError::Transport("script empty".into()))
+        let next = self.queue.lock().unwrap().pop_front();
+        match next {
+            Some(Scripted::Respond(r)) => Ok(r),
+            Some(Scripted::Fail(e)) => Err(e),
+            Some(Scripted::Hang) => {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(text_response("never"))
+            }
+            None => Err(LlmError::Transport("script empty".into())),
+        }
     }
 }
 
-fn script_resp(calls: Vec<(&str, &str, serde_json::Value)>, stop: StopReason) -> Response {
+fn script_resp(calls: Vec<(&str, &str, serde_json::Value)>, stop: StopReason) -> Scripted {
+    Scripted::Respond(response(calls, stop))
+}
+
+fn response(calls: Vec<(&str, &str, serde_json::Value)>, stop: StopReason) -> Response {
     Response {
         message: AssistantMessage {
             content: "step".into(),
@@ -1620,7 +1637,11 @@ fn script_resp(calls: Vec<(&str, &str, serde_json::Value)>, stop: StopReason) ->
     }
 }
 
-fn text_resp(text: &str) -> Response {
+fn text_resp(text: &str) -> Scripted {
+    Scripted::Respond(text_response(text))
+}
+
+fn text_response(text: &str) -> Response {
     Response {
         message: AssistantMessage {
             content: text.into(),
@@ -1819,7 +1840,7 @@ async fn run_e2e_multi_turn_proven_prefix_kept_failed_batch_rolled_back() {
         RUN_N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
     let order = Arc::new(Mutex::new(Vec::new()));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: order.clone(),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -1954,9 +1975,10 @@ async fn run_e2e_multi_turn_proven_prefix_kept_failed_batch_rolled_back() {
 async fn settle_usage_rides_message_end_and_cumulates_on_turn_end() {
     let root = run_tmp("usage");
     std::fs::write(root.join("a.txt"), "hello\n").unwrap();
-    let mut settled = text_resp("done");
+    let mut settled = text_response("done");
     settled.usage.reasoning = Some(3);
-    let client = ScriptClient {
+    let settled = Scripted::Respond(settled);
+    let client = FakeLlm {
         order: Default::default(),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -2043,7 +2065,7 @@ async fn run_half_cap_zero_edits_directive_lands_on_a_tool_tail() {
     ));
     let requests = Arc::new(Mutex::new(Vec::new()));
     // 15 read-only actions (= cap/2) with zero edits: the directive fires.
-    let mut queue: VecDeque<Response> = VecDeque::new();
+    let mut queue: VecDeque<Scripted> = VecDeque::new();
     for i in 1..=15 {
         let id = format!("r{i}");
         queue.push_back(script_resp(
@@ -2052,7 +2074,7 @@ async fn run_half_cap_zero_edits_directive_lands_on_a_tool_tail() {
         ));
     }
     queue.push_back(text_resp("done"));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: requests.clone(),
         queue: Mutex::new(queue),
@@ -2131,7 +2153,7 @@ async fn run_failed_batch_records_rollback_notice_and_queues_it_for_the_model() 
     ));
     std::fs::write(root.join("a.rs"), "v1\n").unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: requests.clone(),
         queue: Mutex::new(VecDeque::from([
@@ -2230,7 +2252,7 @@ async fn run_bets_hook_fires_at_step_head_and_post_batch_in_order() {
     let root = run_tmp("bets");
     std::fs::write(root.join("f.txt"), "old\n").unwrap();
     let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: order.clone(),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -2289,7 +2311,7 @@ async fn run_halt_budget_steps_after_grace_with_budget_frame() {
     assert_eq!(LoopState::new().drain_timeout, Duration::from_secs(30));
     let root = run_tmp("halt");
     let order = Arc::new(Mutex::new(Vec::new()));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order,
         requests: Default::default(),
         queue: Mutex::new(VecDeque::new()),
@@ -2363,7 +2385,7 @@ async fn run_halt_same_action_and_crash_input_source() {
             StopReason::ToolUse,
         )
     };
-    let client = ScriptClient {
+    let client = FakeLlm {
         order,
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([same(), same(), same(), same()])),
@@ -2396,7 +2418,7 @@ async fn run_halt_same_action_and_crash_input_source() {
     // Crash queues like User but keeps the Crash source in the log.
     let root = run_tmp("crash");
     let order = Arc::new(Mutex::new(Vec::new()));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order,
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([text_resp("recovered")])),
@@ -2467,13 +2489,13 @@ async fn run_request_shape_history_delivered_once_collapse_5() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     // 7 write rounds, then a finishing text: the 8th request carries 7 tool
     // results, so collapse-5 has older material to shrink.
-    let mut queue: VecDeque<Response> = VecDeque::new();
+    let mut queue: VecDeque<Scripted> = VecDeque::new();
     for i in 1..=7 {
         let id = format!("c{i}");
         let path = format!("f{i}.txt");
         // Unique marker: the generic "step" would substring-match the
         // "steps N/M" budget tail on every request.
-        let mut resp = script_resp(
+        let mut resp = response(
             vec![(
                 id.as_str(),
                 "write",
@@ -2483,13 +2505,13 @@ async fn run_request_shape_history_delivered_once_collapse_5() {
         );
         resp.message.content = format!("script-step-{i}");
         resp.message.thinking = Some(format!("reason-{i}"));
-        queue.push_back(resp);
+        queue.push_back(Scripted::Respond(resp));
     }
     queue.push_back(text_resp("all done"));
     // Held-declare round trip: the first done is held (unverified
     // writes), the second lands Done.
     queue.push_back(text_resp("done again"));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order,
         requests: requests.clone(),
         queue: Mutex::new(queue),
@@ -2602,19 +2624,19 @@ fn compaction(frac: f64, keep_tokens: usize) -> context::CompactionConfig {
 }
 
 /// A scripted summary response: `input` is what the totals read.
-fn summary_resp(text: &str, stop: StopReason, input: u64) -> Response {
-    let mut r = text_resp(text);
+fn summary_resp(text: &str, stop: StopReason, input: u64) -> Scripted {
+    let mut r = text_response(text);
     r.stop = stop;
     r.usage.input = input;
     r.usage.cost_usd = Some(0.02);
-    r
+    Scripted::Respond(r)
 }
 
 /// One scripted run; hands back everything the checkpoint assertions need.
 /// `followups` open later turns (a checkpoint is per turn).
 async fn run_script(
     name: &str,
-    queue: Vec<Response>,
+    queue: Vec<Scripted>,
     cfg: RunConfig,
     budget_tokens: u64,
     followups: Vec<&str>,
@@ -2622,7 +2644,7 @@ async fn run_script(
 ) -> (Outcome, Arc<Mutex<Vec<Request>>>, LoopState, Emitter) {
     let root = run_tmp(name);
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: requests.clone(),
         queue: Mutex::new(VecDeque::from(queue)),
@@ -2674,11 +2696,11 @@ fn last_totals(emitter: &Emitter) -> UsageReport {
 
 /// One write round billed `input` prompt tokens: the estimate (anchor +
 /// tail chars/4) crosses `budget_tokens * frac` at the next step head.
-fn write_round(calls: Vec<(&str, &str, serde_json::Value)>, content: &str, input: u64) -> Response {
-    let mut r = script_resp(calls, StopReason::ToolUse);
+fn write_round(calls: Vec<(&str, &str, serde_json::Value)>, content: &str, input: u64) -> Scripted {
+    let mut r = response(calls, StopReason::ToolUse);
     r.message.content = content.into();
     r.usage.input = input;
-    r
+    Scripted::Respond(r)
 }
 
 #[tokio::test]
@@ -2941,14 +2963,16 @@ async fn run_checkpoint_composes_on_a_new_turn() {
     // Turn 1 checkpoints rounds 1-2 (keep_from 3). The followup opens turn
     // 2, where a second checkpoint absorbs the first summary plus round 3:
     // `keep_from` must map the folded cut back onto raw history.
-    let mut turn_one_done = text_resp("turn one done");
+    let mut turn_one_done = text_response("turn one done");
     turn_one_done.usage.input = 1_000; // arms turn 2's estimate
                                        // Held-declare round trip: turn one done is held (unverified
                                        // writes); the repeat lands Done. input 1000 re-arms turn 2's
                                        // checkpoint estimate exactly like the held response did; the short
                                        // text keeps the keep_tokens cut on the same row.
-    let mut turn_one_again = text_resp("done again");
+    let turn_one_done = Scripted::Respond(turn_one_done);
+    let mut turn_one_again = text_response("done again");
     turn_one_again.usage.input = 1_000;
+    let turn_one_again = Scripted::Respond(turn_one_again);
     let queue = vec![
         write_round(
             vec![(
@@ -3037,7 +3061,7 @@ async fn run_compaction_off_is_byte_identical_to_collapse_5() {
     // Trigger-ready: budget 8000, frac 0.1 (threshold 800), keep_tokens 3
     // and every round billed 1000 prompt tokens — every knob but `enabled`
     // is set to fire. Default `enabled: false` is the only thing holding.
-    let mut queue: VecDeque<Response> = VecDeque::new();
+    let mut queue: VecDeque<Scripted> = VecDeque::new();
     for i in 1..=7 {
         let id = format!("c{i}");
         let path = format!("f{i}.txt");
@@ -3110,7 +3134,7 @@ async fn run_compaction_off_is_byte_identical_to_collapse_5() {
 async fn run_system_prefix_is_static_and_file_map_frozen() {
     let root = run_tmp("prefix");
     std::fs::write(root.join("a.rs"), "v1\n").unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Arc::new(Mutex::new(Vec::new())),
         queue: Mutex::new(VecDeque::from([
@@ -3208,7 +3232,7 @@ async fn run_multi_turn_request_echoes_assistant_thinking() {
     let root = run_tmp("think");
     std::fs::write(root.join("a.txt"), "hello\n").unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut first = script_resp(
+    let mut first = response(
         vec![(
             "c1",
             "write",
@@ -3217,7 +3241,8 @@ async fn run_multi_turn_request_echoes_assistant_thinking() {
         StopReason::ToolUse,
     );
     first.message.thinking = Some("must edit a.txt".into());
-    let client = ScriptClient {
+    let first = Scripted::Respond(first);
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: requests.clone(),
         queue: Mutex::new(VecDeque::from([
@@ -3275,7 +3300,7 @@ async fn run_provider_failure_emits_provider_failed_then_fails() {
     use agent_event::check_pairing;
     let root = run_tmp("provfail");
     // Empty script: every complete() call returns Err(Transport(...)).
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::new()),
@@ -3334,42 +3359,32 @@ async fn run_provider_failure_emits_provider_failed_then_fails() {
 
 /// First call fails with a metered truncation, then succeeds: F1b through
 /// the real `run()` path (extraction + budget + retry).
-struct MeteredFailThenOk {
-    calls: Mutex<u32>,
-    usage: Usage,
-}
-
-#[async_trait::async_trait]
-impl LlmClient for MeteredFailThenOk {
-    async fn complete(&self, _model: &str, _req: &Request) -> Result<Response, LlmError> {
-        let mut n = self.calls.lock().unwrap();
-        *n += 1;
-        if *n == 1 {
-            return Err(LlmError::Metered {
+fn metered_fail_then_ok(usage: Usage) -> FakeLlm {
+    FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([
+            Scripted::Fail(LlmError::Metered {
                 source: Box::new(LlmError::Transport("output truncated at 64 tokens".into())),
-                usage: Some(self.usage.clone()),
+                usage: Some(usage),
                 exhausted: false,
-            });
-        }
-        drop(n);
-        Ok(text_resp("done"))
+            }),
+            text_resp("done"),
+        ])),
     }
 }
 
 #[tokio::test]
 async fn run_meters_failed_attempt_usage_then_retries() {
     let root = run_tmp("meteredfail");
-    let client = MeteredFailThenOk {
-        calls: Mutex::new(0),
-        usage: Usage {
-            input: 100,
-            output: 20,
-            cache_read: 0,
-            cache_write: 0,
-            reasoning: None,
-            cost_usd: Some(0.02),
-        },
-    };
+    let client = metered_fail_then_ok(Usage {
+        input: 100,
+        output: 20,
+        cache_read: 0,
+        cache_write: 0,
+        reasoning: None,
+        cost_usd: Some(0.02),
+    });
     let registry = run_registry(&root);
     let mut state = LoopState::new();
     let mut emitter = Emitter::new();
@@ -3470,7 +3485,7 @@ async fn incremental_proof_keeps_the_proven_leading_prefix() {
         "import pathlib, sys\nsys.exit(1 if 'BAD' in pathlib.Path('b.rs').read_text() else 0)\n",
     )
     .unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -3537,7 +3552,7 @@ async fn incremental_proof_keeps_the_proven_leading_prefix() {
 async fn empty_hunk_batches_never_inflate_proven_hunks() {
     let root = run_tmp("nohunks");
     std::fs::write(root.join("a.rs"), "one\n").unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -3636,7 +3651,7 @@ async fn run_post_batch_partial_keeps_first_hunk_only_and_continues() {
     let root = run_tmp("partial");
     std::fs::write(root.join("a.rs"), "one\n").unwrap();
     std::fs::write(root.join("b.rs"), "two\n").unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -3692,7 +3707,7 @@ async fn run_post_batch_partial_keeps_first_hunk_only_and_continues() {
 async fn run_post_batch_aborted_rolls_back_the_whole_batch() {
     let root = run_tmp("aborted");
     std::fs::write(root.join("a.rs"), "one\n").unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -3785,7 +3800,7 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
 
     // --- leg 1: run() on real siblings ---
     let run_root = run_tmp("shared-run");
-    let run_client = ScriptClient {
+    let run_client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -3837,7 +3852,7 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
     assert!(s.start_provider_call(&root).is_some());
     ptx.send(ProviderMsg::Settled {
         turn: 1,
-        message: script_resp(vec![write_call("c1")], StopReason::ToolUse).message,
+        message: response(vec![write_call("c1")], StopReason::ToolUse).message,
         stop: StopReason::ToolUse,
         usage: None,
     })
@@ -3880,7 +3895,7 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
     assert!(s.start_provider_call(&root).is_some());
     ptx.send(ProviderMsg::Settled {
         turn: 1,
-        message: text_resp("done").message,
+        message: text_response("done").message,
         stop: StopReason::Stop,
         usage: None,
     })
@@ -3892,7 +3907,7 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
     assert!(s.start_provider_call(&root).is_some());
     ptx.send(ProviderMsg::Settled {
         turn: 1,
-        message: text_resp("done").message,
+        message: text_response("done").message,
         stop: StopReason::Stop,
         usage: None,
     })
@@ -4110,18 +4125,6 @@ fn step_retries_resets_on_fresh_step_head_not_retry_continuation() {
     assert_eq!(s.step_retries, 2, "fresh step after success resets");
 }
 
-/// Hanging provider that never answers unless raced: without the
-/// parent-side `select!` the run would wait out the full sleep.
-struct HangingClient;
-
-#[async_trait::async_trait]
-impl LlmClient for HangingClient {
-    async fn complete(&self, _model: &str, _req: &Request) -> Result<Response, LlmError> {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        Ok(text_resp("never"))
-    }
-}
-
 /// Cancel during `provider.complete` aborts promptly: the step records a
 /// `Failed { cancelled: true }` (budget refunded, no `Attempt` row) and
 /// the run returns `Cancelled` in ~50ms instead of 30s. The per-turn
@@ -4130,7 +4133,13 @@ impl LlmClient for HangingClient {
 #[tokio::test]
 async fn cancel_during_provider_complete_aborts_promptly_as_cancelled() {
     let root = run_tmp("cancel-race");
-    let client = HangingClient;
+    // Hanging provider: without the parent-side `select!` the run would
+    // wait out the full sleep.
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([Scripted::Hang])),
+    };
     let registry = run_registry(&root);
     let mut state = LoopState::new();
     let mut emitter = Emitter::new();
@@ -4387,7 +4396,7 @@ fn terminate_same_action_zero_disables_lesson() {
 #[tokio::test]
 async fn last_step_done_wins_over_steps_halt() {
     let root = run_tmp("last-done");
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Default::default(),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([text_resp("finished")])),
@@ -4538,7 +4547,7 @@ impl CoreTool for ProdCheck {
 async fn run_e2e_failing_test_does_not_verify_but_holds_declare() {
     let root = run_tmp("verify-e2e");
     std::fs::write(root.join("a.rs"), "v1\n").unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -4657,7 +4666,7 @@ fn run_end_of(history: &[AgentEvent]) -> agent_event::RunOutcome {
 async fn char_done_event_and_log_sequence() {
     use agent_event::check_pairing;
     let root = run_tmp("char-done");
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Default::default(),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([text_resp("finished")])),
@@ -4710,7 +4719,7 @@ async fn char_verify_hold_event_and_log_sequence() {
     use agent_event::check_pairing;
     let root = run_tmp("char-hold");
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Default::default(),
         requests: requests.clone(),
         queue: Mutex::new(VecDeque::from([
@@ -4792,7 +4801,7 @@ async fn char_rollback_event_and_log_sequence() {
     use agent_event::check_pairing;
     let root = run_tmp("char-rollback");
     std::fs::write(root.join("a.rs"), "v1\n").unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Default::default(),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([
@@ -4929,7 +4938,7 @@ impl CoreTool for HangingTool {
 async fn char_mid_tool_cancel_aborts_as_cancelled() {
     let root = run_tmp("char-toolcancel");
     std::fs::write(root.join("a.rs"), "v1\n").unwrap();
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Default::default(),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([script_resp(
@@ -5016,7 +5025,7 @@ async fn char_mid_tool_cancel_aborts_as_cancelled() {
 #[tokio::test]
 async fn char_log_append_failure_fails_closed() {
     let root = run_tmp("char-logfail");
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Default::default(),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::from([text_resp("finished")])),
@@ -5024,7 +5033,7 @@ async fn char_log_append_failure_fails_closed() {
     let registry = run_registry(&root);
     let mut state = LoopState::new();
     let mut emitter = Emitter::new();
-    let outcome = run(
+    let _outcome = run(
         &mut state,
         Run {
             provider: &client,
@@ -5061,7 +5070,7 @@ async fn char_provider_failure_event_and_log_sequence() {
     use agent_event::check_pairing;
     let root = run_tmp("char-provfail");
     // Empty script: every complete() call returns Err(Transport(...)).
-    let client = ScriptClient {
+    let client = FakeLlm {
         order: Default::default(),
         requests: Default::default(),
         queue: Mutex::new(VecDeque::new()),
