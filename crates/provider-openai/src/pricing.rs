@@ -6,18 +6,16 @@
 /// cache-hit tokens (OpenAI wire semantics), so they split at the hit rate.
 /// The go-routed id `deepseek-v4.1-flash` is the same model at the same price
 /// book: OpenCode Go's DeepSeek V4.1 Flash rows are DeepSeek's off-peak pair
-/// (hit $0.003 / miss $0.15; research/refresh-cache-economics.md:9-10) and the
+/// (hit $0.003 / miss $0.15; the off-peak pair) and the
 /// identical peak tuple ($0.006 / $0.30 / $1.20; Go page Peak row, captured
-/// in the same research session), so it takes the flash PEAK rates. The table
+/// alongside), so it takes the flash PEAK rates. The table
 /// is keyed by model id with no endpoint dimension — if Go's rates diverge
 /// from DeepSeek's, this needs a per-endpoint price book.
 /// Unknown models price `None`: never fabricate a cost.
 pub(crate) fn price_usd(model: &str, input: u64, cache_read: u64, output: u64) -> Option<f64> {
     let (hit, miss, out) = match model {
         // Legacy alias `deepseek-v4-flash` is served by the same model billed
-        // at the Flash price (research/DECISIONS.md:74: "deepseek-flash IS
-        // DeepSeek-V4.1-Flash (legacy deepseek-v4-flash served by it, billed
-        // at Flash price — api-docs footnote 2026-10-03)").
+        // at the Flash price (api-docs footnote 2026-10-03).
         m if m.starts_with("deepseek-flash")
             || m.starts_with("deepseek-v4-flash")
             || m.starts_with("deepseek-v4.1-flash") =>
@@ -54,7 +52,6 @@ mod tests {
             "go flash prices like direct flash: {go}"
         );
         // legacy alias: same model billed at the Flash price
-        // (research/DECISIONS.md:74)
         let legacy = price_usd("deepseek-v4-flash", 1_000_000, 500_000, 250_000).unwrap();
         assert!(
             (legacy - 0.453).abs() < 1e-9,

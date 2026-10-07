@@ -614,8 +614,9 @@ pub async fn run<P: LlmClient>(
                 state.stop_hard = true;
                 state.gate.begin_abort();
                 Err(LlmError::Metered {
-                    source: "cancelled".into(),
+                    source: Box::new(LlmError::Cancelled),
                     usage: None,
+                    exhausted: false,
                 })
             }
             Some(res) => res,
@@ -626,7 +627,7 @@ pub async fn run<P: LlmClient>(
                 // Metered failures carry what the attempts were billed; every
                 // other error shape has no usage to report.
                 let (msg, usage) = match e {
-                    LlmError::Metered { source, usage } => (source, usage),
+                    LlmError::Metered { source, usage, .. } => (format!("{source}"), usage),
                     other => (format!("{other:?}"), None),
                 };
                 let turn = state.turn;
