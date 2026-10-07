@@ -3359,7 +3359,7 @@ async fn run_provider_failure_emits_provider_failed_then_fails() {
 
 /// First call fails with a metered truncation, then succeeds: F1b through
 /// the real `run()` path (extraction + budget + retry).
-fn metered_fail_then_ok(usage: Usage) -> FakeLlm {
+fn metered_fail_then_ok(usage: Usage, exhausted: bool) -> FakeLlm {
     FakeLlm {
         order: Default::default(),
         requests: Default::default(),
@@ -3367,7 +3367,7 @@ fn metered_fail_then_ok(usage: Usage) -> FakeLlm {
             Scripted::Fail(LlmError::Metered {
                 source: Box::new(LlmError::Transport("output truncated at 64 tokens".into())),
                 usage: Some(usage),
-                exhausted: false,
+                exhausted,
             }),
             text_resp("done"),
         ])),
@@ -3377,14 +3377,17 @@ fn metered_fail_then_ok(usage: Usage) -> FakeLlm {
 #[tokio::test]
 async fn run_meters_failed_attempt_usage_then_retries() {
     let root = run_tmp("meteredfail");
-    let client = metered_fail_then_ok(Usage {
-        input: 100,
-        output: 20,
-        cache_read: 0,
-        cache_write: 0,
-        reasoning: None,
-        cost_usd: Some(0.02),
-    });
+    let client = metered_fail_then_ok(
+        Usage {
+            input: 100,
+            output: 20,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: None,
+            cost_usd: Some(0.02),
+        },
+        false,
+    );
     let registry = run_registry(&root);
     let mut state = LoopState::new();
     let mut emitter = Emitter::new();
@@ -3424,6 +3427,67 @@ async fn run_meters_failed_attempt_usage_then_retries() {
         .filter(|e| matches!(e, AgentEvent::Error { error } if error.code == "provider-failed"))
         .count();
     assert_eq!(errors, 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Worst case: an `exhausted` ladder must not be re-run in-step. One model
+/// call, one non-retryable Attempt, one Error frame, then fatal.
+#[tokio::test]
+async fn run_exhausted_ladder_is_never_retried_in_step() {
+    let root = run_tmp("exhausted");
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let client = FakeLlm {
+        order: order.clone(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([Scripted::Fail(LlmError::Metered {
+            source: Box::new(LlmError::Transport("output truncated at 64 tokens".into())),
+            usage: Some(Usage {
+                input: 100,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: None,
+                cost_usd: Some(0.02),
+            }),
+            exhausted: true,
+        })])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    // The billed attempt is still metered, but the ladder runs exactly once.
+    assert_eq!(order.lock().unwrap().len(), 1, "exhausted ladder re-ran");
+    assert_eq!(state.budget.counters().tokens, 120);
+    let attempts: Vec<bool> = state
+        .items
+        .iter()
+        .filter_map(|i| match &i.kind {
+            ItemKind::Attempt { will_retry, .. } => Some(*will_retry),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attempts, vec![false], "exhausted must not retry");
+    assert!(!state.call_model);
+    match run_end_of(emitter.history()) {
+        agent_event::RunOutcome::Failed(msg) => assert!(msg.contains("truncated"), "got {msg}"),
+        other => panic!("expected failed RunEnd, got {other:?}"),
+    }
+    drop(outcome);
     let _ = std::fs::remove_dir_all(&root);
 }
 

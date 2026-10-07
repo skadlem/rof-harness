@@ -651,7 +651,20 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         // Metered failures carry what the attempts were billed; every
         // other error shape has no usage to report.
         let (msg, usage) = match e {
-            LlmError::Metered { source, usage, .. } => (format!("{source}"), usage),
+            LlmError::Metered {
+                source,
+                usage,
+                exhausted,
+            } => {
+                // An exhausted ladder already ran the adapter's full retry
+                // ladder inside one `complete`: an in-step retry would re-bill
+                // every rung for no new information, so the retry budget is
+                // spent and the failure goes fatal below.
+                if exhausted {
+                    self.state.step_retries = 0;
+                }
+                (format!("{source}"), usage)
+            }
             other => (format!("{other:?}"), None),
         };
         let turn = self.state.turn;
