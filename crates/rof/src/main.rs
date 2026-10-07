@@ -17,7 +17,7 @@ use snapshot::TreeService;
 use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
-const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log]
+const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log]
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
@@ -221,6 +221,30 @@ fn budget_for(args: &Args) -> BudgetGuard {
         None => {}
     }
     BudgetGuard::new(b, Instant::now())
+}
+
+/// Disposable-workdir guard: `--workdir` is mutated in place (`git init`,
+/// `git add -A`, tool exec). Refuse values that would destroy the machine
+/// or the harness checkout itself. Non-empty task dirs stay allowed.
+fn validate_workdir(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_dir() {
+        return Err(format!("workdir is not a directory: {}", path.display()));
+    }
+    let canon = path
+        .canonicalize()
+        .map_err(|e| format!("workdir cannot be canonicalized: {e}"))?;
+    if canon.parent().is_none() {
+        return Err("workdir must not be the filesystem root".into());
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && canon == Path::new(&home) {
+            return Err("workdir must not be $HOME".into());
+        }
+    }
+    if canon.join("crates/rof/Cargo.toml").is_file() {
+        return Err("workdir must not be the harness checkout itself".into());
+    }
+    Ok(canon)
 }
 
 /// WAL filename for the shipped path: the fail-closed log lives inside
@@ -571,10 +595,13 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    if !args.workdir.is_dir() {
-        eprintln!("workdir is not a directory: {}", args.workdir.display());
-        std::process::exit(2);
-    }
+    let _workdir = match validate_workdir(&args.workdir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     let endpoint = match resolve_endpoint(
         args.endpoint.as_deref(),
         std::env::var("OPENAI_BASE_URL").ok().as_deref(),
@@ -1050,6 +1077,23 @@ mod tests {
             proof_cmd: None,
             compaction: None,
         }
+    }
+
+    #[test]
+    fn workdir_guard_rejects_root_home_and_self_repo() {
+        assert!(validate_workdir(Path::new("/")).is_err());
+        if let Ok(home) = std::env::var("HOME") {
+            assert!(validate_workdir(Path::new(&home)).is_err());
+        }
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest.parent().unwrap().parent().unwrap();
+        assert!(validate_workdir(workspace_root).is_err());
+    }
+
+    #[test]
+    fn workdir_guard_accepts_tmp() {
+        let tmp = std::env::temp_dir();
+        assert!(validate_workdir(&tmp).is_ok());
     }
 
     #[test]
