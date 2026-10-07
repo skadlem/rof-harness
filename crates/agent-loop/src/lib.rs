@@ -1,4 +1,5 @@
-//! Turn/step driver. See research/crate-agent-loop.md.
+//! Turn/step driver: headless multi-tick [`run`] plus the channel test
+//! harness [`drive_tick`].
 //!
 //! [`run`] is the headless multi-tick assembly: sequential `complete` +
 //! inline tool execute over the same step-head and termination order as

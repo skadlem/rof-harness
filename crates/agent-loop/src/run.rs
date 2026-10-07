@@ -1,6 +1,7 @@
 //! Multi-tick drivers: headless `run` and channel `drive_tick`.
 
 use crate::proof::BatchSnapshot;
+use crate::state::THINKING_KEEP;
 use crate::{
     append_to, batch_hunks, build_request, checkpoint, incremental_hunks, note_tool_execution,
     outcome_log_reason, outcome_to_result, pin_snapshot, refund_batch, settle_tool_msg,
@@ -107,6 +108,7 @@ pub async fn drive_tick(
     tool_rx: &mut mpsc::Receiver<ToolMsg>,
     cancel: &CancellationToken,
     emitter: &mut Emitter,
+    cfg: &RunConfig,
 ) -> PhaseVerdict {
     let turn_before = state.turn;
     tokio::select! {
@@ -182,7 +184,7 @@ pub async fn drive_tick(
                     } => {
                         // ...and Assistant + ToolCall appends inside step_claim...
                         // Shared with `run`: the same `step_claim` + frames order.
-                        let outcome = state.step_claim(message.clone(), stop);
+                        let outcome = state.step_claim(message.clone(), stop, cfg);
                         emit_message_frames(state, &message, usage.as_ref(), emitter); // ...before these frames.
                         match outcome {
                             ClaimOutcome::Dispatch(calls) => {
@@ -224,7 +226,7 @@ pub async fn drive_tick(
             // `record_tool_result` + `settle_tool_tail`, the same order `run`
             // uses per executed call.
             let shadow = tm.clone();
-            if settle_tool_msg(state, tm) {
+            if settle_tool_msg(state, tm, cfg) {
                 // ToolResult appended above; terminal frame after.
                 emitter.emit(AgentEvent::ToolEnd {
                     id: shadow.call_id,
@@ -235,7 +237,7 @@ pub async fn drive_tick(
         }
         else => {}
     }
-    let verdict = state.terminate();
+    let verdict = state.terminate(cfg);
     // turn_before > 0: the 0 -> 1 opening has no prior turn to close.
     if state.turn != turn_before && turn_before > 0 && matches!(verdict, PhaseVerdict::Continue) {
         // Same hop as run(): closer is durable already, frames follow in order.
@@ -286,6 +288,12 @@ pub struct RunConfig {
     pub proof_cmd: Option<String>,
     /// Compaction checkpoint knobs (default OFF: no summary call, no fold).
     pub compaction: context::CompactionConfig,
+    /// Transcript-fold knobs, the single source of truth: echoed-reasoning
+    /// keep-count (default [`THINKING_KEEP`]) and collapse-boundary
+    /// hysteresis (default [`context::COLLAPSE_HYSTERESIS`]). Arms set these
+    /// fields directly; the loop and `context` never read the environment.
+    pub thinking_keep: usize,
+    pub collapse_hysteresis: usize,
 }
 
 impl Default for RunConfig {
@@ -301,6 +309,8 @@ impl Default for RunConfig {
             incentives: IncentivesLevel::Full,
             proof_cmd: None,
             compaction: context::CompactionConfig::default(),
+            thinking_keep: THINKING_KEEP,
+            collapse_hysteresis: context::COLLAPSE_HYSTERESIS,
         }
     }
 }
@@ -480,7 +490,7 @@ impl<P> RunCtx<'_, '_, P> {
     /// Truncated, and the post-batch verdict): terminate, hop the turn, or
     /// park Done when idle.
     fn settle_terminal(&mut self, before: u64) -> Result<(), Outcome> {
-        match self.state.terminate() {
+        match self.state.terminate(&self.cfg) {
             PhaseVerdict::Return(o) => Err(o),
             _ => {
                 self.close_hop(before)?;
@@ -499,11 +509,6 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
     /// finish-closed cases are already finished inside; log-open and
     /// no-input already emitted their own RunEnd).
     async fn open_run(&mut self, inputs: Vec<Input>) -> Option<Outcome> {
-        // Cfg-over-state (precedence is documented on `run`): cfg wins over
-        // pre-set state; the fold knobs resolve from the env once, here.
-        self.state.drain_timeout = self.cfg.drain_timeout;
-        self.state.incentives = self.cfg.incentives;
-        self.state.resolve_fold_config();
         self.run_id = self.state.next_emit_id();
         self.emitter.emit(AgentEvent::RunStart {
             run_id: self.run_id,
@@ -598,7 +603,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         // Grace runs here (may_step inside); terminate halts after.
         match self.state.start_provider_call(&self.root) {
             Some(t) => Ok(Head::Call(t)),
-            None => match self.state.terminate() {
+            None => match self.state.terminate(&self.cfg) {
                 PhaseVerdict::Return(o) => Ok(Head::Exit(o)),
                 PhaseVerdict::Break => Ok(Head::Yield),
                 PhaseVerdict::Continue => {
@@ -698,7 +703,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         if self.state.call_model {
             return Ok(()); // in-step retry reuses the same assembly
         }
-        match self.state.terminate() {
+        match self.state.terminate(&self.cfg) {
             PhaseVerdict::Return(o) => Err(o),
             _ => {
                 // Never spin: parked-idle without input is Done.
@@ -741,7 +746,9 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             stop: resp.stop,
             usage: Some(billed.clone()),
         });
-        let outcome = self.state.step_claim(resp.message.clone(), resp.stop);
+        let outcome = self
+            .state
+            .step_claim(resp.message.clone(), resp.stop, &self.cfg);
         self.sync()?;
         emit_message_frames(self.state, &resp.message, Some(&billed), self.emitter);
         match outcome {
@@ -780,7 +787,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             ClaimOutcome::HardExit(label) => {
                 self.state.fatal_error = Some(label.clone());
                 self.state.gate.close(label);
-                match self.state.terminate() {
+                match self.state.terminate(&self.cfg) {
                     PhaseVerdict::Return(o) => Err(o),
                     _ => Ok(()),
                 }
@@ -897,7 +904,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             // BEFORE the sync, so the file never holds a stale
             // tail and the row keeps the exact model text.
             // Shared with `drive_tick` (`settle_tool_tail`).
-            settle_tool_tail(self.state);
+            settle_tool_tail(self.state, &self.cfg);
             self.sync()?;
             if let Some(done) = self
                 .state
@@ -958,7 +965,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 },
                 None,
             )?;
-            self.state.push_directive(ROLLBACK_NOTICE.into());
+            self.state.push_directive(ROLLBACK_NOTICE.into(), &self.cfg);
             if let Err(e) = self.tree.rollback() {
                 return Err(Outcome::Failed {
                     kind: FailureKind::Snapshot,
@@ -999,6 +1006,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             "tool batch results all passed"
         };
         self.state
+            .experiment
             .ablation
             .note_assessment(bets::assess_claim(&claim, observation));
         let verdict = self.bets.on_post_batch(&claim, &hunks);
@@ -1009,7 +1017,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             // interventions (Partial/Aborted) only — the
             // legacy failed-batch rollback above is pre-gate
             // and identical across ablation arms.
-            self.state.ablation.note_commit(&verdict);
+            self.state.experiment.ablation.note_commit(&verdict);
         }
         match verdict {
             bets::CommitVerdict::Committed => {}
@@ -1076,9 +1084,9 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
 /// Inputs seed here (Crash queues like User, recorded with Crash source);
 /// followups ride `state.followups`. Parked-idle with empty queues is Done.
 ///
-/// Precedence — the single place this is stated (cfg-over-state): `cfg`
-/// wins over pre-set `LoopState` fields. `run` applies `cfg.incentives` over
-/// `state.incentives` and resolves the fold knobs from the environment;
+/// Single source of truth: `cfg` owns every run knob (incentives, drain
+/// deadline, fold knobs, compaction, proof command). `LoopState` holds no
+/// config mirror, so there is no precedence to document.
 /// `state.budget` arrives pre-seeded (rof builds it from the capability
 /// preset plus CLI overrides via the `agent_budget` constructors) and `run`
 /// never rebuilds it.

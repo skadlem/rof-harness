@@ -187,8 +187,8 @@ pub(crate) fn note_tool_execution(
 /// sync, so the file never holds a stale tail and the row keeps the exact
 /// model-visible text. Both drivers call this after every recorded tool
 /// result.
-pub(crate) fn settle_tool_tail(state: &mut LoopState) {
-    state.queue_directives();
+pub(crate) fn settle_tool_tail(state: &mut LoopState, cfg: &crate::RunConfig) {
+    state.queue_directives(cfg);
     state.apply_budget_nudge();
     state.deliver_directives();
 }
@@ -198,7 +198,7 @@ pub(crate) fn settle_tool_tail(state: &mut LoopState) {
 /// the `name`/`args` sig up from the claim row, so the tripwire sees the
 /// identical bytes. Returns false when the call id was unknown or already
 /// answered (no effects applied).
-pub(crate) fn settle_tool_msg(state: &mut LoopState, msg: ToolMsg) -> bool {
+pub(crate) fn settle_tool_msg(state: &mut LoopState, msg: ToolMsg, cfg: &crate::RunConfig) -> bool {
     let open = matches!(
         state.tool_calls.get(&msg.call_id),
         Some(c) if c.result.is_none()
@@ -214,7 +214,7 @@ pub(crate) fn settle_tool_msg(state: &mut LoopState, msg: ToolMsg) -> bool {
     let _ = note_tool_execution(state, &name, &args_str, &msg.result);
     let recorded = state.record_tool_result(msg);
     debug_assert!(recorded);
-    settle_tool_tail(state);
+    settle_tool_tail(state, cfg);
     true
 }
 

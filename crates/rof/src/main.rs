@@ -672,7 +672,7 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
         },
         (outcome, _) => outcome,
     };
-    eprintln!("ablation {:?}", state.ablation);
+    eprintln!("ablation {:?}", state.experiment.ablation);
     eprintln!("events {}", summarize(emitter.history()));
     RunResult {
         outcome,

@@ -133,12 +133,15 @@ fn single_flight_provider_call() {
 #[test]
 fn termination_order() {
     let mut s = LoopState::new(); // fresh parks, it does not exit
-    assert!(matches!(s.terminate(), PhaseVerdict::Continue));
+    assert!(matches!(
+        s.terminate(&RunConfig::default()),
+        PhaseVerdict::Continue
+    ));
     let mut s = LoopState::new(); // cancel beats budget
     s.stop_hard = true;
     s.budget.counters_mut().steps = s.budget.config().max_steps.get();
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Cancelled)
     ));
     let mut s = LoopState::new(); // hard error beats budget
@@ -146,7 +149,7 @@ fn termination_order() {
     let max = s.budget.config().max_steps.get();
     s.budget.counters_mut().steps = max;
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Failed { .. })
     ));
     let mut s = LoopState::new(); // budget beats done-shaped state
@@ -154,24 +157,27 @@ fn termination_order() {
     let max = s.budget.config().max_steps.get();
     s.budget.counters_mut().steps = max;
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Halted(_))
     ));
     let mut s = LoopState::new(); // refusal is terminal-with-error
     s.turn_reason = Some(TurnEndReason::Error("refused".into()));
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Failed { .. })
     ));
     let mut s = LoopState::new(); // idle + StopWhenIdle exits
     s.stop_when_idle = true;
-    assert!(matches!(s.terminate(), PhaseVerdict::Return(Outcome::Done)));
+    assert!(matches!(
+        s.terminate(&RunConfig::default()),
+        PhaseVerdict::Return(Outcome::Done)
+    ));
     // guard halt labels surface verbatim
     let mut s = LoopState::new();
     let max = s.budget.config().max_steps.get();
     s.budget.counters_mut().steps = max;
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Halted(ref s)) if s == "steps"
     ));
 }
@@ -181,7 +187,11 @@ fn truncation_fails_batch_unexecuted() {
     let mut s = LoopState::new();
     s.turn = 1;
     let before = s.items.len();
-    let outcome = s.step_claim(assistant(vec![call("a"), call("b")]), StopReason::MaxTokens);
+    let outcome = s.step_claim(
+        assistant(vec![call("a"), call("b")]),
+        StopReason::MaxTokens,
+        &RunConfig::default(),
+    );
     assert!(matches!(outcome, ClaimOutcome::Truncated(2)));
     for id in ["a", "b"] {
         let state = &s.tool_calls[id];
@@ -193,7 +203,7 @@ fn truncation_fails_batch_unexecuted() {
     s.stick_turn_reason(TurnEndReason::Completed); // sticky: no downgrade
     assert_eq!(s.turn_reason, Some(TurnEndReason::MaxTokens));
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Halted(_))
     ));
 }
@@ -262,17 +272,24 @@ fn stop_hard_drains_bounded() {
             result: None,
         },
     );
-    assert!(matches!(s.terminate(), PhaseVerdict::Break));
-    s.drain_timeout = Duration::ZERO; // deadline passes: terminal now
+    assert!(matches!(
+        s.terminate(&RunConfig::default()),
+        PhaseVerdict::Break
+    ));
+    // deadline passes: terminal now.
+    let zero_drain = RunConfig {
+        drain_timeout: Duration::ZERO,
+        ..RunConfig::default()
+    };
     s.drain_until = None;
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&zero_drain),
         PhaseVerdict::Return(Outcome::Cancelled)
     ));
     let mut s = LoopState::new(); // idle cancels at once
     s.stop_hard = true;
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Cancelled)
     ));
 }
@@ -291,7 +308,10 @@ fn in_step_retry_then_hard_exit() {
     }));
     assert!(s.call_model); // retry reuses the open step
     assert!(s.in_flight.is_none());
-    assert!(matches!(s.terminate(), PhaseVerdict::Continue));
+    assert!(matches!(
+        s.terminate(&RunConfig::default()),
+        PhaseVerdict::Continue
+    ));
     s.step_retries = 0;
     s.start_provider_call(&root);
     assert!(s.finish_provider_msg(ProviderMsg::Failed {
@@ -302,7 +322,7 @@ fn in_step_retry_then_hard_exit() {
     }));
     assert_eq!(s.fatal_error.as_deref(), Some("dead"));
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Failed { .. })
     ));
     assert!(!s.should_call_model()); // closed gate says nay
@@ -350,7 +370,11 @@ fn failed_attempt_usage_is_metered_and_still_retries() {
 fn crash_repair_synthesizes_results() {
     let mut s = LoopState::new();
     s.turn = 1;
-    let outcome = s.step_claim(assistant(vec![call("a"), call("b")]), StopReason::ToolUse);
+    let outcome = s.step_claim(
+        assistant(vec![call("a"), call("b")]),
+        StopReason::ToolUse,
+        &RunConfig::default(),
+    );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     assert_eq!(s.crash_repair("boom"), 2);
     assert_eq!(s.crash_repair("boom"), 0); // idempotent
@@ -375,7 +399,7 @@ fn tripwire_and_thirty_action_abort() {
     }
     assert!(matches!(last, Some(BudgetHalt::TrialActions)));
     assert!(matches!(
-        s.terminate(),
+        s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Halted(_))
     ));
     // varying the observation resets the streak
@@ -392,7 +416,7 @@ fn derived_messages_fold_history() {
     s.phase = Phase::Running;
     s.apply_input(Input::User("build it".into()));
     s.admit_steering();
-    let msgs = s.derived_messages();
+    let msgs = s.derived_messages(&RunConfig::default());
     assert_eq!(msgs.len(), 1);
     assert_eq!(
         (msgs[0].role.as_str(), msgs[0].content.as_str()),
@@ -417,7 +441,7 @@ fn derived_messages_collapse_5_and_ids() {
             },
         });
     }
-    let msgs = s.derived_messages();
+    let msgs = s.derived_messages(&RunConfig::default());
     assert_eq!(msgs.len(), 7);
     assert_eq!(
         msgs[0].content,
@@ -473,7 +497,7 @@ fn stub_boundary(msgs: &[ProviderMessage]) -> usize {
 #[test]
 fn collapse_hysteresis_zero_is_byte_identical_to_collapse_5() {
     let s = tool_history(8);
-    let msgs = s.raw_messages_with(0);
+    let msgs = s.raw_messages_with(&RunConfig::default(), 0);
     let got: Vec<(&str, String, Option<&str>)> = msgs
         .iter()
         .map(|m| {
@@ -498,7 +522,7 @@ fn collapse_hysteresis_zero_is_byte_identical_to_collapse_5() {
     assert_eq!(got, want);
     // Cached default (no env read) folds the byte-identical path.
     assert_eq!(
-        serde_json::to_string(&s.raw_messages()).unwrap(),
+        serde_json::to_string(&s.raw_messages(&RunConfig::default())).unwrap(),
         serde_json::to_string(&msgs).unwrap()
     );
 }
@@ -509,7 +533,12 @@ fn collapse_hysteresis_zero_is_byte_identical_to_collapse_5() {
 #[test]
 fn collapse_hysteresis_moves_boundary_once_per_h_rows_in_one_batch() {
     let folds: Vec<(usize, usize)> = (1..=30)
-        .map(|t| (t, stub_boundary(&tool_history(t).raw_messages_with(5))))
+        .map(|t| {
+            (
+                t,
+                stub_boundary(&tool_history(t).raw_messages_with(&RunConfig::default(), 5)),
+            )
+        })
         .collect();
     let mut moves = Vec::new();
     let mut prev = 0;
@@ -537,7 +566,7 @@ fn collapse_hysteresis_moves_boundary_once_per_h_rows_in_one_batch() {
     }
     // H=0 control: the boundary tracks the tail, one row per fold.
     let h0: Vec<usize> = (1..=30)
-        .map(|t| stub_boundary(&tool_history(t).raw_messages_with(0)))
+        .map(|t| stub_boundary(&tool_history(t).raw_messages_with(&RunConfig::default(), 0)))
         .collect();
     assert_eq!(
         h0,
@@ -549,15 +578,10 @@ fn collapse_hysteresis_moves_boundary_once_per_h_rows_in_one_batch() {
     assert_eq!(moves.len(), 5);
 }
 
-/// Run-head snapshot: both fold knobs resolve from the env once, and a
-/// mid-run env change no longer flips the fold. This is the only test
-/// that sets these vars; the fold itself never reads them (only
-/// `resolve_fold_config` does) and run-path tests assert behavior, not
-/// fold bytes, so the save/restore window cannot flip a parallel test.
+/// Fold knobs come from `RunConfig`, never the environment: the same state
+/// folds differently under different configs, and no env var is read.
 #[test]
-fn fold_knobs_frozen_at_run_head_mid_run_env_change_ignored() {
-    let saved_thinking = std::env::var("THINKING_KEEP").ok();
-    let saved_hyst = std::env::var("COLLAPSE_HYSTERESIS").ok();
+fn fold_knobs_come_from_run_config_not_the_environment() {
     // Fixture with both signals: 8 tool rows (collapse) + 4 thinking
     // assistants (echo trim).
     let mut s = tool_history(8);
@@ -571,44 +595,41 @@ fn fold_knobs_frozen_at_run_head_mid_run_env_change_ignored() {
             "Stop",
         );
     }
-    std::env::set_var("THINKING_KEEP", "99");
-    std::env::set_var("COLLAPSE_HYSTERESIS", "5");
-    s.resolve_fold_config();
-    assert_eq!((s.thinking_keep, s.collapse_hysteresis), (99, 5));
+    let wide = RunConfig {
+        thinking_keep: 99,
+        collapse_hysteresis: 5,
+        ..RunConfig::default()
+    };
     // H=5 over 8 rows: boundary 5*((8-5)/5) = 0, no stubs; keep 99:
     // every thinking row survives.
-    assert_eq!(stub_boundary(&s.derived_messages()), 0);
-    let before = serde_json::to_string(&s.derived_messages()).unwrap();
+    assert_eq!(stub_boundary(&s.derived_messages(&wide)), 0);
+    let before = serde_json::to_string(&s.derived_messages(&wide)).unwrap();
     assert_eq!(before.matches("reason-").count(), 4);
-    // Mid-run env change: the fold must not move.
-    std::env::set_var("THINKING_KEEP", "0");
-    std::env::set_var("COLLAPSE_HYSTERESIS", "0");
-    let after = serde_json::to_string(&s.derived_messages()).unwrap();
-    assert_eq!(before, after, "mid-run env change flipped the fold");
-    // A fresh head re-resolves: the new env takes effect only there.
-    s.resolve_fold_config();
-    assert_eq!((s.thinking_keep, s.collapse_hysteresis), (0, 0));
-    let re = serde_json::to_string(&s.derived_messages()).unwrap();
-    assert_ne!(re, before, "re-resolve must pick up the new env");
-    assert_eq!(stub_boundary(&s.derived_messages()), 3); // H=0 collapse-5
-    match saved_thinking {
-        Some(v) => std::env::set_var("THINKING_KEEP", v),
-        None => std::env::remove_var("THINKING_KEEP"),
-    }
-    match saved_hyst {
-        Some(v) => std::env::set_var("COLLAPSE_HYSTERESIS", v),
-        None => std::env::remove_var("COLLAPSE_HYSTERESIS"),
-    }
+    // Same state, tighter config: the fold moves with the config.
+    let tight = RunConfig {
+        thinking_keep: 0,
+        collapse_hysteresis: 0,
+        ..RunConfig::default()
+    };
+    let after = serde_json::to_string(&s.derived_messages(&tight)).unwrap();
+    assert_ne!(after, before, "tighter config must move the fold");
+    assert_eq!(stub_boundary(&s.derived_messages(&tight)), 3); // H=0 collapse-5
 }
 
-/// The cached fields alone steer the fold: no env touched at all.
+/// The config fields alone steer the fold: no env touched at all.
 #[test]
-fn fold_uses_cached_knobs_not_the_environment() {
+fn fold_uses_config_knobs_not_the_environment() {
     let mut s = tool_history(8);
-    s.collapse_hysteresis = 5;
-    assert_eq!(stub_boundary(&s.derived_messages()), 0);
-    s.collapse_hysteresis = 0;
-    assert_eq!(stub_boundary(&s.derived_messages()), 3);
+    let cfg = RunConfig {
+        collapse_hysteresis: 5,
+        ..RunConfig::default()
+    };
+    assert_eq!(stub_boundary(&s.derived_messages(&cfg)), 0);
+    let cfg = RunConfig {
+        collapse_hysteresis: 0,
+        ..RunConfig::default()
+    };
+    assert_eq!(stub_boundary(&s.derived_messages(&cfg)), 3);
     for i in 0..4 {
         s.push_assistant(
             &AssistantMessage {
@@ -619,17 +640,23 @@ fn fold_uses_cached_knobs_not_the_environment() {
             "Stop",
         );
     }
-    let thinking = |s: &LoopState| {
-        s.derived_messages()
+    let thinking = |s: &LoopState, cfg: &RunConfig| {
+        s.derived_messages(cfg)
             .iter()
             .filter(|m| m.role == "assistant")
             .filter_map(|m| m.thinking.clone())
             .collect::<Vec<_>>()
     };
-    s.thinking_keep = 1;
-    assert_eq!(thinking(&s), vec!["reason-3".to_string()]);
-    s.thinking_keep = 99;
-    assert_eq!(thinking(&s).len(), 4);
+    let cfg = RunConfig {
+        thinking_keep: 1,
+        ..RunConfig::default()
+    };
+    assert_eq!(thinking(&s, &cfg), vec!["reason-3".to_string()]);
+    let cfg = RunConfig {
+        thinking_keep: 99,
+        ..RunConfig::default()
+    };
+    assert_eq!(thinking(&s, &cfg).len(), 4);
 }
 
 #[test]
@@ -645,7 +672,7 @@ fn derived_messages_keeps_thinking_on_last_two_assistants() {
             "Stop",
         );
     }
-    let msgs = s.derived_messages();
+    let msgs = s.derived_messages(&RunConfig::default());
     let thinking: Vec<Option<&str>> = msgs
         .iter()
         .filter(|m| m.role == "assistant")
@@ -667,11 +694,29 @@ async fn drive_tick_select_spine() {
     let cancel = CancellationToken::new();
     let mut emitter = Emitter::new();
     itx.send(Input::User("go".into())).await.unwrap();
-    let verdict = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let verdict = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(verdict, PhaseVerdict::Continue));
     assert_eq!(s.turn, 1);
     itx.send(Input::StopHard).await.unwrap();
-    let verdict = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let verdict = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(verdict, PhaseVerdict::Return(Outcome::Cancelled)));
 }
 
@@ -684,7 +729,16 @@ async fn cancel_token_drives_stop() {
     let cancel = CancellationToken::new();
     let mut emitter = Emitter::new();
     cancel.cancel();
-    let verdict = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let verdict = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(verdict, PhaseVerdict::Return(Outcome::Cancelled)));
 }
 
@@ -747,7 +801,11 @@ fn lessons_cap_at_three() {
 fn budget_nudge_appends_to_tool_result_tail_once() {
     let mut s = LoopState::new();
     s.turn = 1;
-    let outcome = s.step_claim(assistant(vec![call("a")]), StopReason::ToolUse);
+    let outcome = s.step_claim(
+        assistant(vec![call("a")]),
+        StopReason::ToolUse,
+        &RunConfig::default(),
+    );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     assert!(s.record_tool_result(ToolMsg {
         call_id: "a".into(),
@@ -772,14 +830,18 @@ fn no_tail_keeps_directive_queued_and_nudge_latch_unburned() {
     assert!(s.apply_budget_nudge().is_none());
     // A queued directive with no tail stays queued (retry, not drop).
     s.budget.counters_mut().actions_this_trial = s.budget.config().actions_per_trial / 2;
-    s.queue_directives();
+    s.queue_directives(&RunConfig::default());
     assert_eq!(s.pending_directives.len(), 1);
     assert_eq!(s.deliver_directives(), 0);
     assert_eq!(s.pending_directives.len(), 1);
     // First recorded result creates the tail: both land, once each.
     s.turn = 1;
     assert!(matches!(
-        s.step_claim(assistant(vec![call("a")]), StopReason::ToolUse),
+        s.step_claim(
+            assistant(vec![call("a")]),
+            StopReason::ToolUse,
+            &RunConfig::default()
+        ),
         ClaimOutcome::Dispatch(_)
     ));
     assert!(s.record_tool_result(ToolMsg {
@@ -807,21 +869,21 @@ fn directive_triggers_fire_once_at_half_and_late_cap() {
     let mut s = LoopState::new();
     let cap = s.budget.config().actions_per_trial;
     s.budget.counters_mut().actions_this_trial = cap / 2;
-    s.queue_directives();
+    s.queue_directives(&RunConfig::default());
     assert_eq!(
         s.pending_directives.front().unwrap(),
         "0 edits so far after 15 actions. Stop reading. Apply your first edit with the edit tool NOW."
     );
-    s.queue_directives();
+    s.queue_directives(&RunConfig::default());
     assert_eq!(s.pending_directives.len(), 1); // half-cap latch holds
     s.edits = 1; // an edit silences only the zero-edit rule
     s.budget.counters_mut().actions_this_trial = cap * 4 / 5;
-    s.queue_directives();
+    s.queue_directives(&RunConfig::default());
     assert_eq!(
         s.pending_directives.back().unwrap(),
         "only 6 actions remain before the run is stopped. Finish and submit your patch now."
     );
-    s.queue_directives();
+    s.queue_directives(&RunConfig::default());
     assert_eq!(s.pending_directives.len(), 2); // both one-shot
 }
 
@@ -836,6 +898,7 @@ fn ok_round(s: &mut LoopState, id: &str, name: &str, args: Value) {
             args,
         }]),
         StopReason::ToolUse,
+        &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     assert!(s.record_tool_result(ToolMsg {
@@ -848,7 +911,7 @@ fn ok_round(s: &mut LoopState, id: &str, name: &str, args: Value) {
 }
 
 fn declare(s: &mut LoopState) -> ClaimOutcome {
-    s.step_claim(assistant(vec![]), StopReason::Stop)
+    s.step_claim(assistant(vec![]), StopReason::Stop, &RunConfig::default())
 }
 
 #[test]
@@ -915,6 +978,7 @@ fn verify_nudge_failed_test_is_not_passing() {
             args: Value::Null,
         }]),
         StopReason::ToolUse,
+        &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     assert!(s.record_tool_result(ToolMsg {
@@ -929,6 +993,7 @@ fn verify_nudge_failed_test_is_not_passing() {
             args: Value::Null,
         }]),
         StopReason::ToolUse,
+        &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     assert!(s.record_tool_result(ToolMsg {
@@ -955,6 +1020,7 @@ fn verify_nudge_failed_test_outcome_does_not_verify() {
             args: serde_json::json!({"cmd": "pytest -q"}),
         }]),
         StopReason::ToolUse,
+        &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     let failing = outcome_to_result(ToolOutcome {
@@ -1017,9 +1083,30 @@ fn verify_nudge_silent_on_second_declare_without_write() {
 fn verify_nudge_silent_in_base_and_contract() {
     for level in [IncentivesLevel::Base, IncentivesLevel::Contract] {
         let mut s = LoopState::new();
-        s.incentives = level;
-        ok_round(&mut s, "e1", "edit", Value::Null);
-        assert!(matches!(declare(&mut s), ClaimOutcome::Done));
+        let cfg = RunConfig {
+            incentives: level,
+            ..RunConfig::default()
+        };
+        // One edit round under this level's config, mirroring `ok_round`.
+        let outcome = s.step_claim(
+            assistant(vec![ToolCallRef {
+                id: "e1".into(),
+                name: "edit".into(),
+                args: Value::Null,
+            }]),
+            StopReason::ToolUse,
+            &cfg,
+        );
+        assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
+        assert!(s.record_tool_result(ToolMsg {
+            call_id: "e1".into(),
+            result: result(),
+        }));
+        s.edits += 1;
+        assert!(matches!(
+            s.step_claim(assistant(vec![]), StopReason::Stop, &cfg),
+            ClaimOutcome::Done
+        ));
         assert_eq!(s.verify.nudges_used, 0);
         assert!(s.verify.hold.is_none());
     }
@@ -1105,7 +1192,11 @@ fn lessons_ride_the_tail_once_each() {
     s.push_lesson("vary the approach".into());
     s.turn = 1;
     assert!(matches!(
-        s.step_claim(assistant(vec![call("a")]), StopReason::ToolUse),
+        s.step_claim(
+            assistant(vec![call("a")]),
+            StopReason::ToolUse,
+            &RunConfig::default()
+        ),
         ClaimOutcome::Dispatch(_)
     ));
     assert!(s.record_tool_result(ToolMsg {
@@ -1140,7 +1231,7 @@ fn collapse_stub_preview_caps_at_120_chars() {
             },
         });
     }
-    let msgs = s.derived_messages();
+    let msgs = s.derived_messages(&RunConfig::default());
     let head = &msgs[0].content;
     let prefix = "[collapsed: 202b — re-open to edit] ";
     assert!(head.starts_with(prefix), "{head}");
@@ -1372,7 +1463,16 @@ async fn e2e_full_turn_tool_call_orders_log_before_events() {
     let registry = edit_registry();
 
     itx.send(Input::User("build it".into())).await.unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     s.admit_steering(); // pre-boundary: the only place steering enters the log
     let root = CancellationToken::new();
@@ -1383,7 +1483,16 @@ async fn e2e_full_turn_tool_call_orders_log_before_events() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     ptx.send(ProviderMsg::Settled {
         turn: 1,
@@ -1393,7 +1502,16 @@ async fn e2e_full_turn_tool_call_orders_log_before_events() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     // Pre-effect: the ToolCall row is durable before anything executes.
     let call_seq = s
@@ -1428,12 +1546,30 @@ async fn e2e_full_turn_tool_call_orders_log_before_events() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     // Batch done, results owed back to the model: the tick parks on.
     assert!(matches!(v, PhaseVerdict::Continue));
     // A hard stop drains the parked idle and closes the turn.
     itx.send(Input::StopHard).await.unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Return(Outcome::Cancelled)));
 
     // Events arrive ordered; every Start pairs with its End.
@@ -1524,7 +1660,16 @@ async fn e2e_truncation_halts_with_no_tool_start() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Return(Outcome::Halted(ref s)) if s == "max-tokens"));
     // Truncated batch: answered with errors, never dispatched.
     let order = event_order(emitter.history());
@@ -2308,7 +2453,6 @@ async fn run_bets_hook_fires_at_step_head_and_post_batch_in_order() {
 #[tokio::test]
 async fn run_halt_budget_steps_after_grace_with_budget_frame() {
     assert_eq!(RunConfig::default().drain_timeout, Duration::from_secs(30));
-    assert_eq!(LoopState::new().drain_timeout, Duration::from_secs(30));
     let root = run_tmp("halt");
     let order = Arc::new(Mutex::new(Vec::new()));
     let client = FakeLlm {
@@ -2327,6 +2471,7 @@ async fn run_halt_budget_steps_after_grace_with_budget_frame() {
         drain_timeout: Duration::from_secs(5),
         ..RunConfig::default()
     };
+    assert_eq!(cfg.drain_timeout, Duration::from_secs(5));
     let outcome = run(
         &mut state,
         Run {
@@ -2347,7 +2492,6 @@ async fn run_halt_budget_steps_after_grace_with_budget_frame() {
         "got {outcome:?}"
     );
     assert!(state.budget.may_step().is_err()); // grace ran first, halt after
-    assert_eq!(state.drain_timeout, Duration::from_secs(5));
     match emitter.history().last().unwrap() {
         AgentEvent::RunEnd { outcome, .. } => {
             assert!(matches!(outcome, agent_event::RunOutcome::Failed(_)))
@@ -2471,7 +2615,16 @@ async fn e2e_budget_halt_after_grace_fires_once() {
     assert!(s.start_provider_call(&root).is_none());
     // A live inbox send drives the tick (a senders-dropped tick stalls here).
     itx.send(Input::User("too late".into())).await.unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Return(Outcome::Halted(ref s)) if s == "steps"));
     match emitter.history().last().unwrap() {
         AgentEvent::TurnEnd { reason, .. } => {
@@ -3505,8 +3658,7 @@ fn incentives_levels_gate_contract_and_directive_channel() {
     };
     let r = build_request(&mut state, &registry, &root, &cfg);
     assert!(!r.messages[0].content.contains("WORKFLOW CONTRACT"));
-    state.incentives = IncentivesLevel::Base;
-    state.push_directive("go".into());
+    state.push_directive("go".into(), &cfg);
     assert!(state.pending_directives.is_empty(), "Base drops directives");
     // Contract: contract on, directives still off.
     let cfg = RunConfig {
@@ -3515,15 +3667,14 @@ fn incentives_levels_gate_contract_and_directive_channel() {
     };
     let r = build_request(&mut state, &registry, &root, &cfg);
     assert!(r.messages[0].content.contains("WORKFLOW CONTRACT"));
-    state.incentives = IncentivesLevel::Contract;
-    state.push_directive("go".into());
+    state.push_directive("go".into(), &cfg);
     assert!(
         state.pending_directives.is_empty(),
         "Contract drops directives"
     );
     // Full (default = current behavior): both live.
-    state.incentives = IncentivesLevel::Full;
-    state.push_directive("go".into());
+    let cfg = RunConfig::default();
+    state.push_directive("go".into(), &cfg);
     assert_eq!(state.pending_directives.len(), 1);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -3607,8 +3758,8 @@ async fn incremental_proof_keeps_the_proven_leading_prefix() {
         "two\n",
         "refuted hunk reverts"
     );
-    assert_eq!(state.ablation.proven_hunks, 1);
-    assert_eq!(state.ablation.rollbacks, 1);
+    assert_eq!(state.experiment.ablation.proven_hunks, 1);
+    assert_eq!(state.experiment.ablation.rollbacks, 1);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3648,10 +3799,10 @@ async fn empty_hunk_batches_never_inflate_proven_hunks() {
     .await;
     assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
     assert_eq!(
-        state.ablation.proven_hunks, 0,
+        state.experiment.ablation.proven_hunks, 0,
         "read-only batch: nothing proven, nothing counted"
     );
-    assert_eq!(state.ablation.rollbacks, 0);
+    assert_eq!(state.experiment.ablation.rollbacks, 0);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3909,7 +4060,16 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
     let cancel = CancellationToken::new();
 
     itx.send(Input::User("go".into())).await.unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     s.admit_steering(); // pre-boundary: the only place steering enters the log
     let root = CancellationToken::new();
@@ -3922,7 +4082,16 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     // The ToolCall row is durable (at claim) before the tool runs.
     let prepared = registry.prepare(
@@ -3952,7 +4121,16 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     // Shared `settle_tool_msg` already counted the write (`edits += 1`)
     // like `run`'s `note_tool_execution`: no manual increment here.
@@ -3966,7 +4144,16 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
     .await
     .unwrap();
     // Unverified declare held: the turn stays alive, no Done yet.
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     assert!(s.start_provider_call(&root).is_some());
     ptx.send(ProviderMsg::Settled {
@@ -3977,7 +4164,16 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Return(Outcome::Done)));
     let _ = std::fs::remove_dir_all(&tick_root);
 
@@ -4056,7 +4252,16 @@ async fn drive_tick_verify_hold_matches_run() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     ttx.send(ToolMsg {
         call_id: "e1".into(),
@@ -4067,7 +4272,16 @@ async fn drive_tick_verify_hold_matches_run() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     assert_eq!(s.edits, 1);
     assert_eq!(s.budget.counters().actions_this_trial, 1);
@@ -4084,7 +4298,16 @@ async fn drive_tick_verify_hold_matches_run() {
     })
     .await
     .unwrap();
-    let v = drive_tick(&mut s, &mut irx, &mut prx, &mut trx, &cancel, &mut emitter).await;
+    let v = drive_tick(
+        &mut s,
+        &mut irx,
+        &mut prx,
+        &mut trx,
+        &cancel,
+        &mut emitter,
+        &RunConfig::default(),
+    )
+    .await;
     assert!(matches!(v, PhaseVerdict::Continue));
     assert!(s.call_model);
     assert_eq!(s.verify.hold.as_deref(), Some(VERIFY_NUDGE));
@@ -4117,6 +4340,7 @@ fn rollback_refunds_edits_actions_and_verified() {
             args: serde_json::json!({"path": "b"}),
         }]),
         StopReason::ToolUse,
+        &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
     let (wname, wargs) = {
@@ -4433,7 +4657,7 @@ fn verify_hold_persisted_as_attempt_for_replay() {
     // `derived_messages` still folds items only (Attempt is log-only),
     // so the durable row is the replay source, not a folded message.
     assert!(s
-        .derived_messages()
+        .derived_messages(&RunConfig::default())
         .iter()
         .all(|m| m.content != VERIFY_NUDGE));
 }
@@ -4451,7 +4675,10 @@ fn terminate_same_action_zero_disables_lesson() {
     s.budget = BudgetGuard::new(cfg, Instant::now());
     // Streak 0 >= cycles 0 would fire without the guard.
     assert_eq!(s.budget.counters().same_action_streak, 0);
-    assert!(matches!(s.terminate(), PhaseVerdict::Continue));
+    assert!(matches!(
+        s.terminate(&RunConfig::default()),
+        PhaseVerdict::Continue
+    ));
     assert!(s.lessons.is_empty(), "cycles=0 must not lesson");
 }
 
@@ -4523,7 +4750,7 @@ fn assistant_corrupt_row_is_explicit_marker_not_raw_json() {
                 interrupted: false,
             },
         });
-        let msgs = s.derived_messages();
+        let msgs = s.derived_messages(&RunConfig::default());
         assert_eq!(msgs.len(), 1);
         assert!(
             msgs[0].content.starts_with("[corrupt assistant row:"),
