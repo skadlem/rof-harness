@@ -5,8 +5,8 @@ use crate::{
     append_to, batch_hunks, build_request, checkpoint, incremental_hunks, note_tool_execution,
     outcome_log_reason, outcome_to_result, pin_snapshot, refund_batch, settle_tool_msg,
     settle_tool_tail, snapshot_batch, turn_end_reason_to_event, turn_id, BetsHook, ClaimOutcome,
-    IncentivesLevel, Input, LoopState, Outcome, Phase, PhaseVerdict, ProviderMsg, ToolMsg,
-    ROLLBACK_NOTICE,
+    FailureKind, IncentivesLevel, Input, LoopState, Outcome, Phase, PhaseVerdict, ProviderMsg,
+    ToolMsg, ROLLBACK_NOTICE,
 };
 use agent_budget::BudgetHalt;
 use agent_event::{
@@ -337,7 +337,8 @@ pub(crate) fn sync_log(
 pub(crate) fn event_outcome(outcome: &Outcome) -> EventRunOutcome {
     match outcome {
         Outcome::Done => EventRunOutcome::Passed,
-        Outcome::Halted(s) | Outcome::Failed(s) => EventRunOutcome::Failed(s.clone()),
+        Outcome::Halted(s) => EventRunOutcome::Failed(s.clone()),
+        Outcome::Failed { message, .. } => EventRunOutcome::Failed(message.clone()),
         Outcome::Cancelled => EventRunOutcome::Aborted,
     }
 }
@@ -404,8 +405,12 @@ impl<P> RunCtx<'_, '_, P> {
     /// Tail sync: `Err` is already the terminal log-append failure; the
     /// caller finishes with it.
     fn sync(&mut self) -> Result<(), Outcome> {
-        sync_log(&self.state.items, self.writer.as_mut(), &mut self.synced)
-            .map_err(|_| Outcome::Failed("log append failed".into()))
+        sync_log(&self.state.items, self.writer.as_mut(), &mut self.synced).map_err(|_| {
+            Outcome::Failed {
+                kind: FailureKind::Log,
+                message: "log append failed".into(),
+            }
+        })
     }
 
     /// Durable TurnEnd first, terminal frames second — never inverted. The
@@ -508,7 +513,10 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             match LogWriter::open(&p) {
                 Ok(w) => self.writer = Some(w),
                 Err(e) => {
-                    let o = Outcome::Failed(format!("log open: {e}"));
+                    let o = Outcome::Failed {
+                        kind: FailureKind::Log,
+                        message: format!("log open: {e}"),
+                    };
                     self.emitter.emit(AgentEvent::RunEnd {
                         outcome: event_outcome(&o),
                         messages: Vec::new(),
@@ -533,7 +541,10 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             }
         }
         if let Err(e) = self.tree.ensure() {
-            let o = Outcome::Failed(format!("snapshot ensure: {e}"));
+            let o = Outcome::Failed {
+                kind: FailureKind::Snapshot,
+                message: format!("snapshot ensure: {e}"),
+            };
             return Some(self.finish(o));
         }
         if let Err(o) = self.sync() {
@@ -552,7 +563,10 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             }
         }
         if self.state.turn == 0 {
-            let o = Outcome::Failed("run needs at least one input".into());
+            let o = Outcome::Failed {
+                kind: FailureKind::Input,
+                message: "run needs at least one input".into(),
+            };
             self.emitter.emit(AgentEvent::RunEnd {
                 outcome: event_outcome(&o),
                 messages: Vec::new(),
@@ -833,7 +847,10 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         turn_token: &CancellationToken,
     ) -> Result<BatchReport, Outcome> {
         if let Err(e) = self.tree.baseline() {
-            return Err(Outcome::Failed(format!("snapshot baseline: {e}")));
+            return Err(Outcome::Failed {
+                kind: FailureKind::Snapshot,
+                message: format!("snapshot baseline: {e}"),
+            });
         }
         let mut batch_failed = false;
         // Pre-batch counters: a full rollback refunds `edits` /
@@ -915,7 +932,12 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             };
             match probe {
                 Ok(h) => h,
-                Err(e) => return Err(Outcome::Failed(e)),
+                Err(e) => {
+                    return Err(Outcome::Failed {
+                        kind: FailureKind::Snapshot,
+                        message: e,
+                    });
+                }
             }
         };
         // Batch scope: only the failed batch rolls back; the
@@ -938,7 +960,10 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             )?;
             self.state.push_directive(ROLLBACK_NOTICE.into());
             if let Err(e) = self.tree.rollback() {
-                return Err(Outcome::Failed(format!("snapshot rollback: {e}")));
+                return Err(Outcome::Failed {
+                    kind: FailureKind::Snapshot,
+                    message: format!("snapshot rollback: {e}"),
+                });
             }
             // Rolled-back edits must not linger in the
             // counters: refund to the pre-batch snapshot.
@@ -990,12 +1015,18 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             bets::CommitVerdict::Committed => {}
             bets::CommitVerdict::Partial { savepoint } => {
                 if let Err(e) = self.tree.restore_hunks(&savepoint.kept_hunks) {
-                    return Err(Outcome::Failed(format!("snapshot restore: {e}")));
+                    return Err(Outcome::Failed {
+                        kind: FailureKind::Snapshot,
+                        message: format!("snapshot restore: {e}"),
+                    });
                 }
             }
             bets::CommitVerdict::Aborted { .. } => {
                 if let Err(e) = self.tree.rollback() {
-                    return Err(Outcome::Failed(format!("snapshot rollback: {e}")));
+                    return Err(Outcome::Failed {
+                        kind: FailureKind::Snapshot,
+                        message: format!("snapshot rollback: {e}"),
+                    });
                 }
                 // Gate-aborted batch is a full rollback: the
                 // counters refund like the tool-error path.

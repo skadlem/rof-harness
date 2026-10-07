@@ -147,7 +147,7 @@ fn termination_order() {
     s.budget.counters_mut().steps = max;
     assert!(matches!(
         s.terminate(),
-        PhaseVerdict::Return(Outcome::Failed(_))
+        PhaseVerdict::Return(Outcome::Failed { .. })
     ));
     let mut s = LoopState::new(); // budget beats done-shaped state
     s.stop_when_idle = true;
@@ -161,7 +161,7 @@ fn termination_order() {
     s.turn_reason = Some(TurnEndReason::Error("refused".into()));
     assert!(matches!(
         s.terminate(),
-        PhaseVerdict::Return(Outcome::Failed(_))
+        PhaseVerdict::Return(Outcome::Failed { .. })
     ));
     let mut s = LoopState::new(); // idle + StopWhenIdle exits
     s.stop_when_idle = true;
@@ -303,7 +303,7 @@ fn in_step_retry_then_hard_exit() {
     assert_eq!(s.fatal_error.as_deref(), Some("dead"));
     assert!(matches!(
         s.terminate(),
-        PhaseVerdict::Return(Outcome::Failed(_))
+        PhaseVerdict::Return(Outcome::Failed { .. })
     ));
     assert!(!s.should_call_model()); // closed gate says nay
 }
@@ -3327,7 +3327,7 @@ async fn run_provider_failure_emits_provider_failed_then_fails() {
     // Production outcome path: retries exhaust, the gate closes, the
     // fatal error surfaces as Outcome::Failed.
     match &outcome {
-        Outcome::Failed(msg) => assert!(msg.contains("script empty"), "got {msg}"),
+        Outcome::Failed { message: msg, .. } => assert!(msg.contains("script empty"), "got {msg}"),
         other => panic!("expected Failed, got {other:?}"),
     }
     let history = emitter.history();
@@ -5186,5 +5186,124 @@ async fn char_provider_failure_event_and_log_sequence() {
         .collect();
     assert_eq!(attempts, vec![true, true, false]);
     assert!(check_pairing(emitter.history()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `FailureKind` pins: each run failure site reports its kind, so callers
+/// react without parsing message text.
+#[cfg(unix)]
+#[tokio::test]
+async fn failure_kinds_pin_log_open_and_no_input_sites() {
+    // Log-open failure: the parent dir does not exist.
+    let root = run_tmp("char-kindlog");
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([text_resp("finished")])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                log_path: Some(root.join("no-such-dir").join("run.jsonl")),
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    match outcome {
+        Outcome::Failed { kind, message } => {
+            assert_eq!(kind, FailureKind::Log);
+            assert!(message.contains("log open"), "got {message}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    // No input seeds no turn.
+    let root = run_tmp("char-kindinput");
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::new()),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        Vec::new(),
+        &CancellationToken::new(),
+    )
+    .await;
+    match outcome {
+        Outcome::Failed { kind, message } => {
+            assert_eq!(kind, FailureKind::Input);
+            assert!(message.contains("at least one input"), "got {message}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failure_kinds_pin_snapshot_ensure_site() {
+    // Read-only workdir: `git init` fails, so `ensure` fails Snapshot.
+    let root = run_tmp("char-kindensure");
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::new()),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let mut perms = std::fs::metadata(&root).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&root, perms).unwrap();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    match outcome {
+        Outcome::Failed { kind, message } => {
+            assert_eq!(kind, FailureKind::Snapshot);
+            assert!(message.contains("snapshot ensure"), "got {message}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
     let _ = std::fs::remove_dir_all(&root);
 }

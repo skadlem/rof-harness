@@ -22,8 +22,8 @@ pub use gate::{EffectGate, GateError, GateStatus};
 pub use proof::{BetsHook, NoBets};
 pub use run::{drive_tick, run, Run, RunConfig};
 pub use state::{
-    turn_end_reason_to_event, Checkpoint, ClaimOutcome, InFlight, Input, LoopState, Outcome, Phase,
-    PhaseVerdict, ProviderMsg, QueuedInput, ToolCallState, ToolMsg, TurnGuard,
+    turn_end_reason_to_event, Checkpoint, ClaimOutcome, FailureKind, InFlight, Input, LoopState,
+    Outcome, Phase, PhaseVerdict, ProviderMsg, QueuedInput, ToolCallState, ToolMsg, TurnGuard,
 };
 pub use verify::VerifyState;
 

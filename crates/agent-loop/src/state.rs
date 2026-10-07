@@ -53,7 +53,24 @@ pub enum Outcome {
     Done,
     Halted(String),
     Cancelled,
-    Failed(String),
+    Failed { kind: FailureKind, message: String },
+}
+
+/// Why a run failed: the failure sites in `run` map here so callers can
+/// react without parsing message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The append-only log could not open or persist: fail closed, never
+    /// run from process-only state.
+    Log,
+    /// The snapshot tree (ensure/baseline/rollback/restore, hunk probe)
+    /// failed: the workdir is not in a known-good state.
+    Snapshot,
+    /// The provider ladder failed fatally (retries exhausted, refused):
+    /// the model made no progress.
+    Provider,
+    /// The run was asked to do nothing: no input seeds a turn.
+    Input,
 }
 
 #[derive(Debug, Clone)]
@@ -575,7 +592,10 @@ impl LoopState {
         }
         // 2. Hard error: in-step retries exhausted.
         if let Some(err) = self.fatal_error.clone() {
-            return PhaseVerdict::Return(Outcome::Failed(err));
+            return PhaseVerdict::Return(Outcome::Failed {
+                kind: FailureKind::Provider,
+                message: err,
+            });
         }
         // 3. Budget exhausted: the guard AND-gate owns every cap; the loop
         // holds no shadow caps and halts the moment any counter trips.
@@ -584,7 +604,10 @@ impl LoopState {
         }
         // 4. Refusal is terminal-with-error; sticky max-tokens halts once drained.
         if let Some(TurnEndReason::Error(reason)) = self.turn_reason.clone() {
-            return PhaseVerdict::Return(Outcome::Failed(reason));
+            return PhaseVerdict::Return(Outcome::Failed {
+                kind: FailureKind::Provider,
+                message: reason,
+            });
         }
         if self.turn_reason == Some(TurnEndReason::MaxTokens)
             && self.in_flight.is_none()
@@ -658,7 +681,7 @@ pub(crate) fn outcome_log_reason(
         Outcome::Halted(s) if s == "max-tokens" => TurnEndReason::MaxTokens,
         Outcome::Halted(_) => TurnEndReason::Budget,
         Outcome::Cancelled => TurnEndReason::Interrupted,
-        Outcome::Failed(e) => TurnEndReason::Error(e.clone()),
+        Outcome::Failed { message, .. } => TurnEndReason::Error(message.clone()),
     }
 }
 

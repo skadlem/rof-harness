@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use agent_budget::{config_for, with_steps, BudgetGuard, Capability};
 use agent_event::{AgentEvent, Emitter};
-use agent_loop::{Input, LoopState, NoBets, Outcome, Run, RunConfig};
+use agent_loop::{FailureKind, Input, LoopState, NoBets, Outcome, Run, RunConfig};
 use provider_core::LlmClient;
 use provider_openai::{EndpointProfile, OpenAiCompat};
 use snapshot::TreeService;
@@ -666,7 +666,10 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     // baseline becomes a failure outcome, so the existing exit-code path
     // reports non-zero and `main` prints the stderr warning.
     let outcome = match (outcome, &patch) {
-        (Outcome::Done, Err(e)) => Outcome::Failed(format!("no baseline: {e}")),
+        (Outcome::Done, Err(e)) => Outcome::Failed {
+            kind: FailureKind::Snapshot,
+            message: format!("no baseline: {e}"),
+        },
         (outcome, _) => outcome,
     };
     eprintln!("ablation {:?}", state.ablation);
@@ -1082,7 +1085,10 @@ mod tests {
         for o in [
             Outcome::Halted("steps".into()),
             Outcome::Cancelled,
-            Outcome::Failed("e".into()),
+            Outcome::Failed {
+                kind: FailureKind::Provider,
+                message: "e".into(),
+            },
         ] {
             assert_eq!(exit_code(&o), 3);
         }
@@ -1538,7 +1544,7 @@ mod tests {
             "snapshot names the cause: {err}"
         );
         assert!(
-            matches!(&r.outcome, Outcome::Failed(m) if m.contains("no baseline")),
+            matches!(&r.outcome, Outcome::Failed { message: m, .. } if m.contains("no baseline")),
             "failure outcome carries the stderr hint: {:?}",
             r.outcome
         );
