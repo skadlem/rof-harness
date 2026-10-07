@@ -42,6 +42,36 @@ pub struct PatchText {
     pub truncated: bool,
 }
 
+/// Workdir cleanliness for a path, for pre-flight guards. Ignored files
+/// never count (plain porcelain omits them): only tracked edits and
+/// non-ignored untracked files read as [`WorkdirState::Dirty`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkdirState {
+    NotARepo,
+    Clean,
+    Dirty,
+}
+
+/// Fail-closed workdir probe: anything git cannot confirm clean reads as
+/// [`WorkdirState::Dirty`]; only a missing `.git` reads as
+/// [`WorkdirState::NotARepo`].
+pub fn workdir_state(root: &Path) -> WorkdirState {
+    if !root.join(".git").exists() {
+        return WorkdirState::NotARepo;
+    }
+    match hermetic_git(root)
+        .args(["status", "--porcelain", "--no-renames"])
+        .output()
+    {
+        Ok(out)
+            if out.status.success() && String::from_utf8_lossy(&out.stdout).trim().is_empty() =>
+        {
+            WorkdirState::Clean
+        }
+        _ => WorkdirState::Dirty,
+    }
+}
+
 pub struct TreeService {
     root: PathBuf,
     /// HEAD at [`TreeService::ensure`]: the ref [`TreeService::patch_since_start`]
@@ -145,7 +175,15 @@ impl TreeService {
     }
 
     /// Restores tracked files, drops created ones. Only when a retry follows.
+    /// Requires [`TreeService::ensure`] on this instance first: without a
+    /// recorded start HEAD there is no known-good state, so rolling back
+    /// could destroy work against an unknown base.
     pub fn rollback(&self) -> Result<()> {
+        if self.start.get().is_none() {
+            return Err(other(
+                "rollback: ensure() has not recorded a start HEAD".into(),
+            ));
+        }
         self.git(["checkout", "--", "."])?;
         self.git(["clean", "-fdq"])?;
         Ok(())
@@ -680,6 +718,55 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("a.rs")).unwrap(), before);
         assert!(!dir.join("b.rs").exists());
         assert!(tree.diff().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rollback_before_ensure_errors() {
+        let dir = scratch("rollback-no-ensure");
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        let tree = TreeService::new(&dir);
+        let e = tree.rollback().unwrap_err();
+        assert!(e.to_string().contains("ensure()"), "{e}");
+        // Nothing was touched: no repo created, file intact.
+        assert!(!dir.join(".git").exists());
+        assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), "one\n");
+    }
+
+    #[test]
+    fn rollback_without_recorded_start_errors() {
+        // ensure() ran but the tree was empty: HEAD unborn, no start rev.
+        let dir = scratch("rollback-unborn");
+        let tree = TreeService::new(&dir);
+        tree.ensure().unwrap();
+        let e = tree.rollback().unwrap_err();
+        assert!(e.to_string().contains("start HEAD"), "{e}");
+    }
+
+    #[test]
+    fn workdir_state_reports_repo_cleanliness() {
+        let plain = scratch("state-plain");
+        assert_eq!(workdir_state(&plain), WorkdirState::NotARepo);
+
+        let dir = scratch("state-dirty");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        tree.ensure().unwrap();
+        tree.baseline().unwrap();
+        assert_eq!(workdir_state(&dir), WorkdirState::Clean);
+
+        std::fs::write(dir.join("a.rs"), "two\n").unwrap();
+        assert_eq!(workdir_state(&dir), WorkdirState::Dirty);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        assert_eq!(workdir_state(&dir), WorkdirState::Clean);
+
+        std::fs::write(dir.join("new.txt"), "x\n").unwrap();
+        assert_eq!(workdir_state(&dir), WorkdirState::Dirty);
+
+        // Ignored bytecode does not count as dirty.
+        std::fs::remove_file(dir.join("new.txt")).unwrap();
+        std::fs::create_dir(dir.join("__pycache__")).unwrap();
+        std::fs::write(dir.join("__pycache__/x.pyc"), "junk\n").unwrap();
+        assert_eq!(workdir_state(&dir), WorkdirState::Clean);
     }
 
     #[test]
