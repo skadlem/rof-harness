@@ -5,6 +5,19 @@
 //! each tool also parses into a typed `Deserialize` args struct with
 //! `deny_unknown_fields`, so schema and parser pin the same contract.
 //! (ponytail: no `schemars` dep — five `json!` literals use the already-installed
+//! `serde_json`.)
+//!
+//! ## Threat model (operator read-this)
+//!
+//! The path policy covers `view`/`edit`/`write` only: root-anchored,
+//! symlink-safe, secrets-denied file access. `exec` and `test` run
+//! allowlisted host commands with a cleared environment, null stdin, and a
+//! bounded pipe read — but allowlisting is not isolation. Permitting
+//! `cargo test`, `sh`, or any test runner hands the agent arbitrary code
+//! execution on the host: a hostile command can still reach the network,
+//! IPC, or sibling processes, and no output bound or timeout changes that.
+//! OS-level isolation (container/namespace, no network, read-only mounts)
+//! is the operator's job; this crate builds no sandbox.
 
 mod common;
 mod condense;
