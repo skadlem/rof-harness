@@ -1,9 +1,12 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use tool_core::ToolError;
 
@@ -300,9 +303,10 @@ pub(crate) async fn run_allowed(
 
 static SYNTAX_N: AtomicUsize = AtomicUsize::new(0);
 
-/// Edit-gate syntax check: candidate bytes go to a tempfile OUTSIDE the
-/// tree, `syntax_cmd + tempfile` runs through the existing `run_allowed`
-/// gate (so the checker itself must be allowlisted), tempfile deleted
+/// Edit-gate syntax check: candidate bytes go to a file inside a private
+/// staging dir OUTSIDE the tree, `syntax_cmd + [file]` runs through the
+/// `run_allowed_argv` gate (so the checker itself must be allowlisted) as
+/// real argv — never joined into a string — and the staging dir is deleted
 /// best-effort. A failing check vetoes the write; the file is untouched.
 pub(crate) async fn check_syntax(
     policy: &Policy,
@@ -310,20 +314,99 @@ pub(crate) async fn check_syntax(
     cancel: &CancellationToken,
 ) -> Result<(), ToolError> {
     let argv = policy.syntax_cmd.clone().unwrap_or_default();
-    let tmp = std::env::temp_dir().join(format!(
-        "tools-std-syntax-{}-{}",
-        std::process::id(),
-        SYNTAX_N.fetch_add(1, Ordering::SeqCst)
-    ));
-    std::fs::write(&tmp, candidate).map_err(|e| ToolError::Failed(e.to_string()))?;
-    let cmdline = format!("{} {}", argv.join(" "), tmp.display());
-    let res = run_allowed(policy, &cmdline, EXEC_TIMEOUT, cancel).await;
-    let _ = std::fs::remove_file(&tmp);
+    if argv.is_empty() {
+        return Ok(());
+    }
+    stage_and_check(policy, &argv, candidate, cancel, &std::env::temp_dir()).await
+}
+
+/// Staging parent is a parameter so tests can point it at a path with a
+/// space; production always passes the shared temp dir.
+pub(crate) async fn stage_and_check(
+    policy: &Policy,
+    argv: &[String],
+    candidate: &str,
+    cancel: &CancellationToken,
+    staging_parent: &Path,
+) -> Result<(), ToolError> {
+    let (dir, file) = stage_candidate(staging_parent, candidate).await?;
+    let mut full = argv.to_vec();
+    full.push(file.to_string_lossy().into_owned());
+    let res = run_allowed_argv(policy, &full, EXEC_TIMEOUT, cancel).await;
+    let _ = tokio::fs::remove_dir_all(&dir).await;
     match res {
         Ok((true, _, _)) => Ok(()),
         Ok((false, out, _)) => Err(ToolError::Failed(format!("syntax check failed: {out}"))),
         Err(e) => Err(e),
     }
+}
+
+/// Private staging dir (`0700` on unix) holding one `create_new` candidate
+/// file, all through async fs so no executor thread blocks. `create_new`
+/// fails rather than truncating a file that appeared between staging calls.
+async fn stage_candidate(parent: &Path, candidate: &str) -> Result<(PathBuf, PathBuf), ToolError> {
+    for _ in 0..8 {
+        let dir = parent.join(format!(
+            "tools-std-syntax-{}-{}",
+            std::process::id(),
+            SYNTAX_N.fetch_add(1, Ordering::SeqCst)
+        ));
+        match tokio::fs::create_dir(&dir).await {
+            Ok(()) => {
+                if let Err(e) = lock_down(&dir).await {
+                    let _ = tokio::fs::remove_dir_all(&dir).await;
+                    return Err(e);
+                }
+                let file = dir.join("candidate");
+                let staged = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&file)
+                    .await
+                    .map_err(|e| ToolError::Failed(format!("cannot stage syntax candidate: {e}")));
+                match staged {
+                    Ok(mut f) => {
+                        if let Err(e) = f.write_all(candidate.as_bytes()).await {
+                            let _ = tokio::fs::remove_dir_all(&dir).await;
+                            return Err(ToolError::Failed(format!(
+                                "cannot stage syntax candidate: {e}"
+                            )));
+                        }
+                        if let Err(e) = lock_down(&file).await {
+                            let _ = tokio::fs::remove_dir_all(&dir).await;
+                            return Err(e);
+                        }
+                        return Ok((dir, file));
+                    }
+                    Err(e) => {
+                        let _ = tokio::fs::remove_dir_all(&dir).await;
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(ToolError::Failed(format!(
+                    "cannot create syntax staging dir: {e}"
+                )));
+            }
+        }
+    }
+    Err(ToolError::Failed(
+        "could not claim a syntax staging dir".to_string(),
+    ))
+}
+
+/// `0700` on unix (dir and candidate file alike); elsewhere creation modes
+/// are umask-governed and there is nothing to tighten from here.
+async fn lock_down(path: &Path) -> Result<(), ToolError> {
+    #[cfg(unix)]
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(|e| ToolError::Failed(format!("cannot lock down {path:?}: {e}")))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[derive(Deserialize)]

@@ -30,7 +30,7 @@ pub use write::{write_tool, WriteTool};
 mod tests {
     use super::*;
     use crate::common::{EDIT_FILE_CAP, EDIT_REPLACE_CAP, OUT_CAP, VIEW_CAP};
-    use crate::runner::{run_allowed, split_cmd};
+    use crate::runner::{run_allowed, split_cmd, stage_and_check};
     use crate::view::{view_page, view_read_cap};
     use serde_json::{json, Value};
     use std::collections::HashMap;
@@ -904,6 +904,47 @@ mod tests {
         );
         std::env::remove_var("TOOLS_STD_TEST_PING");
         std::env::remove_var("OPENAI_API_KEY");
+    }
+
+    #[tokio::test]
+    async fn syntax_check_argv_handles_space_in_path() {
+        // Staging under a dir with a space: the old join-then-split
+        // round-trip fed `cat` three paths and failed; real argv passes.
+        let base = tmp_root().join("dir with space");
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["cat".to_string()],
+            syntax_cmd: Some(vec!["cat".to_string()]),
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+        };
+        stage_and_check(
+            &pol,
+            &["cat".to_string()],
+            "hello\n",
+            &CancellationToken::new(),
+            &base,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_syntax_passes_with_space_in_root() {
+        let root = tmp_root().join("work dir");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f.txt"), "hello\n").unwrap();
+        let r = reg(syntax_policy(&root, &["true"]));
+        run(&r, "write", json!({"path": "f.txt", "content": "bye\n"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "bye\n"
+        );
     }
 
     #[test]
