@@ -198,5 +198,6 @@ pub(crate) fn args_for(dir: &std::path::Path, steps: Option<u32>) -> Args {
         thinking_keep: None,
         collapse_hysteresis: None,
         allow_dirty_workdir: false,
+        pass_env: Vec::new(),
     }
 }

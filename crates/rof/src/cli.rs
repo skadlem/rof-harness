@@ -10,7 +10,7 @@ use agent_loop::RunConfig;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir]
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
@@ -18,7 +18,8 @@ pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--work
 --compaction FRAC: checkpoint the older context once the estimate crosses FRAC of the token budget (0 < FRAC <= 1). OFF-BY-DEFAULT and UNVALIDATED: the S-1 compaction experiment has not run yet, so leave it unset unless running that experiment.
 --thinking-keep N: echoed-reasoning rows kept per assistant message (flag wins over THINKING_KEEP; unset leaves the loop default)
 --collapse-hysteresis N: collapse-boundary hysteresis rows (flag wins over COLLAPSE_HYSTERESIS; unset leaves the loop default)
---allow-dirty-workdir: run inside a dirty git workdir (default: refuse; allowed dirt appears in the reported patch)";
+--allow-dirty-workdir: run inside a dirty git workdir (default: refuse; allowed dirt appears in the reported patch)
+--pass-env NAME: forward env var to exec/test children (repeatable; provider-key-shaped names stay withheld at spawn)";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Args {
@@ -55,6 +56,9 @@ pub(crate) struct Args {
     /// Opt in to running inside a dirty git workdir (pre-existing changes
     /// then appear in the reported patch).
     pub allow_dirty_workdir: bool,
+    /// Extra env names forwarded to `exec`/`test` children on top of the
+    /// fixed pass-through set (repeatable).
+    pub pass_env: Vec<String>,
 }
 
 /// One flag definition: the long name, whether it takes a value, and the
@@ -134,6 +138,7 @@ struct RunBuilder {
     thinking_keep: Option<usize>,
     collapse_hysteresis: Option<usize>,
     allow_dirty_workdir: bool,
+    pass_env: Vec<String>,
 }
 
 fn set_goal(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
@@ -301,6 +306,13 @@ fn set_allow_dirty_workdir(b: &mut RunBuilder, _: Option<String>) -> Result<(), 
     Ok(())
 }
 
+fn set_pass_env(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    if let Some(v) = v {
+        b.pass_env.push(v);
+    }
+    Ok(())
+}
+
 const RUN_FLAGS: &[Flag<RunBuilder>] = &[
     Flag {
         name: "--goal",
@@ -412,6 +424,11 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         takes_value: false,
         set: set_allow_dirty_workdir,
     },
+    Flag {
+        name: "--pass-env",
+        takes_value: true,
+        set: set_pass_env,
+    },
 ];
 
 pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -446,6 +463,7 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         thinking_keep: b.thinking_keep,
         collapse_hysteresis: b.collapse_hysteresis,
         allow_dirty_workdir: b.allow_dirty_workdir,
+        pass_env: b.pass_env,
     })
 }
 
@@ -598,6 +616,7 @@ mod tests {
                 thinking_keep: None,
                 collapse_hysteresis: None,
                 allow_dirty_workdir: false,
+                pass_env: Vec::new(),
             }
         );
         let b = parse_args(&argv(&[
@@ -941,5 +960,17 @@ mod tests {
         assert!(a.allow_dirty_workdir);
         let b = parse_args(&run_min(&[])).unwrap();
         assert!(!b.allow_dirty_workdir, "dirty repos refused by default");
+    }
+
+    #[test]
+    fn pass_env_parses_repeatable_and_rejects_bare() {
+        let a = parse_args(&run_min(&["--pass-env", "FOO", "--pass-env=BAR"])).unwrap();
+        assert_eq!(a.pass_env, vec!["FOO".to_string(), "BAR".to_string()]);
+        assert!(parse_args(&run_min(&["--pass-env"])).is_err());
+        assert_eq!(
+            parse_args(&run_min(&[])).unwrap().pass_env,
+            Vec::<String>::new(),
+            "absent flag forwards nothing extra"
+        );
     }
 }

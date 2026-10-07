@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{parse_table, Flag};
 
-pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only]";
+pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply]
+--lenient-apply: record Lenient patch-apply provenance in the report (default Strict; Strict grades are not comparable with earlier fuzz-lenient numbers)";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct EvalArgs {
@@ -14,6 +15,10 @@ pub(crate) struct EvalArgs {
     pub out_dir: PathBuf,
     pub report: Option<PathBuf>,
     pub winnability_only: bool,
+    /// Grade provenance: Strict (`git apply` only) or Lenient (with the
+    /// `patch --fuzz=5` fallback). Strict by default, so reports are
+    /// byte-identical to before the flag existed.
+    pub lenient_apply: bool,
 }
 
 #[derive(Default)]
@@ -23,6 +28,7 @@ struct EvalBuilder {
     out_dir: Option<String>,
     report: Option<String>,
     winnability_only: bool,
+    lenient_apply: bool,
 }
 
 fn set_tasks_dir(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
@@ -55,6 +61,11 @@ fn set_winnability_only(b: &mut EvalBuilder, _: Option<String>) -> Result<(), St
     Ok(())
 }
 
+fn set_lenient_apply(b: &mut EvalBuilder, _: Option<String>) -> Result<(), String> {
+    b.lenient_apply = true;
+    Ok(())
+}
+
 const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
     Flag {
         name: "--tasks-dir",
@@ -81,6 +92,11 @@ const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
         takes_value: false,
         set: set_winnability_only,
     },
+    Flag {
+        name: "--lenient-apply",
+        takes_value: false,
+        set: set_lenient_apply,
+    },
 ];
 
 pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
@@ -98,7 +114,18 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
         out_dir: PathBuf::from(b.out_dir.unwrap_or_else(|| "/tmp/rof-eval-out".into())),
         report: b.report.map(PathBuf::from),
         winnability_only: b.winnability_only,
+        lenient_apply: b.lenient_apply,
     })
+}
+
+/// Which patch applier grades this eval: Strict by default (byte-identical
+/// reports to before the flag existed), Lenient with `--lenient-apply`.
+fn apply_mode_for(args: &EvalArgs) -> eval::ApplyMode {
+    if args.lenient_apply {
+        eval::ApplyMode::Lenient
+    } else {
+        eval::ApplyMode::Strict
+    }
 }
 
 fn eval_winnability_caps() -> eval::ToolCaps {
@@ -167,7 +194,15 @@ pub(crate) async fn run_eval(args: &EvalArgs) -> i32 {
         let wall = start.elapsed().as_secs();
         let events_path = work.join("events.jsonl");
         let _ = std::fs::write(&events_path, "");
-        match eval::instance_report(&inst.id, verdict, &events_path, wall, "") {
+        match eval::instance_report_with_mode(
+            &inst.id,
+            verdict,
+            &events_path,
+            wall,
+            "",
+            apply_mode_for(args),
+            None,
+        ) {
             Ok(r) => reports.push(r),
             Err(e) => {
                 eprintln!("cannot report {}: {e}", inst.id);
@@ -217,6 +252,55 @@ mod tests {
         assert_eq!(a.ids, vec!["aaa".to_string(), "bbb".to_string()]);
         assert_eq!(a.report, Some(PathBuf::from("/tmp/eval-out/report.json")));
         assert!(!a.winnability_only);
+        assert!(!a.lenient_apply, "Strict provenance by default");
+    }
+
+    #[test]
+    fn cli_eval_parses_lenient_apply() {
+        let a = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/tasks",
+            "--lenient-apply",
+        ]))
+        .unwrap();
+        assert!(a.lenient_apply);
+        assert_eq!(apply_mode_for(&a), eval::ApplyMode::Lenient);
+        let strict = parse_eval(&argv(&["rof", "eval", "--tasks-dir", "/tmp/tasks"])).unwrap();
+        assert_eq!(apply_mode_for(&strict), eval::ApplyMode::Strict);
+    }
+
+    #[test]
+    fn eval_report_provenance_matches_mode() {
+        // instance_report_with_mode is what run_eval calls: Strict default is
+        // the old instance_report shape, Lenient says Lenient in JSON.
+        let dir = std::env::temp_dir().join(format!("rof-eval-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let events = dir.join("events.jsonl");
+        std::fs::write(
+            &events,
+            "{\"type\":\"RunEnd\",\"outcome\":\"Passed\",\"messages\":[]}\n",
+        )
+        .unwrap();
+        for (mode, want) in [
+            (eval::ApplyMode::Strict, "Strict"),
+            (eval::ApplyMode::Lenient, "Lenient"),
+        ] {
+            let r = eval::instance_report_with_mode(
+                "t1",
+                eval::Verdict::Resolved,
+                &events,
+                1,
+                "",
+                mode,
+                None,
+            )
+            .unwrap();
+            let v = serde_json::to_value(&r).unwrap();
+            assert_eq!(v["apply_mode"], want);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -247,6 +331,7 @@ mod tests {
             out_dir: root.join("out"),
             report: Some(root.join("out").join("report.json")),
             winnability_only: true,
+            lenient_apply: false,
         };
         let code = run_eval(&args).await;
         assert_eq!(code, 0);

@@ -59,8 +59,12 @@ impl agent_loop::BetsHook for Gate {
     }
 }
 
-async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
-    let policy = Arc::new(tools_std::Policy {
+/// Tool policy for one run: `--allow-cmd` binary prefixes plus the
+/// repeatable `--pass-env` allowlist. Provider-key-shaped names stay
+/// withheld at spawn (the runner drops them), so listing a var forwards it
+/// to `exec`/`test` children without ever leaking the provider key.
+fn policy_for(args: &Args) -> tools_std::Policy {
+    tools_std::Policy {
         root: args.workdir.clone(),
         // --allow-cmd entries are binary prefixes (no shell: `&&`/`|` are
         // literal args, so exact-string matching would allow nothing useful).
@@ -68,8 +72,12 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
         allowed_prefixes: args.allow_cmd.clone(),
         syntax_cmd: None,
         denied_globs: tools_std::default_denied_globs(),
-        pass_env: Vec::new(),
-    });
+        pass_env: args.pass_env.clone(),
+    }
+}
+
+async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
+    let policy = Arc::new(policy_for(args));
     let mut reg = tool_core::Registry::new(Arc::new(GrantGate::new(HashMap::from([(
         "agent".to_string(),
         ["view", "search", "edit", "write", "exec", "test"]
@@ -274,6 +282,25 @@ mod tests {
         std::env::set_var("ROF_TEST_CRED_GATE_KEY", "k");
         assert!(p.check_credentials().is_ok());
         std::env::remove_var("ROF_TEST_CRED_GATE_KEY");
+    }
+
+    #[test]
+    fn pass_env_flag_reaches_policy() {
+        let mut a = args_for(Path::new("/tmp/w"), None);
+        assert!(
+            policy_for(&a).pass_env.is_empty(),
+            "absent flag forwards nothing extra"
+        );
+        a.pass_env = vec!["FOO".into(), "BAR".into()];
+        assert_eq!(
+            policy_for(&a).pass_env,
+            vec!["FOO".to_string(), "BAR".to_string()]
+        );
+        assert_eq!(
+            policy_for(&a).root,
+            Path::new("/tmp/w"),
+            "policy root still the workdir"
+        );
     }
 
     #[tokio::test]
