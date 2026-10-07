@@ -50,7 +50,7 @@ fn create_parent_dirs(root: &Path, path: &str) -> Result<(), ToolError> {
             std::fs::create_dir(&cur)
                 .map_err(|e| ToolError::Failed(format!("cannot create {}: {e}", cur.display())))?;
         }
-        symlink_safe(root, &cur).map_err(path_err)?;
+        symlink_safe(root, &cur, true).map_err(path_err)?;
     }
     Ok(())
 }
@@ -80,7 +80,7 @@ impl Tool for WriteTool {
     async fn execute(
         &self,
         inv: Invocation,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: WriteArgs = parse_args(&inv.args)?;
         if args.content.len() > EDIT_REPLACE_CAP {
@@ -101,10 +101,30 @@ impl Tool for WriteTool {
         }
         if let Some(argv) = self.policy.syntax_cmd.clone() {
             if !argv.is_empty() {
-                check_syntax(&self.policy, &args.content).await?;
+                check_syntax(&self.policy, &args.content, &cancel).await?;
             }
         }
-        std::fs::write(&p, &args.content).map_err(|e| ToolError::Failed(e.to_string()))?;
+        // New files are created with `create_new`: the create is atomic, so
+        // a file that appears between the checks above and the open fails
+        // instead of being truncated. An existing path keeps the plain
+        // overwrite (TOCTOU remains: a symlink swapped in after `resolve`
+        // is still followed; closing that needs O_NOFOLLOW/dirfd handling
+        // the std portables do not offer).
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                f.write_all(args.content.as_bytes())
+                    .map_err(|e| ToolError::Failed(e.to_string()))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::write(&p, &args.content).map_err(|e| ToolError::Failed(e.to_string()))?;
+            }
+            Err(e) => return Err(ToolError::Failed(e.to_string())),
+        }
         Ok(ToolOutcome {
             content: format!("wrote {}", args.path),
             truncated: false,

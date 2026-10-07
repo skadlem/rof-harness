@@ -580,6 +580,7 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
         allowed_prefixes: args.allow_cmd.clone(),
         syntax_cmd: None,
         denied_globs: tools_std::default_denied_globs(),
+        pass_env: Vec::new(),
     });
     let mut reg = tool_core::Registry::new(Arc::new(GrantGate::new(HashMap::from([(
         "agent".to_string(),
