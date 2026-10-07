@@ -1,6 +1,6 @@
 //! Git overlay transactions over a task copy: baseline / diff / rollback.
-//! Salvage of `~/rof-harness/src/engine/tree.rs` (identity, hooks off,
-//! `--no-renames`, exact names, 8KiB/200-line patch caps). Git is never on
+//! Fixed identity (`rof@local`), copied-in hooks off, rename detection off
+//! (`--no-renames`), patch text cut to 8KiB / 200 lines. Git is never on
 //! any command allowlist; rollback runs only when a retry follows, so the
 //! final tree stays readable for post-mortem.
 use serde::{Deserialize, Serialize};
@@ -401,8 +401,7 @@ impl TreeService {
         );
         // Benign no-op baselines: a clean tree, or dirt git refuses to stage
         // (e.g. modified content inside an embedded repo — the gitlink sha
-        // never moves, so `add -A` stages nothing). Measured crash:
-        // sanitize-git-repo pilot death (research/diag-snapshot-anomaly.md).
+        // never moves, so `add -A` stages nothing).
         if is_nothing_to_commit(&combined) {
             return Ok(());
         }
