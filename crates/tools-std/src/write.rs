@@ -104,7 +104,27 @@ impl Tool for WriteTool {
                 check_syntax(&self.policy, &args.content, &cancel).await?;
             }
         }
-        std::fs::write(&p, &args.content).map_err(|e| ToolError::Failed(e.to_string()))?;
+        // New files are created with `create_new`: the create is atomic, so
+        // a file that appears between the checks above and the open fails
+        // instead of being truncated. An existing path keeps the plain
+        // overwrite (TOCTOU remains: a symlink swapped in after `resolve`
+        // is still followed; closing that needs O_NOFOLLOW/dirfd handling
+        // the std portables do not offer).
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                f.write_all(args.content.as_bytes())
+                    .map_err(|e| ToolError::Failed(e.to_string()))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::write(&p, &args.content).map_err(|e| ToolError::Failed(e.to_string()))?;
+            }
+            Err(e) => return Err(ToolError::Failed(e.to_string())),
+        }
         Ok(ToolOutcome {
             content: format!("wrote {}", args.path),
             truncated: false,
