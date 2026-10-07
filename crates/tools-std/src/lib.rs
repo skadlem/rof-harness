@@ -7,6 +7,7 @@
 //! (ponytail: no `schemars` dep — five `json!` literals use the already-installed
 
 mod common;
+mod condense;
 mod edit;
 mod exec;
 mod policy;

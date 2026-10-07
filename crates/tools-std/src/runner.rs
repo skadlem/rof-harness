@@ -3,9 +3,9 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tool_core::ToolError;
-use verify::condense_output;
 
 use crate::common::{cap_chars, prefix_allowed, EXEC_TIMEOUT, OUT_CAP};
+use crate::condense::condense_output;
 use crate::policy::Policy;
 
 /// Split a command into argv honoring single/double quotes and backslash
