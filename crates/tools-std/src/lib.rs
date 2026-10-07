@@ -5,8 +5,22 @@
 //! each tool also parses into a typed `Deserialize` args struct with
 //! `deny_unknown_fields`, so schema and parser pin the same contract.
 //! (ponytail: no `schemars` dep — five `json!` literals use the already-installed
+//! `serde_json`.)
+//!
+//! ## Threat model (operator read-this)
+//!
+//! The path policy covers `view`/`edit`/`write` only: root-anchored,
+//! symlink-safe, secrets-denied file access. `exec` and `test` run
+//! allowlisted host commands with a cleared environment, null stdin, and a
+//! bounded pipe read — but allowlisting is not isolation. Permitting
+//! `cargo test`, `sh`, or any test runner hands the agent arbitrary code
+//! execution on the host: a hostile command can still reach the network,
+//! IPC, or sibling processes, and no output bound or timeout changes that.
+//! OS-level isolation (container/namespace, no network, read-only mounts)
+//! is the operator's job; this crate builds no sandbox.
 
 mod common;
+mod condense;
 mod edit;
 mod exec;
 mod policy;
@@ -29,7 +43,7 @@ pub use write::{write_tool, WriteTool};
 mod tests {
     use super::*;
     use crate::common::{EDIT_FILE_CAP, EDIT_REPLACE_CAP, OUT_CAP, VIEW_CAP};
-    use crate::runner::{run_allowed, split_cmd};
+    use crate::runner::{run_allowed, split_cmd, stage_and_check};
     use crate::view::{view_page, view_read_cap};
     use serde_json::{json, Value};
     use std::collections::HashMap;
@@ -59,6 +73,7 @@ mod tests {
             allowed_prefixes: vec!["echo".to_string(), "cargo test".to_string()],
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
         })
     }
 
@@ -72,6 +87,7 @@ mod tests {
             allowed_prefixes: vec!["echo".to_string(), prefix],
             syntax_cmd: Some(argv.iter().map(|s| s.to_string()).collect()),
             denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
         })
     }
 
@@ -131,6 +147,96 @@ mod tests {
         }
         // Reads may traverse .git (still root-anchored + symlink-safe).
         assert!(resolve_under(&root, ".git/HEAD", false, &[]).is_ok());
+    }
+
+    #[test]
+    fn git_symlink_alias_write_denied_read_allowed() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "x\n").unwrap();
+        // A symlinked dir pointing at the substrate must not launder writes.
+        std::os::unix::fs::symlink(root.join(".git"), root.join("evil")).unwrap();
+        for rel in ["evil/config", "evil/new", "evil"] {
+            match resolve_under(&root, rel, true, &[]) {
+                Err(ToolPathError::Denied(_)) => {}
+                other => panic!("{rel} write must be denied, got {other:?}"),
+            }
+        }
+        // Reads through the alias stay allowed (same rule as plain `.git`).
+        assert!(resolve_under(&root, "evil/config", false, &[]).is_ok());
+        // A final-component link straight at a substrate file is denied too.
+        std::os::unix::fs::symlink(root.join(".git/config"), root.join("head-link")).unwrap();
+        match resolve_under(&root, "head-link", true, &[]) {
+            Err(ToolPathError::Denied(_)) => {}
+            other => panic!("head-link write must be denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secrets_globs_cover_keys_and_cloud_dirs() {
+        for (pat, hit, miss) in [
+            ("**/.env", ".env", ".env.example"),
+            ("**/.env", "a/.env", "a/.envx"),
+            ("**/.env.*", ".env.local", ".env"),
+            ("**/.env.*", "a/.env.local", "a/env.local"),
+            ("**/*.pem", "k.pem", "k.pemx"),
+            ("**/*.pem", "a/b/k.pem", "a/b/pem"),
+            ("**/*.key", "a/tls.key", "a/key"),
+            ("**/id_rsa*", "id_rsa", "x_id_rsa"),
+            ("**/id_rsa*", "a/id_rsa.pub", "a/id_rsa_pub/x"),
+            ("**/.npmrc", ".npmrc", "npmrc"),
+            ("**/.npmrc", "a/.npmrc", "a/.npmrcx"),
+            ("**/.netrc", "sub/.netrc", "sub/netrc"),
+            ("**/.aws", ".aws", ".awsx"),
+            ("**/.aws", "a/.aws", "a/aws"),
+            ("**/.aws/**", "a/.aws/config", "a/aws/config"),
+            ("**/.ssh", "a/.ssh", "a/ssh"),
+            ("**/.ssh/**", ".ssh/id_rsa", ".sshx/id_rsa"),
+        ] {
+            assert!(glob_match(pat, hit), "{pat} must match {hit}");
+            assert!(!glob_match(pat, miss), "{pat} must not match {miss}");
+        }
+    }
+
+    #[test]
+    fn env_template_allowed_but_local_and_keys_denied() {
+        let root = tmp_root();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let globs = default_denied_globs();
+        for rel in [
+            ".env",
+            ".env.local",
+            "a/.env",
+            "a/.env.production",
+            "k.pem",
+            "a/tls.key",
+            "id_rsa",
+            "a/id_rsa.pub",
+            ".npmrc",
+            "sub/.netrc",
+            ".aws/config",
+            "a/.aws/credentials",
+            ".ssh/id_rsa",
+        ] {
+            for write in [true, false] {
+                match resolve_under(&root, rel, write, &globs) {
+                    Err(ToolPathError::Denied(_)) => {}
+                    other => panic!("{rel} must be denied, got {other:?}"),
+                }
+            }
+        }
+        // Templates stay usable on both reads and writes.
+        for rel in [".env.example", ".env.sample", "a/.env.template"] {
+            assert!(
+                resolve_under(&root, rel, false, &globs).is_ok(),
+                "{rel} readable"
+            );
+            assert!(
+                resolve_under(&root, rel, true, &globs).is_ok(),
+                "{rel} writable"
+            );
+        }
     }
 
     #[test]
@@ -654,11 +760,13 @@ mod tests {
             allowed_prefixes: vec!["sh".to_string()],
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
         };
         let err = run_allowed(
             &pol,
             "sh -c 'sleep 1; touch late-marker'",
             Duration::from_millis(100),
+            &CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -667,6 +775,188 @@ mod tests {
         assert!(
             !root.join("late-marker").exists(),
             "child survived the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_timeout_kills_grandchild() {
+        // Middle `sh` backgrounds a grandchild `sh` and waits: killing only
+        // the direct child would orphan the grandchild, which touches the
+        // marker a second later. The process-group kill must take both.
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["sh".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+        };
+        let err = run_allowed(
+            &pol,
+            "sh -c 'sh -c \"sleep 1; touch grandchild-marker\" & wait'",
+            Duration::from_millis(200),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !root.join("grandchild-marker").exists(),
+            "grandchild survived the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_cancel_kills_group_promptly() {
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["sh".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+        };
+        let cancel = CancellationToken::new();
+        let killer = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            killer.cancel();
+        });
+        let start = std::time::Instant::now();
+        let err = run_allowed(
+            &pol,
+            "sh -c 'sh -c \"sleep 1; touch cancel-marker\" & wait'",
+            Duration::from_secs(60),
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("cancel"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cancel must return promptly"
+        );
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !root.join("cancel-marker").exists(),
+            "grandchild survived the cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_output_flood_stays_bounded() {
+        // 20MB of NUL bytes: retained pipes stay at 128KB per stream while
+        // the verdict, condensing, and outer cap behave as before.
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["head".to_string(), "cat".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+        };
+        let start = std::time::Instant::now();
+        let (ok, content, truncated) = run_allowed(
+            &pol,
+            "head -c 20000000 /dev/zero",
+            Duration::from_secs(60),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(ok);
+        assert!(truncated, "a 20MB flood must flag truncation");
+        assert!(content.chars().count() <= OUT_CAP);
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "flood must return promptly"
+        );
+        // Null stdin: `cat` with no args sees EOF and exits at once instead
+        // of blocking on an inherited terminal.
+        let (ok, _, truncated) = run_allowed(
+            &pol,
+            "cat",
+            Duration::from_secs(10),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(ok);
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn exec_env_hides_provider_key_forwards_pass_env() {
+        std::env::set_var("TOOLS_STD_TEST_PING", "pong");
+        std::env::set_var("OPENAI_API_KEY", "secret-should-not-leak");
+        let root = tmp_root();
+        let mut pol = (*policy(&root)).clone();
+        pol.allowed_prefixes.push("printenv".to_string());
+        pol.pass_env = vec![
+            "TOOLS_STD_TEST_PING".to_string(),
+            "OPENAI_API_KEY".to_string(),
+        ];
+        let r = reg(Arc::new(pol));
+        let out = run(&r, "exec", json!({"cmd": "printenv TOOLS_STD_TEST_PING"}))
+            .await
+            .unwrap();
+        assert!(out.content.contains("pong"), "{}", out.content);
+        // Listed in pass_env but key-shaped: still withheld, exit nonzero.
+        let out = run(&r, "exec", json!({"cmd": "printenv OPENAI_API_KEY"}))
+            .await
+            .unwrap();
+        assert!(!out.success);
+        assert!(
+            !out.content.contains("secret-should-not-leak"),
+            "{}",
+            out.content
+        );
+        std::env::remove_var("TOOLS_STD_TEST_PING");
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+
+    #[tokio::test]
+    async fn syntax_check_argv_handles_space_in_path() {
+        // Staging under a dir with a space: the old join-then-split
+        // round-trip fed `cat` three paths and failed; real argv passes.
+        let base = tmp_root().join("dir with space");
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["cat".to_string()],
+            syntax_cmd: Some(vec!["cat".to_string()]),
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+        };
+        stage_and_check(
+            &pol,
+            &["cat".to_string()],
+            "hello\n",
+            &CancellationToken::new(),
+            &base,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_syntax_passes_with_space_in_root() {
+        let root = tmp_root().join("work dir");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f.txt"), "hello\n").unwrap();
+        let r = reg(syntax_policy(&root, &["true"]));
+        run(&r, "write", json!({"path": "f.txt", "content": "bye\n"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "bye\n"
         );
     }
 
@@ -727,6 +1017,7 @@ mod tests {
             allowed_prefixes: vec!["cat".to_string()],
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
         });
         let out = run(&reg(pol), "test", json!({"cmd": "cat noisy.txt"}))
             .await

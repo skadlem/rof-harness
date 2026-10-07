@@ -1,15 +1,16 @@
 # rof-harness
 
 Agent harness: an OpenAI-compatible model drives a tool loop (`agent-loop`)
-against a scratch `--workdir`, with budgets, a snapshot tree, and an
-evidence-bounded stdout patch as the deliverable.
+against a scratch `--workdir`, with budgets, a snapshot tree, and the full
+(uncut) run patch on stdout as the deliverable.
 
 ## Layout
 
 - `crates/rof` — CLI driver. Runs the loop, prints the **full** patch to
-  stdout, exit code reflects the outcome. `--dump-events PATH` appends one
-  JSON line per event (fsync'd, kill-resilient); the WAL defaults to
+  stdout, exit code reflects the outcome. `--dump-events PATH` writes one
+  JSON line per event (one run, one dump file); the WAL defaults to
   `<workdir>/.rof-events.jsonl` (`--log-path` overrides, `--no-log` opts out).
+  `rof eval` grades a frozen task slice into a JSON report.
 - `crates/agent-loop` — the loop: `run()` is the shipped sequential driver
   (`drive_tick` is a test harness over the same step helpers). State,
   verification nudge, request building, proof gating, cancellation.
@@ -22,8 +23,11 @@ evidence-bounded stdout patch as the deliverable.
 - `crates/provider-core` / `crates/provider-openai` — `LlmClient` trait +
   OpenAI-compatible client (8-attempt retry ladder, priced models).
 - `crates/eval` — slice loading, official-container verdicts, gate stats.
-- `crates/agent-event` / `agent-log` / `context` / `bets` / `trace` / `verify`
-  — events, durable log, compaction/file-map, proof gating, tracing, matching.
+  Strict patch-apply grading by default; `--lenient-apply` records Lenient
+  provenance instead (Strict grades are not comparable with earlier
+  fuzz-lenient numbers).
+- `crates/agent-event` / `agent-log` / `context` / `bets` / `trace`
+  — events, durable log, compaction/file-map, proof gating, tracing.
 
 ## Build / test
 
@@ -46,10 +50,38 @@ cargo run -p rof -- --goal "fix ..." --workdir /tmp/w --model <id> \
 
 Useful flags: `--budget-actions/--budget-tokens/--max-tokens`,
 `--context-file`, `--proof-cmd`, `--incentives base|contract|full`,
-`--bets`, `--compaction`, `--dump-events`, `--log-path` / `--no-log`.
+`--bets`, `--compaction`, `--dump-events`, `--log-path` / `--no-log`,
+`--thinking-keep` / `--collapse-hysteresis` (env fallback `THINKING_KEEP` /
+`COLLAPSE_HYSTERESIS`, flag wins), repeatable `--pass-env NAME`,
+`--allow-dirty-workdir`. `rof eval --tasks-dir DIR [--lenient-apply]`
+grades the slice; `--lenient-apply` records Lenient patch-apply provenance
+in the report (default Strict).
 
-## Docs
+Missing credentials fail fast before any spend: exit 4, naming the env var
+(`--api-key-env NAME` selects which var holds the key).
 
-`research/` is read-only input (briefs); decisions live in
-`research/DECISIONS.md`. `AGENTS.md` states the build rules (ponytail,
-contract-first parallelism, evidence discipline, no shared crates).
+## Workdir contract
+
+`--workdir` must be a disposable scratch dir: the run mutates it in place
+(`git init`, `git add -A`, tool exec). These are refused with exit 2:
+
+- the filesystem root (`/`),
+- `$HOME`,
+- the harness checkout itself,
+- a repo with uncommitted changes, unless `--allow-dirty-workdir` is passed
+  (pre-existing dirt then appears in the reported patch).
+
+## Threat model
+
+- The path policy covers `view`/`edit`/`write` only: root-anchored,
+  symlink-safe, secrets-denied file access.
+- `exec` and `test` run allowlisted host commands, but allowlisting is not
+  isolation: permitting `cargo test`, `sh`, or any test runner hands the
+  agent arbitrary code execution on the host.
+- OS-level isolation (container/namespace, no network, read-only mounts) is
+  the operator's job; the tools build no sandbox.
+
+## Exit codes
+
+0 done; 2 usage/parse; 3 run failure (halted, cancelled, provider error);
+4 missing credentials; 5 log failure; 6 snapshot failure; 7 input failure.

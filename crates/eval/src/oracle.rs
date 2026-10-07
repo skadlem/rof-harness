@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Oracle checkers: TB state verifier (tests/ + reward file) and SWE patch
-/// verifier (git-apply chain with patch fallback, eval.sh, per-repo parser).
+/// verifier (apply mode + eval.sh, per-repo parser).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
     Resolved,
@@ -70,33 +70,107 @@ pub fn check_swe_results(fail_to_pass: &[String], pass_to_pass: &[String], log: 
     }
 }
 
-/// Apply prediction via `git apply`, falling back to `patch --batch
-/// --fuzz=5 -p1` (both battle-tested upstream). `Ok(false)` = did not apply.
-pub fn apply_patch(workdir: &Path, patch: &str) -> std::io::Result<bool> {
+/// How strictly a patch must match to count as applied. Strict (the
+/// default) is `git apply` only; Lenient keeps the old `patch --fuzz=5`
+/// fallback. Strict grades are not comparable with earlier fuzz-lenient
+/// benchmark numbers: the same patch can grade differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ApplyMode {
+    #[default]
+    Strict,
+    Lenient,
+}
+
+/// What the applier did: whether the patch landed, which mode ran, and
+/// the applier's stderr (empty when the applier was silent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyOutcome {
+    pub applied: bool,
+    pub mode: ApplyMode,
+    pub detail: String,
+}
+
+// ponytail: one spawn helper for both appliers; stdin is closed before
+// wait so a fast-exiting child can never deadlock the write.
+fn run_applier(
+    program: &str,
+    args: &[&str],
+    workdir: &Path,
+    patch: &str,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .current_dir(workdir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // A fast failure (bad patch) can close the pipe first; the exit
+        // status below already reports that, so never bubble EPIPE here.
+        let _ = stdin.write_all(patch.as_bytes());
+    }
+    child.wait_with_output()
+}
+
+/// Apply prediction via `git apply` (Strict) or `git apply` with a
+/// `patch --batch --fuzz=5 -p1` fallback (Lenient). `Ok` with
+/// `applied == false` = did not apply; only spawn/wait failures are `Err`.
+pub fn apply_patch_with_mode(
+    workdir: &Path,
+    patch: &str,
+    mode: ApplyMode,
+) -> std::io::Result<ApplyOutcome> {
     if patch.trim().is_empty() {
-        return Ok(false);
+        return Ok(ApplyOutcome {
+            applied: false,
+            mode,
+            detail: "empty patch".into(),
+        });
     }
-    let mut git = std::process::Command::new("git")
-        .args(["apply", "-"])
-        .current_dir(workdir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    use std::io::Write;
-    git.stdin.take().unwrap().write_all(patch.as_bytes())?;
-    if git.wait()?.success() {
-        return Ok(true);
+    let git = run_applier("git", &["apply", "-"], workdir, patch)?;
+    if git.status.success() {
+        return Ok(ApplyOutcome {
+            applied: true,
+            mode,
+            detail: String::new(),
+        });
     }
-    let mut fallback = std::process::Command::new("patch")
-        .args(["--batch", "--fuzz=5", "-p1"])
-        .current_dir(workdir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    fallback.stdin.take().unwrap().write_all(patch.as_bytes())?;
-    Ok(fallback.wait()?.success())
+    let git_stderr = String::from_utf8_lossy(&git.stderr).into_owned();
+    if mode == ApplyMode::Strict {
+        return Ok(ApplyOutcome {
+            applied: false,
+            mode,
+            detail: git_stderr,
+        });
+    }
+    let fallback = run_applier("patch", &["--batch", "--fuzz=5", "-p1"], workdir, patch)?;
+    if fallback.status.success() {
+        return Ok(ApplyOutcome {
+            applied: true,
+            mode,
+            detail: git_stderr,
+        });
+    }
+    let mut detail = git_stderr;
+    let fallback_stderr = String::from_utf8_lossy(&fallback.stderr).into_owned();
+    if !fallback_stderr.is_empty() {
+        if !detail.is_empty() {
+            detail.push('\n');
+        }
+        detail.push_str(&fallback_stderr);
+    }
+    Ok(ApplyOutcome {
+        applied: false,
+        mode,
+        detail,
+    })
+}
+
+/// Strict-only shorthand (`git apply`, no fuzz fallback); the default mode.
+pub fn apply_patch(workdir: &Path, patch: &str) -> std::io::Result<bool> {
+    apply_patch_with_mode(workdir, patch, ApplyMode::Strict).map(|o| o.applied)
 }
 
 /// Run the repo test command; output goes through [`swe_test_status`].

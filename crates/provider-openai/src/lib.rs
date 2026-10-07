@@ -1,6 +1,6 @@
 //! One OpenAI-compatible chat/completions adapter implementing
 //! provider_core::LlmClient. Covers DeepSeek/Atria/OpenRouter/Ollama through
-//! config (endpoint + key + model id). See research/crate-provider-core.md.
+//! config (endpoint + key + model id).
 mod client;
 mod pricing;
 mod protocol;

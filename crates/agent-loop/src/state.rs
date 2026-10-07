@@ -1,31 +1,19 @@
 //! Shared turn/step state: `LoopState`, items, and the durable-log helpers.
 
-use crate::{EffectGate, IncentivesLevel, VerifyState};
+use crate::{EffectGate, RunConfig, VerifyState};
 use agent_budget::{config_for, halt_name, BudgetGuard, Capability};
 use agent_event::{TurnEndReason as EventTurnEndReason, UsageReport};
 use agent_log::{InputSource, Item, ItemKind, RecoveryCode, TurnEndReason};
 use provider_core::{AssistantMessage, StopReason, Usage};
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 use tool_core::{ToolCall, ToolResult};
 
 /// Assistant rows whose echoed reasoning survives folding into the derived
-/// transcript.
+/// transcript. Default for [`RunConfig::thinking_keep`]; arms set the field
+/// directly, so the fold never reads the environment.
 pub(crate) const THINKING_KEEP: usize = 2;
-
-/// Echoed-reasoning trim knob: env `THINKING_KEEP` overrides the keep-count
-/// (A/B arm B = a large value echoes everything). Default stays
-/// [`THINKING_KEEP`] (chosen-not-measured; the K=2 A/B validates). Read once
-/// per run via [`LoopState::resolve_fold_config`]: the fold uses the cached
-/// [`LoopState::thinking_keep`], so the env leg is tested through the snapshot
-/// (a mid-run change is ignored), never per-fold.
-pub(crate) fn thinking_keep() -> usize {
-    std::env::var("THINKING_KEEP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(THINKING_KEEP)
-}
 
 /// Per-step provider-failure budget (init + per-step reset value).
 /// Nesting: the provider adapter retries INSIDE each `complete` (cold-start
@@ -53,7 +41,24 @@ pub enum Outcome {
     Done,
     Halted(String),
     Cancelled,
-    Failed(String),
+    Failed { kind: FailureKind, message: String },
+}
+
+/// Why a run failed: the failure sites in `run` map here so callers can
+/// react without parsing message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The append-only log could not open or persist: fail closed, never
+    /// run from process-only state.
+    Log,
+    /// The snapshot tree (ensure/baseline/rollback/restore, hunk probe)
+    /// failed: the workdir is not in a known-good state.
+    Snapshot,
+    /// The provider ladder failed fatally (retries exhausted, refused):
+    /// the model made no progress.
+    Provider,
+    /// The run was asked to do nothing: no input seeds a turn.
+    Input,
 }
 
 #[derive(Debug, Clone)]
@@ -90,16 +95,21 @@ impl From<&str> for QueuedInput {
     }
 }
 
-/// Fake provider traffic: what a single-flight provider task ships back.
+/// Provider traffic: what a single-flight provider task ships back.
+/// `pub(crate)`: the channel harness (`drive_tick`) is test-only; `run`
+/// builds these rows directly from `complete`.
 #[derive(Debug, Clone)]
-pub enum ProviderMsg {
-    Partial {
-        turn: u64,
-        text: String,
-    },
+pub(crate) enum ProviderMsg {
+    // Test-only reads: `run` builds these rows from `complete` and
+    // `finish_provider_msg` consumes them without reading every field back;
+    // the `drive_tick` harness and unit tests read the rest.
+    #[allow(dead_code)]
+    Partial { turn: u64, text: String },
     Settled {
         turn: u64,
+        #[allow(dead_code)]
         message: AssistantMessage,
+        #[allow(dead_code)]
         stop: StopReason,
         usage: Option<Usage>,
     },
@@ -123,9 +133,9 @@ impl ProviderMsg {
     }
 }
 
-/// Fake tool traffic: one finished call.
+/// Tool traffic: one finished call. `pub(crate)`: see [`ProviderMsg`].
 #[derive(Debug, Clone)]
-pub struct ToolMsg {
+pub(crate) struct ToolMsg {
     pub call_id: String,
     pub result: ToolResult,
 }
@@ -145,8 +155,12 @@ pub enum ClaimOutcome {
 }
 
 #[derive(Debug, Clone)]
-pub struct InFlight {
+pub(crate) struct InFlight {
+    // Test-only reads (stale-guard assertions): prod tracks single-flight
+    // occupancy through the `Option`, never the contents.
+    #[allow(dead_code)]
     pub turn: u64,
+    #[allow(dead_code)]
     pub token: CancellationToken,
 }
 
@@ -175,11 +189,10 @@ pub struct Checkpoint {
 }
 
 /// Shared turn/step state for both drivers. `run` is the canonical shipped
-/// driver; every field below is live in `run` (single-flight `in_flight` via
-/// `start_provider_call`/`finish_provider_msg`, `steering`/`followups` via
-/// `admit_steering`/`terminate`, `wake_requested`+`Phase::Maintenance` via the
-/// same admit path). No field is dead machinery: nothing is annotated dead
-/// and nothing may be removed under the parent-frozen ADD-only contract.
+/// driver. Run configuration (incentives, drain deadline, fold knobs) lives
+/// in [`RunConfig`], the single source of truth threaded through every
+/// method that needs it — no field here mirrors it, so there is no
+/// precedence to document.
 pub struct LoopState {
     pub turn: u64,
     pub step: u32,
@@ -195,19 +208,11 @@ pub struct LoopState {
     /// already carried. Frozen once, compared per request: unchanged -> cached
     /// run-start bytes, changed -> dropped to the normal view/edit flow.
     pub pins: Option<Vec<(String, String)>>,
-    /// Transcript-fold knobs frozen at run head ([`Self::resolve_fold_config`]):
-    /// echoed-reasoning keep-count (`THINKING_KEEP`) and the collapse
-    /// hysteresis (`COLLAPSE_HYSTERESIS`). The fold reads these, never the
-    /// environment, so a mid-run env change cannot flip request bytes or
-    /// rotate the cached prefix. Defaults are the constants; `run` resolves
-    /// the env once before the first request.
-    pub thinking_keep: usize,
-    pub collapse_hysteresis: usize,
     pub steering: VecDeque<QueuedInput>,
     pub followups: VecDeque<String>,
     pub wake_requested: bool,
     pub call_model: bool,
-    pub in_flight: Option<InFlight>,
+    pub(crate) in_flight: Option<InFlight>,
     pub tool_calls: HashMap<String, ToolCallState>,
     pub gate: EffectGate,
     pub stop_hard: bool,
@@ -237,16 +242,10 @@ pub struct LoopState {
     pub edits: u32,
     /// Mid-run verification nudge (Full only); see [`VerifyState`].
     pub verify: VerifyState,
-    /// One-shot latches: the half-cap and near-cap directives fire once each.
-    pub half_directive_sent: bool,
-    pub late_directive_sent: bool,
-    /// Ablation observability (Bet B→+A→+C): verdict/assessment counters for
-    /// the run-end report. Never drives behavior.
-    pub ablation: bets::AblationMetrics,
-    /// Incentive scaffold level (B→+A→+C ablation): gates the workflow
-    /// contract and the directive channel. Default Full = current behavior.
-    pub incentives: IncentivesLevel,
-    pub drain_timeout: Duration,
+    /// Mutable experiment runtime (incentive-scaffold B→+A→+C); see
+    /// [`Experiment`]. The immutable half (incentive level, bets hook)
+    /// lives in [`RunConfig`]/`Run`, so the base loop reads cleanly.
+    pub experiment: Experiment,
     pub drain_until: Option<Instant>,
     /// Compaction checkpoint (default off): the request fold replaces the raw
     /// prefix with one summary. `None` = no checkpoint applied.
@@ -259,6 +258,21 @@ pub struct LoopState {
     pub compacted_turn: Option<u64>,
 }
 
+/// Mutable experiment runtime (incentive-scaffold B→+A→+C): ablation
+/// counters plus the half-cap/near-cap directive one-shot latches. The
+/// immutable half of the scaffold (incentive level, bets hook) lives in
+/// [`RunConfig`]/`Run`, so the base loop reads cleanly. Grouped so
+/// `LoopState`'s surface stays on the base loop; no behavior change.
+#[derive(Debug, Clone, Default)]
+pub struct Experiment {
+    /// Ablation observability (Bet B→+A→+C): verdict/assessment counters
+    /// for the run-end report. Never drives behavior.
+    pub ablation: bets::AblationMetrics,
+    /// One-shot latches: the half-cap and near-cap directives fire once each.
+    pub half_directive_sent: bool,
+    pub late_directive_sent: bool,
+}
+
 impl LoopState {
     pub fn new() -> Self {
         Self {
@@ -268,8 +282,6 @@ impl LoopState {
             items: Vec::new(),
             file_map: None,
             pins: None,
-            thinking_keep: THINKING_KEEP,
-            collapse_hysteresis: context::COLLAPSE_HYSTERESIS,
             steering: VecDeque::new(),
             followups: VecDeque::new(),
             wake_requested: false,
@@ -292,26 +304,12 @@ impl LoopState {
             pending_directives: VecDeque::new(),
             edits: 0,
             verify: VerifyState::default(),
-            half_directive_sent: false,
-            late_directive_sent: false,
-            ablation: bets::AblationMetrics::default(),
-            incentives: IncentivesLevel::Full,
-            drain_timeout: Duration::from_secs(30),
+            experiment: Experiment::default(),
             drain_until: None,
             checkpoint: None,
             anchor: None,
             compacted_turn: None,
         }
-    }
-
-    /// Run-head snapshot of the transcript-fold env knobs: reads
-    /// `THINKING_KEEP` / `COLLAPSE_HYSTERESIS` once into
-    /// [`Self::thinking_keep`] / [`Self::collapse_hysteresis`]. `run` calls
-    /// this before the first request; the fold never reads the environment
-    /// after, so a mid-run env change cannot flip behavior.
-    pub fn resolve_fold_config(&mut self) {
-        self.thinking_keep = thinking_keep();
-        self.collapse_hysteresis = context::collapse_hysteresis();
     }
 
     pub fn open_tools(&self) -> usize {
@@ -453,7 +451,7 @@ impl LoopState {
     /// Spend/tokens land here from provider Usage: steps at the step head,
     /// tokens + spend on settle and on a metered failure. Tokens/spend are
     /// never refunded.
-    pub fn finish_provider_msg(&mut self, msg: ProviderMsg) -> bool {
+    pub(crate) fn finish_provider_msg(&mut self, msg: ProviderMsg) -> bool {
         if msg.turn() != self.turn {
             return false; // STALE GUARD: late landing from an interrupted turn.
         }
@@ -561,13 +559,14 @@ impl LoopState {
         repaired
     }
 
-    /// Ordered termination, top-down, first match wins.
-    pub fn terminate(&mut self) -> PhaseVerdict {
+    /// Ordered termination, top-down, first match wins. `cfg` is the single
+    /// source of run configuration (drain deadline here).
+    pub fn terminate(&mut self, cfg: &RunConfig) -> PhaseVerdict {
         // 1. Cancel / StopHard drains to terminal under a bounded deadline.
         if self.stop_hard {
             let until = *self
                 .drain_until
-                .get_or_insert_with(|| Instant::now() + self.drain_timeout);
+                .get_or_insert_with(|| Instant::now() + cfg.drain_timeout);
             if (self.in_flight.is_some() || self.open_tools() > 0) && Instant::now() < until {
                 return PhaseVerdict::Break;
             }
@@ -575,7 +574,10 @@ impl LoopState {
         }
         // 2. Hard error: in-step retries exhausted.
         if let Some(err) = self.fatal_error.clone() {
-            return PhaseVerdict::Return(Outcome::Failed(err));
+            return PhaseVerdict::Return(Outcome::Failed {
+                kind: FailureKind::Provider,
+                message: err,
+            });
         }
         // 3. Budget exhausted: the guard AND-gate owns every cap; the loop
         // holds no shadow caps and halts the moment any counter trips.
@@ -584,7 +586,10 @@ impl LoopState {
         }
         // 4. Refusal is terminal-with-error; sticky max-tokens halts once drained.
         if let Some(TurnEndReason::Error(reason)) = self.turn_reason.clone() {
-            return PhaseVerdict::Return(Outcome::Failed(reason));
+            return PhaseVerdict::Return(Outcome::Failed {
+                kind: FailureKind::Provider,
+                message: reason,
+            });
         }
         if self.turn_reason == Some(TurnEndReason::MaxTokens)
             && self.in_flight.is_none()
@@ -658,7 +663,7 @@ pub(crate) fn outcome_log_reason(
         Outcome::Halted(s) if s == "max-tokens" => TurnEndReason::MaxTokens,
         Outcome::Halted(_) => TurnEndReason::Budget,
         Outcome::Cancelled => TurnEndReason::Interrupted,
-        Outcome::Failed(e) => TurnEndReason::Error(e.clone()),
+        Outcome::Failed { message, .. } => TurnEndReason::Error(message.clone()),
     }
 }
 
@@ -676,49 +681,4 @@ pub(crate) fn append_to(items: &mut Vec<Item>, kind: ItemKind) {
         recorded_at: SystemTime::now(),
         kind,
     });
-}
-
-/// RAII turn guard: appends TurnEnd on drop, always, even on unwind.
-/// TEST-ONLY substrate today: prod turns use `open_turn`/`append_to(TurnEnd)`
-/// (`state.rs`, `run.rs`); only `src/tests.rs` constructs this. Kept for the
-/// unwind-safety property, not wired into `run()`.
-pub struct TurnGuard<'a> {
-    items: Option<&'a mut Vec<Item>>,
-    turn_id: String,
-    reason: TurnEndReason,
-}
-
-impl<'a> TurnGuard<'a> {
-    pub fn open(items: &'a mut Vec<Item>, turn: u64) -> Self {
-        let turn_id = turn_id(turn);
-        append_to(
-            items,
-            ItemKind::TurnStart {
-                turn_id: turn_id.clone(),
-                prev_turn_id: None,
-            },
-        );
-        Self {
-            items: Some(items),
-            turn_id,
-            reason: TurnEndReason::Completed,
-        }
-    }
-    pub fn end(mut self, reason: TurnEndReason) {
-        self.reason = reason;
-    }
-}
-
-impl Drop for TurnGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(items) = self.items.take() {
-            append_to(
-                items,
-                ItemKind::TurnEnd {
-                    turn_id: self.turn_id.clone(),
-                    reason: self.reason.clone(),
-                },
-            );
-        }
-    }
 }

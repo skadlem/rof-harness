@@ -1,5 +1,4 @@
 //! Ordered sink + live forward + JSONL append over the agent-event vocabulary.
-//! Salvage of ~/rof-harness/src/obs/trace.rs emission mechanics (not its variants).
 //! Token totals live here only as passed-in counts; shared atomic accounting
 //! waits for a consumer that needs it.
 use agent_event::AgentEvent;

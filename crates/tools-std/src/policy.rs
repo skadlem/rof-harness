@@ -10,12 +10,37 @@ pub struct Policy {
     pub syntax_cmd: Option<Vec<String>>,
     /// Deny-globs matched against the root-relative path (e.g. `**/*.env`).
     pub denied_globs: Vec<String>,
+    /// Extra env names forwarded to `exec`/`test` children on top of the
+    /// fixed pass-through set. A provider key must never go here: names
+    /// ending in `_API_KEY` (and malformed names) are dropped at spawn.
+    pub pass_env: Vec<String>,
 }
 
 /// The stock secrets deny-glob. Callers constructing `Policy` literally
 /// should start here.
 pub fn default_denied_globs() -> Vec<String> {
-    vec!["**/*.env".to_string()]
+    vec![
+        "**/.env".to_string(),
+        "**/.env.*".to_string(),
+        "**/*.pem".to_string(),
+        "**/*.key".to_string(),
+        "**/id_rsa*".to_string(),
+        "**/.npmrc".to_string(),
+        "**/.netrc".to_string(),
+        "**/.aws".to_string(),
+        "**/.aws/**".to_string(),
+        "**/.ssh".to_string(),
+        "**/.ssh/**".to_string(),
+    ]
+}
+
+/// `.env.example` (and `.sample`/`.template`) are shareable templates, not
+/// secrets: they bypass the `**/.env*` denials but nothing else.
+fn is_env_template(rel: &str) -> bool {
+    matches!(
+        rel.rsplit('/').next().unwrap_or(""),
+        ".env.example" | ".env.sample" | ".env.template"
+    )
 }
 
 /// Hand-rolled glob: `*` matches any run without `/`, `**` any run with
@@ -105,6 +130,8 @@ fn under(root: &Path, cand: &Path) -> bool {
 /// (reads may traverse it, still root-anchored + symlink-safe), then
 /// canonical parent + symlinked-final check. A missing parent is
 /// `MissingParent` (recoverable: "create it first, re-issue"), never a denial.
+/// Same-inode hardlinks with a clean spelling are not detectable by path
+/// checks; the write TOCTOU note in `write.rs` applies here too.
 pub fn resolve_under(
     root: &Path,
     path: &str,
@@ -120,21 +147,33 @@ pub fn resolve_under(
         .map(|r| r.to_string_lossy().replace('\\', "/"))
         .unwrap_or_default();
     let rel = rel.trim_start_matches('/');
-    if denied_globs.iter().any(|g| glob_match(g, rel)) {
-        return Err(ToolPathError::Denied(format!(
-            "path matches denied glob: {rel}"
-        )));
+    for g in denied_globs {
+        if g.starts_with("**/.env") && is_env_template(rel) {
+            continue;
+        }
+        if glob_match(g, rel) {
+            return Err(ToolPathError::Denied(format!(
+                "path matches denied glob: {rel}"
+            )));
+        }
     }
     if write && p.components().any(|c| c.as_os_str() == ".git") {
         return Err(ToolPathError::Denied(
             "path is the git substrate (.git): harness-only".to_string(),
         ));
     }
-    symlink_safe(root, &p)?;
+    symlink_safe(root, &p, write)?;
     Ok(p)
 }
 
-pub(crate) fn symlink_safe(root: &Path, target: &Path) -> Result<(), ToolPathError> {
+fn git_component_hit(canon_root: &Path, canon: &Path) -> bool {
+    canon
+        .strip_prefix(canon_root)
+        .map(|rel| rel.components().any(|c| c.as_os_str() == ".git"))
+        .unwrap_or(false)
+}
+
+pub(crate) fn symlink_safe(root: &Path, target: &Path, write: bool) -> Result<(), ToolPathError> {
     let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     if normalize(target) == normalize(root) {
         return Ok(());
@@ -159,6 +198,14 @@ pub(crate) fn symlink_safe(root: &Path, target: &Path) -> Result<(), ToolPathErr
             "symlink escapes the tool root".to_string(),
         ));
     }
+    if write && git_component_hit(&canon_root, &canon) {
+        // The lexical `.git` check above is blind to symlinks: a link to
+        // the git substrate anywhere in the resolved parent is the same
+        // substrate, denied on writes all the same.
+        return Err(ToolPathError::Denied(
+            "path is the git substrate (.git): harness-only".to_string(),
+        ));
+    }
     if std::fs::symlink_metadata(target)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
@@ -174,6 +221,14 @@ pub(crate) fn symlink_safe(root: &Path, target: &Path) -> Result<(), ToolPathErr
         if !under(&canon_root, &real) {
             return Err(ToolPathError::Denied(
                 "symlink escapes the tool root".to_string(),
+            ));
+        }
+        if write && git_component_hit(&canon_root, &real) {
+            // A final-component link into the substrate (e.g. `evil` ->
+            // `.git/HEAD`): the parent check above sees the link's dir,
+            // not its target, so check the resolved target too.
+            return Err(ToolPathError::Denied(
+                "path is the git substrate (.git): harness-only".to_string(),
             ));
         }
     }

@@ -1,6 +1,7 @@
 //! Incentive scaffold: directives, lessons, and budget nudges.
 
 use crate::LoopState;
+use crate::RunConfig;
 use agent_budget::{BudgetHalt, Nudge};
 use agent_log::{Item, ItemKind};
 use std::collections::hash_map::DefaultHasher;
@@ -46,8 +47,10 @@ impl LoopState {
     }
 
     /// One queued directive, capped at [`DIRECTIVE_CAP`] (drop-oldest).
-    pub fn push_directive(&mut self, text: String) {
-        if self.incentives < IncentivesLevel::Full {
+    /// `cfg` is the single source of run configuration (the incentive
+    /// level gates the channel here).
+    pub fn push_directive(&mut self, text: String, cfg: &RunConfig) {
+        if cfg.incentives < IncentivesLevel::Full {
             return; // ablation arm: the directive channel is off entirely
         }
         if self.pending_directives.len() >= DIRECTIVE_CAP {
@@ -58,24 +61,24 @@ impl LoopState {
 
     /// Action-counter directives, checked after every recorded action so the
     /// text rides that action's own not-yet-synced row. One-shot per run.
-    pub fn queue_directives(&mut self) {
+    pub fn queue_directives(&mut self, cfg: &RunConfig) {
         let cap = self.budget.config().actions_per_trial;
         let actions = self.budget.counters().actions_this_trial;
         if cap == 0 {
             return;
         }
-        if !self.half_directive_sent && actions >= cap / 2 && self.edits == 0 {
-            self.half_directive_sent = true;
+        if !self.experiment.half_directive_sent && actions >= cap / 2 && self.edits == 0 {
+            self.experiment.half_directive_sent = true;
             self.push_directive(format!(
                 "0 edits so far after {actions} actions. Stop reading. Apply your first edit with the edit tool NOW."
-            ));
+            ), cfg);
         }
-        if !self.late_directive_sent && actions >= cap * 4 / 5 {
-            self.late_directive_sent = true;
+        if !self.experiment.late_directive_sent && actions >= cap * 4 / 5 {
+            self.experiment.late_directive_sent = true;
             self.push_directive(format!(
                 "only {} actions remain before the run is stopped. Finish and submit your patch now.",
                 cap - actions
-            ));
+            ), cfg);
         }
     }
 

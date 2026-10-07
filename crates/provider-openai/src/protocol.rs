@@ -10,9 +10,8 @@ pub(crate) fn wire_body(model: &str, req: &Request, k: &WireKnobs) -> serde_json
     // Thinking-mode conversation: any assistant message carried real
     // reasoning. The passback requirement ("reasoning_content ... must be
     // passed back"; 400 otherwise) is OFFICIALLY documented on DeepSeek's
-    // Thinking Mode page. Two behaviors below are EMPIRICAL workarounds,
-    // absent from the docs (research/decision-audit-provider-economics.md
-    // C11): empty string is accepted, and a request ending on tool messages
+    // Thinking Mode page. Two behaviors below are empirical workarounds:
+    // empty string is accepted, and a request ending on tool messages
     // 400s if ANY assistant message OMITS the key. Enforcement is
     // INTERMITTENT when no reasoning exists anywhere in history (measured:
     // ablation matrix, 5/12 runs died while an identical-shape 27-msg run

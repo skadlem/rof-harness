@@ -1,6 +1,7 @@
 //! Mid-run verification nudge: declare hold and verification calls.
 
-use crate::{append_to, ClaimOutcome, IncentivesLevel, LoopState, ToolCallState, ToolMsg};
+use crate::state::ToolMsg;
+use crate::{append_to, ClaimOutcome, IncentivesLevel, LoopState, RunConfig, ToolCallState};
 use agent_log::{ItemKind, TurnEndReason};
 use provider_core::{AssistantMessage, StopReason};
 use serde_json::Value;
@@ -46,7 +47,14 @@ impl LoopState {
     }
 
     /// Claim: validate the settled message before anything executes.
-    pub fn step_claim(&mut self, message: AssistantMessage, stop: StopReason) -> ClaimOutcome {
+    /// `cfg` is the single source of run configuration (incentive level
+    /// gates the nudge here).
+    pub fn step_claim(
+        &mut self,
+        message: AssistantMessage,
+        stop: StopReason,
+        cfg: &RunConfig,
+    ) -> ClaimOutcome {
         let stop_label = stop_label(stop);
         match stop {
             StopReason::MaxTokens => {
@@ -98,7 +106,7 @@ impl LoopState {
             _ => {
                 self.push_assistant(&message, &stop_label);
                 if message.tool_calls.is_empty() {
-                    if let Some(text) = self.verify_nudge_due() {
+                    if let Some(text) = self.verify_nudge_due(cfg) {
                         self.verify.hold = Some(text.clone());
                         // Durable hold record: the request tail never reaches the
                         // log (derived folds items only) while directives ride a
@@ -160,8 +168,8 @@ impl LoopState {
     /// cap already tripped (the same AND-gate [`Self::terminate`] halts on,
     /// so an exhausted budget gets no grace hold via `VerifyHold => continue`).
     /// Returns the directive text and burns one nudge when due.
-    pub(crate) fn verify_nudge_due(&mut self) -> Option<String> {
-        if self.incentives < IncentivesLevel::Full {
+    pub(crate) fn verify_nudge_due(&mut self, cfg: &RunConfig) -> Option<String> {
+        if cfg.incentives < IncentivesLevel::Full {
             return None;
         }
         if self.verify.nudges_used >= VERIFY_NUDGE_CAP {
@@ -209,7 +217,7 @@ impl LoopState {
     }
 
     /// Returns true when the call id was known and still open.
-    pub fn record_tool_result(&mut self, msg: ToolMsg) -> bool {
+    pub(crate) fn record_tool_result(&mut self, msg: ToolMsg) -> bool {
         let open = matches!(
             self.tool_calls.get(&msg.call_id),
             Some(c) if c.result.is_none()

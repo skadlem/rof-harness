@@ -28,10 +28,11 @@ impl Tool for TestTool {
     async fn execute(
         &self,
         inv: Invocation,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: CmdArgs = parse_args(&inv.args)?;
-        let (ok, out, truncated) = run_allowed(&self.policy, &args.cmd, EXEC_TIMEOUT).await?;
+        let (ok, out, truncated) =
+            run_allowed(&self.policy, &args.cmd, EXEC_TIMEOUT, &cancel).await?;
         // Cascade policy (what FAIL does to the loop) lives in loop/bets, not here.
         let content = if ok {
             format!("PASS: {}\n{out}", args.cmd)

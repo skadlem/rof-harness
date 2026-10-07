@@ -1,6 +1,7 @@
 //! Two-phase effect gate for abort/close propagation.
 
 use std::sync::Mutex;
+#[cfg(test)]
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +58,7 @@ impl EffectGate {
     }
     /// TEST-ONLY propagation helper: cancels `token` iff the gate is Aborting.
     /// Prod calls `begin_abort()` then cancels the turn token directly.
+    #[cfg(test)]
     pub fn signal_abort(&self, token: &CancellationToken) {
         if self.status() == GateStatus::Aborting {
             token.cancel();
