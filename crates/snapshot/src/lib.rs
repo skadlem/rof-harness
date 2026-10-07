@@ -48,14 +48,31 @@ pub struct TreeService {
     /// diffs from. Recorded once because `baseline()` moves HEAD per batch, so a
     /// diff against it forgets every earlier batch.
     start: OnceLock<String>,
+    /// Copy-local ignore list written to `.git/info/exclude` by
+    /// [`TreeService::ensure`].
+    excludes: Vec<String>,
 }
+
+/// Copy-local ignore defaults: bytecode and package-manager outputs that
+/// must never reach the baseline commit or the evidence. `build/` and
+/// `dist/` are deliberately NOT here: new source files there must reach the
+/// patch, so silencing them would drop deliverable content.
+const DEFAULT_EXCLUDES: &[&str] = &["__pycache__/", "*.pyc", "target/", "node_modules/"];
 
 impl TreeService {
     pub fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
             start: OnceLock::new(),
+            excludes: DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    /// Override the copy-local ignore list (replaces the defaults): e.g. a
+    /// task whose build output must stay out of evidence re-adds `build/`.
+    pub fn with_excludes(mut self, excludes: &[&str]) -> Self {
+        self.excludes = excludes.iter().map(|s| s.to_string()).collect();
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -85,10 +102,13 @@ impl TreeService {
         Ok(())
     }
 
-    /// Bytecode + build dirs in the copy-local `.git/info/exclude`:
-    /// measured, baseline commits (`commit_all` = `git add -A`) were absorbing
-    /// bytecode; `cargo`/`npm` outputs would do the same. Local to the copy —
-    /// never tracked, never a global git setting.
+    /// Copy-local ignores in `.git/info/exclude`: baseline commits
+    /// (`commit_all` = `git add -A`) would otherwise absorb bytecode and
+    /// package-manager outputs. Local to the copy — never tracked, never a
+    /// global git setting.
+    ///
+    /// // ponytail: append-only line merge instead of `.gitignore` handling,
+    /// so no ignore-parser dependency is needed.
     fn exclude_bytecode(&self) -> Result<()> {
         if !self.root.join(".git").is_dir() {
             return Ok(()); // gitfile (worktree/submodule): not this copy's repo dir
@@ -96,24 +116,26 @@ impl TreeService {
         let info = self.root.join(".git/info");
         std::fs::create_dir_all(&info)?;
         let path = info.join("exclude");
-        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-        for pat in [
-            "__pycache__/",
-            "*.pyc",
-            "target/",
-            "node_modules/",
-            "dist/",
-            "build/",
-        ] {
-            if !text.lines().any(|l| l == pat) {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                text.push_str(pat);
-                text.push('\n');
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        // Stale harness lines (`build/`, `dist/` were defaults before they
+        // started hiding new deliverable files) are dropped unless the caller
+        // re-added them via `with_excludes`; every other existing line is
+        // kept, then missing configured patterns are appended.
+        let mut lines: Vec<String> = text
+            .lines()
+            .filter(|l| (*l != "build/" && *l != "dist/") || self.excludes.iter().any(|e| e == *l))
+            .map(str::to_string)
+            .collect();
+        for pat in &self.excludes {
+            if !lines.iter().any(|l| l == pat) {
+                lines.push(pat.clone());
             }
         }
-        std::fs::write(&path, text)?;
+        let mut out = lines.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        std::fs::write(&path, out)?;
         Ok(())
     }
 
@@ -816,7 +838,10 @@ mod tests {
     }
 
     #[test]
-    fn ensure_excludes_build_dirs_from_commits() {
+    fn ensure_excludes_bytecode_and_package_outputs_from_commits() {
+        // `target/` and `node_modules/` stay silenced; `build/` and `dist/`
+        // are NOT defaults anymore — new files there must reach the patch,
+        // so excluding them silently dropped deliverable content.
         let dir = scratch("build-dirs");
         let tree = TreeService::new(&dir);
         std::fs::write(dir.join("a.rs"), "one\n").unwrap();
@@ -833,23 +858,76 @@ mod tests {
         let ls = tree.git(["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
         let committed = String::from_utf8_lossy(&ls.stdout).into_owned();
         assert!(committed.contains("a.rs"), "{committed}");
-        for junk in ["out.bin", "nested.bin", "target", "node_modules", "dist"] {
+        for shipped in ["build/out.bin", "dist/out.bin"] {
+            assert!(
+                committed.contains(shipped),
+                "new deliverable file must ship: {committed}"
+            );
+        }
+        for junk in ["target/out.bin", "node_modules/out.bin", "nested.bin"] {
             assert!(
                 !committed.contains(junk),
                 "build output reached the commit: {committed}"
             );
         }
-        assert!(
-            tree.diff().unwrap().is_empty(),
-            "build output stays out of evidence"
-        );
         let exclude = std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap();
-        for pat in ["target/", "node_modules/", "dist/", "build/"] {
+        for pat in ["target/", "node_modules/"] {
             assert!(
                 exclude.lines().any(|l| l == pat),
                 "missing exclude {pat}: {exclude}"
             );
         }
+        for pat in ["build/", "dist/"] {
+            assert!(
+                !exclude.lines().any(|l| l == pat),
+                "stale exclude {pat} hides deliverable files: {exclude}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_file_under_build_reaches_baseline_and_patch() {
+        let dir = scratch("build-patch");
+        let tree = TreeService::new(&dir);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        tree.ensure().unwrap();
+        tree.baseline().unwrap();
+
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join("build/new.txt"), "build-marker-7a1e\n").unwrap();
+        // Untracked under build/: visible in evidence, not ignored away
+        // (porcelain collapses the new dir to `build/`; the patch expands it
+        // per file via `ls-files --others`).
+        let d = tree.diff().unwrap();
+        assert_eq!(d.changed, vec!["build/"]);
+        assert_eq!(d.untracked, vec!["build/"]);
+        let p = tree.patch(&d).unwrap();
+        assert!(p.text.contains("+build-marker-7a1e"), "{}", p.text);
+        // ... and the next baseline absorbs it instead of dropping it.
+        tree.baseline().unwrap();
+        let ls = tree.git(["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        let committed = String::from_utf8_lossy(&ls.stdout).into_owned();
+        assert!(committed.contains("build/new.txt"), "{committed}");
+    }
+
+    #[test]
+    fn with_excludes_re_adds_build_silence() {
+        let dir = scratch("with-excludes");
+        let tree = TreeService::new(&dir).with_excludes(&["target/", "build/"]);
+        std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join("build/out.bin"), "junk\n").unwrap();
+        tree.ensure().unwrap();
+        tree.baseline().unwrap();
+
+        let ls = tree.git(["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        let committed = String::from_utf8_lossy(&ls.stdout).into_owned();
+        assert!(committed.contains("a.rs"), "{committed}");
+        assert!(
+            !committed.contains("out.bin"),
+            "caller-silenced output reached the commit: {committed}"
+        );
+        assert!(tree.diff().unwrap().is_empty());
     }
 
     /// One `git diff --patch` fragment per hunk: each file's header lines
