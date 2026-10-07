@@ -1,6 +1,8 @@
 //! Batch proof: patch splitting, incremental hunks, and bets wiring.
 
-use crate::{LoopState, PhaseVerdict, ToolMsg};
+#[cfg(test)]
+use crate::state::ToolMsg;
+use crate::{LoopState, PhaseVerdict};
 use agent_budget::BudgetHalt;
 use std::path::Path;
 use std::time::Duration;
@@ -197,7 +199,9 @@ pub(crate) fn settle_tool_tail(state: &mut LoopState, cfg: &crate::RunConfig) {
 /// observe/`edits`/`record`/tail order `run` uses per executed call. Looks
 /// the `name`/`args` sig up from the claim row, so the tripwire sees the
 /// identical bytes. Returns false when the call id was unknown or already
-/// answered (no effects applied).
+/// answered (no effects applied). Test-only: the only caller is the
+/// `drive_tick` harness.
+#[cfg(test)]
 pub(crate) fn settle_tool_msg(state: &mut LoopState, msg: ToolMsg, cfg: &crate::RunConfig) -> bool {
     let open = matches!(
         state.tool_calls.get(&msg.call_id),

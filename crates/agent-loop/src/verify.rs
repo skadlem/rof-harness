@@ -1,8 +1,7 @@
 //! Mid-run verification nudge: declare hold and verification calls.
 
-use crate::{
-    append_to, ClaimOutcome, IncentivesLevel, LoopState, RunConfig, ToolCallState, ToolMsg,
-};
+use crate::state::ToolMsg;
+use crate::{append_to, ClaimOutcome, IncentivesLevel, LoopState, RunConfig, ToolCallState};
 use agent_log::{ItemKind, TurnEndReason};
 use provider_core::{AssistantMessage, StopReason};
 use serde_json::Value;
@@ -218,7 +217,7 @@ impl LoopState {
     }
 
     /// Returns true when the call id was known and still open.
-    pub fn record_tool_result(&mut self, msg: ToolMsg) -> bool {
+    pub(crate) fn record_tool_result(&mut self, msg: ToolMsg) -> bool {
         let open = matches!(
             self.tool_calls.get(&msg.call_id),
             Some(c) if c.result.is_none()

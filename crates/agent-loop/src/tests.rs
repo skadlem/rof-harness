@@ -1,6 +1,8 @@
 use crate::proof::{note_tool_execution, outcome_to_result, refund_batch, snapshot_batch};
 use crate::request::{build_request, CHECKPOINT_PREFIX};
+use crate::run::drive_tick;
 use crate::state::{turn_end_reason_to_event, STEP_RETRY_BUDGET};
+use crate::state::{InFlight, ProviderMsg, ToolMsg};
 use crate::verify::{is_verification_call, stop_label, VERIFY_NUDGE};
 use crate::*;
 use agent_budget::{config_for, BudgetGuard, BudgetHalt, Capability};
@@ -233,6 +235,51 @@ fn steering_admitted_only_at_pre_boundary() {
     s.admit_steering();
     assert_eq!((s.phase, s.turn), (Phase::Running, 1));
     assert!(!s.wake_requested);
+}
+
+/// RAII turn guard: appends TurnEnd on drop, always, even on unwind.
+/// TEST-ONLY substrate: prod turns use `open_turn`/`append_to(TurnEnd)`;
+/// only the test below constructs this. Kept for the unwind-safety
+/// property, not wired into `run()`.
+struct TurnGuard<'a> {
+    items: Option<&'a mut Vec<Item>>,
+    turn_id: String,
+    reason: TurnEndReason,
+}
+
+impl<'a> TurnGuard<'a> {
+    fn open(items: &'a mut Vec<Item>, turn: u64) -> Self {
+        let turn_id = format!("turn-{turn}");
+        append_to(
+            items,
+            ItemKind::TurnStart {
+                turn_id: turn_id.clone(),
+                prev_turn_id: None,
+            },
+        );
+        Self {
+            items: Some(items),
+            turn_id,
+            reason: TurnEndReason::Completed,
+        }
+    }
+    fn end(mut self, reason: TurnEndReason) {
+        self.reason = reason;
+    }
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(items) = self.items.take() {
+            append_to(
+                items,
+                ItemKind::TurnEnd {
+                    turn_id: self.turn_id.clone(),
+                    reason: self.reason.clone(),
+                },
+            );
+        }
+    }
 }
 
 #[test]

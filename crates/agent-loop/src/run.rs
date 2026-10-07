@@ -1,25 +1,29 @@
 //! Multi-tick drivers: headless `run` and channel `drive_tick`.
 
 use crate::proof::BatchSnapshot;
+#[cfg(test)]
+use crate::settle_tool_msg;
 use crate::state::THINKING_KEEP;
+use crate::state::{ProviderMsg, ToolMsg};
 use crate::{
     append_to, batch_hunks, build_request, checkpoint, incremental_hunks, note_tool_execution,
-    outcome_log_reason, outcome_to_result, pin_snapshot, refund_batch, settle_tool_msg,
-    settle_tool_tail, snapshot_batch, turn_end_reason_to_event, turn_id, BetsHook, ClaimOutcome,
-    FailureKind, IncentivesLevel, Input, LoopState, Outcome, Phase, PhaseVerdict, ProviderMsg,
-    ToolMsg, ROLLBACK_NOTICE,
+    outcome_log_reason, outcome_to_result, pin_snapshot, refund_batch, settle_tool_tail,
+    snapshot_batch, turn_end_reason_to_event, turn_id, BetsHook, ClaimOutcome, FailureKind,
+    IncentivesLevel, Input, LoopState, Outcome, Phase, PhaseVerdict, ROLLBACK_NOTICE,
 };
 use agent_budget::BudgetHalt;
 use agent_event::{
-    AgentError, AgentEvent, ControlAck, ControlKind, ControlStatus, DeltaKind, Emitter, Message,
-    MessageDelta, Role, RunOutcome as EventRunOutcome, TurnEndReason as EventTurnEndReason,
-    UsageReport,
+    AgentError, AgentEvent, DeltaKind, Emitter, Message, MessageDelta, Role,
+    RunOutcome as EventRunOutcome, TurnEndReason as EventTurnEndReason, UsageReport,
 };
+#[cfg(test)]
+use agent_event::{ControlAck, ControlKind, ControlStatus};
 use agent_log::{Item, ItemKind, LogWriter, LOG_VERSION};
 use provider_core::{AssistantMessage, LlmClient, LlmError, Request, Response, Usage};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+#[cfg(test)]
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tool_core::{Invocation, ToolCall, ToolResult};
@@ -90,17 +94,11 @@ pub(crate) fn emit_message_frames(
 /// `observe_action`, and the `edits`/`actions` increments behave identically
 /// because both drivers call the same fns.
 ///
-/// `LoopState` field note: every field is live in `run` — single-flight
-/// `in_flight` (`start_provider_call`/`finish_provider_msg`) and `steering`
-/// (`admit_steering`) ARE used and kept; there is no dead machinery to
-/// annotate, and none may be removed under the frozen contract.
-///
 /// Ordering rule: the durable log append always
 /// precedes its terminal frame in code order — `step_claim` /
 /// `record_tool_result` / the TurnEnd append below run before the matching
 /// `emit`, so replay from the log agrees with replay from events.
-/// Starting the next provider call (should_call_model -> start_provider_call)
-/// stays the caller's job; the multi-tick run() is the shipped driver.
+#[cfg(test)]
 pub async fn drive_tick(
     state: &mut LoopState,
     inbox: &mut mpsc::Receiver<Input>,

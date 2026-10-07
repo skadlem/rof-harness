@@ -95,16 +95,21 @@ impl From<&str> for QueuedInput {
     }
 }
 
-/// Fake provider traffic: what a single-flight provider task ships back.
+/// Provider traffic: what a single-flight provider task ships back.
+/// `pub(crate)`: the channel harness (`drive_tick`) is test-only; `run`
+/// builds these rows directly from `complete`.
 #[derive(Debug, Clone)]
-pub enum ProviderMsg {
-    Partial {
-        turn: u64,
-        text: String,
-    },
+pub(crate) enum ProviderMsg {
+    // Test-only reads: `run` builds these rows from `complete` and
+    // `finish_provider_msg` consumes them without reading every field back;
+    // the `drive_tick` harness and unit tests read the rest.
+    #[allow(dead_code)]
+    Partial { turn: u64, text: String },
     Settled {
         turn: u64,
+        #[allow(dead_code)]
         message: AssistantMessage,
+        #[allow(dead_code)]
         stop: StopReason,
         usage: Option<Usage>,
     },
@@ -128,9 +133,9 @@ impl ProviderMsg {
     }
 }
 
-/// Fake tool traffic: one finished call.
+/// Tool traffic: one finished call. `pub(crate)`: see [`ProviderMsg`].
 #[derive(Debug, Clone)]
-pub struct ToolMsg {
+pub(crate) struct ToolMsg {
     pub call_id: String,
     pub result: ToolResult,
 }
@@ -150,8 +155,12 @@ pub enum ClaimOutcome {
 }
 
 #[derive(Debug, Clone)]
-pub struct InFlight {
+pub(crate) struct InFlight {
+    // Test-only reads (stale-guard assertions): prod tracks single-flight
+    // occupancy through the `Option`, never the contents.
+    #[allow(dead_code)]
     pub turn: u64,
+    #[allow(dead_code)]
     pub token: CancellationToken,
 }
 
@@ -203,7 +212,7 @@ pub struct LoopState {
     pub followups: VecDeque<String>,
     pub wake_requested: bool,
     pub call_model: bool,
-    pub in_flight: Option<InFlight>,
+    pub(crate) in_flight: Option<InFlight>,
     pub tool_calls: HashMap<String, ToolCallState>,
     pub gate: EffectGate,
     pub stop_hard: bool,
@@ -442,7 +451,7 @@ impl LoopState {
     /// Spend/tokens land here from provider Usage: steps at the step head,
     /// tokens + spend on settle and on a metered failure. Tokens/spend are
     /// never refunded.
-    pub fn finish_provider_msg(&mut self, msg: ProviderMsg) -> bool {
+    pub(crate) fn finish_provider_msg(&mut self, msg: ProviderMsg) -> bool {
         if msg.turn() != self.turn {
             return false; // STALE GUARD: late landing from an interrupted turn.
         }
@@ -672,49 +681,4 @@ pub(crate) fn append_to(items: &mut Vec<Item>, kind: ItemKind) {
         recorded_at: SystemTime::now(),
         kind,
     });
-}
-
-/// RAII turn guard: appends TurnEnd on drop, always, even on unwind.
-/// TEST-ONLY substrate today: prod turns use `open_turn`/`append_to(TurnEnd)`
-/// (`state.rs`, `run.rs`); only `src/tests.rs` constructs this. Kept for the
-/// unwind-safety property, not wired into `run()`.
-pub struct TurnGuard<'a> {
-    items: Option<&'a mut Vec<Item>>,
-    turn_id: String,
-    reason: TurnEndReason,
-}
-
-impl<'a> TurnGuard<'a> {
-    pub fn open(items: &'a mut Vec<Item>, turn: u64) -> Self {
-        let turn_id = turn_id(turn);
-        append_to(
-            items,
-            ItemKind::TurnStart {
-                turn_id: turn_id.clone(),
-                prev_turn_id: None,
-            },
-        );
-        Self {
-            items: Some(items),
-            turn_id,
-            reason: TurnEndReason::Completed,
-        }
-    }
-    pub fn end(mut self, reason: TurnEndReason) {
-        self.reason = reason;
-    }
-}
-
-impl Drop for TurnGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(items) = self.items.take() {
-            append_to(
-                items,
-                ItemKind::TurnEnd {
-                    turn_id: self.turn_id.clone(),
-                    reason: self.reason.clone(),
-                },
-            );
-        }
-    }
 }
