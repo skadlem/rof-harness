@@ -679,6 +679,9 @@ pub(crate) fn append_to(items: &mut Vec<Item>, kind: ItemKind) {
 }
 
 /// RAII turn guard: appends TurnEnd on drop, always, even on unwind.
+/// TEST-ONLY substrate today: prod turns use `open_turn`/`append_to(TurnEnd)`
+/// (`state.rs`, `run.rs`); only `src/tests.rs` constructs this. Kept for the
+/// unwind-safety property, not wired into `run()`.
 pub struct TurnGuard<'a> {
     items: Option<&'a mut Vec<Item>>,
     turn_id: String,

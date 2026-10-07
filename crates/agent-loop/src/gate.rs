@@ -16,7 +16,7 @@ pub enum GateError {
     Closed(String),
 }
 
-/// Two-phase effect gate: begin_abort decides, signal_abort propagates.
+/// Two-phase effect gate: begin_abort decides, signal_abort propagates (signal_abort is test-only today; prod cancels the token directly).
 pub struct EffectGate {
     inner: Mutex<GateInner>,
 }
@@ -55,6 +55,8 @@ impl EffectGate {
             gate.status = GateStatus::Aborting;
         }
     }
+    /// TEST-ONLY propagation helper: cancels `token` iff the gate is Aborting.
+    /// Prod calls `begin_abort()` then cancels the turn token directly.
     pub fn signal_abort(&self, token: &CancellationToken) {
         if self.status() == GateStatus::Aborting {
             token.cancel();
