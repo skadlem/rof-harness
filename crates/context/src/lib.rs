@@ -65,7 +65,12 @@ pub struct ItemKey {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Fidelity {
     Exact,
-    Windowed { anchor: String, cap: usize },
+    Windowed {
+        anchor: String,
+        cap: usize,
+    },
+    /// Reserved, never constructed in prod: the `Exact|Drop` arm (`shape()`)
+    /// treats it as Exact (fits-or-must_include). Only `tests` builds it.
     Drop,
 }
 
