@@ -380,28 +380,22 @@ impl TreeService {
         Ok(!self.git_ok(["rev-parse", "--quiet", "--verify", "HEAD"]))
     }
 
-    /// Tolerates the one benign failure: a tree matching HEAD has nothing
-    /// to commit, and HEAD already is the baseline then. The match is on the
-    /// English text because [`TreeService::git_status`] pins `LC_ALL=C` /
-    /// `LANG=C` on every git child, so the output is locale-stable.
+    /// Benign no-op baselines commit nothing: a tree matching HEAD, or dirt
+    /// git refuses to stage (modified content inside an embedded repo stages
+    /// an unchanged gitlink, so `add -A` stages nothing). The staged-empty
+    /// check owns that case, so a failed commit is always an error — no
+    /// stdout text matching.
     fn commit_all(&self, message: &str) -> Result<()> {
         self.git(["add", "-A"])?;
-        let out = self.git_status(["commit", "--quiet", "-m", message])?;
-        if out.status.success() {
+        if self
+            .git_status(["diff", "--cached", "--quiet"])
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
             return Ok(());
         }
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        // Benign no-op baselines: a clean tree, or dirt git refuses to stage
-        // (e.g. modified content inside an embedded repo — the gitlink sha
-        // never moves, so `add -A` stages nothing).
-        if is_nothing_to_commit(&combined) {
-            return Ok(());
-        }
-        Err(other(format!("git commit: {}", combined.trim_end())))
+        self.git(["commit", "--quiet", "-m", message])?;
+        Ok(())
     }
 
     fn git<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Result<Output> {
@@ -488,15 +482,6 @@ fn null_config() -> &'static str {
 
 fn other(msg: String) -> Error {
     Error::other(msg)
-}
-
-/// English "nothing to commit" forms git prints under `LC_ALL=C` (pinned in
-/// [`TreeService::git_status`]): clean tree plus the two staged-nothing forms
-/// (embedded-repo dirt stages an unchanged gitlink, so `add -A` is a no-op).
-fn is_nothing_to_commit(combined: &str) -> bool {
-    combined.contains("nothing to commit")
-        || combined.contains("nothing added to commit")
-        || combined.contains("no changes added to commit")
 }
 
 /// Whole lines only: a line that does not fit is dropped, so a multi-byte
@@ -753,19 +738,6 @@ mod tests {
     }
 
     #[test]
-    fn nothing_to_commit_matcher_covers_english_forms() {
-        for s in [
-            "nothing to commit, working tree clean",
-            "nothing added to commit but untracked files present",
-            "no changes added to commit (use \"git add\" and/or \"git commit -a\")",
-        ] {
-            assert!(is_nothing_to_commit(s), "{s}");
-        }
-        assert!(!is_nothing_to_commit("fatal: not a git repository"));
-        assert!(!is_nothing_to_commit(""));
-    }
-
-    #[test]
     fn baseline_stable_under_hostile_locale_env() {
         let _guard = env_guard();
         let dir = scratch("locale");
@@ -773,7 +745,8 @@ mod tests {
         std::fs::write(dir.join("a.rs"), "one\n").unwrap();
         tree.ensure().unwrap();
         // Hostile parent locale: git children still run under C (see
-        // `git_status`), so the benign no-op baseline still parses.
+        // `hermetic_git`), and the benign no-op baseline needs no output
+        // parsing (staged-empty check), so locale cannot skew it.
         let old_lc = std::env::var("LC_ALL").ok();
         let old_lang = std::env::var("LANG").ok();
         std::env::set_var("LC_ALL", "xx_XX.UTF-8");
