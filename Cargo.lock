@@ -840,6 +840,7 @@ dependencies = [
  "agent-loop",
  "async-trait",
  "bets",
+ "eval",
  "provider-core",
  "provider-openai",
  "serde_json",

@@ -16,6 +16,7 @@ agent-loop = { path = "../agent-loop" }
 agent-event = { path = "../agent-event" }
 agent-budget = { path = "../agent-budget" }
 bets = { path = "../bets" }
+eval = { path = "../eval" }
 tool-core = { path = "../tool-core" }
 tools-std = { path = "../tools-std" }
 provider-core = { path = "../provider-core" }

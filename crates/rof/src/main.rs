@@ -53,6 +53,72 @@ struct Args {
     compaction: Option<f64>,
 }
 
+const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only]";
+
+#[derive(Debug, PartialEq)]
+struct EvalArgs {
+    tasks_dir: PathBuf,
+    ids: Vec<String>,
+    out_dir: PathBuf,
+    report: Option<PathBuf>,
+    winnability_only: bool,
+}
+
+fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
+    let a: Vec<&str> = argv.iter().map(String::as_str).collect();
+    if a.len() < 2 || a[1] != "eval" {
+        return Err(EVAL_USAGE.into());
+    }
+    let (mut tasks_dir, mut ids, mut out_dir, mut report) = (None, Vec::new(), None, None);
+    let mut winnability_only = false;
+    let mut i = 2;
+    while i < a.len() {
+        let flag = a[i];
+        let (k, inline) = match flag.split_once('=') {
+            Some((k, v)) => (k, Some(v.to_string())),
+            None => (flag, None),
+        };
+        let take = |i: &mut usize, inline: Option<String>| -> Result<String, String> {
+            if let Some(v) = inline {
+                return Ok(v);
+            }
+            *i += 1;
+            a.get(*i)
+                .map(|s| (*s).to_string())
+                .ok_or_else(|| format!("{k} needs a value"))
+        };
+        match k {
+            "--tasks-dir" => tasks_dir = Some(take(&mut i, inline)?),
+            "--ids" => {
+                ids = take(&mut i, inline)?
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }
+            "--out-dir" => out_dir = Some(take(&mut i, inline)?),
+            "--report" => report = Some(take(&mut i, inline)?),
+            "--winnability-only" => {
+                winnability_only = true;
+            }
+            _ => return Err(EVAL_USAGE.into()),
+        }
+        i += 1;
+    }
+    Ok(EvalArgs {
+        tasks_dir: PathBuf::from(tasks_dir.ok_or("missing --tasks-dir")?),
+        ids,
+        out_dir: PathBuf::from(out_dir.unwrap_or_else(|| "/tmp/rof-eval-out".into())),
+        report: report.map(PathBuf::from),
+        winnability_only,
+    })
+}
+
+// Task 2 fills in the thin eval runner; this stub keeps the Task 1 dispatch compiling.
+async fn run_eval(_args: &EvalArgs) -> i32 {
+    2
+}
+
 fn parse_args(argv: &[String]) -> Result<Args, String> {
     let a: Vec<&str> = argv.iter().map(String::as_str).collect();
     if a.len() < 2 || a[1] != "run" {
@@ -588,6 +654,16 @@ fn finalize_dump(path: &str, events: &[AgentEvent]) -> Result<(), String> {
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("eval") {
+        let eargs = match parse_eval(&argv) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
+        std::process::exit(run_eval(&eargs).await);
+    }
     let args = match parse_args(&argv) {
         Ok(a) => a,
         Err(e) => {
@@ -838,6 +914,27 @@ mod tests {
         ] {
             assert!(parse_args(&argv(&words)).is_err(), "{words:?}");
         }
+    }
+
+    #[test]
+    fn cli_eval_parses_tasks_dir_and_report() {
+        let a = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/tasks",
+            "--ids",
+            "aaa,bbb",
+            "--out-dir",
+            "/tmp/eval-out",
+            "--report",
+            "/tmp/eval-out/report.json",
+        ]))
+        .unwrap();
+        assert_eq!(a.tasks_dir, PathBuf::from("/tmp/tasks"));
+        assert_eq!(a.ids, vec!["aaa".to_string(), "bbb".to_string()]);
+        assert_eq!(a.report, Some(PathBuf::from("/tmp/eval-out/report.json")));
+        assert!(!a.winnability_only);
     }
 
     #[test]
