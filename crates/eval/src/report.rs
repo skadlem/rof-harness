@@ -1,6 +1,12 @@
-use crate::oracle::Verdict;
+use crate::oracle::{ApplyMode, Verdict};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// Strict-apply grades are not comparable with earlier fuzz-lenient
+/// benchmark numbers: the same patch can grade differently, so any
+/// cross-run comparison must check `InstanceReport.apply_mode` first.
+pub const APPLY_COMPARABILITY_NOTE: &str =
+    "Strict-apply grades are not comparable with earlier fuzz-lenient benchmark numbers.";
 
 /// Per-instance report: capability numbers plus the scaffold-study metrics
 /// that are the real objective (tokens-per-solved, no-action turns).
@@ -19,6 +25,13 @@ pub struct InstanceReport {
     pub steps: u32,
     pub halt_reason: Option<String>,
     pub patch_digest: String,
+    /// Which patch applier graded this instance. Strict grades are not
+    /// comparable with earlier fuzz-lenient benchmark numbers.
+    #[serde(default)]
+    pub apply_mode: ApplyMode,
+    /// Applier stderr for the run (`None` = applier silent or no patch step).
+    #[serde(default)]
+    pub apply_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +75,30 @@ pub fn instance_report(
     wall_secs: u64,
     patch: &str,
 ) -> std::io::Result<InstanceReport> {
+    instance_report_with_mode(
+        id,
+        verdict,
+        events_jsonl,
+        wall_secs,
+        patch,
+        ApplyMode::Strict,
+        None,
+    )
+}
+
+/// [`instance_report`] plus the patch-apply provenance: which [`ApplyMode`]
+/// graded the instance and the applier's stderr. Strict grades are not
+/// comparable with earlier fuzz-lenient benchmark numbers
+/// ([`APPLY_COMPARABILITY_NOTE`]).
+pub fn instance_report_with_mode(
+    id: &str,
+    verdict: Verdict,
+    events_jsonl: &Path,
+    wall_secs: u64,
+    patch: &str,
+    apply_mode: ApplyMode,
+    apply_detail: Option<&str>,
+) -> std::io::Result<InstanceReport> {
     use agent_event::{AgentEvent, RunOutcome, UsageReport};
     let text = std::fs::read_to_string(events_jsonl)?;
     let mut totals: Option<UsageReport> = None;
@@ -93,6 +130,8 @@ pub fn instance_report(
         steps,
         halt_reason: halt,
         patch_digest: patch_digest(patch),
+        apply_mode,
+        apply_detail: apply_detail.map(str::to_owned),
     })
 }
 
