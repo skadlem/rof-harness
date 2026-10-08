@@ -46,6 +46,14 @@ says so explicitly.
   the harness checkout, and dirty-without-opt-in; disposability of every
   other directory is documented operator responsibility (threat model),
   not an enforced property.
+- **Exec children run niced, never capped.** Every agent-spawned host
+  child takes nice 19 at spawn (descendants inherit): sweeps stop
+  making the desktop unusable during builds without changing task wall
+  times on an idle host (measured trigger: sweep-cell builds drove the
+  14G/12-core host to global OOM and desktop stalls on 2026-10-08; the
+  grading containers were already spec-capped — a docker scope peaked at
+  125M). Affinity/cgroup caps would change measurements and are the
+  operator's isolation job; memory stays uncapped by design.
 - **Exit codes.** 0 done; 2 usage/parse/workdir refusal; 3 run failure
   (halted, cancelled, provider error — Provider keeps the historical 3);
   4 missing credentials; 5 log failure; 6 snapshot failure; 7 input

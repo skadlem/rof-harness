@@ -42,7 +42,7 @@ pub use write::{write_tool, WriteTool};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{EDIT_FILE_CAP, EDIT_REPLACE_CAP, OUT_CAP, VIEW_CAP};
+    use crate::common::{EDIT_FILE_CAP, EDIT_REPLACE_CAP, EXEC_TIMEOUT, OUT_CAP, VIEW_CAP};
     use crate::runner::{run_allowed, split_cmd, stage_and_check};
     use crate::view::{view_page, view_read_cap};
     use serde_json::{json, Value};
@@ -776,6 +776,34 @@ mod tests {
             !root.join("late-marker").exists(),
             "child survived the timeout"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_children_run_niced() {
+        // Batch courtesy: agent-spawned host children take nice 19 at
+        // spawn (and descendants inherit), measured via the child's own
+        // view of its niceness.
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["python3".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+        };
+        let (ok, out, _) = run_allowed(
+            &pol,
+            "python3 -c \"import os; print(os.nice(0))\"",
+            EXEC_TIMEOUT,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(ok, "{out}");
+        assert!(out.contains("19"), "child runs niced: {out}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

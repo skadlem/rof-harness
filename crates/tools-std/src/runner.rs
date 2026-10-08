@@ -98,9 +98,21 @@ fn spawn_allowed(policy: &Policy, argv: &[String]) -> Result<tokio::process::Chi
     {
         // Own process group: timeout/cancel/drop kills the whole tree
         // (grandchildren included), not just the direct child.
-        // ponytail: std CommandExt for one flag instead of a daemon crate.
+        // Batch courtesy: agent-spawned host children run at the lowest
+        // scheduling priority — they still get the full idle CPU (no
+        // wall-time change on an idle host) but yield to interactive work
+        // instead of making the desktop unusable during agent builds;
+        // descendants inherit the niceness. (ponytail: one syscall;
+        // affinity/cgroup caps would change task wall times and are the
+        // operator's isolation job per the threat model.)
         use std::os::unix::process::CommandExt as _;
         cmd.process_group(0);
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+                Ok(())
+            });
+        }
     }
     // Non-unix fallback: no groups, so `kill_on_drop` only reaps the direct
     // child and a grandchild holding the pipe can delay reaping. Unix is the

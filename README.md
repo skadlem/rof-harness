@@ -101,9 +101,12 @@ Refused with exit 2:
   symlink-safe, secrets-denied file access.
 - `exec` and `test` run allowlisted host commands, but allowlisting is not
   isolation: permitting `cargo test`, `sh`, or any test runner hands the
-  agent arbitrary code execution on the host.
-- OS-level isolation (container/namespace, no network, read-only mounts) is
-  the operator's job; the tools build no sandbox.
+  agent arbitrary code execution on the host. Agent-spawned host children
+  run at the lowest scheduling priority (nice 19): they yield to
+  interactive work but still get the full idle CPU, so unattended sweeps
+  do not make the desktop unusable during builds. Memory stays uncapped.
+- OS-level isolation (container/namespace, no network, read-only mounts,
+  memory caps) is the operator's job; the tools build no sandbox.
 
 ## Exit codes
 
