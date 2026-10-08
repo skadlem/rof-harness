@@ -58,6 +58,14 @@ says so explicitly.
   chosen-to-be-validated. The context-pinned 200k token floor is
   chosen-to-validate (pinned-prefix floor ~4-5k tok/req x 20-30 requests
   plus reasoning completions); explicit flags always win.
+- **Explicit budget flags own the whole budget.** Any of
+  `--budget-steps` / `--budget-actions` / `--budget-tokens` lifts the
+  UnattendedBatch 900s wall to the LongTask 3600s allowance: the wall is
+  the measured guard for 20-step default batches, never part of a flagged
+  recipe (measured 2026-10-08: v0 sweep cells ran 207–816s and all bound
+  on the token cap; one fresh 60-step/300k cell wall-halted at 21 steps,
+  24% of its token budget — 300s exec timeouts burn the 900s wall in
+  three builds). Flag-less runs keep the preset wall.
 - **Dump semantics.** `--dump-events PATH` replaces any previous dump at
   PATH (one run, one dump), truncating at start and appending per event.
 

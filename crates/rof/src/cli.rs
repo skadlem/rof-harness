@@ -3,7 +3,7 @@
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use agent_budget::{config_for, with_steps, BudgetGuard, Capability};
 use agent_loop::RunConfig;
@@ -502,6 +502,18 @@ fn read_env_usize(name: &str) -> Result<Option<usize>, String> {
 /// (cfg-over-state) is documented on `agent_loop::run`.
 pub(crate) fn budget_for(args: &Args) -> BudgetGuard {
     let mut b = config_for(Capability::UnattendedBatch);
+    if args.budget_steps.is_some() || args.budget_actions.is_some() || args.budget_tokens.is_some()
+    {
+        // Explicit recipe flags own the whole budget. The preset wall
+        // (900s) is the measured guard for the 20-step default batch, not
+        // part of a flagged recipe: v0 sweep cells (207-816s) all died on
+        // the token cap, so tokens/steps/actions are the operative budget
+        // — and one 60-step cell wall-halted at 24% of its 300k tokens
+        // (300s exec timeouts burn the 900s wall in three builds). The
+        // LongTask 3600s allowance stays as the runaway guard: it cannot
+        // bind at the measured slowest pace (55s/step x 60 = 3300s).
+        b.max_wallclock = Duration::from_secs(3600);
+    }
     if let Some(n) = args.budget_steps {
         b = with_steps(b, NonZeroU32::new(n).expect("parse rejects 0"));
     }
@@ -558,7 +570,7 @@ pub(crate) fn resolve_endpoint(flag: Option<&str>, env: Option<&str>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::argv;
+    use crate::fixtures::{args_for, argv};
     use std::path::Path;
 
     #[test]
@@ -973,5 +985,36 @@ mod tests {
             Vec::<String>::new(),
             "absent flag forwards nothing extra"
         );
+    }
+
+    #[test]
+    fn budget_flags_lift_the_preset_wall() {
+        // No flags: the measured UnattendedBatch wall stays (20-step
+        // default-batch guard).
+        assert_eq!(
+            budget_for(&args_for(Path::new("/tmp/w"), None))
+                .config()
+                .max_wallclock,
+            Duration::from_secs(900)
+        );
+        // Any explicit recipe flag owns the whole budget: the wall lifts
+        // to the LongTask allowance so it can never truncate a flagged
+        // recipe before its own caps bind (measured: a 60-step/300k cell
+        // wall-halted at 24% of its token budget under the 900s preset).
+        for (steps, actions, tokens) in [
+            (Some(60u32), None, None),
+            (None, Some(120u32), None),
+            (None, None, Some(300_000u64)),
+            (Some(60), Some(120), Some(300_000)),
+        ] {
+            let mut a = args_for(Path::new("/tmp/w"), steps);
+            a.budget_actions = actions;
+            a.budget_tokens = tokens;
+            assert_eq!(
+                budget_for(&a).config().max_wallclock,
+                Duration::from_secs(3600),
+                "flags: steps={steps:?} actions={actions:?} tokens={tokens:?}"
+            );
+        }
     }
 }

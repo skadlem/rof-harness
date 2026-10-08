@@ -69,6 +69,13 @@ is computed once at the end from the snapshot tree.
 ## Budget defaults (`cli::budget_for`)
 
 - Explicit `--budget-steps` / `--budget-actions` / `--budget-tokens` win.
+- Any explicit budget flag also lifts the preset's 900s wall-clock cap to
+  the LongTask 3600s allowance: the wall is the measured runaway guard for
+  20-step default batches, never part of a flagged recipe (measured
+  2026-10-08: v0 sweep cells ran 207–816s and all bound on the token cap;
+  one 60-step/300k cell wall-halted at 24% of its token budget — three
+  300s exec timeouts consume the 900s wall). Flag-less runs keep the
+  preset wall.
 - Pinned-context run (`--context-file`) with no token/step flags:
   200_000 token cap (floor justified in the code comment as
   chosen-to-validate; no measured anchor yet).
