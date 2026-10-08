@@ -69,8 +69,53 @@ const PASS_ENV: [&str; 9] = [
     "RUSTUP_HOME",
 ];
 
+/// Whole-token and glued shell operators exec must never receive. Exec has
+/// no shell and null stdin, so a heredoc (`python3 - <<'EOF'`) is a silent
+/// exit-0 no-op the agent can build conclusions on, and a glued redirect
+/// (`python3 gen.py >out.txt`) passes the file name `>out.txt` as a literal
+/// argv argument — the write silently never happens. WHOLE tokens and
+/// heredoc prefixes (`<<…`) plus redirection prefixes (`>`, `2>`, `1>`,
+/// `&>`) are rejected; metacharacters inside one quoted argument (e.g.
+/// `python3 -c "import x; y()"`) stay legal — UNLESS the argument itself
+/// is a whole operator or starts with one of the rejected prefixes (a
+/// fully-quoted `grep '<<' f` is rejected too; the escape hatch is the
+/// write-script-to-file path). Args genuinely starting with the prefixes
+/// (e.g. `grep ">=x" f`) are over-matched — accepted tradeoff, they are
+/// rarer than the silent redirects they prevent.
+const SHELL_OPS: [&str; 15] = [
+    "<", ">", ">>", "<<", "<<<", "|", "||", "&&", "&", ";", "2>", "1>", "2>&1", "1>&2", "&>",
+];
+
+fn is_shell_op(tok: &str) -> bool {
+    tok.starts_with("<<")
+        || SHELL_OPS.contains(&tok)
+        || tok.starts_with('>')
+        || tok.starts_with("2>")
+        || tok.starts_with("1>")
+        || tok.starts_with("&>")
+}
+
+/// Final spawn argv from (policy, argv): `exec_wrap` is prepended at spawn
+/// only — the shell-op guard, the allowlist check, and the canonical join
+/// in `run_allowed_argv` all see the UNWRAPPED argv. Pure so tests pin the
+/// guard-vs-spawn split without docker.
+pub(crate) fn spawn_argv(policy: &Policy, argv: &[String]) -> Vec<String> {
+    match &policy.exec_wrap {
+        None => argv.to_vec(),
+        Some(wrap) => wrap.iter().chain(argv.iter()).cloned().collect(),
+    }
+}
+
 fn spawn_allowed(policy: &Policy, argv: &[String]) -> Result<tokio::process::Child, ToolError> {
-    let (bin, rest) = argv
+    // The exec wrap (e.g. `docker exec <cid>` for in-container eval) lands
+    // here only: the shell-op guard, the allowlist check, and the canonical
+    // join in `run_allowed_argv` all saw the UNWRAPPED argv, and the child
+    // below runs the wrapped one — still no shell, still argv-exact.
+    // ponytail: timeout/cancel kill the wrap's client (the docker-exec
+    // process); the in-container process may outlive it — upgrade path is
+    // docker kill or exec-session tracking.
+    let full = spawn_argv(policy, argv);
+    let (bin, rest) = full
         .split_first()
         .ok_or_else(|| ToolError::Failed("empty cmd".to_string()))?;
     let mut cmd = std::process::Command::new(bin);
@@ -235,6 +280,14 @@ pub(crate) async fn run_allowed_argv(
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<(bool, String, bool), ToolError> {
+    // Before the allowlist: a whole-token shell operator is a semantics
+    // trap (no shell, null stdin), so it fails with the fix on the line
+    // even when a naive allowlist entry would otherwise accept it.
+    if let Some(op) = argv.iter().find(|t| is_shell_op(t)) {
+        return Err(ToolError::Failed(format!(
+            "exec has no shell and stdin is closed: '{op}' is a literal argument here — write the script to a file and run it"
+        )));
+    }
     // Canonical join: the allowlist sees exactly what exec will run, so a
     // quoted space can neither smuggle an arg past the check nor split one
     // apart after it. (An exact-allowlisted command with irregular internal

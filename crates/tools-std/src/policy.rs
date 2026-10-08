@@ -14,6 +14,12 @@ pub struct Policy {
     /// fixed pass-through set. A provider key must never go here: names
     /// ending in `_API_KEY` (and malformed names) are dropped at spawn.
     pub pass_env: Vec<String>,
+    /// Optional argv prefix prepended at spawn only (in-container eval:
+    /// `"docker", "exec", <container>` so every exec/test tool call lands
+    /// inside the container). The shell-op guard, the allowlist check, and
+    /// the canonical join always see the UNWRAPPED argv; `None` (the
+    /// default at every construction site) is zero behavior change.
+    pub exec_wrap: Option<Vec<String>>,
 }
 
 /// The stock secrets deny-glob. Callers constructing `Policy` literally

@@ -43,7 +43,7 @@ pub use write::{write_tool, WriteTool};
 mod tests {
     use super::*;
     use crate::common::{EDIT_FILE_CAP, EDIT_REPLACE_CAP, EXEC_TIMEOUT, OUT_CAP, VIEW_CAP};
-    use crate::runner::{run_allowed, split_cmd, stage_and_check};
+    use crate::runner::{run_allowed, spawn_argv, split_cmd, stage_and_check};
     use crate::view::{view_page, view_read_cap};
     use serde_json::{json, Value};
     use std::collections::HashMap;
@@ -74,6 +74,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            exec_wrap: None,
         })
     }
 
@@ -88,6 +89,7 @@ mod tests {
             syntax_cmd: Some(argv.iter().map(|s| s.to_string()).collect()),
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            exec_wrap: None,
         })
     }
 
@@ -761,6 +763,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            exec_wrap: None,
         };
         let err = run_allowed(
             &pol,
@@ -792,6 +795,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            exec_wrap: None,
         };
         let (ok, out, _) = run_allowed(
             &pol,
@@ -819,6 +823,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            exec_wrap: None,
         };
         let err = run_allowed(
             &pol,
@@ -846,6 +851,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            exec_wrap: None,
         };
         let cancel = CancellationToken::new();
         let killer = cancel.clone();
@@ -886,6 +892,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            exec_wrap: None,
         };
         let start = std::time::Instant::now();
         let (ok, content, truncated) = run_allowed(
@@ -915,6 +922,181 @@ mod tests {
         .unwrap();
         assert!(ok);
         assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn exec_rejects_whole_token_shell_operators() {
+        // A heredoc under null stdin is a silent exit-0 no-op: whole-token
+        // shell operators fail before the allowlist with the file fix.
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["python3".to_string(), "echo".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+            exec_wrap: None,
+        };
+        for cmd in [
+            "python3 - <<'EOF'\nprint(1)\nEOF",
+            "python3 - <<EOF",
+            "echo hi | cat",
+            "echo hi > out.txt",
+            "echo a && echo b",
+            "true ; true",
+            "cat < in.txt",
+            "echo hi >> out.txt",
+            "cat <<< x",
+            "echo a & echo b",
+            "echo hi 2> err.txt",
+            "echo hi 1> out.txt",
+            "echo hi 2>&1",
+            "echo hi 1>&2",
+            "echo hi &> all.txt",
+            "python3 gen.py >result.json",
+            "python3 gen.py 2>>err.log",
+        ] {
+            let err = run_allowed(&pol, cmd, EXEC_TIMEOUT, &CancellationToken::new())
+                .await
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("no shell") && msg.contains("write the script to a file"),
+                "{cmd:?}: {msg}"
+            );
+        }
+        // Guard runs BEFORE the allowlist: a shell-op command that is NOT
+        // allowlisted gets the teaching error, never "not allowlisted".
+        let mut strict = pol;
+        strict.allowed_prefixes = vec!["python3".to_string()];
+        let err = run_allowed(
+            &strict,
+            "cat x | wc",
+            EXEC_TIMEOUT,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no shell") && !msg.contains("allowlisted"),
+            "teaching error wins over the allowlist denial: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_quoted_metacharacters_still_run() {
+        // Metacharacters INSIDE one quoted argument are legal argv: only
+        // whole tokens are rejected by the shell-op guard.
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["python3".to_string(), "sh".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+            exec_wrap: None,
+        };
+        let (ok, out, _) = run_allowed(
+            &pol,
+            "python3 -c \"import os; print('semi in quotes')\"",
+            EXEC_TIMEOUT,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(ok, "{out}");
+        assert!(out.contains("semi in quotes"), "{out}");
+        let (ok, out, _) = run_allowed(
+            &pol,
+            "sh -c 'true | true; true'",
+            EXEC_TIMEOUT,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(ok, "{out}");
+    }
+
+    #[tokio::test]
+    async fn exec_plain_allowlisted_command_still_runs() {
+        // Regression: the shell-op guard must not disturb ordinary
+        // allowlisted commands.
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["echo".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+            exec_wrap: None,
+        };
+        let (ok, out, _) = run_allowed(
+            &pol,
+            "echo plain-ok",
+            EXEC_TIMEOUT,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(ok, "{out}");
+        assert!(out.contains("plain-ok"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn exec_wrap_check_sees_unwrapped_spawn_runs_wrapped() {
+        // The shell-op guard and the allowlist check see the UNWRAPPED argv:
+        // `echo hi` passes the `echo` prefix, then spawn runs the WRAPPED
+        // argv (a missing binary fails at spawn — never an allowlist
+        // denial; a wrap leaked into the check would say "not allowlisted").
+        let root = tmp_root();
+        let pol = Policy {
+            root: root.clone(),
+            allowed_commands: vec![],
+            allowed_prefixes: vec!["echo".to_string()],
+            syntax_cmd: None,
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+            exec_wrap: Some(vec!["/nonexistent-rof-wrap/bin".to_string()]),
+        };
+        let err = run_allowed(&pol, "echo hi", EXEC_TIMEOUT, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("not allowlisted") && !msg.contains("no shell"),
+            "check saw the unwrapped argv, spawn ran the wrap: {msg}"
+        );
+        // The wrap does not launder a non-allowlisted command: the denial
+        // message still names the UNWRAPPED argv.
+        let err = run_allowed(&pol, "rm -rf /", EXEC_TIMEOUT, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("command not allowlisted: rm -rf /")
+                && !msg.contains("/nonexistent-rof-wrap/bin"),
+            "canonical join sees the unwrapped argv: {msg}"
+        );
+        // The final spawn argv is the wrapped one (pure helper, no docker).
+        assert_eq!(
+            spawn_argv(&pol, &["echo".to_string(), "hi".to_string()]),
+            vec![
+                "/nonexistent-rof-wrap/bin".to_string(),
+                "echo".to_string(),
+                "hi".to_string()
+            ]
+        );
+        // None is zero behavior change.
+        let mut plain = pol.clone();
+        plain.exec_wrap = None;
+        assert_eq!(
+            spawn_argv(&plain, &["echo".to_string(), "hi".to_string()]),
+            vec!["echo".to_string(), "hi".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -961,6 +1143,7 @@ mod tests {
             syntax_cmd: Some(vec!["cat".to_string()]),
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            exec_wrap: None,
         };
         stage_and_check(
             &pol,
@@ -1046,6 +1229,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            exec_wrap: None,
         });
         let out = run(&reg(pol), "test", json!({"cmd": "cat noisy.txt"}))
             .await
