@@ -23,6 +23,12 @@ pub(crate) fn price_usd(model: &str, input: u64, cache_read: u64, output: u64) -
             (0.006, 0.30, 1.20)
         }
         m if m.starts_with("deepseek-v4-pro") => (0.044, 1.32, 3.96),
+        // GLM-5.3-flash at Z.ai list rates (effective 2026-09-10,
+        // corroborated by docs.bankofai.io, crossmodel.ai and requesty.ai):
+        // cache-read $0.03 / input-miss $0.15 / output $0.50. A proxy may
+        // mark this up — chosen as the list-rate anchor, validated against
+        // the first invoice.
+        m if m.starts_with("glm-5.3-flash") => (0.03, 0.15, 0.50),
         _ => return None,
     };
     let miss_in = input.saturating_sub(cache_read);
@@ -61,6 +67,21 @@ mod tests {
             price_usd("gpt-4o", 10, 0, 10),
             None,
             "unknown models never fabricate a cost"
+        );
+    }
+
+    #[test]
+    fn price_usd_glm_flash_list_rates() {
+        // GLM-5.3-flash list rates (2026-09-10): hit $0.03, miss $0.15,
+        // out $0.50 per 1M — 500k hit + 500k miss + 250k out
+        // = 0.015 + 0.075 + 0.125.
+        let c = price_usd("glm-5.3-flash", 1_000_000, 500_000, 250_000).unwrap();
+        assert!((c - 0.215).abs() < 1e-9, "{c}");
+        let all_hit = price_usd("glm-5.3-flash", 1_000_000, 1_000_000, 0).unwrap();
+        assert!((all_hit - 0.03).abs() < 1e-9, "{all_hit}");
+        assert!(
+            price_usd("glm-5.2", 0, 0, 0).is_none(),
+            "only 5.3-flash priced"
         );
     }
     #[test]

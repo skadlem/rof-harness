@@ -7,13 +7,15 @@ use std::time::{Duration, Instant};
 
 use agent_budget::{config_for, with_steps, BudgetGuard, Capability};
 use agent_loop::RunConfig;
+use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
+--keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default sends the DeepSeek thinking-off body)
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget
 --compaction FRAC: checkpoint the older context once the estimate crosses FRAC of the token budget (0 < FRAC <= 1). OFF-BY-DEFAULT and UNVALIDATED: the S-1 compaction experiment has not run yet, so leave it unset unless running that experiment.
 --thinking-keep N: echoed-reasoning rows kept per assistant message (flag wins over THINKING_KEEP; unset leaves the loop default)
@@ -44,6 +46,11 @@ pub(crate) struct Args {
     pub log_path: Option<String>,
     /// Opt out of the fail-closed WAL.
     pub no_log: bool,
+    /// Send no thinking-off knob in the request body (`EndpointProfile`
+    /// with `thinking_off: None`): for providers that reject the
+    /// DeepSeek-specific fragment or when reasoning is wanted. Default
+    /// false keeps the current body byte-identical.
+    pub keep_thinking: bool,
     pub proof_cmd: Option<String>,
     pub incentives: agent_loop::IncentivesLevel,
     pub bets: bool,
@@ -60,6 +67,10 @@ pub(crate) struct Args {
     /// Extra env names forwarded to `exec`/`test` children on top of the
     /// fixed pass-through set (repeatable).
     pub pass_env: Vec<String>,
+    /// Exec-wrap argv prepended at spawn by the tool policy (in-container
+    /// eval: `docker exec <container>` so exec/test calls land in the task
+    /// environment container); `None` keeps host-side exec.
+    pub(crate) exec_wrap: Option<Vec<String>>,
 }
 
 /// One flag definition: the long name, whether it takes a value, and the
@@ -132,6 +143,7 @@ struct RunBuilder {
     dump_events: Option<String>,
     log_path: Option<String>,
     no_log: bool,
+    keep_thinking: bool,
     proof_cmd: Option<String>,
     incentives: Option<agent_loop::IncentivesLevel>,
     bets: bool,
@@ -174,6 +186,11 @@ fn set_log_path(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
 
 fn set_no_log(b: &mut RunBuilder, _: Option<String>) -> Result<(), String> {
     b.no_log = true;
+    Ok(())
+}
+
+fn set_keep_thinking(b: &mut RunBuilder, _: Option<String>) -> Result<(), String> {
+    b.keep_thinking = true;
     Ok(())
 }
 
@@ -351,6 +368,11 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_no_log,
     },
     Flag {
+        name: "--keep-thinking",
+        takes_value: false,
+        set: set_keep_thinking,
+    },
+    Flag {
         name: "--allow-cmd",
         takes_value: true,
         set: set_allow_cmd,
@@ -457,6 +479,7 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         dump_events: b.dump_events,
         log_path: b.log_path,
         no_log: b.no_log,
+        keep_thinking: b.keep_thinking,
         proof_cmd: b.proof_cmd,
         incentives: b.incentives.unwrap_or(agent_loop::IncentivesLevel::Full),
         bets: b.bets,
@@ -465,6 +488,7 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         collapse_hysteresis: b.collapse_hysteresis,
         allow_dirty_workdir: b.allow_dirty_workdir,
         pass_env: b.pass_env,
+        exec_wrap: None,
     })
 }
 
@@ -530,6 +554,21 @@ pub(crate) fn budget_for(args: &Args) -> BudgetGuard {
         None => {}
     }
     BudgetGuard::new(b, Instant::now())
+}
+
+/// Request profile for one run: `keep_thinking` skips the DeepSeek-specific
+/// thinking-off body (for providers that reject the fragment, or when
+/// reasoning is wanted); the default profile stays byte-identical. Shared
+/// by `rof run` (main) and the eval agent leg so the knob has one impl.
+pub(crate) fn endpoint_profile(keep_thinking: bool) -> EndpointProfile {
+    if keep_thinking {
+        EndpointProfile {
+            emission_threshold_chars: 12_000,
+            thinking_off: None,
+        }
+    } else {
+        EndpointProfile::default()
+    }
 }
 
 /// One run's loop config from the parsed flags. The compaction checkpoint is
@@ -622,6 +661,7 @@ mod tests {
                 dump_events: Some("/tmp/ev.json".into()),
                 log_path: Some("/tmp/w.log".into()),
                 no_log: false,
+                keep_thinking: false,
                 bets: false,
                 incentives: agent_loop::IncentivesLevel::Full,
                 proof_cmd: None,
@@ -630,6 +670,7 @@ mod tests {
                 collapse_hysteresis: None,
                 allow_dirty_workdir: false,
                 pass_env: Vec::new(),
+                exec_wrap: None,
             }
         );
         let b = parse_args(&argv(&[
@@ -1016,5 +1057,21 @@ mod tests {
                 "flags: steps={steps:?} actions={actions:?} tokens={tokens:?}"
             );
         }
+    }
+
+    #[test]
+    fn keep_thinking_parses_and_selects_the_profile() {
+        let a = parse_args(&run_min(&["--keep-thinking"])).unwrap();
+        assert!(a.keep_thinking);
+        let plain = parse_args(&run_min(&[])).unwrap();
+        assert!(!plain.keep_thinking, "default sends the thinking-off body");
+        let on = endpoint_profile(true);
+        assert!(on.thinking_off.is_none(), "keep-thinking sends no knob");
+        let off = endpoint_profile(false);
+        assert_eq!(off.emission_threshold_chars, on.emission_threshold_chars);
+        assert!(
+            off.thinking_off.is_some(),
+            "default keeps the DeepSeek thinking-off body"
+        );
     }
 }

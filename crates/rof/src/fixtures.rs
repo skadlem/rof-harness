@@ -191,6 +191,7 @@ pub(crate) fn args_for(dir: &std::path::Path, steps: Option<u32>) -> Args {
         dump_events: None,
         log_path: None,
         no_log: false,
+        keep_thinking: false,
         bets: false,
         incentives: agent_loop::IncentivesLevel::Full,
         proof_cmd: None,
@@ -199,5 +200,6 @@ pub(crate) fn args_for(dir: &std::path::Path, steps: Option<u32>) -> Args {
         collapse_hysteresis: None,
         allow_dirty_workdir: false,
         pass_env: Vec::new(),
+        exec_wrap: None,
     }
 }

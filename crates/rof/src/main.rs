@@ -18,12 +18,15 @@ use std::sync::Arc;
 use agent_event::{AgentEvent, Emitter};
 use agent_loop::{FailureKind, Input, LoopState, NoBets, Outcome, Run};
 use provider_core::LlmClient;
-use provider_openai::{EndpointProfile, OpenAiCompat};
+use provider_openai::OpenAiCompat;
 use snapshot::TreeService;
 use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
-use cli::{apply_env_defaults, budget_for, parse_args, resolve_endpoint, run_config, Args};
+use cli::{
+    apply_env_defaults, budget_for, endpoint_profile, parse_args, resolve_endpoint, run_config,
+    Args,
+};
 use dump::{attach_dump, finalize_dump};
 use eval_cmd::{parse_eval, run_eval};
 use exit::{exit_code, summarize, EXIT_NO_CREDENTIALS};
@@ -74,6 +77,7 @@ fn policy_for(args: &Args) -> tools_std::Policy {
         syntax_cmd: None,
         denied_globs: tools_std::default_denied_globs(),
         pass_env: args.pass_env.clone(),
+        exec_wrap: args.exec_wrap.clone(),
     }
 }
 
@@ -225,8 +229,8 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let mut provider =
-        OpenAiCompat::new(&endpoint, EndpointProfile::default()).with_key_env(&args.api_key_env);
+    let mut provider = OpenAiCompat::new(&endpoint, endpoint_profile(args.keep_thinking))
+        .with_key_env(&args.api_key_env);
     for h in &args.headers {
         if let Some((name, value)) = h.split_once(':') {
             provider = provider.with_header(name, value);
@@ -268,7 +272,7 @@ mod tests {
         // Unique env var, set-then-removed in this test only, so parallel
         // tests cannot observe it.
         std::env::remove_var("ROF_TEST_CRED_GATE_KEY");
-        let p = OpenAiCompat::new("http://127.0.0.1:1", EndpointProfile::default())
+        let p = OpenAiCompat::new("http://127.0.0.1:1", cli::endpoint_profile(false))
             .with_key_env("ROF_TEST_CRED_GATE_KEY");
         let err = p.check_credentials().unwrap_err().to_string();
         let msg = missing_credentials_message("ROF_TEST_CRED_GATE_KEY", &err);

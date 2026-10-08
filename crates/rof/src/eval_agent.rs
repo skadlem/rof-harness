@@ -9,9 +9,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use agent_event::AgentEvent;
-use provider_openai::{EndpointProfile, OpenAiCompat};
+use provider_openai::OpenAiCompat;
 
-use crate::cli::Args;
+use crate::cli::{endpoint_profile, Args};
 use crate::dump::finalize_dump;
 use crate::eval_cmd::{apply_mode_for, EvalArgs};
 use crate::exit::EXIT_NO_CREDENTIALS;
@@ -20,7 +20,7 @@ use crate::{execute, missing_credentials_message};
 
 /// Goal rules tail, ported verbatim from the driver's `mk_goal` (plain
 /// variant).
-const GOAL_TAIL: &str = "\n\nRules: all paths are relative to the workdir (a /app prefix maps to the workdir root). The exec tool runs single commands with NO shell (no pipes, &&, or redirection) one at a time; write scripts to files and run them when you need composition. Do not add test-harness files. When your work is complete, reply with a text message and no tool calls.";
+const GOAL_TAIL: &str = "\n\nRules: all paths are relative to the workdir (a /app prefix maps to the workdir root). The exec tool runs single commands with NO shell (no pipes, &&, or redirection) one at a time; its stdin is closed, so heredocs and stdin reads return nothing; write scripts to files and run them when you need composition. Do not add test-harness files. When your work is complete, reply with a text message and no tool calls.";
 
 /// Goal text from the instruction: `/app/` goes first so the remaining bare
 /// `/app` maps to the workdir. Ported verbatim (mk_goal plain variant).
@@ -131,6 +131,9 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
         dump_events: Some(events_path.to_string_lossy().into_owned()),
         log_path: None,
         no_log: false,
+        // The eval leg builds its provider from `EvalArgs.keep_thinking`
+        // directly (run_agent_leg); the run-Args copy stays consistent.
+        keep_thinking: a.keep_thinking,
         proof_cmd: None,
         incentives: agent_loop::IncentivesLevel::Full,
         bets: false,
@@ -139,6 +142,7 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
         collapse_hysteresis: None,
         allow_dirty_workdir: false,
         pass_env: Vec::new(),
+        exec_wrap: None,
     }
 }
 
@@ -191,6 +195,23 @@ fn parse_reward(r: &serde_json::Value) -> Option<f64> {
     m.keys().next()?.parse().ok()
 }
 
+/// Last of the final 4 lines containing "passed" or "failed" (driver
+/// parity). Shared by the harbor verifier files and the in-container
+/// verifier output.
+fn last_passed_failed(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let window: &[&str] = if lines.len() > 4 {
+        &lines[lines.len() - 4..]
+    } else {
+        &lines
+    };
+    window
+        .iter()
+        .rev()
+        .find(|l| l.contains("passed") || l.contains("failed"))
+        .map(|l| l.trim().to_owned())
+}
+
 /// Short verifier string for the row: over `<jobs_dir>/*/verifier/
 /// test-stdout.txt`, the last of the final 4 lines containing "passed" or
 /// "failed" (driver parity).
@@ -205,17 +226,7 @@ fn verifier_string(jobs_dir: &Path) -> Option<String> {
             continue;
         }
         let text = std::fs::read_to_string(&p).ok()?;
-        let lines: Vec<&str> = text.lines().collect();
-        let window = if lines.len() > 4 {
-            lines[lines.len() - 4..].to_vec()
-        } else {
-            lines
-        };
-        return window
-            .into_iter()
-            .rev()
-            .find(|l| l.contains("passed") || l.contains("failed"))
-            .map(|l| l.trim().to_owned());
+        return last_passed_failed(&text);
     }
     None
 }
@@ -233,6 +244,203 @@ fn has_run_end(events: &Path) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// Env container name for one instance: the single handle for the agent
+/// exec wrap, the pre-clean, and the verifier (docker exec/rm accept name
+/// or id).
+fn env_container_name(id: &str) -> String {
+    format!("eval-{id}-env")
+}
+
+/// Exec-wrap argv for one live env container: prepended at spawn by the
+/// tool policy so every exec/test call lands inside the container (still
+/// no shell, still argv-exact on the unwrapped command).
+fn docker_exec_wrap(container: &str) -> Vec<String> {
+    vec!["docker".into(), "exec".into(), container.into()]
+}
+
+/// Exact `docker run` argv for one in-container instance: detached, named,
+/// workdir bind-mounted at /app, task tests read-only at /tests, /app as
+/// the container workdir, cpus/memory capped, and the image entrypoint
+/// overridden to `tail -f /dev/null` so a server-entrypoint image does not
+/// hijack the run. Pure so tests pin the flag list without docker.
+fn env_container_run_args(image: &str, work: &Path, tasks_dir: &Path, id: &str) -> Vec<String> {
+    // /logs is the harbor verifier-artifact root: task test.sh scripts
+    // write /logs/verifier/{ctrf.json,reward.txt}. Mounted writable at
+    // <home>/verifier-logs (work's parent is the instance home) so the
+    // artifacts persist on the host; the `verifier` subdir is pre-created
+    // by start_env_container (pytest --ctrf does not mkdir).
+    let logs = work.parent().unwrap_or(work).join("verifier-logs");
+    vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        env_container_name(id),
+        "-v".into(),
+        format!("{}:/app", work.display()),
+        "-v".into(),
+        format!("{}:/tests:ro", tasks_dir.join(id).join("tests").display()),
+        "-v".into(),
+        format!("{}:/logs", logs.display()),
+        "-w".into(),
+        "/app".into(),
+        "--cpus=2".into(),
+        "--memory=4096m".into(),
+        "--entrypoint".into(),
+        "tail".into(),
+        image.into(),
+        "-f".into(),
+        "/dev/null".into(),
+    ]
+}
+
+/// docker rm -f, best-effort: the stale pre-clean before a run and the
+/// cleanup afterwards (every path, including failure).
+async fn rm_env_container(id: &str) {
+    let _ = tokio::process::Command::new("docker")
+        .args(["rm", "-f", &env_container_name(id)])
+        .output()
+        .await;
+}
+
+/// Wipe the workdir inside a throwaway container: in-container runs write as
+/// root through the bind mount, and those files outlive a host-side rm.
+async fn wipe_workdir_via_docker(image: &str, work: &Path) {
+    let target = format!("{}:/w", work.display());
+    let _ = tokio::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "-v",
+            &target,
+            "--entrypoint",
+            "sh",
+            image,
+            "-c",
+            "rm -rf /w/* /w/.[!.]* /w/..?* 2>/dev/null; true",
+        ])
+        .output()
+        .await;
+}
+
+/// Start the task environment container BEFORE the agent run: pre-clean a
+/// stale container from a crashed attempt, then run detached with the
+/// workdir bind-mounted at /app and tests read-only at /tests. Returns the
+/// container name; spawn/pull failure is infra (never capability).
+async fn start_env_container(
+    inst: &eval::Instance,
+    work: &Path,
+    tasks_dir: &Path,
+) -> Result<String, String> {
+    rm_env_container(&inst.id).await;
+    // The verifier artifact dir: harbor's compose pre-creates /logs/verifier;
+    // pytest --ctrf will not mkdir it itself.
+    let _ = std::fs::create_dir_all(
+        work.parent()
+            .unwrap_or(work)
+            .join("verifier-logs")
+            .join("verifier"),
+    );
+    // ponytail: cpus/memory chosen to match the task specs observed
+    // (cpus=2, memory_mb=4096); upgrade path: parse [environment] from
+    // task.toml per task. The entrypoint override keeps task images with
+    // server entrypoints from hijacking the run.
+    let out = tokio::process::Command::new("docker")
+        .args(env_container_run_args(
+            &inst.image,
+            work,
+            tasks_dir,
+            &inst.id,
+        ))
+        .output()
+        .await
+        .map_err(|e| format!("cannot spawn docker: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "docker run failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(env_container_name(&inst.id))
+}
+
+/// Verdict from the verifier exit: 0 is Resolved, nonzero Unresolved; a
+/// spawn failure or wall-clock timeout is infra (never capability). Pure so
+/// tests pin the mapping.
+/// Verdict from the live-container verifier exit. Docker's daemon-error
+/// exit (125: "Error response from daemon" — e.g. the container died
+/// mid-run), the daemon's error text on stderr, and the verifier-machinery
+/// codes (126 not-executable, 127 not-found — the test script never ran)
+/// are InfraFailure: the verifier did not execute, so it can never score
+/// as capability. Test suites report failure through their own exit
+/// codes (pytest 1-5), which stay Unresolved.
+fn grade_exit_verdict(status: &std::process::ExitStatus, stderr: &str) -> eval::Verdict {
+    if status.success() {
+        return eval::Verdict::Resolved;
+    }
+    if status.code() == Some(125)
+        || status.code() == Some(126)
+        || status.code() == Some(127)
+        || stderr.contains("Error response from daemon")
+    {
+        return eval::Verdict::InfraFailure;
+    }
+    eval::Verdict::Unresolved
+}
+
+/// Grade one agent run inside the live env container: exec /tests/test.sh
+/// in the SAME container the agent worked in, so agent-installed packages
+/// and running services persist to grading. Verdict provenance here is the
+/// verifier exit code — a NEW estimand, never mixed with the harbor
+/// result.json reward. Spawn failure or timeout is infra (never
+/// capability).
+async fn grade_live_container(
+    inst: &eval::Instance,
+    container: &str,
+    home: &Path,
+) -> eval::Verdict {
+    // ponytail: 300s slack above the instance timeout is chosen (same slack
+    // as the harbor path); upgrade path: a per-task verifier timeout.
+    let out = tokio::time::timeout(
+        Duration::from_secs(inst.timeout_secs + 300),
+        tokio::process::Command::new("docker")
+            // bash-invoked: the ro tests mount carries no exec bit, and a
+            // missing/unrunnable test.sh is 126/127 — machinery, not the
+            // suite failing.
+            .args(["exec", container, "bash", "/tests/test.sh"])
+            .output(),
+    )
+    .await;
+    let ok: Option<std::process::Output> = match out {
+        Err(_) => None,  // wall-clock timeout is infra
+        Ok(r) => r.ok(), // spawn failure (no docker) is infra
+    };
+    let Some(o) = ok else {
+        eprintln!(
+            "infra {}: docker exec timed out or failed to spawn",
+            inst.id
+        );
+        return eval::Verdict::InfraFailure;
+    };
+    let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+    let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+    text.push_str(&stderr);
+    // Persist the verifier output (harbor's path keeps test-stdout.txt; this
+    // is the in-container mode's equivalent) and name the exit code.
+    let _ = std::fs::write(home.join("verifier-stdout.txt"), &text);
+    eprintln!("{} verifier exit: {:?}", inst.id, o.status.code());
+    if let Some(vs) = last_passed_failed(&text) {
+        eprintln!("{} verifier: {vs}", inst.id);
+    }
+    let verdict = grade_exit_verdict(&o.status, &stderr);
+    if matches!(verdict, eval::Verdict::InfraFailure) {
+        eprintln!(
+            "infra {}: docker daemon error at grading (container died?)",
+            inst.id
+        );
+    }
+    verdict
 }
 
 /// Grade one agent run via harbor: build the grade tree, run
@@ -324,7 +532,7 @@ pub(crate) async fn run_agent_leg(
     };
     let api_key_env = args.api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
     let mut provider =
-        OpenAiCompat::new(endpoint, EndpointProfile::default()).with_key_env(api_key_env);
+        OpenAiCompat::new(endpoint, endpoint_profile(args.keep_thinking)).with_key_env(api_key_env);
     for h in &args.headers {
         if let Some((name, value)) = h.split_once(':') {
             provider = provider.with_header(name, value);
@@ -349,6 +557,15 @@ pub(crate) async fn run_agent_leg(
             return 2;
         }
         let work = home.join("work");
+        // In-container mode: root-owned leftovers from a previous run's
+        // container writes (bind-mounted /app) survive a host-side rm;
+        // wipe them inside a throwaway container from the task image BEFORE
+        // seeding, so reruns start clean. ponytail: the image is local (it
+        // is about to be run anyway); images without sh stay dirty — upgrade
+        // path: an Alpine helper image.
+        if args.in_container && !inst.image.is_empty() {
+            wipe_workdir_via_docker(&inst.image, &work).await;
+        }
         if let Err(e) = fresh_workdir(&task_dir, &work) {
             eprintln!("infra {}: workdir: {e}", inst.id);
             reports.push(infra_report(
@@ -363,7 +580,7 @@ pub(crate) async fn run_agent_leg(
         let start = Instant::now();
         let goal = agent_goal(&inst.instruction);
         let events = home.join("events.jsonl");
-        let run_args = agent_args(args, &work, &goal, &events);
+        let mut run_args = agent_args(args, &work, &goal, &events);
         // A workdir refusal is per-instance infra failure, never capability.
         if validate_workdir(&work, false).is_err() {
             eprintln!("infra {}: workdir refused: {}", inst.id, work.display());
@@ -377,6 +594,47 @@ pub(crate) async fn run_agent_leg(
             ));
             continue;
         }
+        // In-container mode: the agent works INSIDE the task environment
+        // container (started before the run, workdir bind-mounted at /app)
+        // and the verifier execs the same live container, so installed
+        // packages and running services persist to grading; the harbor
+        // grade-task path is replaced entirely in this mode. File tools
+        // stay host-side on the bind-mounted workdir, so the deliverable
+        // patch still captures file work.
+        let container = if args.in_container {
+            if inst.image.is_empty() {
+                eprintln!("infra {}: no docker_image in task.toml", inst.id);
+                let wall = start.elapsed().as_secs();
+                reports.push(infra_report(
+                    inst,
+                    args,
+                    &home,
+                    eval::Verdict::InfraFailure,
+                    wall,
+                ));
+                continue;
+            }
+            match start_env_container(inst, &work, &args.tasks_dir).await {
+                Ok(name) => {
+                    run_args.exec_wrap = Some(docker_exec_wrap(&name));
+                    Some(name)
+                }
+                Err(e) => {
+                    eprintln!("infra {}: {e}", inst.id);
+                    let wall = start.elapsed().as_secs();
+                    reports.push(infra_report(
+                        inst,
+                        args,
+                        &home,
+                        eval::Verdict::InfraFailure,
+                        wall,
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         // ponytail: execute() spawns a fresh ctrl-c listener per call (one
         // per instance here) — bounded by the slice size; upgrade path: a
         // shared CancellationToken threaded through execute().
@@ -385,6 +643,9 @@ pub(crate) async fn run_agent_leg(
             if let Err(e) = finalize_dump(path, &r.events) {
                 eprintln!("infra {}: cannot write {path}: {e}", inst.id);
                 let wall = start.elapsed().as_secs();
+                if container.is_some() {
+                    rm_env_container(&inst.id).await;
+                }
                 reports.push(infra_report(
                     inst,
                     args,
@@ -401,9 +662,15 @@ pub(crate) async fn run_agent_leg(
         // is infra.
         let verdict = if !has_run_end(&events) {
             eval::Verdict::InfraFailure
+        } else if let Some(name) = &container {
+            grade_live_container(inst, name, &home).await
         } else {
             grade(inst, args, &work).await
         };
+        // The env container dies on every path, including infra grading.
+        if container.is_some() {
+            rm_env_container(&inst.id).await;
+        }
         let patch = r.patch.unwrap_or_default();
         match eval::instance_report_with_mode(
             &inst.id,
@@ -494,6 +761,12 @@ mod tests {
             "tail appended exactly once: {g}"
         );
         assert!(g.ends_with(GOAL_TAIL), "tail is the last thing: {g}");
+        // stdin clause (26-cell sweep arm marker: banked cells ran the old
+        // tail without it).
+        assert!(
+            g.contains("its stdin is closed, so heredocs and stdin reads return nothing"),
+            "{g}"
+        );
     }
 
     #[test]
@@ -778,6 +1051,8 @@ mod tests {
         assert_eq!(run.log_path, None, "WAL defaults inside the workdir");
         // Default api-key-env fills OPENAI_API_KEY.
         assert_eq!(run.api_key_env, "OPENAI_API_KEY");
+        // Default path stays host-side: no exec wrap without --in-container.
+        assert_eq!(run.exec_wrap, None, "default path: no exec wrap");
     }
 
     #[test]
@@ -806,5 +1081,113 @@ mod tests {
         assert_eq!(run.budget_tokens, Some(42));
         assert_eq!(run.budget_steps, Some(60));
         assert_eq!(run.budget_actions, Some(120));
+    }
+
+    #[test]
+    fn env_container_run_args_exact_flag_list() {
+        let got = env_container_run_args(
+            "img:1",
+            Path::new("/out/id/work"),
+            Path::new("/tasks"),
+            "id",
+        );
+        assert_eq!(
+            got,
+            [
+                "run",
+                "-d",
+                "--name",
+                "eval-id-env",
+                "-v",
+                "/out/id/work:/app",
+                "-v",
+                "/tasks/id/tests:/tests:ro",
+                "-v",
+                "/out/id/verifier-logs:/logs",
+                "-w",
+                "/app",
+                "--cpus=2",
+                "--memory=4096m",
+                "--entrypoint",
+                "tail",
+                "img:1",
+                "-f",
+                "/dev/null",
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_exec_wrap_prefixes_the_container() {
+        assert_eq!(
+            docker_exec_wrap("eval-id-env"),
+            vec![
+                "docker".to_string(),
+                "exec".to_string(),
+                "eval-id-env".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn live_container_verdict_maps_exit_and_infra() {
+        #[cfg(unix)]
+        fn est(code: i32) -> std::process::ExitStatus {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(grade_exit_verdict(&est(0), ""), eval::Verdict::Resolved);
+            assert_eq!(
+                grade_exit_verdict(&est(1), "1 failed"),
+                eval::Verdict::Unresolved
+            );
+            assert_eq!(
+                grade_exit_verdict(&est(125), "Error response from daemon"),
+                eval::Verdict::InfraFailure,
+                "docker daemon error (container dead) is infra, never capability"
+            );
+            assert_eq!(
+                grade_exit_verdict(&est(2), "Error response from daemon: nope"),
+                eval::Verdict::InfraFailure,
+                "daemon error text on stderr is infra at any exit code"
+            );
+            assert_eq!(
+                grade_exit_verdict(&est(2), "py exit 2"),
+                eval::Verdict::Unresolved,
+                "a plain test-suite exit stays a capability row"
+            );
+            assert_eq!(
+                grade_exit_verdict(&est(126), "bash: /tests/test.sh: Permission denied"),
+                eval::Verdict::InfraFailure,
+                "verifier script never ran (not executable) — infra"
+            );
+            assert_eq!(
+                grade_exit_verdict(&est(127), "bash: /tests/test.sh: No such file"),
+                eval::Verdict::InfraFailure,
+                "verifier script missing — infra"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            use std::process::ExitStatus;
+            let ok = std::process::Command::new("true").status().unwrap();
+            let bad = std::process::Command::new("false").status().unwrap();
+            assert_eq!(grade_exit_verdict(&ok, ""), eval::Verdict::Resolved);
+            assert_eq!(grade_exit_verdict(&bad, ""), eval::Verdict::Unresolved);
+        }
+    }
+
+    #[test]
+    fn last_passed_failed_takes_last_of_final_four() {
+        let text = "noise\nnoise2\n3 passed; 0 failed\nnoise3\nnoise4\nnoise5";
+        assert_eq!(
+            last_passed_failed(text).as_deref(),
+            Some("3 passed; 0 failed"),
+            "driver parity: last of the final 4 lines containing passed/failed"
+        );
+        assert_eq!(last_passed_failed("no markers at all"), None);
+        assert_eq!(last_passed_failed("1 failed"), Some("1 failed".to_string()));
     }
 }

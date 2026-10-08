@@ -31,6 +31,21 @@ the loop executed in-process through the same `execute()` wiring as
 refusal, and a run with no RunEnd in the events dump are infra failures,
 never capability). The container default is unchanged.
 
+With `--in-container` the per-instance shape changes (`eval_agent.rs`):
+the task environment container (`Instance.image`, from task.toml
+`docker_image`) is started before the agent run with the workdir
+bind-mounted at `/app` and the task tests read-only at `/tests`
+(cpus/memory capped at 2/4096m); the run's tool policy carries an exec
+wrap (`docker exec <container>`) so exec/test tool calls land inside the
+container while the allowlist and shell-op guard still see the unwrapped
+argv, and file tools stay host-side on the bind-mounted workdir. The
+verifier then execs the same live container (`/tests/test.sh`), so
+installed packages and running services persist to grading; the verdict
+is the verifier exit code — a new estimand, never mixed with the harbor
+`result.json` reward. Every per-instance failure in this mode (missing
+image, container start, verifier spawn/timeout) is infra, never
+capability, and the container is removed best-effort on every path.
+
 ## Crate map
 
 - `agent-loop` — the loop. `run()` is the shipped sequential driver;

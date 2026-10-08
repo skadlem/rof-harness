@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{parse_table, resolve_endpoint, Flag};
 
-pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N]
+pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--keep-thinking] [--in-container]
 --lenient-apply: record Lenient patch-apply provenance in the report (default Strict; Strict grades are not comparable with earlier fuzz-lenient numbers)
---agent: run the agent leg per instance instead of the oracle-container leg (fresh workdir, in-process rof-run wiring, harbor-CLI grading). Requires --model ID and --endpoint URL (or OPENAI_BASE_URL); mutually exclusive with --winnability-only. Agent budgets default to the frozen pilot recipe: 300000 tokens / 60 steps / 120 actions; explicit flags win.";
+--agent: run the agent leg per instance instead of the oracle-container leg (fresh workdir, in-process rof-run wiring, harbor-CLI grading). Requires --model ID and --endpoint URL (or OPENAI_BASE_URL); mutually exclusive with --winnability-only. Agent budgets default to the frozen pilot recipe: 300000 tokens / 60 steps / 120 actions; explicit flags win.
+--keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default sends the DeepSeek thinking-off body)
+--in-container: with --agent, the agent works inside the task environment container (started before the run; workdir bind-mounted at /app, cpus/memory capped at 2/4096m; agent exec/test calls wrapped with docker exec; the verifier execs the same live container, so installed packages and running services persist to grading). Verdict provenance in this mode is the verifier exit code, never the harbor result.json reward";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct EvalArgs {
@@ -33,6 +35,17 @@ pub(crate) struct EvalArgs {
     pub budget_actions: Option<u32>,
     pub budget_tokens: Option<u64>,
     pub max_tokens: Option<usize>,
+    /// Skip the thinking-off request body (`EndpointProfile` with
+    /// `thinking_off: None`): for providers that reject the DeepSeek
+    /// fragment or when reasoning is wanted. Default false keeps the
+    /// current body byte-identical.
+    pub keep_thinking: bool,
+    /// In-container agent mode: the agent works inside the task
+    /// environment container (workdir bind-mounted at /app) and the
+    /// verifier execs the same live container, so installed packages and
+    /// running services persist to grading. Requires `--agent`; default
+    /// false keeps the harbor grade-task path byte-identical.
+    pub in_container: bool,
 }
 
 #[derive(Default)]
@@ -44,6 +57,8 @@ struct EvalBuilder {
     winnability_only: bool,
     lenient_apply: bool,
     agent: bool,
+    keep_thinking: bool,
+    in_container: bool,
     model: Option<String>,
     endpoint: Option<String>,
     api_key_env: Option<String>,
@@ -174,6 +189,16 @@ fn set_max_tokens(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> 
     Ok(())
 }
 
+fn set_keep_thinking(b: &mut EvalBuilder, _: Option<String>) -> Result<(), String> {
+    b.keep_thinking = true;
+    Ok(())
+}
+
+fn set_in_container(b: &mut EvalBuilder, _: Option<String>) -> Result<(), String> {
+    b.in_container = true;
+    Ok(())
+}
+
 const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
     Flag {
         name: "--tasks-dir",
@@ -255,6 +280,16 @@ const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
         takes_value: true,
         set: set_max_tokens,
     },
+    Flag {
+        name: "--keep-thinking",
+        takes_value: false,
+        set: set_keep_thinking,
+    },
+    Flag {
+        name: "--in-container",
+        takes_value: false,
+        set: set_in_container,
+    },
 ];
 
 pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
@@ -268,6 +303,9 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
     )?;
     if b.agent && b.winnability_only {
         return Err("--agent and --winnability-only are mutually exclusive".into());
+    }
+    if b.in_container && !b.agent {
+        return Err("--in-container requires --agent".into());
     }
     // Agent mode requires --model; the Option stays for the default path.
     let model = if b.agent {
@@ -303,6 +341,8 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
         budget_actions: b.budget_actions,
         budget_tokens: b.budget_tokens,
         max_tokens: b.max_tokens,
+        keep_thinking: b.keep_thinking,
+        in_container: b.in_container,
     })
 }
 
@@ -453,6 +493,72 @@ mod tests {
     }
 
     #[test]
+    fn cli_eval_parses_keep_thinking() {
+        let a = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/tasks",
+            "--agent",
+            "--model",
+            "m",
+            "--endpoint",
+            "https://e",
+            "--keep-thinking",
+        ]))
+        .unwrap();
+        assert!(a.keep_thinking);
+        assert!(
+            !parse_eval(&argv(&["rof", "eval", "--tasks-dir", "/tmp/tasks"]))
+                .unwrap()
+                .keep_thinking,
+            "default keeps the thinking-off body"
+        );
+    }
+
+    #[test]
+    fn in_container_requires_agent_and_parses_with_it() {
+        // Alone (no --agent): parse error.
+        assert!(parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--in-container"
+        ]))
+        .is_err());
+        // With --agent: parses, flag set.
+        let a = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--agent",
+            "--model",
+            "m",
+            "--endpoint",
+            "http://x",
+            "--in-container",
+        ]))
+        .unwrap();
+        assert!(a.in_container);
+        // Default off: the harbor grade-task path stays byte-identical.
+        let plain = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--agent",
+            "--model",
+            "m",
+            "--endpoint",
+            "http://x",
+        ]))
+        .unwrap();
+        assert!(!plain.in_container);
+    }
+
+    #[test]
     fn cli_eval_parses_lenient_apply() {
         let a = parse_eval(&argv(&[
             "rof",
@@ -539,6 +645,8 @@ mod tests {
             budget_actions: None,
             budget_tokens: None,
             max_tokens: None,
+            keep_thinking: false,
+            in_container: false,
         };
         let code = run_eval(&args).await;
         assert_eq!(code, 0);

@@ -22,7 +22,10 @@ against a scratch `--workdir`, with budgets, a snapshot tree, and the full
   with no RunEnd in the events dump) never score as capability;
   packaged files exclude top-level `.git`/`__pycache__`/`.pytest_cache`,
   any-depth `*.pyc`, and the WAL sidecar (driver parity: first component
-  only, so a nested repo a task builds still reaches the container).
+  only, so a nested repo a task builds still reaches the container). With
+  `--in-container` the agent works inside the task environment container
+  (workdir bind-mounted at `/app`) and the verifier execs the same live
+  container instead of grading a fresh copy via harbor.
 - `crates/agent-loop` — the loop: `run()` is the shipped sequential driver
   (`drive_tick` is a test harness over the same step helpers). State,
   verification nudge, request building, proof gating, cancellation.
@@ -65,6 +68,7 @@ Useful flags: `--budget-actions/--budget-tokens/--max-tokens`,
 `--bets`, `--compaction`, `--dump-events`, `--log-path` / `--no-log`,
 `--thinking-keep` / `--collapse-hysteresis` (env fallback `THINKING_KEEP` /
 `COLLAPSE_HYSTERESIS`, flag wins), repeatable `--pass-env NAME`,
+`--keep-thinking` (skip the DeepSeek-specific thinking-off request body),
 `--allow-dirty-workdir`. `rof eval --tasks-dir DIR [--lenient-apply]`
 grades the slice; `--lenient-apply` records Lenient patch-apply provenance
 in the report (default Strict).
@@ -76,7 +80,20 @@ Optional: `--api-key-env NAME` (default `OPENAI_API_KEY`), repeatable
 `--allow-cmd CMD` (same binary-prefix semantics as `rof run`),
 `--budget-steps/--budget-actions/--budget-tokens/--max-tokens` (agent
 budgets default to the frozen pilot recipe: 300000 tokens / 60 steps /
-120 actions). Mutually exclusive with `--winnability-only`.
+120 actions), `--keep-thinking` (skip the thinking-off request body),
+`--in-container` (run the agent inside the task environment container).
+Mutually exclusive with `--winnability-only`.
+
+With `--in-container`, the task environment container is started before
+the agent run (workdir bind-mounted at `/app`, cpus/memory capped at
+2 / 4096m); agent exec/test calls run inside it via `docker exec`, and
+the verifier execs the same live container — so installed packages and
+running services persist to grading, and the env-mutation task class
+(installed-by-the-agent imports, a live server) becomes winnable.
+Verdict provenance in this mode is the verifier exit code — a NEW
+estimand, never mixed with harbor-graded rows (the harbor path reads
+the `result.json` reward). Missing image, container-start failure, or
+verifier spawn failure/timeout are infra failures, never capability.
 
 Missing credentials fail fast before any spend: exit 4, naming the env var
 (`--api-key-env NAME` selects which var holds the key).

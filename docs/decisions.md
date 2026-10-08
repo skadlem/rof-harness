@@ -31,6 +31,35 @@ says so explicitly.
   omits the budget flags (chosen: copied from the frozen pilot recipe in
   NEXT.md; validated when the agent-leg slice runs). Explicit flags win,
   and `cli::budget_for` stays the single resolver.
+- **The goal rules tail gained a stdin clause after the 26-cell sweep.**
+  Agents issued heredoc execs (`python3 - <<'EOF'`) — silent exit-0 no-ops
+  under exec's null stdin — and built conclusions on them (56 execs, zero
+  deliverable writes). The tail now states stdin is closed and points at
+  the write-script-to-file fix; the banked sweep cells ran the old tail
+  (arm marker).
+- **Second provider wired: GLM-5.3-flash priced at Z.ai list rates.**
+  The price book keys `glm-5.3-flash` at cache-read $0.03 / input $0.15 /
+  output $0.50 per 1M (chosen: Z.ai list rates effective 2026-09-10,
+  corroborated by three independent pricing pages; validated against the
+  first invoice — a proxy may mark them up). `--keep-thinking` on both
+  `rof run` and `rof eval` builds the request profile without the
+  DeepSeek-specific thinking-off body, for providers that reject the
+  fragment or when reasoning is wanted; the default body stays
+  byte-identical. Unpriced models still report null cost, never zero.
+- **In-container eval is a separate mode with a separate estimand.**
+  `rof eval --agent --in-container` starts the task environment container
+  before the agent run (workdir bind-mounted at /app, tests read-only at
+  /tests, cpus/memory capped at 2/4096m — chosen: the caps observed in the
+  task specs; upgrade path: parse [environment] from task.toml per task),
+  wraps the run's tool policy with `docker exec <container>` so exec/test
+  calls land inside (the allowlist and shell-op guard still see the
+  unwrapped argv; the wrap applies at spawn only), and grades by execing
+  /tests/test.sh in the SAME live container. The env-mutation task class
+  (installed-by-the-agent imports, a live server) becomes winnable.
+  Verdict provenance in this mode is the verifier exit code — a NEW
+  estimand, never mixed with the harbor result.json reward rows. Ceiling:
+  timeout/cancel kill the docker-exec client; the in-container process may
+  outlive it (upgrade path: docker kill or exec-session tracking).
 - **The harbor CLI is the agent-leg grading seam.** `rof eval --agent`
   ports the bash pilot driver's mk_goal/verdict verbatim: job yaml (JSON)
   plus `harbor run -c <job> -y -q`; harbor spawn failure, grading timeout
