@@ -168,13 +168,27 @@ pub(crate) fn reward_verdict(result: &Path) -> eval::Verdict {
                 .and_then(|e| e.as_object())
                 .and_then(|m| m.values().next())
                 .and_then(|ev| ev.pointer("/reward_stats/reward"))
-                .and_then(|r| r.as_f64())
+                .and_then(parse_reward)
         });
     match reward {
         Some(r) if (r - 1.0).abs() < 1e-9 => eval::Verdict::Resolved,
         Some(0.0) => eval::Verdict::Unresolved,
         _ => no_report,
     }
+}
+
+/// The reward is a scalar in the harbor the pilots measured and a
+/// `{value: [trials]}` histogram in current harbor; one trial per job
+/// means exactly one key. Anything else fails closed.
+fn parse_reward(r: &serde_json::Value) -> Option<f64> {
+    if let Some(n) = r.as_f64() {
+        return Some(n);
+    }
+    let m = r.as_object()?;
+    if m.len() != 1 {
+        return None; // multi-trial histogram: not the one-trial-per-job protocol
+    }
+    m.keys().next()?.parse().ok()
 }
 
 /// Short verifier string for the row: over `<jobs_dir>/*/verifier/
@@ -554,6 +568,30 @@ mod tests {
         assert_eq!(
             r("{\"stats\":{\"evals\":{\"tb\":{\"reward_stats\":{\"reward\":0.0}}}}}"),
             eval::Verdict::Unresolved
+        );
+        assert_eq!(
+            r("{\"stats\":{\"evals\":{\"tb\":{\"reward_stats\":{\"reward\":{\"0.0\":[\"t\"]}}}}}}"),
+            eval::Verdict::Unresolved,
+            "current harbor: reward is a {{value: [trials]}} histogram"
+        );
+        assert_eq!(
+            r("{\"stats\":{\"evals\":{\"tb\":{\"reward_stats\":{\"reward\":{\"1.0\":[\"t\"]}}}}}}"),
+            eval::Verdict::Resolved
+        );
+        assert_eq!(
+            r("{\"stats\":{\"evals\":{\"tb\":{\"reward_stats\":{\"reward\":{\"0.0\":[\"a\"],\"1.0\":[\"b\"]}}}}}}"),
+            eval::Verdict::ErrorNoReport,
+            "multi-trial histogram is not the one-trial-per-job protocol"
+        );
+        assert_eq!(
+            r("{\"stats\":{\"evals\":{\"tb\":{\"reward_stats\":{\"reward\":{\"maybe\":[\"t\"]}}}}}}"),
+            eval::Verdict::ErrorNoReport,
+            "non-numeric histogram key"
+        );
+        assert_eq!(
+            r("{\"stats\":{\"evals\":{\"tb\":{\"reward_stats\":{\"reward\":{\"0.5\":[\"t\"]}}}}}}"),
+            eval::Verdict::ErrorNoReport,
+            "neither 1.0 nor 0.0 has a verdict in the taxonomy"
         );
         assert_eq!(
             r("{\"stats\":{\"evals\":{}}}"),

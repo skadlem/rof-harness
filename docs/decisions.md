@@ -35,8 +35,13 @@ says so explicitly.
   ports the bash pilot driver's mk_goal/verdict verbatim: job yaml (JSON)
   plus `harbor run -c <job> -y -q`; harbor spawn failure, grading timeout
   without result.json, workdir refusal, or a run with no RunEnd in the
-  events dump is InfraFailure — infra is never capability. The harbor
-  invocation itself is untested (stays env-gated, like live_smoke).
+  events dump is InfraFailure — infra is never capability. Live-smoked
+  2026-10-08 end-to-end (swd, DeepSeek direct, deepseek-flash): current
+  harbor writes `reward_stats.reward` as a `{value: [trials]}` histogram,
+  not the pilots' scalar — the Rust reader takes both shapes and fails
+  closed on anything else (the old bash drivers' reward lines print the
+  dict on current harbor; fix their parse or use `rof eval --agent`
+  before resuming them).
 - **The workdir guard enforces exactly the four refusals.** Root, `$HOME`,
   the harness checkout, and dirty-without-opt-in; disposability of every
   other directory is documented operator responsibility (threat model),
