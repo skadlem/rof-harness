@@ -1,4 +1,4 @@
-//! Incentive scaffold: directives, lessons, and budget nudges.
+//! Incentive scaffold: directives and budget nudges.
 
 use crate::LoopState;
 use crate::RunConfig;
@@ -8,7 +8,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 /// Queued directives kept before the oldest is dropped (drop-oldest: the
-/// newest counter warning outranks stale advice, mirroring the lessons cap).
+/// newest counter warning outranks stale advice).
 pub(crate) const DIRECTIVE_CAP: usize = 3;
 
 impl LoopState {
@@ -37,13 +37,6 @@ impl LoopState {
             return Some(BudgetHalt::SameAction);
         }
         None
-    }
-
-    pub fn push_lesson(&mut self, lesson: String) {
-        if self.lessons.len() >= 3 {
-            self.lessons.pop_front();
-        }
-        self.lessons.push_back(lesson);
     }
 
     /// One queued directive, capped at [`DIRECTIVE_CAP`] (drop-oldest).
@@ -82,7 +75,7 @@ impl LoopState {
         }
     }
 
-    /// Deliver queued directives and each undelivered lesson onto the newest
+    /// Deliver queued directives onto the newest
     /// ToolResult tail, one text per line; nothing is consumed while no tail
     /// exists, so the next batch retries. The carried texts become part of
     /// that durable ToolResult row — no synthetic row, no new `ItemKind`.
@@ -94,10 +87,6 @@ impl LoopState {
         let mut delivered = 0;
         while let Some(text) = self.pending_directives.pop_front() {
             self.append_to_tail(&text);
-            delivered += 1;
-        }
-        while let Some(lesson) = self.lessons.pop_front() {
-            self.append_to_tail(&lesson);
             delivered += 1;
         }
         delivered
@@ -154,7 +143,7 @@ impl LoopState {
 /// Incentive scaffold level for the B→+A→+C ablation. `Base` ships no
 /// workflow contract and drops the directive channel; `Contract` adds the
 /// static workflow contract; `Full` (default = current behavior) adds the
-/// model-facing directives (cap notices, lessons, rollback notices).
+/// model-facing directives (cap notices, rollback notices).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum IncentivesLevel {
     Base,

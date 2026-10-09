@@ -19,17 +19,6 @@ use super::{
 };
 
 #[test]
-fn lessons_cap_at_three() {
-    let mut s = LoopState::new();
-    for i in 0..4 {
-        s.push_lesson(format!("lesson-{i}"));
-    }
-    assert_eq!(s.lessons.len(), 3);
-    assert!(!s.lessons.iter().any(|l| l == "lesson-0"));
-    assert_eq!(s.lessons[2], "lesson-3");
-}
-
-#[test]
 fn budget_nudge_appends_to_tool_result_tail_once() {
     let mut s = LoopState::new();
     s.turn = 1;
@@ -120,9 +109,9 @@ fn directive_triggers_fire_once_at_half_and_late_cap() {
 }
 
 #[test]
-fn lessons_ride_the_tail_once_each() {
+fn directives_ride_the_tail_once_each() {
     let mut s = LoopState::new();
-    s.push_lesson("vary the approach".into());
+    s.push_directive("vary the approach".into(), &RunConfig::default());
     s.turn = 1;
     assert!(matches!(
         s.step_claim(
@@ -143,8 +132,8 @@ fn lessons_ride_the_tail_once_each() {
         }
         other => panic!("expected ToolResult tail, got {other:?}"),
     }
-    assert!(s.lessons.is_empty());
-    assert_eq!(s.deliver_directives(), 0); // each lesson delivered once
+    assert!(s.pending_directives.is_empty());
+    assert_eq!(s.deliver_directives(), 0); // each directive delivered once
 }
 
 #[tokio::test]
@@ -300,7 +289,7 @@ async fn run_halt_budget_steps_after_grace_with_budget_frame() {
 
 #[tokio::test]
 async fn run_halt_same_action_and_crash_input_source() {
-    // Same action + same observation x4 trips the tripwire; lessons stay capped.
+    // Same action + same observation x4 trips the tripwire.
     let root = run_tmp("trip");
     std::fs::write(root.join("f.txt"), "x\n").unwrap();
     let order = Arc::new(Mutex::new(Vec::new()));
@@ -342,7 +331,6 @@ async fn run_halt_same_action_and_crash_input_source() {
         matches!(outcome, Outcome::Halted(ref s) if s == "same-action"),
         "got {outcome:?}"
     );
-    assert!(state.lessons.len() <= 3);
     let _ = std::fs::remove_dir_all(&root);
     // Crash queues like User but keeps the Crash source in the log.
     let root = run_tmp("crash");

@@ -9,7 +9,7 @@ use provider_core::AssistantMessage;
 use provider_core::StopReason;
 use provider_core::Usage;
 use serde_json::Value;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use tokio_util::sync::CancellationToken;
 
 use super::{assistant, settled};
@@ -433,26 +433,6 @@ fn step_retries_resets_on_fresh_step_head_not_retry_continuation() {
     assert_eq!(s.step_retries, 1, "success does not itself reset");
     assert!(s.start_provider_call(&root).is_some());
     assert_eq!(s.step_retries, 2, "fresh step after success resets");
-}
-
-/// (4) `same_action_cycles == 0` disables the tripwire lesson, mirroring
-/// `observe_action`'s `> 0` guard.
-#[test]
-fn terminate_same_action_zero_disables_lesson() {
-    use agent_budget::{config_for, BudgetConfig, BudgetGuard, Capability};
-    let mut s = LoopState::new();
-    let cfg = BudgetConfig {
-        same_action_cycles: 0,
-        ..config_for(Capability::UnattendedBatch)
-    };
-    s.budget = BudgetGuard::new(cfg, Instant::now());
-    // Streak 0 >= cycles 0 would fire without the guard.
-    assert_eq!(s.budget.counters().same_action_streak, 0);
-    assert!(matches!(
-        s.terminate(&RunConfig::default()),
-        PhaseVerdict::Continue
-    ));
-    assert!(s.lessons.is_empty(), "cycles=0 must not lesson");
 }
 
 /// (7) stop labels are explicit matches, never `Debug`.

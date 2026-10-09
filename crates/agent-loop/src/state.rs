@@ -234,7 +234,6 @@ pub struct LoopState {
     pub fatal_error: Option<String>,
     pub last_sig: String,
     pub last_obs: u64,
-    pub lessons: VecDeque<String>,
     /// Model-facing directives from the action counters, delivered onto the
     /// newest ToolResult tail; nothing is consumed until a tail exists.
     pub pending_directives: VecDeque<String>,
@@ -300,7 +299,6 @@ impl LoopState {
             fatal_error: None,
             last_sig: String::new(),
             last_obs: 0,
-            lessons: VecDeque::new(),
             pending_directives: VecDeque::new(),
             edits: 0,
             verify: VerifyState::default(),
@@ -600,11 +598,6 @@ impl LoopState {
         // Retry and reflection latches keep the run alive without new decisions.
         if self.call_model {
             return PhaseVerdict::Continue;
-        }
-        if self.budget.config().same_action_cycles > 0
-            && self.budget.counters().same_action_streak >= self.budget.config().same_action_cycles
-        {
-            self.push_lesson("same action repeated without progress; vary the approach".into());
         }
         // 5. Semantic termination: drained turn, empty queues, follow-up poll.
         // The old turn closes here (sticky reason or Completed) so the log
