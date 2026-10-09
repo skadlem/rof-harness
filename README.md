@@ -10,6 +10,9 @@ against a scratch `--workdir`, with budgets, a snapshot tree, and the full
   stdout, exit code reflects the outcome. `--dump-events PATH` writes one
   JSON line per event (one run, one dump file); the WAL defaults to
   `<workdir>/.rof-events.jsonl` (`--log-path` overrides, `--no-log` opts out).
+  The WAL's `events` filename is historical: it holds the durable agent-log
+  Item rows (`kind`-tagged), never the live event stream — that is
+  `--dump-events`.
   `rof eval` without `--agent` is a scaffold, not a grader: the default
   engine runs no command and reports no reward, so instances grade
   ErrorNoReport; real grading is the agent leg — with `--agent` each
