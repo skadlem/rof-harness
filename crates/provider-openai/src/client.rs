@@ -33,6 +33,12 @@ impl Default for EndpointProfile {
     }
 }
 
+/// Chosen (no anchor): generous ceilings — a gateway that accepts TCP and
+/// never answers must wedge `complete()` no longer than this. Re-anchor when
+/// a measured task exceeds 600 s; connect is always a misconfiguration wait.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Adapter-internal credential handle: per-call env resolve, never cached
 /// past expiry. A static env key cannot recover from 401/403 (fatal); only a
 /// refreshable source retries stale credentials.
@@ -80,6 +86,10 @@ pub struct OpenAiCompat {
     /// Extra per-request headers (e.g. opencode-go's `x-opencode-session`:
     /// a stable per-conversation id for routing + prompt caching).
     headers: Vec<(String, String)>,
+    /// Whole-request ceiling: without it a silent gateway wedges `complete()`
+    /// forever (the agent loop consults its wallclock budget only at step
+    /// head, never mid-request).
+    request_timeout: Duration,
 }
 
 impl OpenAiCompat {
@@ -89,11 +99,21 @@ impl OpenAiCompat {
             profile,
             http: reqwest::Client::builder()
                 .user_agent(format!("rof/{}", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             creds: CredentialSource::env("OPENAI_API_KEY"),
             headers: Vec::new(),
+            request_timeout: REQUEST_TIMEOUT,
         }
+    }
+
+    /// Override the whole-request ceiling (tests, slow endpoints). Zero
+    /// construction-site changes elsewhere: the default stays `REQUEST_TIMEOUT`.
+    pub fn with_request_timeout(mut self, d: Duration) -> Self {
+        self.request_timeout = d;
+        self
     }
 
     pub fn with_key_env(mut self, env: &str) -> Self {
@@ -241,6 +261,10 @@ impl OpenAiCompat {
         let mut call = self
             .http
             .post(format!("{}/chat/completions", self.endpoint));
+        // Per-request ceiling from the field: `RequestBuilder::timeout`
+        // replaces the client default for this call, so `with_request_timeout`
+        // is real. Default equals `REQUEST_TIMEOUT` — byte-identical without it.
+        call = call.timeout(self.request_timeout);
         for (name, value) in &self.headers {
             call = call.header(name.as_str(), value.as_str());
         }
@@ -249,15 +273,29 @@ impl OpenAiCompat {
             .json(&wire_body(model, req, k))
             .send()
             .await
-            .map_err(|e| OnceFail {
-                msg: e.to_string(),
-                error: Box::new(LlmError::Transport(e.to_string())),
-                after: None,
-                retryable: true,
-                truncated: false,
-                content_chars: 0,
-                reasoning_chars: 0,
-                usage: None,
+            .map_err(|e| {
+                // reqwest's Display stops at "error sending request for url
+                // (...)"; the timeout only lives in the source chain. Walk it
+                // so forensics can tell a hang from connection-refused. The
+                // chain of a send error never contains "503" (statuses take
+                // the status branch), so `is_cold_start` is unaffected.
+                let mut msg = e.to_string();
+                let mut src = std::error::Error::source(&e);
+                while let Some(x) = src {
+                    msg.push_str(": ");
+                    msg.push_str(&x.to_string());
+                    src = x.source();
+                }
+                OnceFail {
+                    msg: msg.clone(),
+                    error: Box::new(LlmError::Transport(msg)),
+                    after: None,
+                    retryable: true,
+                    truncated: false,
+                    content_chars: 0,
+                    reasoning_chars: 0,
+                    usage: None,
+                }
             })?;
         if !resp.status().is_success() {
             let code = resp.status();
@@ -710,6 +748,51 @@ mod tests {
             },
             other => panic!("expected Metered, got {other:?}"),
         }
+    }
+    /// A gateway that accepts TCP and never answers must surface as a
+    /// bounded, retryable Transport timeout riding the ladder to a terminal
+    /// Metered error — never an infinite await.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_endpoint_times_out_as_retryable_transport_error() {
+        std::env::set_var("TEST_OAI_KEY_HANG", "k");
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ep = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            // Accept and hold every connection open, never writing: the wedge.
+            for stream in l.incoming() {
+                std::mem::forget(stream);
+            }
+        });
+        let c =
+            client_on(&ep, "TEST_OAI_KEY_HANG").with_request_timeout(Duration::from_millis(100));
+        let mut req = req_with_tool();
+        req.tools.clear();
+        let t0 = tokio::time::Instant::now();
+        let err = c.complete("m", &req).await.unwrap_err();
+        match err {
+            LlmError::Metered {
+                source, exhausted, ..
+            } => {
+                let s = source.to_string();
+                assert!(s.contains("operation timed out"), "{s}");
+                assert!(exhausted, "the 1+4 ladder ran out: {s}");
+                // A timeout hits no fatal keyword: it rides the retry ladder.
+                assert_eq!(
+                    classify_error(&source),
+                    provider_core::ErrorClass::Retryable
+                );
+            }
+            other => panic!("expected Metered, got {other:?}"),
+        }
+        // Paused-clock pin that the override applied: virtual elapsed stays
+        // far under the 600s client default (a vacuous setter would run the
+        // ladder at 5x600s ~= 50min virtual; the override runs ~30s virtual
+        // = 5x100ms + the 2/4/8/16s rungs).
+        assert!(
+            t0.elapsed() < Duration::from_secs(600),
+            "the 100ms override must bound the request: {:?}",
+            t0.elapsed()
+        );
     }
     #[tokio::test]
     async fn cold_start_503_retries_and_recovers() {

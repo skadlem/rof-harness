@@ -11,3 +11,8 @@ tokio.workspace = true
 reqwest.workspace = true
 provider-core = { path = "../provider-core" }
 tool-core = { path = "../tool-core" }
+
+# start_paused needs tokio's test-util; additive to the workspace "full" set,
+# dev-only.
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
