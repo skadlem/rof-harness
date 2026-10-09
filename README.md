@@ -10,8 +10,10 @@ against a scratch `--workdir`, with budgets, a snapshot tree, and the full
   stdout, exit code reflects the outcome. `--dump-events PATH` writes one
   JSON line per event (one run, one dump file); the WAL defaults to
   `<workdir>/.rof-events.jsonl` (`--log-path` overrides, `--no-log` opts out).
-  `rof eval` grades a frozen task slice into a JSON report; with `--agent`
-  each instance instead runs the agent leg: a fresh workdir
+  `rof eval` without `--agent` is a scaffold, not a grader: the default
+  engine runs no command and reports no reward, so instances grade
+  ErrorNoReport; real grading is the agent leg — with `--agent` each
+  instance runs a fresh workdir
   `<out-dir>/<id>/work` seeded from `<tasks-dir>/<id>/environment`
   (or left empty for can_create tasks), the goal built from the instruction
   (`/app/` stripped, bare `/app` → "the workdir") plus the frozen pilot
@@ -37,7 +39,8 @@ against a scratch `--workdir`, with budgets, a snapshot tree, and the full
   evidence patch + unbounded `patch_since_start_full()` deliverable.
 - `crates/provider-core` / `crates/provider-openai` — `LlmClient` trait +
   OpenAI-compatible client (8-attempt retry ladder, priced models).
-- `crates/eval` — slice loading, official-container verdicts, gate stats.
+- `crates/eval` — slice loading, winnability, gate stats (verdicts come
+  from the `rof eval --agent` leg; the plain leg is a scaffold).
   Strict patch-apply grading by default; `--lenient-apply` records Lenient
   provenance instead (Strict grades are not comparable with earlier
   fuzz-lenient numbers).
@@ -70,7 +73,9 @@ Useful flags: `--budget-actions/--budget-tokens/--max-tokens`,
 `COLLAPSE_HYSTERESIS`, flag wins), repeatable `--pass-env NAME`,
 `--keep-thinking` (skip the DeepSeek-specific thinking-off request body),
 `--allow-dirty-workdir`. `rof eval --tasks-dir DIR [--lenient-apply]`
-grades the slice; `--lenient-apply` records Lenient patch-apply provenance
+loads the slice, checks winnability, and aggregates gate stats into the
+report (verdicts come from the `--agent` leg; the plain leg is a
+scaffold); `--lenient-apply` records Lenient patch-apply provenance
 in the report (default Strict).
 
 `rof eval --agent` runs the agent leg instead of the oracle-container leg.

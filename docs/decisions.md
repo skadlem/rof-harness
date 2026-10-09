@@ -45,7 +45,10 @@ says so explicitly.
   `rof run` and `rof eval` builds the request profile without the
   DeepSeek-specific thinking-off body, for providers that reject the
   fragment or when reasoning is wanted; the default body stays
-  byte-identical. Unpriced models still report null cost, never zero.
+  byte-identical. Precision on when the default sends the fragment: only
+  compaction-summary requests (`Thinking::Off`) and the truncation ladder's
+  first rung carry it — ordinary requests are built with `Thinking::Auto`
+  and send no thinking fragment. Unpriced models still report null cost, never zero.
 - **In-container eval is a separate mode with a separate estimand.**
   `rof eval --agent --in-container` starts the task environment container
   before the agent run (workdir bind-mounted at /app, tests read-only at

@@ -20,11 +20,13 @@ directory.
 5. Exit code from the outcome (`exit.rs`); a one-line event summary on
    stderr.
 
-`rof eval --tasks-dir DIR` (`eval_cmd.rs`) grades a frozen task slice:
-load instances, run the official-container verdict per task, aggregate
-gate stats into a JSON report. Default patch-apply provenance is Strict;
+`rof eval --tasks-dir DIR` (`eval_cmd.rs`) loads a frozen task slice and
+aggregates gate stats into a JSON report, but without `--agent` it is a
+scaffold: the default engine runs no command and reports no reward, so
+instances grade ErrorNoReport. Default patch-apply provenance is Strict;
 `--lenient-apply` records Lenient instead. With `--agent` the per-instance
-engine is the agent leg instead (`eval_agent.rs`): fresh seeded workdir,
+engine is the agent leg (`eval_agent.rs`) — the real grading path: fresh
+seeded workdir,
 the loop executed in-process through the same `execute()` wiring as
 `rof run`, then the harbor CLI as the grading seam (job yaml +
 `harbor run -c <job> -y -q`; spawn failure, grading timeout, workdir
@@ -66,8 +68,8 @@ capability, and the container is removed best-effort on every path.
   patch, unbounded `patch_since_start_full()` deliverable.
 - `provider-core` / `provider-openai` — `LlmClient` trait +
   OpenAI-compatible client (8-attempt retry ladder, priced models).
-- `eval` — slice loading (`load_tb_slice`), official-container verdicts,
-  gate stats.
+- `eval` — slice loading (`load_tb_slice`), winnability, gate stats
+  (verdicts come from the `rof eval --agent` agent leg).
 - `agent-event` — the live event vocabulary (11 variants; pinned in
   `exit.rs::NAMES`). `agent-log` — the durable JSONL log. `context` —
   compaction/file-map. `bets` — three capability bets, feature-flagged.
