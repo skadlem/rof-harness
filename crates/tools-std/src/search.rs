@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tool_core::{CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome};
 
-use crate::common::{cap_chars, dispatch, parse_args, path_err, OUT_CAP};
+use crate::common::{cap_chars, dispatch, parse_args, path_err, OUT_CAP, READ_FILE_CAP};
 use crate::policy::{resolve_under, Policy};
 
 pub struct SearchTool {
@@ -36,7 +36,14 @@ fn search_schema() -> Value {
     })
 }
 
-fn search_dir(dir: &Path, root: &Path, pat: &str, hits: &mut Vec<String>, limit: usize) {
+fn search_dir(
+    dir: &Path,
+    root: &Path,
+    pat: &str,
+    hits: &mut Vec<String>,
+    limit: usize,
+    skipped: &mut usize,
+) {
     if hits.len() >= limit {
         return;
     }
@@ -55,9 +62,9 @@ fn search_dir(dir: &Path, root: &Path, pat: &str, hits: &mut Vec<String>, limit:
         let Ok(ft) = e.file_type() else { continue };
         let p = e.path();
         if ft.is_dir() {
-            search_dir(&p, root, pat, hits, limit);
+            search_dir(&p, root, pat, hits, limit, skipped);
         } else if ft.is_file() {
-            search_file(&p, root, pat, hits, limit);
+            search_file(&p, root, pat, hits, limit, skipped);
         }
     }
 }
@@ -66,7 +73,25 @@ fn search_dir(dir: &Path, root: &Path, pat: &str, hits: &mut Vec<String>, limit:
 /// A direct file search must not share `search_dir`'s sibling scan: siblings
 /// would fill `limit` first and silently drop this file's lines.
 /// ponytail: literal contains only, no regex; add regex when a task needs it.
-fn search_file(p: &Path, root: &Path, pat: &str, hits: &mut Vec<String>, limit: usize) {
+fn search_file(
+    p: &Path,
+    root: &Path,
+    pat: &str,
+    hits: &mut Vec<String>,
+    limit: usize,
+    skipped: &mut usize,
+) {
+    // Size check BEFORE the read: std::fs::read loads the whole file, and an
+    // allowlisted exec can mint multi-GB files. Skip (never fail the whole
+    // scan); the caller appends one honesty note when anything was skipped.
+    match std::fs::metadata(p) {
+        Ok(m) if m.len() > READ_FILE_CAP => {
+            *skipped += 1;
+            return;
+        }
+        Err(_) => return,
+        Ok(_) => {}
+    }
     let Ok(data) = std::fs::read(p) else {
         return;
     };
@@ -111,10 +136,30 @@ impl Tool for SearchTool {
         .map_err(path_err)?;
         let limit = args.max_results.unwrap_or(50).clamp(1, 200) as usize;
         let mut hits = Vec::new();
+        let mut skipped = 0usize;
         if base.is_file() {
-            search_file(&base, &self.policy.root, &args.pattern, &mut hits, limit);
+            search_file(
+                &base,
+                &self.policy.root,
+                &args.pattern,
+                &mut hits,
+                limit,
+                &mut skipped,
+            );
         } else {
-            search_dir(&base, &self.policy.root, &args.pattern, &mut hits, limit);
+            search_dir(
+                &base,
+                &self.policy.root,
+                &args.pattern,
+                &mut hits,
+                limit,
+                &mut skipped,
+            );
+        }
+        // Fail-loud honesty: skipped oversized files are never silently
+        // dropped — exactly one final note line reports the count.
+        if skipped > 0 {
+            hits.push(format!("[{skipped} file(s) over 64MB skipped]"));
         }
         let (content, truncated) = cap_chars(hits.join("\n"), OUT_CAP);
         Ok(ToolOutcome {

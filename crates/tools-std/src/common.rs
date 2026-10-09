@@ -8,6 +8,11 @@ pub(crate) const VIEW_CAP: usize = 16_384;
 pub(crate) const OUT_CAP: usize = 8_000;
 pub(crate) const EDIT_FILE_CAP: usize = 512 * 1024;
 pub(crate) const EDIT_REPLACE_CAP: usize = 256 * 1024;
+/// Whole-file read bound for view/search. (chosen, no anchor: bounds
+/// harness RAM at a survivable level — an allowlisted exec can mint
+/// multi-GB files and a host OOM killed a sweep cell on 2026-10-08;
+/// re-anchor if a measured task needs more.)
+pub(crate) const READ_FILE_CAP: u64 = 64 * 1024 * 1024;
 pub(crate) const EXEC_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn collapse_ws(s: &str) -> (String, Vec<usize>) {

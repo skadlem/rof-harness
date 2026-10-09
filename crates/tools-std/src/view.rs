@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tool_core::{CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome};
 
-use crate::common::{cap_chars, dispatch, parse_args, path_err, OUT_CAP, VIEW_CAP};
+use crate::common::{cap_chars, dispatch, parse_args, path_err, OUT_CAP, READ_FILE_CAP, VIEW_CAP};
 use crate::policy::{resolve_under, Policy};
 
 /// `max_bytes` narrows the read, never widens it: the output bound is
@@ -121,6 +121,19 @@ impl Tool for ViewTool {
             &self.policy.denied_globs,
         )
         .map_err(path_err)?;
+        // Metadata check BEFORE the read: std::fs::read loads the whole file
+        // before any slicing, so an oversized file must be refused up front
+        // (covers both the no-offset and offset paths below).
+        let size = std::fs::metadata(&p)
+            .map_err(|e| ToolError::Failed(e.to_string()))?
+            .len();
+        if size > READ_FILE_CAP {
+            return Err(ToolError::Failed(format!(
+                "file is {} MB, over the {}MB read cap; trim or split the file first",
+                size / (1024 * 1024),
+                READ_FILE_CAP / (1024 * 1024)
+            )));
+        }
         let data = std::fs::read(&p).map_err(|e| ToolError::Failed(e.to_string()))?;
         let cap = view_read_cap(args.max_bytes);
         let Some(offset) = args.offset else {

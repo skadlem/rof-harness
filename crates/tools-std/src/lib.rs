@@ -42,7 +42,9 @@ pub use write::{write_tool, WriteTool};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{EDIT_FILE_CAP, EDIT_REPLACE_CAP, EXEC_TIMEOUT, OUT_CAP, VIEW_CAP};
+    use crate::common::{
+        EDIT_FILE_CAP, EDIT_REPLACE_CAP, EXEC_TIMEOUT, OUT_CAP, READ_FILE_CAP, VIEW_CAP,
+    };
     use crate::runner::{run_allowed, spawn_argv, split_cmd, stage_and_check};
     use crate::view::{view_page, view_read_cap};
     use serde_json::{json, Value};
@@ -336,6 +338,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn edit_cap_check_precedes_the_read() {
+        // 600KB of NUL (sparse, invalid UTF-8) is over the 512KB cap AND
+        // unparseable: the metadata check must fire before read_to_string
+        // ever runs — the old order failed first on the UTF-8 error.
+        let root = tmp_root();
+        let big = root.join("big.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(600 * 1024)
+            .unwrap();
+        let r = reg(policy(&root));
+        let err = run(
+            &r,
+            "edit",
+            json!({"path": "big.bin", "search": "x", "replace": "y"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("512KB cap"), "{err}");
+        assert!(!err.to_lowercase().contains("utf-8"), "{err}");
+    }
+
     // --- write ---
 
     #[tokio::test]
@@ -592,6 +617,23 @@ mod tests {
         let big = run(&r, "view", json!({"path": "big.txt"})).await.unwrap();
         assert_eq!(big.content, "a".repeat(OUT_CAP));
         assert!(big.truncated);
+    }
+
+    #[tokio::test]
+    async fn view_refuses_file_over_read_cap() {
+        let root = tmp_root();
+        // Sparse fixture: the metadata length is what is checked, so no 64MB
+        // of bytes are ever written.
+        let f = std::fs::File::create(root.join("huge.bin")).unwrap();
+        f.set_len(READ_FILE_CAP + 1).unwrap();
+        let r = reg(policy(&root));
+        let err = run(&r, "view", json!({"path": "huge.bin"}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("over the 64MB read cap") && err.contains("trim or split"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -956,6 +998,8 @@ mod tests {
             "echo hi &> all.txt",
             "python3 gen.py >result.json",
             "python3 gen.py 2>>err.log",
+            "cat <in.txt",
+            "python3 script.py <input.json",
         ] {
             let err = run_allowed(&pol, cmd, EXEC_TIMEOUT, &CancellationToken::new())
                 .await
@@ -1285,6 +1329,25 @@ mod tests {
             out.content
         );
         assert!(!out.content.contains("a.txt"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn search_skips_oversized_files_with_note() {
+        let root = tmp_root();
+        std::fs::write(root.join("a.txt"), "needle here\n").unwrap();
+        // Sparse fixture over the read cap (metadata length, no real bytes).
+        let f = std::fs::File::create(root.join("big.bin")).unwrap();
+        f.set_len(READ_FILE_CAP + 1).unwrap();
+        let r = reg(policy(&root));
+        let out = run(&r, "search", json!({"pattern": "needle"}))
+            .await
+            .unwrap();
+        assert!(out.content.contains("a.txt:1:"), "{}", out.content);
+        assert!(
+            out.content.contains("[1 file(s) over 64MB skipped]"),
+            "{}",
+            out.content
+        );
     }
 
     // --- schema strictness incl no-coercion ---

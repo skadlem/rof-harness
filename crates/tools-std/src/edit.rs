@@ -69,10 +69,15 @@ impl Tool for EditTool {
                 "refusing to patch a directory".to_string(),
             ));
         }
-        let original = std::fs::read_to_string(&p).map_err(|e| ToolError::Failed(e.to_string()))?;
-        if original.len() > EDIT_FILE_CAP {
+        // Metadata check BEFORE the read: read_to_string loads the whole file
+        // first, and the 512KB cap exists to bound that load.
+        let size = std::fs::metadata(&p)
+            .map_err(|e| ToolError::Failed(e.to_string()))?
+            .len();
+        if size > EDIT_FILE_CAP as u64 {
             return Err(ToolError::Failed("file over 512KB cap".to_string()));
         }
+        let original = std::fs::read_to_string(&p).map_err(|e| ToolError::Failed(e.to_string()))?;
         let updated =
             apply_hunk(&original, &args.search, &args.replace).map_err(ToolError::Failed)?;
         if let Some(argv) = self.policy.syntax_cmd.clone() {

@@ -73,15 +73,15 @@ const PASS_ENV: [&str; 9] = [
 /// no shell and null stdin, so a heredoc (`python3 - <<'EOF'`) is a silent
 /// exit-0 no-op the agent can build conclusions on, and a glued redirect
 /// (`python3 gen.py >out.txt`) passes the file name `>out.txt` as a literal
-/// argv argument — the write silently never happens. WHOLE tokens and
-/// heredoc prefixes (`<<…`) plus redirection prefixes (`>`, `2>`, `1>`,
-/// `&>`) are rejected; metacharacters inside one quoted argument (e.g.
+/// argv argument — the write silently never happens. WHOLE tokens,
+/// heredoc prefixes (`<<…`) and redirection prefixes (`>`, `2>`, `1>`,
+/// `&>`, `<`) are rejected; metacharacters inside one quoted argument (e.g.
 /// `python3 -c "import x; y()"`) stay legal — UNLESS the argument itself
 /// is a whole operator or starts with one of the rejected prefixes (a
-/// fully-quoted `grep '<<' f` is rejected too; the escape hatch is the
-/// write-script-to-file path). Args genuinely starting with the prefixes
-/// (e.g. `grep ">=x" f`) are over-matched — accepted tradeoff, they are
-/// rarer than the silent redirects they prevent.
+/// fully-quoted `grep '<<' f` or `grep "<tag" f` is rejected too; the escape
+/// hatch is the write-script-to-file path). Args genuinely starting with
+/// the prefixes (e.g. `grep ">=x" f`) are over-matched — accepted
+/// tradeoff, they are rarer than the silent redirects they prevent.
 const SHELL_OPS: [&str; 15] = [
     "<", ">", ">>", "<<", "<<<", "|", "||", "&&", "&", ";", "2>", "1>", "2>&1", "1>&2", "&>",
 ];
@@ -93,6 +93,7 @@ fn is_shell_op(tok: &str) -> bool {
         || tok.starts_with("2>")
         || tok.starts_with("1>")
         || tok.starts_with("&>")
+        || tok.starts_with('<')
 }
 
 /// Final spawn argv from (policy, argv): `exec_wrap` is prepended at spawn
