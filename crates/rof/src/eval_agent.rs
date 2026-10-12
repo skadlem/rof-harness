@@ -389,11 +389,35 @@ fn grade_exit_verdict(status: &std::process::ExitStatus, stderr: &str) -> eval::
     eval::Verdict::Unresolved
 }
 
+/// Verdict from the live-container grade: the task-written reward file
+/// decides whenever it exists (measured 2026-10-12 on the 26-cell arm:
+/// every TB2.1 slice test.sh ends with `echo 1|0 > /logs/verifier/reward.txt`,
+/// so its exit code is ALWAYS 0 and cannot carry the suite outcome — the
+/// exit-code-only estimand graded workless runs Resolved). The reward file
+/// is written by THIS grading: the instance home is fresh per cell and
+/// holds exactly one grading, so a present file means test.sh reached its
+/// final echo. Absence (or an unreadable file) falls back to the exit
+/// code, so tasks that propagate their suite exit stay byte-identical.
+/// A junk reward withholds as Ambiguous — it never falls back to the
+/// lying exit code. Pure so tests pin the precedence.
+fn grade_live_verdict(
+    status: &std::process::ExitStatus,
+    stderr: &str,
+    reward: Option<eval::Verdict>,
+) -> eval::Verdict {
+    match reward {
+        Some(v) => v,
+        None => grade_exit_verdict(status, stderr),
+    }
+}
+
 /// Grade one agent run inside the live env container: exec /tests/test.sh
 /// in the SAME container the agent worked in, so agent-installed packages
 /// and running services persist to grading. Verdict provenance here is the
-/// verifier exit code — a NEW estimand, never mixed with the harbor
-/// result.json reward. Spawn failure or timeout is infra (never
+/// task-written reward file (/logs/verifier/reward.txt, mounted + persisted
+/// at <home>/verifier-logs) with the verifier exit code as the no-artifact
+/// fallback — a NEW estimand, never mixed with the harbor result.json
+/// reward. Spawn failure or timeout is infra (never
 /// capability).
 async fn grade_live_container(
     inst: &eval::Instance,
@@ -433,7 +457,16 @@ async fn grade_live_container(
     if let Some(vs) = last_passed_failed(&text) {
         eprintln!("{} verifier: {vs}", inst.id);
     }
-    let verdict = grade_exit_verdict(&o.status, &stderr);
+    // The task-written reward decides; missing file = exit-code fallback.
+    let reward_path = home
+        .join("verifier-logs")
+        .join("verifier")
+        .join("reward.txt");
+    let reward = eval::check_tb_reward(&reward_path).ok();
+    if let Some(v) = &reward {
+        eprintln!("{} verifier reward file: {v:?}", inst.id);
+    }
+    let verdict = grade_live_verdict(&o.status, &stderr, reward);
     if matches!(verdict, eval::Verdict::InfraFailure) {
         eprintln!(
             "infra {}: docker daemon error at grading (container died?)",
@@ -1176,6 +1209,61 @@ mod tests {
             let bad = std::process::Command::new("false").status().unwrap();
             assert_eq!(grade_exit_verdict(&ok, ""), eval::Verdict::Resolved);
             assert_eq!(grade_exit_verdict(&bad, ""), eval::Verdict::Unresolved);
+        }
+    }
+
+    #[test]
+    fn reward_file_overrides_the_always_zero_exit_code() {
+        // Measured 2026-10-12 on the 26-cell arm: every slice task's
+        // test.sh ends with `echo 1|0 > /logs/verifier/reward.txt`, so the
+        // script ALWAYS exits 0 — the exit-code estimand graded workless
+        // runs Resolved. The task-written reward file decides whenever it
+        // exists; absence falls back to the exit code (exit-propagating
+        // tasks stay byte-identical).
+        #[cfg(unix)]
+        fn est(code: i32) -> std::process::ExitStatus {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                grade_live_verdict(&est(0), "", Some(eval::Verdict::Unresolved)),
+                eval::Verdict::Unresolved,
+                "reward 0 beats the lying exit code"
+            );
+            assert_eq!(
+                grade_live_verdict(&est(1), "1 failed", Some(eval::Verdict::Resolved)),
+                eval::Verdict::Resolved,
+                "reward 1 beats a nonzero exit (script continued past failures)"
+            );
+            assert_eq!(
+                grade_live_verdict(&est(0), "", Some(eval::Verdict::Ambiguous)),
+                eval::Verdict::Ambiguous,
+                "junk reward withholds — never falls back to the lying exit code"
+            );
+            assert_eq!(
+                grade_live_verdict(&est(0), "", None),
+                eval::Verdict::Resolved,
+                "no reward file: exit-propagating tasks stay byte-identical"
+            );
+            assert_eq!(
+                grade_live_verdict(&est(2), "py exit 2", None),
+                eval::Verdict::Unresolved
+            );
+            assert_eq!(
+                grade_live_verdict(&est(125), "Error response from daemon", None),
+                eval::Verdict::InfraFailure
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let ok = std::process::Command::new("true").status().unwrap();
+            assert_eq!(
+                grade_live_verdict(&ok, "", Some(eval::Verdict::Unresolved)),
+                eval::Verdict::Unresolved
+            );
+            assert_eq!(grade_live_verdict(&ok, "", None), eval::Verdict::Resolved);
         }
     }
 

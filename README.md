@@ -98,10 +98,15 @@ the agent run (workdir bind-mounted at `/app`, cpus/memory capped at
 the verifier execs the same live container — so installed packages and
 running services persist to grading, and the env-mutation task class
 (installed-by-the-agent imports, a live server) becomes winnable.
-Verdict provenance in this mode is the verifier exit code — a NEW
-estimand, never mixed with harbor-graded rows (the harbor path reads
-the `result.json` reward). Missing image, container-start failure, or
-verifier spawn failure/timeout are infra failures, never capability.
+Verdict provenance in this mode is the task-written reward file
+(`/logs/verifier/reward.txt`, persisted at `<home>/verifier-logs`) with the
+verifier exit code as the no-artifact fallback — a NEW estimand, never
+mixed with harbor-graded rows (the harbor path reads the `result.json`
+reward). Measured 2026-10-12: every TB2.1 slice `test.sh` ends with
+`echo 1|0 > reward.txt`, so its exit code is always 0 — exit-code-only
+grading read workless runs as Resolved. Missing image, container-start
+failure, or verifier spawn failure/timeout are infra failures, never
+capability.
 
 Missing credentials fail fast before any spend: exit 4, naming the env var
 (`--api-key-env NAME` selects which var holds the key).

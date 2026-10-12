@@ -59,10 +59,22 @@ says so explicitly.
   unwrapped argv; the wrap applies at spawn only), and grades by execing
   /tests/test.sh in the SAME live container. The env-mutation task class
   (installed-by-the-agent imports, a live server) becomes winnable.
-  Verdict provenance in this mode is the verifier exit code — a NEW
-  estimand, never mixed with the harbor result.json reward rows. Ceiling:
-  timeout/cancel kill the docker-exec client; the in-container process may
-  outlive it (upgrade path: docker kill or exec-session tracking).
+  Verdict provenance in this mode is the task-written reward file
+  (`/logs/verifier/reward.txt`, mounted writable at `<home>/verifier-logs`)
+  with the verifier exit code as the no-artifact fallback — a NEW
+  estimand, never mixed with the harbor result.json reward rows.
+  MEASURED 2026-10-12 (26-cell arm audit): every TB2.1 slice test.sh
+  ends with `echo 1|0 > /logs/verifier/reward.txt`, so the script ALWAYS
+  exits 0 — exit-code-only grading read workless runs as Resolved (three
+  seed-identical-workdir rows "Resolved" at reward 0; the banked 8/8 was
+  2/8 by reward). The reward file decides whenever it exists; a junk
+  reward withholds as Ambiguous, never falling back to the lying exit
+  code; absence keeps the exit-code fallback so exit-propagating tasks
+  stay byte-identical. A present reward file is trusted because the
+  instance home is fresh per cell with exactly one grading (no staleness
+  window). Ceiling: timeout/cancel kill the docker-exec client; the
+  in-container process may outlive it (upgrade path: docker kill or
+  exec-session tracking).
 - **The harbor CLI is the agent-leg grading seam.** `rof eval --agent`
   ports the bash pilot driver's mk_goal/verdict verbatim: job yaml (JSON)
   plus `harbor run -c <job> -y -q`; harbor spawn failure, grading timeout

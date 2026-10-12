@@ -43,8 +43,12 @@ container while the allowlist and shell-op guard still see the unwrapped
 argv, and file tools stay host-side on the bind-mounted workdir. The
 verifier then execs the same live container (`/tests/test.sh`), so
 installed packages and running services persist to grading; the verdict
-is the verifier exit code — a new estimand, never mixed with the harbor
-`result.json` reward. Every per-instance failure in this mode (missing
+is the task-written reward file (`/logs/verifier/reward.txt`, mounted
+writable and persisted at `<home>/verifier-logs`) with the verifier exit
+code as the no-artifact fallback — a new estimand, never mixed with the
+harbor `result.json` reward. Measured 2026-10-12: every slice `test.sh`
+ends with `echo > reward.txt`, so its exit code is always 0 and cannot
+carry the suite outcome. Every per-instance failure in this mode (missing
 image, container start, verifier spawn/timeout) is infra, never
 capability, and the container is removed best-effort on every path.
 
