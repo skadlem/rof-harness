@@ -49,6 +49,8 @@ against a scratch `--workdir`, with budgets, a snapshot tree, and the full
   fuzz-lenient numbers).
 - `crates/agent-event` / `agent-log` / `context` / `bets` / `trace`
   — events, durable log, compaction/file-map, proof gating, tracing.
+- `docs/` — `architecture.md`, `decisions.md` (decision log),
+  `roadmap.md` (what's next, spend-gated), `threat-model.md`.
 
 ## Build / test
 
