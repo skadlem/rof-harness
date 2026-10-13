@@ -212,3 +212,7 @@ cargo fmt --all -- --check
 
 CI runs all three on every push, plus a stale-reference grep over all
 tracked files.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).
