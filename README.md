@@ -1,146 +1,214 @@
-# rof-harness
+# rof
 
-Agent harness: an OpenAI-compatible model drives a tool loop (`agent-loop`)
-against a scratch `--workdir`, with budgets, a snapshot tree, and the full
-(uncut) run patch on stdout as the deliverable.
+[![CI](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml)
 
-## Layout
+A minimal, measurable coding-agent harness in Rust: an OpenAI-compatible
+model drives a tool loop against a scratch workdir — capped by budgets,
+guarded by a git-overlay snapshot tree, recorded to a write-ahead log —
+and the deliverable is the **full, uncut diff** of everything the agent
+changed, printed to stdout.
 
-- `crates/rof` — CLI driver. Runs the loop, prints the **full** patch to
-  stdout, exit code reflects the outcome. `--dump-events PATH` writes one
-  JSON line per event (one run, one dump file); the WAL defaults to
-  `<workdir>/.rof-events.jsonl` (`--log-path` overrides, `--no-log` opts out).
-  The WAL's `events` filename is historical: it holds the durable agent-log
-  Item rows (`kind`-tagged), never the live event stream — that is
-  `--dump-events`.
-  `rof eval` without `--agent` is a scaffold, not a grader: the default
-  engine runs no command and reports no reward, so instances grade
-  ErrorNoReport; real grading is the agent leg — with `--agent` each
-  instance runs a fresh workdir
-  `<out-dir>/<id>/work` seeded from `<tasks-dir>/<id>/environment`
-  (or left empty for can_create tasks), the goal built from the instruction
-  (`/app/` stripped, bare `/app` → "the workdir") plus the frozen pilot
-  rules tail, the run executed in-process with the same wiring as
-  `rof run`, then graded via the harbor CLI (`harbor run -c <job> -y -q`):
-  reward 1.0 → Resolved, 0 → Unresolved, missing → ErrorNoReport. Agent
-  infra failures (workdir refusal, missing harbor, grading timeout, a run
-  with no RunEnd in the events dump) never score as capability;
-  packaged files exclude top-level `.git`/`__pycache__`/`.pytest_cache`,
-  any-depth `*.pyc`, and the WAL sidecar (driver parity: first component
-  only, so a nested repo a task builds still reaches the container). With
-  `--in-container` the agent works inside the task environment container
-  (workdir bind-mounted at `/app`) and the verifier execs the same live
-  container instead of grading a fresh copy via harbor.
-- `crates/agent-loop` — the loop: `run()` is the shipped sequential driver
-  (`drive_tick` is a test harness over the same step helpers). State,
-  verification nudge, request building, proof gating, cancellation.
-- `crates/tool-core` — tool vocabulary, registry gate, `ToolOutcome`
-  (`success` carries the exit status; serde default false = fail-closed).
-- `crates/tools-std` — policy-gated `view/search/edit/write/exec/test` tools.
-- `crates/agent-budget` — step/action/token/spend caps, halts, `with_steps()`.
-- `crates/snapshot` — git-overlay tree: baselines, rollbacks, bounded
-  evidence patch + unbounded `patch_since_start_full()` deliverable.
-- `crates/provider-core` / `crates/provider-openai` — `LlmClient` trait +
-  OpenAI-compatible client (8-attempt retry ladder, priced models).
-- `crates/eval` — slice loading, winnability, gate stats (verdicts come
-  from the `rof eval --agent` leg; the plain leg is a scaffold).
-  Strict patch-apply grading by default; `--lenient-apply` records Lenient
-  provenance instead (Strict grades are not comparable with earlier
-  fuzz-lenient numbers).
-- `crates/agent-event` / `agent-log` / `context` / `bets` / `trace`
-  — events, durable log, compaction/file-map, proof gating, tracing.
-- `docs/` — `architecture.md`, `decisions.md` (decision log),
-  `roadmap.md` (what's next, spend-gated), `threat-model.md`.
+No planner scaffolding, no framework lock-in. One loop, six tools, and
+a benchmark rig strict enough to publish against.
 
-## Build / test
+## Design principles
+
+- **The log is the truth; the prompt is a view.** Every request is
+  derived from an append-only write-ahead log written *before* each
+  effect. Crash mid-run and you can replay exactly what the agent did.
+- **Budgets are the kill switch.** Steps, actions, tokens, dollars, and
+  wall-clock, checked at the top of every step. A confused model cannot
+  loop forever on your dime.
+- **Honest reporting is enforced in code.** Unknown costs are `null`,
+  never `$0.00`; infra failures never score as capability; every rate
+  ships with a Wilson confidence interval; flaky and saturated cells are
+  flagged rather than averaged away.
+- **Frozen benchmarks, digest-pinned.** Task slices are locked with
+  SHA-256 digests — a re-frozen slice fails `cargo test` before any run.
+- **Minimal by default.** Hand-rolled bootstrap and Wilson gates with
+  zero dependencies; experimental features ship behind flags that stay
+  off until measurements earn them a place.
+
+## Quickstart
 
 ```sh
 cargo build -p rof
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all -- --check
+export OPENAI_API_KEY=...
+
+# Point an agent at a scratch repo and let it work:
+./target/debug/rof run --goal "fix the failing test" --workdir /tmp/w \
+  --model <id> --endpoint https://api.deepseek.com/v1 \
+  --allow-cmd "cargo test" --budget-steps 20
 ```
 
-Scoped form per crate, e.g. `cargo test -p agent-loop`.
+The full unified diff of the workdir lands on stdout; the exit code says
+what happened. `--dump-events PATH` writes the complete event log for
+replay or post-mortem.
 
-## Run
+To benchmark an agent on the frozen Terminal-Bench slice:
 
 ```sh
-export OPENAI_API_KEY=...
-cargo run -p rof -- --goal "fix ..." --workdir /tmp/w --model <id> \
-  --endpoint https://... --allow-cmd "cargo test" --budget-steps 20
+./target/debug/rof eval --agent --in-container --tasks-dir <tb-tasks> \
+  --ids <task> --model <id> --endpoint <url> \
+  --allow-cmd python3 --report out.json
 ```
 
-Useful flags: `--budget-actions/--budget-tokens/--max-tokens`,
-`--context-file`, `--proof-cmd`, `--incentives base|contract|full`,
-`--bets`, `--compaction`, `--dump-events`, `--log-path` / `--no-log`,
-`--thinking-keep` / `--collapse-hysteresis` (env fallback `THINKING_KEEP` /
-`COLLAPSE_HYSTERESIS`, flag wins), repeatable `--pass-env NAME`,
-`--keep-thinking` (skip the DeepSeek-specific thinking-off request body),
-`--allow-dirty-workdir`. `rof eval --tasks-dir DIR [--lenient-apply]`
-loads the slice, checks winnability, and aggregates gate stats into the
-report (verdicts come from the `--agent` leg; the plain leg is a
-scaffold); `--lenient-apply` records Lenient patch-apply provenance
-in the report (default Strict).
+## Measured results
 
-`rof eval --agent` runs the agent leg instead of the oracle-container leg.
-Required: `--model ID`, `--endpoint URL` (or `OPENAI_BASE_URL`; flag wins).
-Optional: `--api-key-env NAME` (default `OPENAI_API_KEY`), repeatable
-`--header NAME:VALUE` (a colon-less value is a parse error), repeatable
-`--allow-cmd CMD` (same binary-prefix semantics as `rof run`),
-`--budget-steps/--budget-actions/--budget-tokens/--max-tokens` (agent
-budgets default to the frozen pilot recipe: 300000 tokens / 60 steps /
-120 actions), `--keep-thinking` (skip the thinking-off request body),
-`--in-container` (run the agent inside the task environment container).
-Mutually exclusive with `--winnability-only`.
+All numbers are reward-verified — graded by each task's own verifier
+artifacts, not by exit codes (see the note below).
 
-With `--in-container`, the task environment container is started before
-the agent run (workdir bind-mounted at `/app`, cpus/memory capped at
-2 / 4096m); agent exec/test calls run inside it via `docker exec`, and
-the verifier execs the same live container — so installed packages and
-running services persist to grading, and the env-mutation task class
-(installed-by-the-agent imports, a live server) becomes winnable.
-Verdict provenance in this mode is the task-written reward file
-(`/logs/verifier/reward.txt`, persisted at `<home>/verifier-logs`) with the
-verifier exit code as the no-artifact fallback — a NEW estimand, never
-mixed with harbor-graded rows (the harbor path reads the `result.json`
-reward). Measured 2026-10-12: every TB2.1 slice `test.sh` ends with
-`echo 1|0 > reward.txt`, so its exit code is always 0 — exit-code-only
-grading read workless runs as Resolved. Missing image, container-start
-failure, or verifier spawn failure/timeout are infra failures, never
-capability.
+| Measurement | Result |
+|---|---|
+| 26-cell in-container arm, frozen TB slice, glm-5.3-flash (2026-10-12) | 6 Resolved / 17 Unresolved / 1 infra — **$0.76 total spend** |
+| File-artifact widening, 18 tasks (2026-10-12) | 4/18 solved, partial credit on 4 more |
+| Env-mutation task class (live servers, agent-installed packages) | solvable in-container; structurally impossible under file-copy grading |
+| Cost per cell (flash-tier models) | $0.006–$0.13; frontier-tier harnesses report $6–$23 per task on the full 89-task suite |
 
-Missing credentials fail fast before any spend: exit 4, naming the env var
-(`--api-key-env NAME` selects which var holds the key).
+Capability signal is early — the point of the rig is that the numbers
+above can be trusted. Case in point: an audit after the widening found
+that every task's test script ends with `echo ... > reward.txt` and so
+*always exits 0*; the original exit-code grading read workless runs as
+passes (a "25/26" that was really 6/26, including a corrected 2/8 on the
+earlier banked cells). The grader now reads the task-written reward file,
+and every published number on this page was re-derived from it. The
+benchmark caught the harness's own bug — that is the feature.
+
+## What a run looks like
+
+One step of the loop:
+
+1. Build the request from the log (system head frozen for prefix
+   caching; old tool observations collapsed to one-line stubs; echoed
+   reasoning trimmed — thinking was 64% of input tokens on heavy traces).
+2. Ask the model.
+3. If the reply carries tool calls, gate them, execute, and fold the
+   results back in.
+4. Check budgets, append to the WAL, repeat — until the model answers in
+   plain text or a cap trips.
+
+Six tools, policy-gated: `view` / `search` / `edit` / `write` are
+workdir-anchored (symlink-safe, secrets-denied, bounded reads); `exec` /
+`test` run only allowlisted commands (binary-prefix match, shell-syntax
+guard, bounded output). Edits land in a git overlay: bad batches roll
+back, the proven prefix survives, and the final deliverable is the
+complete patch against the starting tree — a "done" run with an empty
+diff is a failure, never exit 0.
+
+The provider layer speaks the OpenAI chat protocol (DeepSeek, GLM, and
+any compatible endpoint), retries through an 8-attempt ladder with hard
+HTTP timeout ceilings, and meters exact token counts and dollars per
+model — an unpriced model reports `null` cost, never zero.
+
+## Benchmarks, graded honestly
+
+- **Slices:** Terminal-Bench 2.1 frozen slice (21 tasks, IRT-selected,
+  SHA-256-pinned), Multi-SWE-bench Rust slice (50 ids); SWE-bench
+  Verified is calibration-only.
+- **Taxonomy:** `Resolved | Unresolved | ErrorNoReport | EmptyPatch |
+  InfraFailure | Ambiguous` — infra failures are never scored as
+  capability, and broken instances are excluded loudly before any spend.
+- **Statistics:** Wilson 95% intervals on every rate; paired-bootstrap
+  comparisons seeded and reproducible without a `rand` dependency;
+  `Flaky` / saturation flags instead of silent averaging.
+- **Apply modes:** patch grading defaults to Strict (`git apply` only);
+  `--lenient-apply` records Lenient provenance, and the two are never
+  compared.
+- **Two estimands, never mixed:** harbor-graded (file-copy) rows and
+  in-container rows (verifier = the same live container the agent worked
+  in; verdict from the task-written reward file) live in separate arms.
+- Missing credentials fail fast (exit 4) before a single token of spend.
+
+## Repository layout
+
+- `crates/rof` — CLI driver: wires the loop once, prints the patch,
+  sets exit codes; `rof eval` runs the benchmark legs.
+- `crates/agent-loop` — the loop: state, request building, verification
+  nudge, proof gating, cancellation, termination order.
+- `crates/tool-core` / `tools-std` — tool vocabulary + registry gate, and
+  the six built-in tools with their containment policy.
+- `crates/agent-budget` — step/action/token/spend/wall caps and halts.
+- `crates/snapshot` — git-overlay baselines, rollback, the unbounded
+  deliverable patch.
+- `crates/provider-core` / `provider-openai` — `LlmClient` trait +
+  OpenAI-compatible adapter with retry ladder and pricing.
+- `crates/eval` — frozen slice loading, winnability, oracles, gate
+  statistics, report honesty flags.
+- `crates/agent-event` / `agent-log` / `trace` — event vocabulary,
+  durable WAL, ordered sinks.
+- `crates/context` — prompt selection: file map, pinned files,
+  collapse, compaction checkpoints (off by default).
+- `crates/bets` — three capability experiments, flagged off until
+  measured.
+- `docs/` — [`architecture.md`](docs/architecture.md),
+  [`decisions.md`](docs/decisions.md) (decision log),
+  [`roadmap.md`](docs/roadmap.md) (what's next),
+  [`threat-model.md`](docs/threat-model.md).
+
+## CLI reference
+
+`rof run` — required: `--goal`, `--workdir`, `--model`. Common flags:
+
+| Flag | Meaning |
+|---|---|
+| `--endpoint URL` | OpenAI-compatible base URL (env `OPENAI_BASE_URL`) |
+| `--allow-cmd CMD` | allowlisted command (repeatable; binary-prefix match) |
+| `--budget-steps/-actions/-tokens N` | caps; any explicit flag lifts the 900s wall to 3600s |
+| `--max-tokens N` | per-request output ceiling |
+| `--context-file PATH` | pinned file context (repeatable) |
+| `--dump-events PATH` | full event log (one run, one dump) |
+| `--log-path` / `--no-log` | WAL location (defaults to `<workdir>/.rof-events.jsonl`) |
+| `--incentives base\|contract\|full` | prompt scaffold level |
+| `--compaction FRAC` | context checkpointing (off by default, unvalidated) |
+| `--keep-thinking`, `--thinking-keep N`, `--collapse-hysteresis N` | transcript-shape knobs |
+| `--pass-env NAME`, `--header NAME:VALUE`, `--api-key-env NAME` | provider plumbing |
+
+`rof eval` adds: `--tasks-dir DIR` (required), `--ids a,b`, `--out-dir`,
+`--report PATH`, `--winnability-only`, `--lenient-apply`, `--agent`
+(per-instance in-process runs), `--in-container` (agent inside the task
+environment container). Without `--agent` it is a scaffold, not a
+grader — it checks winnability and slice integrity only. Agent budgets
+default to the frozen recipe: 300k tokens / 60 steps / 120 actions.
 
 ## Workdir contract
 
 `rof run` mutates `--workdir` in place (`git init`, `git add -A`, tool
-exec). The guard enforces exactly the four refusals below (exit 2); every
-other directory — however valuable it looks — is run today under the
-operator's responsibility (see Threat model: the tools build no sandbox).
-Refused with exit 2:
+exec). The guard enforces exactly four refusals (exit 2); every other
+directory — however valuable it looks — runs today under the operator's
+responsibility:
 
 - the filesystem root (`/`),
 - `$HOME`,
 - the harness checkout itself,
-- a repo with uncommitted changes, unless `--allow-dirty-workdir` is passed
-  (pre-existing dirt then appears in the reported patch).
+- a repo with uncommitted changes, unless `--allow-dirty-workdir` is
+  passed (pre-existing dirt then appears in the reported patch).
 
 ## Threat model
 
 - The path policy covers `view`/`edit`/`write` only: root-anchored,
   symlink-safe, secrets-denied file access.
-- `exec` and `test` run allowlisted host commands, but allowlisting is not
-  isolation: permitting `cargo test`, `sh`, or any test runner hands the
-  agent arbitrary code execution on the host. Agent-spawned host children
-  run at the lowest scheduling priority (nice 19): they yield to
-  interactive work but still get the full idle CPU, so unattended sweeps
-  do not make the desktop unusable during builds. Memory stays uncapped.
-- OS-level isolation (container/namespace, no network, read-only mounts,
-  memory caps) is the operator's job; the tools build no sandbox.
+- `exec` and `test` run allowlisted host commands, but allowlisting is
+  not isolation: permitting `cargo test`, `sh`, or any test runner hands
+  the agent arbitrary code execution on the host. Agent-spawned children
+  run at the lowest scheduling priority (nice 19) so unattended sweeps
+  yield to interactive work; memory stays uncapped.
+- OS-level isolation (container, namespaces, no network, read-only
+  mounts, memory caps) is the operator's job — the tools build no
+  sandbox.
 
 ## Exit codes
 
-0 done; 2 usage/parse; 3 run failure (halted, cancelled, provider error);
-4 missing credentials; 5 log failure; 6 snapshot failure; 7 input failure.
+0 done; 2 usage/parse; 3 run failure (halted, cancelled, provider
+error); 4 missing credentials; 5 log failure; 6 snapshot failure;
+7 input failure.
+
+## Build / test
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+CI runs all three on every push, plus a stale-reference grep over all
+tracked files.
