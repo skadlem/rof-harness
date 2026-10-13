@@ -1028,7 +1028,7 @@ mod tests {
             "--endpoint",
             "https://e/v1",
             "--header",
-            "x-opencode-session:r1-a",
+            "x-run-session:r1-a",
             "--allow-cmd",
             "python3",
             "--allow-cmd",
@@ -1046,7 +1046,7 @@ mod tests {
         assert!(a.agent);
         assert_eq!(a.model.as_deref(), Some("deepseek-v4.1-flash"));
         assert_eq!(a.endpoint.as_deref(), Some("https://e/v1"));
-        assert_eq!(a.headers, vec!["x-opencode-session:r1-a".to_string()]);
+        assert_eq!(a.headers, vec!["x-run-session:r1-a".to_string()]);
         assert_eq!(
             a.allow_cmd,
             vec!["python3".to_string(), "cargo test".to_string()]
