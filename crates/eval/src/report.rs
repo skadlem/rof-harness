@@ -34,9 +34,66 @@ pub struct InstanceReport {
     pub apply_detail: Option<String>,
 }
 
+/// Reward estimand: which grading path decided a run's verdicts. One
+/// value per `rof eval` leg, never mixed in a comparison (see
+/// `docs/roadmap.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Estimand {
+    /// Plain `rof eval` (no `--agent`): the engine runs no solve and no
+    /// verifier, so no grading path produces a reward — rows are typically
+    /// `ErrorNoReport` — a scaffold, not a grade.
+    Ungraded,
+    /// `--agent`: the harbor CLI grades the oracle solution and the reward
+    /// comes from `result.json`.
+    HarborOracle,
+    /// `--agent --in-container`: the verdict is the task-written reward
+    /// file, with the verifier exit code as the no-artifact fallback.
+    InContainerReward,
+}
+
+/// Harness specification for one run, written alongside its rows so a
+/// report file identifies its own arm without driver-script convention:
+/// which binary, which grading path, which budget recipe, which applier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunProvenance {
+    /// Short git sha of the `rof` binary that produced the run, embedded
+    /// at build time by `crates/rof/build.rs` (`git rev-parse --short
+    /// HEAD`); `None` only if the value was not embedded, and "unknown"
+    /// when git was unavailable — never fabricated.
+    pub binary_git_sha: Option<String>,
+    pub estimand: Estimand,
+    /// Token/step/action caps resolved from this run's flags (the agent-leg
+    /// recipe; an `Ungraded` run never applies a budget): explicit flags win
+    /// over the frozen pilot recipe.
+    pub budget_tokens: u64,
+    pub budget_steps: u32,
+    pub budget_actions: u32,
+    /// Token-cap accounting shape for the agent leg (report label; the
+    /// charging behavior lives in the loop). A `MissPlusOut` arm is a
+    /// different estimand from a `Gross` arm — never mixed in one table.
+    /// Required field: a provenance block without it fails loudly rather
+    /// than silently reading as `Gross`.
+    pub budget_shape: BudgetShapeLabel,
+    pub apply_mode: ApplyMode,
+}
+
+/// Report-side spelling of the token-cap shape (`Gross` = input+output,
+/// the frozen recipe; `MissPlusOut` = (input − cache_read) + output). Mirrors
+/// the charging enum in the loop crate without a dependency edge; `rof`
+/// converts at the report site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BudgetShapeLabel {
+    Gross,
+    MissPlusOut,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunReport {
     pub instances: Vec<InstanceReport>,
+    /// `None` in a report written before provenance existed (the key is
+    /// absent), so old report files still deserialize.
+    #[serde(default)]
+    pub provenance: Option<RunProvenance>,
 }
 
 impl RunReport {

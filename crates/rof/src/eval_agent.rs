@@ -123,9 +123,19 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
             .unwrap_or_else(|| "OPENAI_API_KEY".into()),
         headers: a.headers.clone(),
         allow_cmd: a.allow_cmd.clone(),
-        budget_steps: Some(a.budget_steps.unwrap_or(60)),
-        budget_actions: Some(a.budget_actions.unwrap_or(120)),
-        budget_tokens: Some(a.budget_tokens.unwrap_or(300_000)),
+        budget_steps: Some(
+            a.budget_steps
+                .unwrap_or(crate::eval_cmd::PILOT_BUDGET_STEPS),
+        ),
+        budget_actions: Some(
+            a.budget_actions
+                .unwrap_or(crate::eval_cmd::PILOT_BUDGET_ACTIONS),
+        ),
+        budget_tokens: Some(
+            a.budget_tokens
+                .unwrap_or(crate::eval_cmd::PILOT_BUDGET_TOKENS),
+        ),
+        budget_shape: a.budget_shape,
         max_tokens: a.max_tokens,
         context_files: Vec::new(),
         dump_events: Some(events_path.to_string_lossy().into_owned()),

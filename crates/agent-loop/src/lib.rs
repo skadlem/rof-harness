@@ -19,7 +19,7 @@ mod tests;
 pub use budget_nudge::IncentivesLevel;
 pub use gate::{EffectGate, GateError, GateStatus};
 pub use proof::{BetsHook, NoBets};
-pub use run::{run, Run, RunConfig};
+pub use run::{run, BudgetShape, Run, RunConfig};
 pub use state::{
     turn_end_reason_to_event, Checkpoint, ClaimOutcome, Experiment, FailureKind, Input, LoopState,
     Outcome, Phase, PhaseVerdict, QueuedInput, ToolCallState,

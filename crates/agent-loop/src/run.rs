@@ -282,6 +282,37 @@ fn settle_provider_tick(
     // else: STALE GUARD, dropped without an event.
 }
 
+/// What the token cap counts. `Gross` charges `input + output` (today's
+/// behavior: the frozen recipe's default); `MissPlusOut` charges
+/// `(input - cache_read) + output`, so provider-cached prompt re-reads stop
+/// counting against the cap (the subtraction saturates). `cache_read ⊆
+/// input` is a property of the OpenAI-shaped wire
+/// (`provider-openai/src/protocol.rs` maps `cached_tokens` inside
+/// `prompt_tokens`, the same miss share `pricing.rs` charges), not a
+/// documented `provider-core` invariant — an adapter that reports cache
+/// reads outside `input` must not use `MissPlusOut`. Reporting and dollars
+/// are unchanged by either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetShape {
+    #[default]
+    Gross,
+    MissPlusOut,
+}
+
+impl std::str::FromStr for BudgetShape {
+    type Err = String;
+    /// CLI spellings, one source for both the `run` and `eval` tables.
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "gross" => Ok(Self::Gross),
+            "miss-plus-out" | "miss_plus_out" => Ok(Self::MissPlusOut),
+            _ => Err(format!(
+                "unknown budget shape {s:?}: expected gross or miss-plus-out"
+            )),
+        }
+    }
+}
+
 /// Headless run knobs. `drain_timeout` defaults to 30s (unattended runs must
 /// not wedge on a stuck tool); the context budget reuses v1's 24k evidence
 /// window until the histogram retunes it.
@@ -308,6 +339,10 @@ pub struct RunConfig {
     /// fields directly; the loop and `context` never read the environment.
     pub thinking_keep: usize,
     pub collapse_hysteresis: usize,
+    /// Token-cap accounting shape (default [`BudgetShape::Gross`]: the frozen
+    /// recipe's gross input+output). Arms set the field directly; the loop
+    /// never reads the environment.
+    pub budget_shape: BudgetShape,
 }
 
 impl Default for RunConfig {
@@ -325,6 +360,7 @@ impl Default for RunConfig {
             compaction: context::CompactionConfig::default(),
             thinking_keep: THINKING_KEEP,
             collapse_hysteresis: context::COLLAPSE_HYSTERESIS,
+            budget_shape: BudgetShape::Gross,
         }
     }
 }
@@ -1144,8 +1180,9 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
 /// followups ride `state.followups`. Parked-idle with empty queues is Done.
 ///
 /// Single source of truth: `cfg` owns every run knob (incentives, drain
-/// deadline, fold knobs, compaction, proof command). `LoopState` holds no
-/// config mirror, so there is no precedence to document.
+/// deadline, fold knobs, compaction, proof command, budget shape). The one
+/// config copy is `cfg.budget_shape` -> `state.budget_shape`, seeded below
+/// because the sole charge site (`record_usage`) sees `LoopState`, not `cfg`.
 /// `state.budget` arrives pre-seeded (rof builds it from the capability
 /// preset plus CLI overrides via the `agent_budget` constructors) and `run`
 /// never rebuilds it.
@@ -1164,6 +1201,7 @@ pub async fn run<P: LlmClient>(
         bets,
         cfg,
     } = r;
+    state.budget_shape = cfg.budget_shape; // the one config copy; see the `run` doc
     let tree = Arc::new(snapshot::TreeService::new(workdir));
     let mut ctx = RunCtx {
         state,

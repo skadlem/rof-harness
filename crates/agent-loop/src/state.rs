@@ -1,6 +1,6 @@
 //! Shared turn/step state: `LoopState`, items, and the durable-log helpers.
 
-use crate::{EffectGate, RunConfig, VerifyState};
+use crate::{BudgetShape, EffectGate, RunConfig, VerifyState};
 use agent_budget::{config_for, halt_name, BudgetGuard, Capability};
 use agent_event::{TurnEndReason as EventTurnEndReason, UsageReport};
 use agent_log::{InputSource, Item, ItemKind, RecoveryCode, TurnEndReason};
@@ -191,8 +191,8 @@ pub struct Checkpoint {
 /// Shared turn/step state for both drivers. `run` is the canonical shipped
 /// driver. Run configuration (incentives, drain deadline, fold knobs) lives
 /// in [`RunConfig`], the single source of truth threaded through every
-/// method that needs it — no field here mirrors it, so there is no
-/// precedence to document.
+/// method that needs it; the one mirror is `budget_shape`, seeded by `run`
+/// (`cfg` wins) — everything else reads `cfg` directly.
 pub struct LoopState {
     pub turn: u64,
     pub step: u32,
@@ -219,6 +219,9 @@ pub struct LoopState {
     pub stop_when_idle: bool,
     pub turn_reason: Option<TurnEndReason>,
     pub budget: BudgetGuard,
+    /// What the token cap counts; seeded from [`RunConfig::budget_shape`] at
+    /// run start (direct `LoopState` users keep the gross default).
+    pub budget_shape: BudgetShape,
     /// Live running totals for `TurnEnd.usage_totals`, cumulative over the
     /// run; the durable log vocabulary is unchanged.
     pub usage_totals: UsageReport,
@@ -292,6 +295,7 @@ impl LoopState {
             stop_when_idle: false,
             turn_reason: None,
             budget: BudgetGuard::new(config_for(Capability::UnattendedBatch), Instant::now()),
+            budget_shape: BudgetShape::Gross,
             usage_totals: UsageReport::default(),
             emit_next: 0,
             open_msg: None,
@@ -499,10 +503,17 @@ impl LoopState {
     }
 
     /// Tokens meter every settle and every metered failure; spend converts
-    /// cost_usd to cents. The same reading folds into the live running totals
+    /// cost_usd to cents. What counts toward the cap follows
+    /// [`crate::BudgetShape`]; the reported totals below are always gross.
+    /// The same reading folds into the live running totals
     /// (`TurnEnd.usage_totals`).
     pub fn record_usage(&mut self, usage: &Usage) {
-        self.budget.record_tokens(usage.total_tokens());
+        self.budget.record_tokens(match self.budget_shape {
+            BudgetShape::Gross => usage.total_tokens(),
+            // Cache reads are a subset of `input`: saturate so a provider
+            // that over-reports them clamps the input share at 0.
+            BudgetShape::MissPlusOut => usage.input.saturating_sub(usage.cache_read) + usage.output,
+        });
         if let Some(cost) = usage.cost_usd {
             self.budget
                 .record_spend_cents((cost * 100.0).round().max(0.0) as u64);

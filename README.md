@@ -114,9 +114,15 @@ model — an unpriced model reports `null` cost, never zero.
 - **Apply modes:** patch grading defaults to Strict (`git apply` only);
   `--lenient-apply` records Lenient provenance, and the two are never
   compared.
-- **Two estimands, never mixed:** harbor-graded (file-copy) rows and
+- **Two graded estimands, never mixed:** harbor-graded (file-copy) rows and
   in-container rows (verifier = the same live container the agent worked
   in; verdict from the task-written reward file) live in separate arms.
+- **Self-describing reports:** every report carries a provenance
+  block — binary git sha, the agent-leg budget recipe (token/step/action
+  caps and the token-cap shape), apply mode, and the
+  estimand label (`Ungraded` for plain eval, `HarborOracle` for
+  `--agent`, `InContainerReward` for `--agent --in-container`) — so an
+  arm is identified by its own file, not by driver-script convention.
 - Missing credentials fail fast (exit 4) before a single token of spend.
 
 ## Repository layout

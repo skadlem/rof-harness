@@ -13,46 +13,51 @@ measured numbers carry a date and live with the run artifacts.
   read always-zero verifier exits as passes).
 - Measured on the frozen TB Slice A (21 tasks): 26 banked in-container
   cells (glm-5.3-flash, frozen recipe 300k tokens / 60 steps / 120
-  actions), reward-verified **6 Resolved / 17 Unresolved / 1 infra**
-  (2026-10-12). The env-mutation family (installed-by-the-agent imports,
+  actions), reward-verified **6 Resolved / 19 Unresolved / 1 infra**
+  (2026-10-12; re-derived from the summary artifact 2026-10-13 — an
+  earlier note that read 6/17/1 summed to 24 and was an arithmetic slip).
+  The env-mutation family (installed-by-the-agent imports,
   a live server) is winnable in-container and structurally impossible
   under the file-copy grading bridge.
 - The file-artifact widening read **4/18 solved**
   (break-filter-js-from-html, hf-model-inference,
   log-summary-date-ranges, sam-cell-seg; 2026-10-12).
+- Every report self-describes (2026-10-13): the provenance block
+  carries the binary git sha (embedded at build time), the agent-leg
+  budget recipe including the token-cap shape, the apply mode, and the
+  estimand label — `Ungraded` (plain eval), `HarborOracle` (`--agent`),
+  `InContainerReward` (`--agent --in-container`). Reports written before
+  the block existed still deserialize.
+- The budget-shape knob landed OFF by default (2026-10-13):
+  `--budget-shape gross|miss-plus-out` on `rof run` and `rof eval`.
+  `miss-plus-out` charges `(input - cache_read) + output` against the
+  token cap (reported usage and dollars stay gross); it is a different
+  estimand from `gross`, recorded on every provenance block, and its
+  first arm run is still owner-gated spend.
 
 ## Next (ordered, spend-gated)
 
-1. **Provenance labels on every report** (small): a provenance block on
-   each `RunReport` — binary git sha, budget recipe, estimand label,
-   apply mode — so every arm is self-describing by its own file instead
-   of by driver-script convention. This is the 2026 comparability
-   literature's core demand — report the full harness specification
-   alongside any comparison, and treat model+harness as the tested
-   solver (arXiv:2607.22585, arXiv:2608.26218) — and it feeds every
-   later move. DECISIONS entry first, then struct + wiring + tests.
-2. **Rivals comparison grid** (free): cross-harness comparison over the
-   stored matrix data — same models, same frozen tasks, only the
-   harness varies — with per-cell rollouts published.
-   **Cost and tokens-per-solved are the primary axes; pass rate is
-   secondary.** The measured noise floor (arXiv:2610.04433: 447 tasks
-   resolve ~5 points; 45 tasks catch a 13-point gap only half the
-   time) means pass-rate harness deltas are not resolvable at this
-   slice size (21 tasks), while harness cost effects are — up to 3x
-   per task and 40x tokens-per-solved at fixed model and tasks
-   (arXiv:2610.04433, arXiv:2607.22585). Never mix estimands
-   (harbor-graded rows vs in-container reward-file rows) or arms
-   (different binaries, models, or recipes) in one table.
-3. **Budget-shape arm** (the structural bet): charge cache-miss +
-   output tokens, not gross input, against the token cap. Measured
-   motivation (2026-10-08 forensics): 90–98% of the 300k cap is context
-   re-reads (out:in 0.02–0.12); runs die at 21–53 steps having done
-   ~5–25k tokens of novel work. This is a new estimand: record it in
-   `docs/decisions.md` before the first run.
-4. **Near-miss rep top-ups** (if they earn the spend): the
+1. **Rivals grid comparisons** (free): the comparison grid over the
+   stored arms is defined (2026-10-13: 204 measured cells inventoried
+   from disk with estimand, arm, and verdict-layer provenance). Run and
+   publish the legal tables — the model-matched layout comparison
+   (rof/hermes/pi, n=3, harbor-graded) and within-arm cost trends.
+   Cross-harness cost is not computable (rival logs carry no usage
+   fields), and pass-rate deltas sit below the noise floor at this
+   slice size, so claims stay within what each table resolves.
+   Never mix estimands (harbor-graded rows vs in-container reward-file
+   rows) or arms (different binaries, models, or recipes) in one table.
+2. **Budget-shape arm run** (the structural bet, owner-gated spend):
+   first arm at the frozen recipe with `--budget-shape miss-plus-out`
+   on the near-miss cells. Measured motivation (2026-10-08 forensics):
+   90–98% of the 300k cap is context re-reads; runs die at 21–53 steps
+   having done ~5–25k tokens of novel work. Pass = more solves at
+   ≤1.3× dollars-per-solved vs the gross arm. A miss-plus-out arm
+   never shares a table with a gross arm.
+3. **Near-miss rep top-ups** (if they earn the spend): the
    partial-credit cells (1/3, 1/2, 2/4, 2/3 test shapes) are the
    cheapest capability information per cell.
-5. **S-1 compaction experiment**: the `--compaction` knob is landed
+4. **S-1 compaction experiment**: the `--compaction` knob is landed
    OFF by default and unvalidated; the first paid run validates
    `frac`/`keep_tokens` or revises them.
 

@@ -24,7 +24,14 @@ directory.
 aggregates gate stats into a JSON report, but without `--agent` it is a
 scaffold: the default engine runs no command and reports no reward, so
 instances grade ErrorNoReport. Default patch-apply provenance is Strict;
-`--lenient-apply` records Lenient instead. With `--agent` the per-instance
+`--lenient-apply` records Lenient instead. Every report carries a
+provenance block (`eval::RunProvenance`): the binary's short git sha
+(embedded by `crates/rof/build.rs`, "unknown" when git is unavailable),
+the agent-leg budget recipe (token/step/action caps and the token-cap
+shape, `gross` or `miss-plus-out`), the apply mode, and
+the estimand label — `Ungraded` (plain eval), `HarborOracle` (`--agent`),
+or `InContainerReward` (`--agent --in-container`), so an arm is
+identified by its own report file. With `--agent` the per-instance
 engine is the agent leg (`eval_agent.rs`) — the real grading path: fresh
 seeded workdir,
 the loop executed in-process through the same `execute()` wiring as

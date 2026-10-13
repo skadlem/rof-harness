@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{parse_table, resolve_endpoint, Flag};
 
-pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--keep-thinking] [--in-container]
+pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--max-tokens N] [--keep-thinking] [--in-container]
 --lenient-apply: record Lenient patch-apply provenance in the report (default Strict; Strict grades are not comparable with earlier fuzz-lenient numbers)
 --agent: run the agent leg per instance instead of the oracle-container leg (fresh workdir, in-process rof-run wiring, harbor-CLI grading). Requires --model ID and --endpoint URL (or OPENAI_BASE_URL); mutually exclusive with --winnability-only. Agent budgets default to the frozen pilot recipe: 300000 tokens / 60 steps / 120 actions; explicit flags win.
 --keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default keeps the DeepSeek thinking-off knob, sent only on compaction-summary calls and the truncation ladder first rung; ordinary requests carry no thinking fragment)
---in-container: with --agent, the agent works inside the task environment container (started before the run; workdir bind-mounted at /app, cpus/memory capped at 2/4096m; agent exec/test calls wrapped with docker exec; the verifier execs the same live container, so installed packages and running services persist to grading). Verdict provenance in this mode is the task-written reward file (/logs/verifier/reward.txt) with the verifier exit code as the no-artifact fallback, never the harbor result.json reward";
+--in-container: with --agent, the agent works inside the task environment container (started before the run; workdir bind-mounted at /app, cpus/memory capped at 2/4096m; agent exec/test calls wrapped with docker exec; the verifier execs the same live container, so installed packages and running services persist to grading). Verdict provenance in this mode is the task-written reward file (/logs/verifier/reward.txt) with the verifier exit code as the no-artifact fallback, never the harbor result.json reward;
+--budget-shape: token-cap accounting, recorded on the report's provenance block. gross = input+output (default, the frozen recipe); miss-plus-out = (input - cache_read) + output, so provider-cached prompt re-reads stop spending the token cap. A miss-plus-out arm is a DIFFERENT ESTIMAND from a gross arm: never mix the two shapes in one table. Reported usage totals and dollars are unchanged by either shape";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct EvalArgs {
@@ -34,6 +35,9 @@ pub(crate) struct EvalArgs {
     pub budget_steps: Option<u32>,
     pub budget_actions: Option<u32>,
     pub budget_tokens: Option<u64>,
+    /// Token-cap accounting shape (`None` = the loop default `Gross`);
+    /// `MissPlusOut` is a different estimand — never mixed with Gross rows.
+    pub budget_shape: Option<agent_loop::BudgetShape>,
     pub max_tokens: Option<usize>,
     /// Skip the thinking-off request body (`EndpointProfile` with
     /// `thinking_off: None`): for providers that reject the DeepSeek
@@ -71,6 +75,7 @@ struct EvalBuilder {
     budget_steps: Option<u32>,
     budget_actions: Option<u32>,
     budget_tokens: Option<u64>,
+    budget_shape: Option<agent_loop::BudgetShape>,
     max_tokens: Option<usize>,
 }
 
@@ -156,6 +161,15 @@ fn set_budget_tokens(b: &mut EvalBuilder, v: Option<String>) -> Result<(), Strin
     b.budget_tokens = Some(
         s.parse()
             .map_err(|_| format!("--budget-tokens needs a positive integer, got {s:?}"))?,
+    );
+    Ok(())
+}
+
+fn set_budget_shape(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    b.budget_shape = Some(
+        s.parse()
+            .map_err(|_| format!("--budget-shape needs gross or miss-plus-out, got {s:?}"))?,
     );
     Ok(())
 }
@@ -280,6 +294,11 @@ const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
         set: set_budget_tokens,
     },
     Flag {
+        name: "--budget-shape",
+        takes_value: true,
+        set: set_budget_shape,
+    },
+    Flag {
         name: "--max-tokens",
         takes_value: true,
         set: set_max_tokens,
@@ -344,6 +363,7 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
         budget_steps: b.budget_steps,
         budget_actions: b.budget_actions,
         budget_tokens: b.budget_tokens,
+        budget_shape: b.budget_shape,
         max_tokens: b.max_tokens,
         keep_thinking: b.keep_thinking,
         in_container: b.in_container,
@@ -357,6 +377,46 @@ pub(crate) fn apply_mode_for(args: &EvalArgs) -> eval::ApplyMode {
         eval::ApplyMode::Lenient
     } else {
         eval::ApplyMode::Strict
+    }
+}
+
+/// Frozen pilot-recipe budget defaults (NEXT.md): the slots `agent_args`
+/// fills when the user omits the flag.
+pub(crate) const PILOT_BUDGET_TOKENS: u64 = 300_000;
+pub(crate) const PILOT_BUDGET_STEPS: u32 = 60;
+pub(crate) const PILOT_BUDGET_ACTIONS: u32 = 120;
+
+/// The budget recipe as actually resolved for this run: explicit flags win,
+/// the pilot defaults fill the rest. The same resolution `agent_args`
+/// applies before the run, recorded so the report matches the run.
+pub(crate) fn budget_recipe(args: &EvalArgs) -> (u64, u32, u32) {
+    (
+        args.budget_tokens.unwrap_or(PILOT_BUDGET_TOKENS),
+        args.budget_steps.unwrap_or(PILOT_BUDGET_STEPS),
+        args.budget_actions.unwrap_or(PILOT_BUDGET_ACTIONS),
+    )
+}
+
+/// Reward estimand this run's rows carry (see [`eval::Estimand`]): plain
+/// eval is ungraded, `--agent` is the harbor oracle, and
+/// `--agent --in-container` is the task-written reward file.
+pub(crate) fn estimand_for(args: &EvalArgs) -> eval::Estimand {
+    if !args.agent {
+        eval::Estimand::Ungraded
+    } else if args.in_container {
+        eval::Estimand::InContainerReward
+    } else {
+        eval::Estimand::HarborOracle
+    }
+}
+
+/// Token-cap shape recorded on the report (see
+/// [`eval::BudgetShapeLabel`]): an absent flag records `Gross`, the
+/// frozen-recipe default the run used.
+pub(crate) fn budget_shape_for(args: &EvalArgs) -> eval::BudgetShapeLabel {
+    match args.budget_shape {
+        Some(agent_loop::BudgetShape::MissPlusOut) => eval::BudgetShapeLabel::MissPlusOut,
+        Some(agent_loop::BudgetShape::Gross) | None => eval::BudgetShapeLabel::Gross,
     }
 }
 
@@ -449,9 +509,25 @@ pub(crate) async fn run_eval(args: &EvalArgs) -> i32 {
 }
 
 /// Shared report tail: JSON to `--report` (prettied) or stdout. Extracted so
-/// the agent leg writes the exact same bytes through the same code.
+/// the agent leg writes the exact same bytes through the same code. Every
+/// report carries a [`eval::RunProvenance`] block (binary git sha, estimand
+/// label, resolved budget recipe, apply mode) so the arm is identified by
+/// its own file.
 pub(crate) fn finish_report(args: &EvalArgs, reports: Vec<eval::InstanceReport>) -> i32 {
-    let report = eval::RunReport { instances: reports };
+    let (budget_tokens, budget_steps, budget_actions) = budget_recipe(args);
+    let report = eval::RunReport {
+        instances: reports,
+        provenance: Some(eval::RunProvenance {
+            // Embedded by build.rs; "unknown" when git was unavailable.
+            binary_git_sha: option_env!("ROF_GIT_SHA").map(str::to_owned),
+            estimand: estimand_for(args),
+            budget_tokens,
+            budget_steps,
+            budget_actions,
+            budget_shape: budget_shape_for(args),
+            apply_mode: apply_mode_for(args),
+        }),
+    };
     if let Some(path) = args.report.as_deref() {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -610,6 +686,119 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn estimand_labels_follow_the_grading_path() {
+        let plain = parse_eval(&argv(&["rof", "eval", "--tasks-dir", "/tmp/t"])).unwrap();
+        assert_eq!(estimand_for(&plain), eval::Estimand::Ungraded);
+        let agent = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--agent",
+            "--model",
+            "m",
+            "--endpoint",
+            "http://x",
+        ]))
+        .unwrap();
+        assert_eq!(estimand_for(&agent), eval::Estimand::HarborOracle);
+        let in_container = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--agent",
+            "--model",
+            "m",
+            "--endpoint",
+            "http://x",
+            "--in-container",
+        ]))
+        .unwrap();
+        assert_eq!(
+            estimand_for(&in_container),
+            eval::Estimand::InContainerReward
+        );
+    }
+
+    #[test]
+    fn finish_report_embeds_the_resolved_recipe_and_estimand() {
+        let dir = std::env::temp_dir().join(format!("rof-eval-prov-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.json");
+        let a = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--agent",
+            "--model",
+            "m",
+            "--endpoint",
+            "http://x",
+            "--budget-tokens",
+            "12345",
+            "--budget-shape",
+            "miss-plus-out",
+            "--report",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert_eq!(finish_report(&a, Vec::new()), 0);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let p = &v["provenance"];
+        assert_eq!(p["estimand"], "HarborOracle");
+        assert_eq!(p["budget_tokens"], 12345, "explicit flag wins");
+        assert_eq!(p["budget_steps"], 60, "omitted slots fill the pilot recipe");
+        assert_eq!(p["budget_actions"], 120);
+        assert_eq!(p["budget_shape"], "MissPlusOut", "flag recorded");
+        assert_eq!(p["apply_mode"], "Strict");
+        assert!(
+            p["binary_git_sha"].as_str().is_some_and(|s| !s.is_empty()),
+            "sha embedded by build.rs (real or 'unknown'), never silently absent: {p}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn budget_shape_defaults_to_gross_and_rejects_junk() {
+        let base = |extra: &[&str]| {
+            let mut v = vec![
+                "rof",
+                "eval",
+                "--tasks-dir",
+                "/tmp/t",
+                "--agent",
+                "--model",
+                "m",
+                "--endpoint",
+                "http://x",
+            ];
+            v.extend(extra);
+            parse_eval(&argv(&v))
+        };
+        assert_eq!(
+            base(&[]).unwrap().budget_shape,
+            None,
+            "absent flag keeps the loop default (recorded as Gross)"
+        );
+        assert_eq!(
+            base(&["--budget-shape", "gross"]).unwrap().budget_shape,
+            Some(agent_loop::BudgetShape::Gross)
+        );
+        assert!(
+            base(&["--budget-shape", "miss+out"]).is_err(),
+            "junk rejected"
+        );
+        assert_eq!(
+            budget_shape_for(&base(&[]).unwrap()),
+            eval::BudgetShapeLabel::Gross,
+            "absent flag records Gross on the report"
+        );
+    }
+
     #[tokio::test]
     async fn eval_winnability_only_reports_violations_without_docker() {
         let root = std::env::temp_dir().join(format!("rof-eval-test-{}", std::process::id()));
@@ -648,6 +837,7 @@ mod tests {
             budget_steps: None,
             budget_actions: None,
             budget_tokens: None,
+            budget_shape: None,
             max_tokens: None,
             keep_thinking: false,
             in_container: false,

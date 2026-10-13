@@ -120,6 +120,53 @@ says so explicitly.
   three builds). Flag-less runs keep the preset wall.
 - **Dump semantics.** `--dump-events PATH` replaces any previous dump at
   PATH (one run, one dump), truncating at start and appending per event.
+- **Reports self-describe: the provenance block is part of the report
+  contract (2026-10-13).** `RunReport.provenance` carries the binary's
+  short git sha (embedded at build time; "unknown" when git is
+  unavailable, never fabricated — a pinned test fails if it goes
+  silently absent), the strict `Estimand` enum — `Ungraded` (plain
+  eval: no grading path runs, rows are typically `ErrorNoReport`),
+  `HarborOracle` (`--agent`, harbor `result.json`), `InContainerReward`
+  (`--agent --in-container`, task-written reward file with exit-code
+  fallback) — wired once at the shared report tail both legs use, the
+  agent-leg budget recipe (explicit flags over the frozen pilot
+  defaults; an `Ungraded` run never applies it), the token-cap shape,
+  and the apply mode. Reports written before the block existed (no
+  key) still deserialize as `provenance: null`. The estimand labels
+  were verified against the actual grading seams by fresh review
+  (2026-10-13), including that the always-zero-exit misgrade class of
+  2026-10-12 is not reintroduced.
+- **Budget-shape is a separate estimand, OFF by default (2026-10-13).**
+  `--budget-shape gross|miss-plus-out` (one spelling source shared by
+  the `run` and `eval` tables). `gross` = input+output, bit-identical
+  to the frozen recipe by construction (the default arm selects the
+  literal pre-change expression). `miss-plus-out` charges
+  `(input - cache_read) + output`, saturating, at the single metering
+  site — so provider-cached prompt re-reads stop spending the token
+  cap (measured 2026-10-08 forensics: 90–98% of the 300k cap is
+  context re-reads). Reported usage totals and dollars stay gross:
+  only the cap moves. `cache_read ⊆ input` is a property of the
+  OpenAI-shaped wire (the adapter maps `cached_tokens` inside
+  `prompt_tokens`, the same miss share pricing charges), not a
+  documented provider-core invariant — an adapter that reports cache
+  reads outside `input` must not use `miss-plus-out`. A miss-plus-out
+  arm never shares a table with a gross arm; the shape is a required
+  field on every provenance block (a block without it fails loudly
+  rather than silently reading as `Gross`). The arm is unvalidated;
+  the first run is owner-gated spend.
+- **Rivals-grid comparability rules (grid defined 2026-10-13).** A
+  measured inventory of the stored data (204 cells) defines which
+  tables are legal: per-estimand and per-arm only, never mixing
+  harbor-graded rows with in-container reward-file rows, never mixing
+  arms (different binaries, models, or recipes). Cross-harness cost is
+  NOT computable — rival per-task logs carry zero usage fields
+  (verified 2026-10-13) — so the cost axis stays within-rof, and
+  pass-rate deltas at 3 reps over 2 shared tasks sit below the noise
+  floor (Wilson ±28–37pp). Recount of the 26-cell in-container arm
+  from its summary artifact: 6 Resolved / 19 Unresolved / 1 infra,
+  $0.76 — an earlier note reading 6/17/1 summed to 24 and was an
+  arithmetic slip. The recorded-exit verdict layer is dead on this
+  slice; the reward-verified layer supersedes it everywhere.
 
 ## Not inferable from code
 

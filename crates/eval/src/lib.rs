@@ -21,7 +21,8 @@ pub use oracle::{
     swe_test_status, ApplyMode, ApplyOutcome, Verdict,
 };
 pub use report::{
-    instance_report, instance_report_with_mode, InstanceReport, RunReport, APPLY_COMPARABILITY_NOTE,
+    instance_report, instance_report_with_mode, BudgetShapeLabel, Estimand, InstanceReport,
+    RunProvenance, RunReport, APPLY_COMPARABILITY_NOTE,
 };
 pub use slices::{
     check_winnability, load_swe_slice, load_tb_slice, slice_path, Instance, SweInstance, ToolCaps,
@@ -442,13 +443,17 @@ mod tests {
             apply_mode: ApplyMode::Strict,
             apply_detail: None,
         };
-        let empty = RunReport { instances: vec![] };
+        let empty = RunReport {
+            instances: vec![],
+            provenance: None,
+        };
         assert_eq!(empty.tokens_per_solved(), None);
         let r = RunReport {
             instances: vec![
                 rep("a", Verdict::Resolved, Some(100)),
                 rep("b", Verdict::Unresolved, Some(100)),
             ],
+            provenance: None,
         };
         assert_eq!(r.tokens_per_solved(), Some(200.0));
         let unknown = RunReport {
@@ -456,12 +461,64 @@ mod tests {
                 rep("a", Verdict::Resolved, Some(100)),
                 rep("b", Verdict::Unresolved, None),
             ],
+            provenance: None,
         };
         assert_eq!(
             unknown.tokens_per_solved(),
             None,
             "an unknown token count makes the total unknown, not smaller"
         );
+    }
+
+    #[test]
+    fn run_report_without_provenance_still_deserializes() {
+        // A report written before the provenance block existed carries no
+        // "provenance" key; serde(default) keeps it readable rather than
+        // rejecting the file (and never fabricates a block).
+        let r: RunReport = serde_json::from_str("{\"instances\": []}").unwrap();
+        assert!(r.provenance.is_none());
+        assert!(r.instances.is_empty());
+    }
+
+    #[test]
+    fn run_report_provenance_round_trips() {
+        let r = RunReport {
+            instances: vec![],
+            provenance: Some(RunProvenance {
+                binary_git_sha: Some("b3a2597".into()),
+                estimand: Estimand::InContainerReward,
+                budget_tokens: 300_000,
+                budget_steps: 60,
+                budget_actions: 120,
+                budget_shape: BudgetShapeLabel::MissPlusOut,
+                apply_mode: ApplyMode::Strict,
+            }),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["provenance"]["estimand"], "InContainerReward");
+        assert_eq!(v["provenance"]["budget_tokens"], 300_000);
+        assert_eq!(v["provenance"]["budget_steps"], 60);
+        assert_eq!(v["provenance"]["budget_actions"], 120);
+        assert_eq!(v["provenance"]["budget_shape"], "MissPlusOut");
+        assert_eq!(v["provenance"]["apply_mode"], "Strict");
+        let back: RunReport = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.provenance.unwrap().estimand,
+            Estimand::InContainerReward
+        );
+    }
+
+    #[test]
+    fn estimand_labels_are_stable() {
+        // Report files record these exact strings; renaming a variant would
+        // silently change every arm's label.
+        for (label, want) in [
+            (Estimand::Ungraded, "Ungraded"),
+            (Estimand::HarborOracle, "HarborOracle"),
+            (Estimand::InContainerReward, "InContainerReward"),
+        ] {
+            assert_eq!(serde_json::to_value(label).unwrap(), want);
+        }
     }
 
     fn seeded_workdir() -> PathBuf {

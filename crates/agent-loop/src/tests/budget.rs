@@ -7,6 +7,7 @@ use agent_event::Emitter;
 use agent_log::InputSource;
 use agent_log::ItemKind;
 use provider_core::StopReason;
+use provider_core::Usage;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,8 +15,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    assistant, call, result, run_registry, run_tmp, script_resp, text_resp, FakeLlm, Scripted,
-    RUN_N,
+    assistant, call, result, run_registry, run_script, run_tmp, script_resp, text_resp,
+    text_response, FakeLlm, Scripted, RUN_N,
 };
 
 #[test]
@@ -473,4 +474,68 @@ async fn last_step_done_wins_over_steps_halt() {
     assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
     assert_eq!(state.budget.counters().steps, max);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A bill with explicit prompt/output/cache shares. `cache_write` is kept
+/// non-zero where it matters: it must play no part in either shape's charge.
+fn billed_usage(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Usage {
+    Usage {
+        input,
+        output,
+        cache_read,
+        cache_write,
+        reasoning: None,
+        cost_usd: Some(0.02),
+    }
+}
+
+#[test]
+fn budget_shape_default_is_gross() {
+    assert_eq!(RunConfig::default().budget_shape, BudgetShape::Gross);
+    assert_eq!(LoopState::new().budget_shape, BudgetShape::Gross);
+    assert_eq!("gross".parse(), Ok(BudgetShape::Gross));
+    assert_eq!("miss-plus-out".parse(), Ok(BudgetShape::MissPlusOut));
+    assert!("miss+out".parse::<BudgetShape>().is_err());
+}
+
+#[test]
+fn record_usage_charges_by_shape() {
+    // Gross: input + output (today's behavior); cache_write never adds.
+    let mut gross = LoopState::new();
+    gross.record_usage(&billed_usage(100, 10, 60, 5));
+    assert_eq!(gross.budget.counters().tokens, 110);
+    // MissPlusOut: (input - cache_read) + output — cache reads off the cap;
+    // cache writes stay out (not a subtrahend, not an addend).
+    let mut miss = LoopState::new();
+    miss.budget_shape = BudgetShape::MissPlusOut;
+    miss.record_usage(&billed_usage(100, 10, 60, 5));
+    assert_eq!(miss.budget.counters().tokens, 50);
+    // Over-reported cache_read clamps the input share at 0, never underflows.
+    miss.record_usage(&billed_usage(10, 10, 60, 5));
+    assert_eq!(miss.budget.counters().tokens, 60); // 50 + (0 + 10)
+}
+
+#[tokio::test]
+async fn run_seeds_budget_shape_from_config() {
+    // The cap charge follows `cfg.budget_shape`; reporting stays gross.
+    let mut resp = text_response("all done");
+    resp.usage = billed_usage(100, 10, 60, 0);
+    let cfg = RunConfig {
+        budget_shape: BudgetShape::MissPlusOut,
+        ..RunConfig::default()
+    };
+    let (outcome, _, state, _) = run_script(
+        "budget-shape",
+        vec![Scripted::Respond(resp)],
+        cfg,
+        300_000,
+        Vec::new(),
+        "goal",
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+    assert_eq!(state.budget.counters().tokens, 50);
+    assert_eq!(state.usage_totals.input_tokens, 100); // totals never follow the shape
+    assert_eq!(state.usage_totals.cache_read_tokens, 60);
+    assert_eq!(state.usage_totals.output_tokens, 10);
 }

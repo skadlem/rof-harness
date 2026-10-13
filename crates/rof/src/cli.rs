@@ -11,7 +11,7 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
@@ -39,6 +39,9 @@ pub(crate) struct Args {
     pub budget_steps: Option<u32>,
     pub budget_actions: Option<u32>,
     pub budget_tokens: Option<u64>,
+    /// Token-cap accounting shape (`None` = the loop default `Gross`);
+    /// `MissPlusOut` is a different estimand — never mixed with Gross rows.
+    pub budget_shape: Option<agent_loop::BudgetShape>,
     pub max_tokens: Option<usize>,
     pub context_files: Vec<String>,
     pub dump_events: Option<String>,
@@ -138,6 +141,7 @@ struct RunBuilder {
     budget_steps: Option<u32>,
     budget_actions: Option<u32>,
     budget_tokens: Option<u64>,
+    budget_shape: Option<agent_loop::BudgetShape>,
     max_tokens: Option<usize>,
     context_files: Vec<String>,
     dump_events: Option<String>,
@@ -222,6 +226,15 @@ fn set_budget_tokens(b: &mut RunBuilder, v: Option<String>) -> Result<(), String
     b.budget_tokens = Some(
         s.parse()
             .map_err(|_| format!("--budget-tokens needs a positive integer, got {s:?}"))?,
+    );
+    Ok(())
+}
+
+fn set_budget_shape(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    b.budget_shape = Some(
+        s.parse()
+            .map_err(|_| format!("--budget-shape needs gross or miss-plus-out, got {s:?}"))?,
     );
     Ok(())
 }
@@ -393,6 +406,11 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_budget_tokens,
     },
     Flag {
+        name: "--budget-shape",
+        takes_value: true,
+        set: set_budget_shape,
+    },
+    Flag {
         name: "--budget-steps",
         takes_value: true,
         set: set_budget_steps,
@@ -476,6 +494,7 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         budget_steps: b.budget_steps,
         budget_actions: b.budget_actions,
         budget_tokens: b.budget_tokens,
+        budget_shape: b.budget_shape,
         dump_events: b.dump_events,
         log_path: b.log_path,
         no_log: b.no_log,
@@ -591,6 +610,7 @@ pub(crate) fn run_config(args: &Args) -> RunConfig {
     let dflt = RunConfig::default();
     cfg.thinking_keep = args.thinking_keep.unwrap_or(dflt.thinking_keep);
     cfg.collapse_hysteresis = args.collapse_hysteresis.unwrap_or(dflt.collapse_hysteresis);
+    cfg.budget_shape = args.budget_shape.unwrap_or(dflt.budget_shape);
     cfg.log_path = resolve_log_path(args);
     if let Some(frac) = args.compaction {
         cfg.compaction.enabled = true;
@@ -633,6 +653,8 @@ mod tests {
             "7",
             "--budget-actions",
             "9",
+            "--budget-shape",
+            "miss-plus-out",
             "--context-file",
             "app/a.py",
             "--dump-events",
@@ -656,6 +678,7 @@ mod tests {
                 budget_steps: Some(7),
                 budget_actions: Some(9),
                 budget_tokens: None,
+                budget_shape: Some(agent_loop::BudgetShape::MissPlusOut),
                 context_files: vec!["app/a.py".into()],
                 max_tokens: None,
                 dump_events: Some("/tmp/ev.json".into()),
@@ -693,6 +716,7 @@ mod tests {
             (None, None),
             "absent fold flags leave the loop defaults"
         );
+        assert_eq!(b.budget_shape, None, "absent shape keeps the loop default");
     }
 
     #[test]
@@ -737,6 +761,18 @@ mod tests {
                 "m",
                 "--budget-steps",
                 "many",
+            ],
+            vec![
+                "rof",
+                "run",
+                "--goal",
+                "g",
+                "--workdir",
+                "/w",
+                "--model",
+                "m",
+                "--budget-shape",
+                "miss+out",
             ],
             vec![
                 "rof",
@@ -1006,6 +1042,16 @@ mod tests {
         a.collapse_hysteresis = Some(6);
         let cfg = run_config(&a);
         assert_eq!((cfg.thinking_keep, cfg.collapse_hysteresis), (9, 6));
+        let mut a = args_for(dir, None);
+        a.budget_shape = Some(agent_loop::BudgetShape::MissPlusOut);
+        assert_eq!(
+            run_config(&a).budget_shape,
+            agent_loop::BudgetShape::MissPlusOut
+        );
+        assert_eq!(
+            run_config(&args_for(dir, None)).budget_shape,
+            dflt.budget_shape
+        );
     }
 
     #[test]
