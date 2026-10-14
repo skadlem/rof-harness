@@ -167,6 +167,21 @@ says so explicitly.
   $0.76 — an earlier note reading 6/17/1 summed to 24 and was an
   arithmetic slip. The recorded-exit verdict layer is dead on this
   slice; the reward-verified layer supersedes it everywhere.
+- **Budget-shape arm 1 measured (2026-10-14): gate failed, knob stays
+  OFF.** The pre-registered pass rule was more solves at ≤1.3×
+  dollars-per-solved vs the banked gross rows. Measured on the 4
+  near-miss cells (glm-5.3-flash, frozen recipe, in-container,
+  matched config, n=1/cell/arm): solves 0/4 vs 0/4, tests flat
+  (video 2p both) to down (mcmc 2p→1p), arm cost 1.42× ($0.1693 vs
+  $0.1196). The mechanism is real — both previously token-dead
+  cells migrated to the step cap and consumed 1.60×/1.70× the gross
+  arm's input (466k/493k, cache reads 246k/207k) — but the extra
+  working context did not convert to capability at this model tier.
+  Structural read: at step death the miss+out charge stood at 84.6%
+  and 99.8% of the 300k cap, so the recipe binds both caps nearly
+  together; raising either alone just moves the wall. The shape is
+  a required provenance field, so miss-plus-out rows can never be
+  silently pooled with gross rows.
 
 ## Not inferable from code
 

@@ -37,29 +37,28 @@ measured numbers carry a date and live with the run artifacts.
 
 ## Next (ordered, spend-gated)
 
-1. **Rivals grid comparisons** (free): the comparison grid over the
-   stored arms is defined (2026-10-13: 204 measured cells inventoried
-   from disk with estimand, arm, and verdict-layer provenance). Run and
-   publish the legal tables — the model-matched layout comparison
-   (rof/hermes/pi, n=3, harbor-graded) and within-arm cost trends.
-   Cross-harness cost is not computable (rival logs carry no usage
-   fields), and pass-rate deltas sit below the noise floor at this
-   slice size, so claims stay within what each table resolves.
-   Never mix estimands (harbor-graded rows vs in-container reward-file
-   rows) or arms (different binaries, models, or recipes) in one table.
-2. **Budget-shape arm run** (the structural bet, owner-gated spend):
-   first arm at the frozen recipe with `--budget-shape miss-plus-out`
-   on the near-miss cells. Measured motivation (2026-10-08 forensics):
-   90–98% of the 300k cap is context re-reads; runs die at 21–53 steps
-   having done ~5–25k tokens of novel work. Pass = more solves at
-   ≤1.3× dollars-per-solved vs the gross arm. A miss-plus-out arm
-   never shares a table with a gross arm.
-3. **Near-miss rep top-ups** (if they earn the spend): the
+1. **Near-miss rep top-ups** (if they earn the spend): the
    partial-credit cells (1/3, 1/2, 2/4, 2/3 test shapes) are the
    cheapest capability information per cell.
-4. **S-1 compaction experiment**: the `--compaction` knob is landed
+2. **S-1 compaction experiment**: the `--compaction` knob is landed
    OFF by default and unvalidated; the first paid run validates
    `frac`/`keep_tokens` or revises them.
+3. **Budget-shape arm run** — MEASURED 2026-10-14 (first arm,
+   4 near-miss cells, owner-authorized): the pre-registered gate
+   (more solves at ≤1.3× dollars-per-solved) **failed** — 0/4
+   solves on both shapes, arm cost 1.42×, tests flat-to-down. The
+   mechanism itself is confirmed (the token-dead cells migrated to
+   the step cap, consuming 1.6–1.7× the gross arm's input), and the
+   frozen recipe now binds both caps nearly together (84.6%/99.8%
+   of the miss+out cap at step death), so raising either cap alone
+   just moves the wall. The knob stays OFF by default, opt-in via
+   `--budget-shape`, flagged mechanism-validated /
+   capability-unconverted.
+4. **Rivals grid comparisons** — DONE 2026-10-14 (free): the legal
+   tables are computed and published in the local analysis artifact
+   (L1/L2 screening, L4/L5 single-arm cost+solve tables). Cross-harness
+   cost is not computable (rival logs carry no usage fields); pass-rate
+   deltas sit below the noise floor. Estimands and arms never mix.
 
 ## Deferred / gated (build only when the gate opens)
 
@@ -103,4 +102,8 @@ literature on 2026-10-13 and deliberately stay closed.
 - Timeout/cancel kill the docker-exec client; the in-container process
   may outlive it (upgrade: docker kill or exec-session tracking).
 - Root-owned in-container artifacts survive host-side `git clean`
-  during batch rollback (fail-soft; no verdicts affected to date).
+  during batch rollback (fail-soft, no verdicts affected), and —
+  measured 2026-10-14, budget-shape arm 1 — can also **hard-halt a
+  run** when the end-of-run patch digest (`git diff --no-index`)
+  cannot read them (`halt=snapshot` on install-windows-3.11; upgrade:
+  digest via a root-readable copy or chmod at harvest).
