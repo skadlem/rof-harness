@@ -119,6 +119,14 @@ struct ChoiceMsg {
     content: String,
     #[serde(default, deserialize_with = "null_as_empty")]
     reasoning_content: String,
+    /// Some vLLM-fronted gateways (measured: lighthouse.dphn.ai,
+    /// vLLM 0.32) ship the same field under `reasoning`, and one probe
+    /// showed it alongside a `reasoning_content`-less usage block. Kept
+    /// as a second field, not a serde alias: a body carrying both keys
+    /// must parse, and `reasoning_content` (the DeepSeek convention our
+    /// echo belt is built on) wins when both are non-empty.
+    #[serde(default, deserialize_with = "null_as_empty")]
+    reasoning: String,
     #[serde(default, deserialize_with = "null_as_empty_vec")]
     tool_calls: Vec<WireToolCall>,
 }
@@ -222,7 +230,11 @@ pub(crate) fn parse_body(
     })?;
     let finish = choice.finish_reason.clone();
     let text = choice.message.content.clone();
-    let reasoning = choice.message.reasoning_content.clone();
+    let reasoning = if choice.message.reasoning_content.trim().is_empty() {
+        choice.message.reasoning.clone()
+    } else {
+        choice.message.reasoning_content.clone()
+    };
     let mut calls = Vec::new();
     for (i, tc) in choice.message.tool_calls.iter().enumerate() {
         let args_raw = tc.function.arguments.as_deref().unwrap_or("{}");
@@ -436,6 +448,36 @@ mod tests {
         assert_eq!(r.usage.reasoning, Some(30));
         assert_eq!(r.usage.total_tokens(), 110);
         assert_eq!(r.usage.content_tokens(), 70);
+    }
+    #[test]
+    fn reasoning_field_is_captured_when_reasoning_content_is_absent() {
+        // vLLM-fronted gateway shape (measured live on lighthouse.dphn.ai):
+        // thinking rides `reasoning`; `content` is null on a tool-call turn.
+        let v = serde_json::json!({
+            "choices": [{"message": {"content": null, "reasoning": "call ls",
+                "tool_calls": [{"id": "c1", "type": "function",
+                    "function": {"name": "exec", "arguments": "{\"cmd\":\"ls\"}"}}]},
+                "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4}
+        });
+        let r = parse_body(&v, "m", 64).unwrap();
+        assert_eq!(r.message.thinking.as_deref(), Some("call ls"));
+        assert_eq!(r.message.tool_calls.len(), 1);
+    }
+    #[test]
+    fn reasoning_content_wins_over_reasoning_and_both_keys_parse() {
+        let v = serde_json::json!({
+            "choices": [{"message": {"content": "ok", "reasoning_content": "deepseek",
+                         "reasoning": "vllm"}, "finish_reason": "stop"}]
+        });
+        let r = parse_body(&v, "m", 64).unwrap();
+        assert_eq!(r.message.thinking.as_deref(), Some("deepseek"));
+        // Empty/null on both sides is no thinking, never an empty-string Some.
+        let v = serde_json::json!({
+            "choices": [{"message": {"content": "ok", "reasoning": null},
+                         "finish_reason": "stop"}]
+        });
+        assert!(parse_body(&v, "m", 64).unwrap().message.thinking.is_none());
     }
     #[test]
     fn null_tool_calls_decode_to_empty() {
