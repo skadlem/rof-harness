@@ -8,8 +8,10 @@ CLI guards (`crates/rof/src/workdir.rs`).
 - Command allowlist for `exec`/`test`: `--allow-cmd` binary prefixes,
   skipped only by the explicit `--exec-policy any` (see below).
 - Path policy for `view`/`edit`/`write` only: root-anchored to the
-  policy root, symlink-safe (a symlinked directory must not launder
-  writes out of the tree), secrets-denied file access.
+  policy root (a leading `/app/` is that root, so the workspace can be
+  addressed as task statements spell it), symlink-safe (a symlinked
+  directory must not launder writes out of the tree), secrets-denied file
+  access.
 - `--workdir` must be a disposable scratch directory; refused (exit 2)
   for `/`, `$HOME`, the harness checkout, and repos with uncommitted
   changes unless `--allow-dirty-workdir` is passed.

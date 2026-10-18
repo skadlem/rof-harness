@@ -71,7 +71,9 @@ capability, and the container is removed best-effort on every path.
   carries the exit status; serde default false = fail-closed).
 - `tools-std` — policy-gated `view/search/edit/write/exec/test` tools.
   The path policy (root-anchored, symlink-safe, secrets-denied) covers
-  `view`/`edit`/`write` only.
+  `view`/`edit`/`write` only, and resolves a leading `/app/` to the tool
+  root so the workspace can be addressed the way task statements spell
+  it.
 - `agent-budget` — step/action/token/spend caps, halts, `with_steps()`
   (warn clamp + refund re-derive live there). `config_for` presets per
   capability; run budgets resolve in `cli::budget_for`.
