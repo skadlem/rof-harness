@@ -298,3 +298,13 @@ says so explicitly.
   required R package survives to grading, which sinks rows in both arms
   equally. Next step is generalization to the other requirement-shaped
   cells, not more reps of this one.
+- **Completion-checklist lever scoped (2026-10-18, second arm, 16 rows).**
+  The same generic checklist that converted a deliverable-verification
+  defect into a solve (5/6 -> 6/6, path-robustness code 11-12x in the
+  checklist deliverables versus 0-1x in control) changed nothing on three
+  cells that fail on accuracy or correctness: identical failing test sets
+  in both arms, flat token spend, and the regression cell untouched. The
+  lever is rerun-context specific; the kill rule fired and no further
+  checklist arms run. The remaining failures on that slice are semantic and
+  capability-bound at this model tier, so the next honest experiment is a
+  stronger-model ceiling read, not another prompt variant.
