@@ -67,20 +67,19 @@ measured numbers carry a date and live with the run artifacts.
    it cannot fire at any plausible `frac`. Re-design first (trigger on
    spent-vs-cap, keep-budget scaled to real prompts), then re-register a
    pass rule; do not run the original arm.
-3. **In-container exec policy (queued, 2026-10-16)**: measured on 53
-   banked in-container rows, 83% hit at least one tool denial and the
-   denied set includes the tools the tasks' own tests require
-   (task toolchains, `./release`, `valgrind`, `sqlite3`, `pip`,
-   `apt-get`, `bash`). The allowlist is a host-exec hygiene guard; in
-   in-container mode every exec is wrapped through `docker exec`, so the
-   container is the boundary and the list only removes capability.
-   Planned: an explicit opt-in trust policy, honored only when an exec
-   wrapper is installed and recorded in report provenance (relaxed rows
-   never pool with strict rows), then a pre-registered arm on the cells
-   whose zero is a denial artifact. The flag itself has LANDED
-   (`--exec-policy allowlist|any`, default allowlist, recorded in
-   provenance); the arm starts after the envelope arm below finishes,
-   since rows must not straddle two binaries.
+3. **In-container exec policy — MEASURED 2026-10-18: mechanism confirmed,
+   capability unconverted.** `--exec-policy allowlist|any` landed (default
+   allowlist, recorded as a required provenance field). The measured
+   friction is real — 83% of banked in-container rows hit a tool denial and
+   the denied set included the tasks' own toolchains — and the treatment
+   removed it completely (allowlist denials 3-9 per row -> 0). But on the
+   three cells chosen because their zeros looked like denial artefacts, the
+   freed toolchain converted nothing: the same named tests fail in every
+   arm, at the same steps and tokens, and the solved regression cell stays
+   solved. So the zeros on this slice are capability/semantic, not policy:
+   the published in-container solve numbers do not need a re-label, the knob
+   stays flagged mechanism-validated / capability-unconverted, and no
+   further policy arms are planned.
 4. **Envelope arm — MEASURED 2026-10-16/18, KILL RULE TRIGGERED.** Three
    matched arms (control = frozen recipe; shape = miss-plus-out at the
    same cap; joint = miss-plus-out plus a doubled step/action envelope)

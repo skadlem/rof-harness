@@ -272,3 +272,15 @@ says so explicitly.
   gross tokens per test passed came out at 1.85x and 2.35x against the
   1.3x rule. No further envelope arms; the parked near-miss top-ups stay
   parked because their prior was envelope-shaped.
+- **In-container exec policy arm closed (2026-10-18): mechanism
+  confirmed, capability unconverted.** `--exec-policy any` removed the
+  command-list friction completely (allowlist denials 3-9 per row to 0,
+  same tokens), and converted nothing on the three cells whose zeros
+  looked like denial artefacts: the same named verifier tests fail in
+  every arm at the same steps, and the solved regression cell stays
+  solved in both arms. The zeros on that slice are capability/semantic at
+  this model tier, so the published in-container solve numbers do not need
+  a policy re-label and the knob stays flagged mechanism-validated /
+  capability-unconverted. Next capability question there is goal/feedback
+  shaped (the same named requirements fail every time), not tooling or
+  budget.
