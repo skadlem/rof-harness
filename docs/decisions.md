@@ -332,3 +332,26 @@ says so explicitly.
   semantic and capability-bound at this model tier, so the next honest
   experiment is a stronger-model ceiling read, not another prompt, budget or
   tooling variant.
+- **Reasoning effort is a request knob, not a constant (2026-10-19).** The
+  harness sent no effort level at all, so every arm ran the model at the
+  endpoint's default. A $0 probe of the gateway on one prompt (and a
+  harness-level rerun at a fixed `--max-tokens`) measured that
+  `reasoning_effort` is honored — `none/low/high/xhigh/max` =
+  0/722/1060/1149/2976 reasoning tokens in the raw call, 236 → 568 in
+  `rof run` at equal caps — while `thinking:{type:enabled|disabled}` moves
+  nothing and api.deepseek.com ignores the field entirely. It is therefore a
+  per-endpoint property carried on `EndpointProfile` (like the thinking-off
+  fragment), set per run with `--reasoning-effort` on `run` and `eval`,
+  never a global default, and recorded in the report provenance so an
+  effort arm never pools with frozen-recipe rows. Default stays "no level
+  sent" (byte-identical body). Note the interaction that made the first
+  probe read flat: reasoning length is bounded by `max_tokens`, so a small
+  per-request ceiling clips the effect — the overflow ladder raises the
+  ceiling on a truncated attempt, which is why the knob is safe at default.
+- **Unpriced models now say the `$` cap is inert (2026-10-19).** The spend
+  cap only binds when the price book prices the model; an id with no rate
+  anchor (the vLLM gateway's `deepseek-ai/DeepSeek-V4.1-Flash`, any future
+  provider) reported no cost, so `max_spend_cents` could never trip while
+  the run looked guarded. A run-start stderr warning now names it once per
+  process and says which caps are operative. This closes the deferred gate
+  recorded on 2026-10-16; no price is invented to close it the other way.

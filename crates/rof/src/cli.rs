@@ -11,11 +11,12 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
 --keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default keeps the DeepSeek thinking-off knob, sent only on compaction-summary calls and the truncation ladder first rung; ordinary requests carry no thinking fragment)
+--reasoning-effort LEVEL (none|low|high|xhigh|max): send `reasoning_effort` on every request (default: none sent = endpoint default). Measured on the vLLM gateway 2026-10-19: 0/722/1060/1149/2976 reasoning tokens on one prompt for none/low/high/xhigh/max; api.deepseek.com ignores the field
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget
 --exec-policy allowlist|any: command-allowlist policy for exec/test. `any` skips the list entirely and is for callers whose process boundary is elsewhere (in-container eval wraps exec as `docker exec <container>`, so the allowlist is not a boundary there, only capability loss); the choice is recorded in the report provenance so relaxed rows never pool with strict rows
 --compaction FRAC: checkpoint the older context once the estimate crosses FRAC of the token budget (0 < FRAC <= 1). OFF-BY-DEFAULT and UNVALIDATED: the S-1 compaction experiment has not run yet, so leave it unset unless running that experiment.
@@ -59,6 +60,9 @@ pub(crate) struct Args {
     /// DeepSeek-specific fragment or when reasoning is wanted. Default
     /// false keeps the current body byte-identical.
     pub keep_thinking: bool,
+    /// `reasoning_effort` level sent on every request (`None` = endpoint
+    /// default). Validated at the edge against [`EFFORT_LEVELS`].
+    pub reasoning_effort: Option<String>,
     pub proof_cmd: Option<String>,
     pub incentives: agent_loop::IncentivesLevel,
     pub bets: bool,
@@ -154,6 +158,7 @@ struct RunBuilder {
     log_path: Option<String>,
     no_log: bool,
     keep_thinking: bool,
+    reasoning_effort: Option<String>,
     proof_cmd: Option<String>,
     incentives: Option<agent_loop::IncentivesLevel>,
     bets: bool,
@@ -201,6 +206,23 @@ fn set_no_log(b: &mut RunBuilder, _: Option<String>) -> Result<(), String> {
 
 fn set_keep_thinking(b: &mut RunBuilder, _: Option<String>) -> Result<(), String> {
     b.keep_thinking = true;
+    Ok(())
+}
+
+/// Levels the gateway serves (its `thinkingLevelMap`, verified live
+/// 2026-10-19). Validated here so a typo fails loudly instead of sending
+/// junk the endpoint ignores.
+pub(crate) const EFFORT_LEVELS: [&str; 5] = ["none", "low", "high", "xhigh", "max"];
+
+fn set_reasoning_effort(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let level = v.ok_or("--reasoning-effort needs a level")?;
+    if !EFFORT_LEVELS.contains(&level.as_str()) {
+        return Err(format!(
+            "--reasoning-effort expects {} , got {level:?}",
+            EFFORT_LEVELS.join("|")
+        ));
+    }
+    b.reasoning_effort = Some(level);
     Ok(())
 }
 
@@ -398,6 +420,11 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_keep_thinking,
     },
     Flag {
+        name: "--reasoning-effort",
+        takes_value: true,
+        set: set_reasoning_effort,
+    },
+    Flag {
         name: "--allow-cmd",
         takes_value: true,
         set: set_allow_cmd,
@@ -517,6 +544,7 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         log_path: b.log_path,
         no_log: b.no_log,
         keep_thinking: b.keep_thinking,
+        reasoning_effort: b.reasoning_effort,
         proof_cmd: b.proof_cmd,
         incentives: b.incentives.unwrap_or(agent_loop::IncentivesLevel::Full),
         bets: b.bets,
@@ -590,22 +618,50 @@ pub(crate) fn budget_for(args: &Args) -> BudgetGuard {
         }
         None => {}
     }
-    BudgetGuard::new(b, Instant::now())
+    let guard = BudgetGuard::new(b, Instant::now());
+    if let Some(msg) = inert_spend_cap_warning(args, &guard) {
+        // Once per process: `rof eval` builds one guard per instance and the
+        // same fact holds for every row (roadmap gate 2026-10-16, closed here).
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| eprintln!("{msg}"));
+    }
+    guard
+}
+
+/// The `$` cap only binds when the price book prices the model: an id with no
+/// rate anchor (never invented) reports no cost, so `max_spend_cents` can
+/// never trip. Say so instead of letting an unpriced run look guarded.
+fn inert_spend_cap_warning(args: &Args, guard: &BudgetGuard) -> Option<String> {
+    let capped = guard.config().max_spend_cents?;
+    (!provider_openai::prices_model(&args.model)).then(|| {
+        format!(
+            "warning: no price book entry for model {}: the ${} spend cap is inert \
+             (dollars stay null) — the token and step caps are the guards",
+            args.model,
+            capped / 100
+        )
+    })
 }
 
 /// Request profile for one run: `keep_thinking` skips the DeepSeek-specific
 /// thinking-off body (for providers that reject the fragment, or when
 /// reasoning is wanted); the default profile stays byte-identical. Shared
 /// by `rof run` (main) and the eval agent leg so the knob has one impl.
-pub(crate) fn endpoint_profile(keep_thinking: bool) -> EndpointProfile {
-    if keep_thinking {
+pub(crate) fn endpoint_profile(
+    keep_thinking: bool,
+    reasoning_effort: Option<&str>,
+) -> EndpointProfile {
+    let mut p = if keep_thinking {
         EndpointProfile {
             emission_threshold_chars: 12_000,
             thinking_off: None,
+            reasoning_effort: None,
         }
     } else {
         EndpointProfile::default()
-    }
+    };
+    p.reasoning_effort = reasoning_effort.map(str::to_owned);
+    p
 }
 
 /// One run's loop config from the parsed flags. The compaction checkpoint is
@@ -704,6 +760,7 @@ mod tests {
                 log_path: Some("/tmp/w.log".into()),
                 no_log: false,
                 keep_thinking: false,
+                reasoning_effort: None,
                 bets: false,
                 incentives: agent_loop::IncentivesLevel::Full,
                 proof_cmd: None,
@@ -1164,13 +1221,54 @@ mod tests {
         assert!(a.keep_thinking);
         let plain = parse_args(&run_min(&[])).unwrap();
         assert!(!plain.keep_thinking, "default sends the thinking-off body");
-        let on = endpoint_profile(true);
+        let on = endpoint_profile(true, None);
         assert!(on.thinking_off.is_none(), "keep-thinking sends no knob");
-        let off = endpoint_profile(false);
+        let off = endpoint_profile(false, None);
         assert_eq!(off.emission_threshold_chars, on.emission_threshold_chars);
         assert!(
             off.thinking_off.is_some(),
             "default keeps the DeepSeek thinking-off body"
         );
+    }
+
+    #[test]
+    fn reasoning_effort_parses_validates_and_lands_in_the_profile() {
+        assert_eq!(endpoint_profile(false, None).reasoning_effort, None);
+        for level in ["none", "low", "high", "xhigh", "max"] {
+            let a = parse_args(&run_min(&["--reasoning-effort", level])).unwrap();
+            assert_eq!(a.reasoning_effort.as_deref(), Some(level));
+            let p = endpoint_profile(a.keep_thinking, a.reasoning_effort.as_deref());
+            assert_eq!(p.reasoning_effort.as_deref(), Some(level));
+            assert!(p.thinking_off.is_some(), "effort never drops the knob");
+        }
+        let err = parse_args(&run_min(&["--reasoning-effort", "turbo"])).unwrap_err();
+        assert!(err.contains("none|low|high|xhigh|max"), "{err}");
+        assert!(parse_args(&run_min(&["--reasoning-effort"])).is_err());
+    }
+
+    #[test]
+    fn unpriced_models_warn_that_the_spend_cap_is_inert() {
+        let mut priced = args_for(Path::new("/tmp/w"), Some(60));
+        priced.model = "deepseek-flash".into();
+        let mut g = budget_for(&priced);
+        assert!(
+            g.config().max_spend_cents.is_some(),
+            "preset arms the $ cap"
+        );
+        assert_eq!(inert_spend_cap_warning(&priced, &g), None);
+
+        let mut unpriced = args_for(Path::new("/tmp/w"), Some(60));
+        unpriced.model = "deepseek-ai/DeepSeek-V4.1-Flash".into();
+        g = budget_for(&unpriced);
+        let w = inert_spend_cap_warning(&unpriced, &g).expect("inert cap is named");
+        assert!(
+            w.contains("deepseek-ai/DeepSeek-V4.1-Flash") && w.contains("inert"),
+            "{w}"
+        );
+        // No cap configured: nothing to warn about.
+        let mut b = agent_budget::config_for(agent_budget::Capability::Interactive);
+        b.max_spend_cents = None;
+        let guard = BudgetGuard::new(b, Instant::now());
+        assert_eq!(inert_spend_cap_warning(&unpriced, &guard), None);
     }
 }

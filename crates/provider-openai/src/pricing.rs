@@ -13,7 +13,20 @@
 /// from DeepSeek's, this needs a per-endpoint price book.
 /// Unknown models price `None`: never fabricate a cost.
 pub(crate) fn price_usd(model: &str, input: u64, cache_read: u64, output: u64) -> Option<f64> {
-    let (hit, miss, out) = match model {
+    let (hit, miss, out) = rates(model)?;
+    let miss_in = input.saturating_sub(cache_read);
+    Some((cache_read as f64 * hit + miss_in as f64 * miss + output as f64 * out) / 1e6)
+}
+
+/// Whether the price book prices this model at all — the precondition for the
+/// `$` spend cap to ever trip. `false` for ids with no rate anchor (never
+/// invented), e.g. the vLLM gateway's `deepseek-ai/DeepSeek-V4.1-Flash`.
+pub fn prices_model(model: &str) -> bool {
+    rates(model).is_some()
+}
+
+fn rates(model: &str) -> Option<(f64, f64, f64)> {
+    let r = match model {
         // Legacy alias `deepseek-v4-flash` is served by the same model billed
         // at the Flash price (api-docs footnote 2026-10-03).
         m if m.starts_with("deepseek-flash")
@@ -31,8 +44,7 @@ pub(crate) fn price_usd(model: &str, input: u64, cache_read: u64, output: u64) -
         m if m.starts_with("glm-5.3-flash") => (0.03, 0.15, 0.50),
         _ => return None,
     };
-    let miss_in = input.saturating_sub(cache_read);
-    Some((cache_read as f64 * hit + miss_in as f64 * miss + output as f64 * out) / 1e6)
+    Some(r)
 }
 
 #[cfg(test)]
@@ -67,6 +79,11 @@ mod tests {
             price_usd("gpt-4o", 10, 0, 10),
             None,
             "unknown models never fabricate a cost"
+        );
+        assert!(prices_model("deepseek-flash") && prices_model("glm-5.3-flash"));
+        assert!(
+            !prices_model("deepseek-ai/DeepSeek-V4.1-Flash"),
+            "gateway ids carry no rate anchor: the $ cap must read as unguardable"
         );
     }
 

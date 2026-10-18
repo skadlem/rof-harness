@@ -22,6 +22,14 @@ pub struct EndpointProfile {
     /// skips the rung instead of sending a placebo.
     #[serde(default)]
     pub thinking_off: Option<serde_json::Value>,
+    /// Reasoning-effort level sent as `reasoning_effort` on every request;
+    /// `None` keeps the body byte-identical to before the knob existed.
+    /// Honored by the vLLM gateway (measured 2026-10-19, one prompt:
+    /// none/low/high/xhigh/max = 0/722/1060/1149/2976 reasoning tokens) and
+    /// ignored by api.deepseek.com (live probe) — a per-endpoint property,
+    /// so arms set it per run instead of a global default.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for EndpointProfile {
@@ -29,6 +37,7 @@ impl Default for EndpointProfile {
         Self {
             emission_threshold_chars: 12_000,
             thinking_off: Some(serde_json::json!({"thinking": {"type": "disabled"}})),
+            reasoning_effort: None,
         }
     }
 }

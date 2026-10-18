@@ -3,6 +3,25 @@
 Ordered and spend-gated. Design decisions anchor to `docs/decisions.md`;
 measured numbers carry a date and live with the run artifacts.
 
+## Current state (2026-10-19)
+
+- **Reasoning effort is now a request knob** (`--reasoning-effort` on `run`
+  and `eval`), because a $0 probe showed the harness ran every arm at the
+  endpoint's default while the gateway honors `none|low|high|xhigh|max`
+  (0/722/1060/1149/2976 reasoning tokens on one prompt; 236 -> 568 inside
+  `rof run` at equal caps; api.deepseek.com ignores the field). The level
+  rides `EndpointProfile`, is off by default (byte-identical body) and is
+  recorded in the report provenance, so effort rows never pool with
+  frozen-recipe rows. Reasoning length is bounded by `max_tokens`, and the
+  overflow ladder raises that ceiling on a truncated attempt.
+- **The unpriced-spend warning gate is closed.** A run whose model has no
+  price-book entry now says on stderr, once, that the `$` cap is inert and
+  that the token/step caps are the guards.
+- A **stronger-model ceiling read is unavailable** (no stronger model on
+  hand), so the capability question at this model tier is asked with the
+  one dial that does not need a new model: same model, higher effort
+  (`dphn-effort`, pre-registered before spend).
+
 ## Current state (2026-10-18)
 
 Five arms measured on the in-container leg in one session (68 graded cells,
@@ -71,6 +90,22 @@ self-describe through the provenance block; no arm's rows pool with another's.
   first arm run is still owner-gated spend.
 
 ## Next (ordered, spend-gated)
+
+0. **Reasoning-effort arm (`dphn-effort`) - pre-registered 2026-10-19,
+   running.** Same model/endpoint/binary/recipe/estimand, two arms that
+   differ by one flag: control (no level sent) vs `--reasoning-effort max`.
+   Cells = the three headroom cells of the checklist arms (mcmc 5/6,
+   video-processing 2/5, query-optimize 0-1/6) plus custom-memory-heap-crash
+   (0/6), 2 reps each, with log-summary-date-ranges (2/2 everywhere) as the
+   regression cell at 1 rep. PASS: a treatment row passes a NAMED test that
+   never passed in any control row of the arm (or solves a cell the control
+   never solved), with the regression cell unchanged. MECHANISM: median
+   reasoning tokens per row at least 1.5x control. GUARDRAIL: gross tokens
+   per test-passed within 1.3x of control - the cap counts reasoning at full
+   weight, so this can fail even when capability moves. KILL: no named test
+   flips in any treatment row => the effort axis is dead at this tier and no
+   further effort or wording variants run. Rows carry
+   `provenance.reasoning_effort`; never pooled with frozen-recipe rows.
 
 0. **Completion-checklist goal lever — first capability-positive result,
    and now scoped (2026-10-18, 22 rows over two arms).** One added
@@ -176,12 +211,13 @@ literature on 2026-10-13 and deliberately stay closed.
   scope by the no-planner/no-MAS rule.
 - **Bet C (candidate racing)**: unbuilt until a workload shows
   proof-gate interventions (zero in all measured runs to date).
-- **Unpriced-model spend warning**: gate TRIGGERED 2026-10-16 — the
-  dphn endpoint is unpriced and runs for real there, so dollars are
-  `null` and the `$` cap cannot bind. The endpoint's own reported cost is
-  unreliable (present on only some routes), so the honest fix is either a
-  run-start warning that the spend cap is inert, or a per-endpoint price
-  book; no price is invented.
+- ~~**Unpriced-model spend warning**: gate triggered 2026-10-16, CLOSED
+  2026-10-19.~~ A run whose model has no price-book entry prints one stderr
+  warning naming the inert `$` cap and the operative token/step caps
+  (`cli::budget_for`; `provider_openai::prices_model` is the single
+  predicate), so an unpriced run never looks guarded. The other half of the
+  gate — a per-endpoint price book — is still unbuilt by choice: no price is
+  invented.
 - **Parked nits** (only if they earn it): search depth cap, `/app`
   word-boundary in goal mapping, assemble budget accounting,
   finalize_dump exit code.

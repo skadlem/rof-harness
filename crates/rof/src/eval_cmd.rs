@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{parse_table, resolve_endpoint, Flag};
 
-pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--keep-thinking] [--in-container]
+pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--keep-thinking] [--in-container]
 --lenient-apply: record Lenient patch-apply provenance in the report (default Strict; Strict grades are not comparable with earlier fuzz-lenient numbers)
 --agent: run the agent leg per instance instead of the oracle-container leg (fresh workdir, in-process rof-run wiring, harbor-CLI grading). Requires --model ID and --endpoint URL (or OPENAI_BASE_URL); mutually exclusive with --winnability-only. Agent budgets default to the frozen pilot recipe: 300000 tokens / 60 steps / 120 actions; explicit flags win.
 --keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default keeps the DeepSeek thinking-off knob, sent only on compaction-summary calls and the truncation ladder first rung; ordinary requests carry no thinking fragment)
 --in-container: with --agent, the agent works inside the task environment container (started before the run; workdir bind-mounted at /app, cpus/memory capped at 2/4096m; agent exec/test calls wrapped with docker exec; the verifier execs the same live container, so installed packages and running services persist to grading). Verdict provenance in this mode is the task-written reward file (/logs/verifier/reward.txt) with the verifier exit code as the no-artifact fallback, never the harbor result.json reward;
 --exec-policy allowlist|any: command-allowlist policy forwarded to the agent leg. `any` skips the prefix list entirely (the in-container agent's process boundary is the task container, not this harness); the value is recorded in the report provenance, so relaxed rows never pool with strict rows
---budget-shape: token-cap accounting, recorded on the report's provenance block. gross = input+output (default, the frozen recipe); miss-plus-out = (input - cache_read) + output, so provider-cached prompt re-reads stop spending the token cap. A miss-plus-out arm is a DIFFERENT ESTIMAND from a gross arm: never mix the two shapes in one table. Reported usage totals and dollars are unchanged by either shape";
+--budget-shape: token-cap accounting, recorded on the report's provenance block. gross = input+output (default, the frozen recipe); miss-plus-out = (input - cache_read) + output, so provider-cached prompt re-reads stop spending the token cap. A miss-plus-out arm is a DIFFERENT ESTIMAND from a gross arm: never mix the two shapes in one table. Reported usage totals and dollars are unchanged by either shape;
+--reasoning-effort LEVEL (none|low|high|xhigh|max): send `reasoning_effort` on every request of the agent leg; recorded in the report provenance (default: none sent = endpoint default). Measured on the vLLM gateway 2026-10-19: 0/722/1060/1149/2976 reasoning tokens on one prompt for none/low/high/xhigh/max; the field is ignored by api.deepseek.com";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct EvalArgs {
@@ -49,6 +50,10 @@ pub(crate) struct EvalArgs {
     /// fragment or when reasoning is wanted. Default false keeps the
     /// current body byte-identical.
     pub keep_thinking: bool,
+    /// `reasoning_effort` level for the agent leg (`None` = endpoint
+    /// default); recorded in the report provenance so effort arms never pool
+    /// with the frozen-recipe rows.
+    pub reasoning_effort: Option<String>,
     /// In-container agent mode: the agent works inside the task
     /// environment container (workdir bind-mounted at /app) and the
     /// verifier execs the same live container, so installed packages and
@@ -71,6 +76,7 @@ struct EvalBuilder {
     lenient_apply: bool,
     agent: bool,
     keep_thinking: bool,
+    reasoning_effort: Option<String>,
     in_container: bool,
     model: Option<String>,
     endpoint: Option<String>,
@@ -224,6 +230,18 @@ fn set_keep_thinking(b: &mut EvalBuilder, _: Option<String>) -> Result<(), Strin
     Ok(())
 }
 
+fn set_reasoning_effort(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    let level = v.ok_or("--reasoning-effort needs a level")?;
+    if !crate::cli::EFFORT_LEVELS.contains(&level.as_str()) {
+        return Err(format!(
+            "--reasoning-effort expects {}, got {level:?}",
+            crate::cli::EFFORT_LEVELS.join("|")
+        ));
+    }
+    b.reasoning_effort = Some(level);
+    Ok(())
+}
+
 fn set_in_container(b: &mut EvalBuilder, _: Option<String>) -> Result<(), String> {
     b.in_container = true;
     Ok(())
@@ -326,6 +344,11 @@ const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
         set: set_keep_thinking,
     },
     Flag {
+        name: "--reasoning-effort",
+        takes_value: true,
+        set: set_reasoning_effort,
+    },
+    Flag {
         name: "--in-container",
         takes_value: false,
         set: set_in_container,
@@ -384,6 +407,7 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
         budget_shape: b.budget_shape,
         max_tokens: b.max_tokens,
         keep_thinking: b.keep_thinking,
+        reasoning_effort: b.reasoning_effort,
         in_container: b.in_container,
     })
 }
@@ -551,6 +575,7 @@ pub(crate) fn finish_report(args: &EvalArgs, reports: Vec<eval::InstanceReport>)
             budget_actions,
             budget_shape: budget_shape_for(args),
             exec_policy: exec_policy_for(args),
+            reasoning_effort: args.reasoning_effort.clone(),
             apply_mode: apply_mode_for(args),
         }),
     };
@@ -644,6 +669,50 @@ mod tests {
                 .keep_thinking,
             "default keeps the thinking-off body"
         );
+    }
+
+    #[test]
+    fn cli_eval_parses_reasoning_effort_into_provenance() {
+        let dir = std::env::temp_dir().join(format!("rof-eval-effort-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.json");
+        let a = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--agent",
+            "--model",
+            "m",
+            "--endpoint",
+            "https://e",
+            "--reasoning-effort",
+            "max",
+            "--report",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert_eq!(a.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(finish_report(&a, Vec::new()), 0);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["provenance"]["reasoning_effort"], "max");
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Absent flag: no level recorded (the frozen recipe), and junk fails.
+        let plain = parse_eval(&argv(&["rof", "eval", "--tasks-dir", "/tmp/t"])).unwrap();
+        assert_eq!(plain.reasoning_effort, None);
+        let p = finish_report(&plain, Vec::new());
+        assert_eq!(p, 0);
+        assert!(parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/t",
+            "--reasoning-effort",
+            "turbo"
+        ]))
+        .is_err());
     }
 
     #[test]
@@ -891,6 +960,7 @@ mod tests {
             budget_shape: None,
             max_tokens: None,
             keep_thinking: false,
+            reasoning_effort: None,
             in_container: false,
         };
         let code = run_eval(&args).await;

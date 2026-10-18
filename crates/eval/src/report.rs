@@ -80,6 +80,12 @@ pub struct RunProvenance {
     /// never pool in one table. Required field: a provenance block without
     /// it fails loudly rather than silently reading as `Allowlist`.
     pub exec_policy: ExecPolicyLabel,
+    /// `reasoning_effort` level the agent leg sent on every request, if any.
+    /// `None` = endpoint default (the frozen recipe); not a required field,
+    /// so report files written before the knob existed read as "none sent",
+    /// which is true. An effort arm never pools with frozen-recipe rows.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub apply_mode: ApplyMode,
 }
 

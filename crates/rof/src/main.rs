@@ -230,8 +230,11 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let mut provider = OpenAiCompat::new(&endpoint, endpoint_profile(args.keep_thinking))
-        .with_key_env(&args.api_key_env);
+    let mut provider = OpenAiCompat::new(
+        &endpoint,
+        endpoint_profile(args.keep_thinking, args.reasoning_effort.as_deref()),
+    )
+    .with_key_env(&args.api_key_env);
     for h in &args.headers {
         if let Some((name, value)) = h.split_once(':') {
             provider = provider.with_header(name, value);
@@ -273,7 +276,7 @@ mod tests {
         // Unique env var, set-then-removed in this test only, so parallel
         // tests cannot observe it.
         std::env::remove_var("ROF_TEST_CRED_GATE_KEY");
-        let p = OpenAiCompat::new("http://127.0.0.1:1", cli::endpoint_profile(false))
+        let p = OpenAiCompat::new("http://127.0.0.1:1", cli::endpoint_profile(false, None))
             .with_key_env("ROF_TEST_CRED_GATE_KEY");
         let err = p.check_credentials().unwrap_err().to_string();
         let msg = missing_credentials_message("ROF_TEST_CRED_GATE_KEY", &err);

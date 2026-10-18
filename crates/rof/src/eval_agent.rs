@@ -145,6 +145,7 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
         // The eval leg builds its provider from `EvalArgs.keep_thinking`
         // directly (run_agent_leg); the run-Args copy stays consistent.
         keep_thinking: a.keep_thinking,
+        reasoning_effort: a.reasoning_effort.clone(),
         proof_cmd: None,
         incentives: agent_loop::IncentivesLevel::Full,
         bets: false,
@@ -575,8 +576,11 @@ pub(crate) async fn run_agent_leg(
         }
     };
     let api_key_env = args.api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
-    let mut provider =
-        OpenAiCompat::new(endpoint, endpoint_profile(args.keep_thinking)).with_key_env(api_key_env);
+    let mut provider = OpenAiCompat::new(
+        endpoint,
+        endpoint_profile(args.keep_thinking, args.reasoning_effort.as_deref()),
+    )
+    .with_key_env(api_key_env);
     for h in &args.headers {
         if let Some((name, value)) = h.split_once(':') {
             provider = provider.with_header(name, value);

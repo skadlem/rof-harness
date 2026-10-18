@@ -179,6 +179,7 @@ writes the complete event log for replay.
 | `--exec-policy allowlist\|any` | `any` skips the list where the process boundary is elsewhere (in-container exec); recorded in provenance |
 | `--budget-steps/-actions/-tokens N` | caps; any explicit flag lifts the 900s wall to 3600s |
 | `--max-tokens N` | per-request output ceiling |
+| `--reasoning-effort none\|low\|high\|xhigh\|max` | `reasoning_effort` sent on every request (default: not sent); measured 0→2976 reasoning tokens on one prompt; ignored by api.deepseek.com, honored by the vLLM gateway |
 | `--context-file PATH` | pinned file context, repeatable |
 | `--dump-events PATH` | full event log, one run one dump |
 | `--log-path` / `--no-log` | WAL location (defaults to `<workdir>/.rof-events.jsonl`) |

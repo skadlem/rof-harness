@@ -11,6 +11,8 @@ pub(crate) struct WireKnobs {
     /// Endpoint's thinking-off fragment, if it has a real one.
     pub(crate) thinking_off: Option<serde_json::Value>,
     pub(crate) thinking_suppressed: bool,
+    /// Run-level `reasoning_effort` level (`None` = endpoint default).
+    pub(crate) reasoning_effort: Option<String>,
 }
 
 impl WireKnobs {
@@ -24,6 +26,7 @@ impl WireKnobs {
             max_tokens: req.max_tokens,
             thinking_off,
             thinking_suppressed,
+            reasoning_effort: profile.reasoning_effort.clone(),
         }
     }
 }
@@ -261,6 +264,7 @@ mod tests {
             max_tokens: 0,
             thinking_off: None,
             thinking_suppressed: true,
+            reasoning_effort: None,
         };
         assert!(!apply_ladder(&mut z, 50, 0));
         assert_eq!(z.max_tokens, 0);

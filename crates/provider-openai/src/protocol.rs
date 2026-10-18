@@ -73,6 +73,11 @@ pub(crate) fn wire_body(model: &str, req: &Request, k: &WireKnobs) -> serde_json
             }
         }
     }
+    if let Some(level) = k.reasoning_effort.as_deref() {
+        // Explicit run-level effort wins over the thinking-off fragment: a
+        // caller that named a level meant it.
+        b["reasoning_effort"] = serde_json::Value::String(level.to_string());
+    }
     if !req.tools.is_empty() {
         let tools: Vec<serde_json::Value> = req
             .tools
@@ -407,6 +412,7 @@ mod tests {
         assert_eq!(tools[0]["function"]["name"], "read");
         assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
         assert!(b.get("thinking").is_none());
+        assert!(b.get("reasoning_effort").is_none());
         // Thinking::Off applies the profile's real knob, nothing else.
         let mut off = req.clone();
         off.thinking = Thinking::Off;
@@ -419,6 +425,37 @@ mod tests {
         assert!(b2.get("reasoning").is_none());
         assert!(b2.get("enable_thinking").is_none());
         assert!(b2.get("reasoning_effort").is_none());
+    }
+
+    /// The effort knob is a run-level body field, present only when set, and
+    /// it outranks the thinking-off fragment (a caller that named a level
+    /// meant it). Default profile: the key stays absent (byte-identity).
+    #[test]
+    fn reasoning_effort_rides_the_profile_and_wins_over_thinking_off() {
+        let req = req_with_tool();
+        let plain = wire_body(
+            "m",
+            &req,
+            &WireKnobs::from_req(&req, &EndpointProfile::default()),
+        );
+        assert!(plain.get("reasoning_effort").is_none());
+
+        let profile = EndpointProfile {
+            thinking_off: Some(serde_json::json!({
+                "thinking": {"type": "disabled"},
+                "reasoning_effort": "low"
+            })),
+            reasoning_effort: Some("max".into()),
+            ..EndpointProfile::default()
+        };
+        let mut off = req.clone();
+        off.thinking = Thinking::Off;
+        let b = wire_body("m", &off, &WireKnobs::from_req(&off, &profile));
+        assert_eq!(b["reasoning_effort"], "max");
+        assert_eq!(b["thinking"]["type"], "disabled");
+        for k in ["model", "messages", "max_tokens", "tools"] {
+            assert_eq!(b.get(k).is_some(), plain.get(k).is_some(), "{k}");
+        }
     }
     #[test]
     fn response_parse_incl_tool_calls_and_usage_subset() {

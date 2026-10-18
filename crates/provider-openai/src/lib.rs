@@ -9,3 +9,4 @@ mod retry;
 mod test_support;
 
 pub use client::{EndpointProfile, OpenAiCompat};
+pub use pricing::prices_model;
