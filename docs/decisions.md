@@ -284,3 +284,17 @@ says so explicitly.
   capability-unconverted. Next capability question there is goal/feedback
   shaped (the same named requirements fail every time), not tooling or
   budget.
+- **Completion-checklist goal lever: first capability-positive result
+  (2026-10-18).** One generic completion-checklist block appended to the
+  task goal — list every explicit requirement, verify each in place,
+  re-execute each deliverable from a working directory other than the one
+  it was developed in, then declare done — converted a cell the control
+  had never solved (0 of 6 control rows) into a 6/6 solve, at identical
+  token spend and fewer tokens per test passed in every pair. The
+  mechanism shows in the artifacts: path-robustness code appears 11-12
+  times in the checklist scripts versus 0-1 in the control scripts. The
+  claim is deliberately small: direction measured, effect size unresolved
+  (one converted rep on one cell), and the cell is bimodal on whether the
+  required R package survives to grading, which sinks rows in both arms
+  equally. Next step is generalization to the other requirement-shaped
+  cells, not more reps of this one.

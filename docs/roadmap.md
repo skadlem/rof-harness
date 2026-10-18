@@ -58,6 +58,17 @@ measured numbers carry a date and live with the run artifacts.
 
 ## Next (ordered, spend-gated)
 
+0. **Completion-checklist goal lever — FIRST CAPABILITY-POSITIVE RESULT
+   (2026-10-18, 6 rows).** One added completion-checklist block (list every
+   explicit requirement; verify each in place; **re-execute each deliverable
+   from a working directory other than the one it was developed in**; only
+   then declare done) turned a cell the control had never solved into a
+   6/6 solve, at identical token spend and better tokens per test passed in
+   every pair. The mechanism is visible in the deliverables: path-robustness
+   code appears 11-12 times in checklist scripts versus 0-1 in control
+   scripts. Claim size: direction measured, effect size unresolved (one
+   converted rep, one cell). Next test is generalization, not more reps of
+   the same cell — see the arm doc for the planned cells.
 1. **Near-miss rep top-ups** (if they earn the spend): the
    partial-credit cells (1/3, 1/2, 2/4, 2/3 test shapes) are the
    cheapest capability information per cell.
