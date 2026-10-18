@@ -3,6 +3,20 @@
 Ordered and spend-gated. Design decisions anchor to `docs/decisions.md`;
 measured numbers carry a date and live with the run artifacts.
 
+## Current state (2026-10-18)
+
+Five arms measured on the in-container leg in one session (68 graded cells,
+deepseek-v4.1-flash via a vLLM gateway, reward-file estimand, frozen recipe):
+the envelope axis (token-cap shape, doubled step envelope) is **dead** — it
+moves walls and not capability; the command allowlist was a real friction and a
+fix (`--exec-policy any`) removes it with no capability effect; the file tools
+refused the workspace spelled `/app/...` as the task statements spell it, which
+is fixed (correctness; the solved regression cell now finishes in ~half the
+steps and tokens); and one **capability-positive** lever exists: a generic
+completion checklist in the goal converts deliverable-verification defects
+(5/6 → 6/6) but changes nothing on cells that fail on accuracy. Each arm's rows
+self-describe through the provenance block; no arm's rows pool with another's.
+
 ## Current state (2026-10-16)
 
 - A second experiment endpoint is wired: `deepseek-ai/DeepSeek-V4.1-Flash`

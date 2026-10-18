@@ -321,3 +321,14 @@ says so explicitly.
   verdict in about half the steps and tokens. Container-only paths
   (`/tests`) stay refused: serving them would mean letting the agent read
   the verifier's tests, which is a fairness decision rather than a bug fix.
+- **Session banked (2026-10-18): five arms, one capability lever.** 68
+  graded in-container cells on one model/endpoint/recipe, all reward-file
+  graded and provenance-self-describing: envelope axis dead (walls move,
+  capability doesn't, 1.79-3.05x tokens per test passed); command allowlist
+  friction removed with no capability effect; `/app` file-tool parity fixed
+  (correctness; ~half the steps and tokens on the already-solved regression
+  cell); completion checklist capability-positive but scoped to
+  deliverable-verification defects. The remaining failures on that slice are
+  semantic and capability-bound at this model tier, so the next honest
+  experiment is a stronger-model ceiling read, not another prompt, budget or
+  tooling variant.

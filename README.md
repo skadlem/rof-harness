@@ -64,6 +64,10 @@ artifacts, not by exit codes (see the note below).
 | File-artifact widening, 18 tasks (2026-10-12) | 4/18 solved, partial credit on 4 more |
 | Env-mutation task class (live servers, agent-installed packages) | solvable in-container; structurally impossible under file-copy grading |
 | Cost per cell (flash-tier models) | $0.006–$0.13; frontier-tier harnesses report $6–$23 per task on the full 89-task suite |
+| Envelope arms — token-cap shape, miss-plus-out accounting, doubled step envelope (2026-10-18, 18 cells, two reps) | **killed:** walls move (47 → 60 → 87 → 113 steps, up to 4.8× gross input), capability doesn't — the same named verifier test fails in every arm, and the deepest run loses one. 1.79×/3.05× tokens per test passed against a 1.3× rule |
+| Command-allowlist policy — `--exec-policy any` (2026-10-18, 16 cells) | **mechanism only:** allowlist denials fall from 3–9 per row to 0 at identical token spend, and no test moves |
+| Completion checklist in the goal (2026-10-18, 22 cells over two arms) | **capability-positive, scoped:** converts a deliverable-verification defect (a script that works where it was written but not where an evaluator runs it) — 5/6 → 6/6 solve, path-robustness code 11–12× in checklist deliverables vs 0–1× in control — and changes nothing on cells that fail on accuracy or correctness |
+| `/app/...` file-tool parity (2026-10-18, 12 cells, two binaries) | **correctness fix, efficiency visible:** the largest denial class was agents refused the very files the task statement names; class eliminated, no test moves, and the already-solved regression cell reaches the same verdict in ~half the steps and tokens |
 
 Capability signal is early — the point of the rig is that the numbers
 above can be trusted. Case in point: an audit after the widening found
