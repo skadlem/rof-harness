@@ -355,3 +355,17 @@ says so explicitly.
   the run looked guarded. A run-start stderr warning now names it once per
   process and says which caps are operative. This closes the deferred gate
   recorded on 2026-10-16; no price is invented to close it the other way.
+- **Reasoning effort: measured, and it is not a capability lever (2026-10-19).**
+  18 in-container rows, one binary, one flag apart (control vs
+  `--reasoning-effort max`): no named verifier test flipped that the control
+  did not already pass — query-optimize went 1/6,1/6 to 0/6,0/6, video failed
+  the same three tests in all four rows, and the arm's only solve was a control
+  row. The manipulation itself under-delivered: median reasoning tokens rose
+  only 1.23x against a pre-registered 1.5x, with per-pair ratios from 0.42x to
+  2.4x, so on real tool-loop turns this endpoint's default is already near the
+  task's natural reasoning length and the flag reallocates rather than adds.
+  Tokens per test-passed 1.54x (against a 1.3x rule). Kill rule triggered: no
+  further effort variants. Consequently the remaining failures on this slice
+  survive more budget, more steps, a full toolchain, `/app`-correct paths, a
+  stricter goal and more reasoning — they are capability-bound at this model
+  tier, and the next question is a different model or a smaller slice.

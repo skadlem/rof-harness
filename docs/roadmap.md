@@ -17,10 +17,14 @@ measured numbers carry a date and live with the run artifacts.
 - **The unpriced-spend warning gate is closed.** A run whose model has no
   price-book entry now says on stderr, once, that the `$` cap is inert and
   that the token/step caps are the guards.
-- A **stronger-model ceiling read is unavailable** (no stronger model on
-  hand), so the capability question at this model tier is asked with the
-  one dial that does not need a new model: same model, higher effort
-  (`dphn-effort`, pre-registered before spend).
+- **The reasoning-effort dial has now been measured and is not a
+  capability lever** (`dphn-effort`, 18 rows, 2026-10-19): zero named-test
+  flips, and the manipulation itself only moved median reasoning tokens
+  1.23x (per-pair 0.42x-2.4x), so the endpoint's default reasoner already
+  matches the task on real tool-loop turns. With no stronger model
+  available, the harness-side search space is now measured out: the same
+  named verifier failures survive more budget, more steps, a full
+  toolchain, `/app`-correct paths, a stricter goal and more reasoning.
 
 ## Current state (2026-10-18)
 
@@ -91,36 +95,24 @@ self-describe through the provenance block; no arm's rows pool with another's.
 
 ## Next (ordered, spend-gated)
 
-0. **Reasoning-effort arm (`dphn-effort`) - pre-registered 2026-10-19,
-   running.** Same model/endpoint/binary/recipe/estimand, two arms that
-   differ by one flag: control (no level sent) vs `--reasoning-effort max`.
-   Cells = the three headroom cells of the checklist arms (mcmc 5/6,
-   video-processing 2/5, query-optimize 0-1/6) plus custom-memory-heap-crash
-   (0/6), 2 reps each, with log-summary-date-ranges (2/2 everywhere) as the
-   regression cell at 1 rep. PASS: a treatment row passes a NAMED test that
-   never passed in any control row of the arm (or solves a cell the control
-   never solved), with the regression cell unchanged. MECHANISM: median
-   reasoning tokens per row at least 1.5x control. GUARDRAIL: gross tokens
-   per test-passed within 1.3x of control - the cap counts reasoning at full
-   weight, so this can fail even when capability moves. KILL: no named test
-   flips in any treatment row => the effort axis is dead at this tier and no
-   further effort or wording variants run. Rows carry
-   `provenance.reasoning_effort`; never pooled with frozen-recipe rows.
+0. **Reasoning-effort arm (`dphn-effort`) — MEASURED 2026-10-19, KILL RULE
+   TRIGGERED: the effort dial is not a capability lever.** 18 in-container
+   rows on one binary, the arms differing by one flag (control vs
+   `--reasoning-effort max`). No named verifier test flipped in any treatment
+   row that a control row had not already passed: query-optimize 1/6,1/6 ->
+   0/6,0/6, video the same three fails in all four rows, cmhc 0/6 everywhere,
+   and the arm's only solve was a *control* row. The manipulation itself
+   under-delivered — median reasoning tokens +1.23x against a pre-registered
+   1.5x, per-pair ratios 0.42x-2.4x — so the honest claim is "this knob does
+   not raise effort on tool-loop turns", not "effort does not help"; the raw
+   probe's 497 -> 2976 tokens came from a short ungrounded prompt, and on real
+   turns the endpoint's default already sits near the task's natural reasoning
+   length. Guardrail also failed (1.54x tokens per test-passed). No further
+   effort or wording variants. With this, every harness-side dial that does
+   not need a different model has been measured: same named failures survive
+   more budget, more steps, a full toolchain, `/app`-correct paths, a stricter
+   goal and more reasoning.
 
-0. **Completion-checklist goal lever — first capability-positive result,
-   and now scoped (2026-10-18, 22 rows over two arms).** One added
-   completion-checklist block (list every explicit requirement; verify each
-   in place; **re-execute each deliverable from a working directory other
-   than the one it was developed in**; only then declare done) converted a
-   cell the control had never solved into a 6/6 solve (5/6 -> 6/6, identical
-   token spend, path-robustness code 11-12x in checklist deliverables vs
-   0-1x in control), and changed **nothing** on three cells that fail on
-   accuracy or correctness: identical failing test sets, flat tokens,
-   regression cell untouched. So the lever is real but **rerun-context
-   specific**; the kill rule fired and no further checklist arms run. The
-   remaining failures on this slice are semantic and capability-bound at
-   this model tier, which makes a stronger-model ceiling read the next
-   honest experiment rather than another prompt variant.
 1. **Near-miss rep top-ups** (if they earn the spend): the
    partial-credit cells (1/3, 1/2, 2/4, 2/3 test shapes) are the
    cheapest capability information per cell.
