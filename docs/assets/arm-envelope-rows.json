@@ -1,0 +1,177 @@
+{
+ "arm": "dphn-cap",
+ "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+ "endpoint": "lighthouse.dphn.ai/run/text-v/v1",
+ "estimand": "InContainerReward",
+ "recipe": [
+  300000,
+  60,
+  120
+ ],
+ "graded": "2026-10-16/18",
+ "note": "one arm, 18 runs, two reps per cell; arms differ only in the token-cap shape and the step envelope",
+ "rows": [
+  {
+   "arm": "C",
+   "rep": "r1",
+   "task": "log-summary-date-ranges",
+   "steps": 21,
+   "tin": 103853,
+   "passed": 2,
+   "total": 2
+  },
+  {
+   "arm": "C",
+   "rep": "r1",
+   "task": "mcmc-sampling-stan",
+   "steps": 47,
+   "tin": 293545,
+   "passed": 5,
+   "total": 6
+  },
+  {
+   "arm": "C",
+   "rep": "r1",
+   "task": "video-processing",
+   "steps": 36,
+   "tin": 294060,
+   "passed": 2,
+   "total": 5
+  },
+  {
+   "arm": "C",
+   "rep": "r2",
+   "task": "log-summary-date-ranges",
+   "steps": 26,
+   "tin": 128158,
+   "passed": 2,
+   "total": 2
+  },
+  {
+   "arm": "C",
+   "rep": "r2",
+   "task": "mcmc-sampling-stan",
+   "steps": 46,
+   "tin": 297602,
+   "passed": 5,
+   "total": 6
+  },
+  {
+   "arm": "C",
+   "rep": "r2",
+   "task": "video-processing",
+   "steps": 42,
+   "tin": 291150,
+   "passed": 2,
+   "total": 5
+  },
+  {
+   "arm": "J",
+   "rep": "r1",
+   "task": "log-summary-date-ranges",
+   "steps": 22,
+   "tin": 97438,
+   "passed": 2,
+   "total": 2
+  },
+  {
+   "arm": "J",
+   "rep": "r1",
+   "task": "mcmc-sampling-stan",
+   "steps": 87,
+   "tin": 881529,
+   "passed": 5,
+   "total": 6
+  },
+  {
+   "arm": "J",
+   "rep": "r1",
+   "task": "video-processing",
+   "steps": 55,
+   "tin": 594763,
+   "passed": 2,
+   "total": 5
+  },
+  {
+   "arm": "J",
+   "rep": "r2",
+   "task": "log-summary-date-ranges",
+   "steps": 28,
+   "tin": 136496,
+   "passed": null,
+   "total": null
+  },
+  {
+   "arm": "J",
+   "rep": "r2",
+   "task": "mcmc-sampling-stan",
+   "steps": 113,
+   "tin": 1399878,
+   "passed": 4,
+   "total": 6
+  },
+  {
+   "arm": "J",
+   "rep": "r2",
+   "task": "video-processing",
+   "steps": 50,
+   "tin": 511544,
+   "passed": 2,
+   "total": 5
+  },
+  {
+   "arm": "S",
+   "rep": "r1",
+   "task": "log-summary-date-ranges",
+   "steps": 27,
+   "tin": 124974,
+   "passed": 2,
+   "total": 2
+  },
+  {
+   "arm": "S",
+   "rep": "r1",
+   "task": "mcmc-sampling-stan",
+   "steps": 60,
+   "tin": 575093,
+   "passed": 5,
+   "total": 6
+  },
+  {
+   "arm": "S",
+   "rep": "r1",
+   "task": "video-processing",
+   "steps": 58,
+   "tin": 642183,
+   "passed": 2,
+   "total": 5
+  },
+  {
+   "arm": "S",
+   "rep": "r2",
+   "task": "log-summary-date-ranges",
+   "steps": 24,
+   "tin": 114065,
+   "passed": 2,
+   "total": 2
+  },
+  {
+   "arm": "S",
+   "rep": "r2",
+   "task": "mcmc-sampling-stan",
+   "steps": 60,
+   "tin": 462158,
+   "passed": 5,
+   "total": 6
+  },
+  {
+   "arm": "S",
+   "rep": "r2",
+   "task": "video-processing",
+   "steps": 57,
+   "tin": 697988,
+   "passed": 3,
+   "total": 5
+  }
+ ]
+}

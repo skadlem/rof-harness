@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 400" width="880" height="400" role="img" aria-label="Spend against work for 18 graded runs: more budget buys steps, not passing tests">
+<style>.bg{fill:#fff;stroke:#dfe4ea}.ttl{font:600 15px/1.25 ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif;fill:#1a202c}.sub{font:400 11.5px/1.3 ui-sans-serif,system-ui,-apple-system,'Segoe UI',sans-serif;fill:#64748b}.lb{font:600 12px/1.2 ui-sans-serif,system-ui,-apple-system,sans-serif;fill:#1a202c}.ax{font:500 10.5px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;fill:#64748b}.an{font:600 10px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;fill:#1a202c}.g{stroke:#dfe4ea;stroke-width:1}@media (prefers-color-scheme:dark){.bg{fill:#0d1117;stroke:#30363d}.ttl{fill:#e6edf3}.sub{fill:#9198a1}.lb{fill:#e6edf3}.ax{fill:#9198a1}.an{fill:#e6edf3}.g{stroke:#30363d}}</style>
+<rect class="bg" x="0.5" y="0.5" width="879" height="399" rx="10"/>
+<text class="ttl" x="58" y="26">Same cap, more budget: steps climb, passing tests do not</text>
+<text class="sub" x="58" y="44">18 graded runs of one arm family, two reps per cell · deepseek-v4.1-flash, in-container, verdict from the task-written reward file</text>
+<text class="sub" x="58" y="60">filled marker = rep 1, hollow = rep 2 · source: docs/assets/arm-envelope-rows.json</text>
+<text class="lb" x="58.0" y="77.0">steps taken before the run stops</text>
+<line class="g" x1="58.0" y1="322.0" x2="437.0" y2="322.0" opacity="0.95"/>
+<text class="ax" x="50.0" y="325.5" text-anchor="end">0</text>
+<line class="g" x1="58.0" y1="263.0" x2="437.0" y2="263.0" opacity="0.5"/>
+<text class="ax" x="50.0" y="266.5" text-anchor="end">30</text>
+<line class="g" x1="58.0" y1="204.0" x2="437.0" y2="204.0" opacity="0.5"/>
+<text class="ax" x="50.0" y="207.5" text-anchor="end">60</text>
+<line class="g" x1="58.0" y1="145.0" x2="437.0" y2="145.0" opacity="0.5"/>
+<text class="ax" x="50.0" y="148.5" text-anchor="end">90</text>
+<line class="g" x1="58.0" y1="86.0" x2="437.0" y2="86.0" opacity="0.5"/>
+<text class="ax" x="50.0" y="89.5" text-anchor="end">120</text>
+<line class="g" x1="58.0" y1="86.0" x2="58.0" y2="322.0" opacity="0.5"/>
+<text class="ax" x="58.0" y="336.0" text-anchor="middle">0</text>
+<line class="g" x1="121.2" y1="86.0" x2="121.2" y2="322.0" opacity="0.5"/>
+<text class="ax" x="121.2" y="336.0" text-anchor="middle">250</text>
+<line class="g" x1="184.3" y1="86.0" x2="184.3" y2="322.0" opacity="0.5"/>
+<text class="ax" x="184.3" y="336.0" text-anchor="middle">500</text>
+<line class="g" x1="247.5" y1="86.0" x2="247.5" y2="322.0" opacity="0.5"/>
+<text class="ax" x="247.5" y="336.0" text-anchor="middle">750</text>
+<line class="g" x1="310.7" y1="86.0" x2="310.7" y2="322.0" opacity="0.5"/>
+<text class="ax" x="310.7" y="336.0" text-anchor="middle">1000</text>
+<line class="g" x1="373.8" y1="86.0" x2="373.8" y2="322.0" opacity="0.5"/>
+<text class="ax" x="373.8" y="336.0" text-anchor="middle">1250</text>
+<line class="g" x1="437.0" y1="86.0" x2="437.0" y2="322.0" opacity="0.5"/>
+<text class="ax" x="437.0" y="336.0" text-anchor="middle">1500</text>
+<text class="ax" x="247.5" y="352.0" text-anchor="middle">thousand input tokens</text>
+<circle cx="132.2" cy="229.6" r="5" fill="#3f5b78" stroke="#3f5b78" stroke-width="1.8"/>
+<rect x="127.7" y="246.6" width="9.2" height="9.2" rx="1.6" fill="#3f5b78" stroke="#3f5b78" stroke-width="1.8"/>
+<circle cx="133.2" cy="231.5" r="5" fill="none" stroke="#3f5b78" stroke-width="1.8"/>
+<rect x="127.0" y="234.8" width="9.2" height="9.2" rx="1.6" fill="none" stroke="#3f5b78" stroke-width="1.8"/>
+<circle cx="280.7" cy="150.9" r="5" fill="#96242a" stroke="#96242a" stroke-width="1.8"/>
+<rect x="203.7" y="209.2" width="9.2" height="9.2" rx="1.6" fill="#96242a" stroke="#96242a" stroke-width="1.8"/>
+<circle cx="411.7" cy="99.8" r="5" fill="none" stroke="#96242a" stroke-width="1.8"/>
+<rect x="182.7" y="219.1" width="9.2" height="9.2" rx="1.6" fill="none" stroke="#96242a" stroke-width="1.8"/>
+<circle cx="203.3" cy="204.0" r="5" fill="#a86b12" stroke="#a86b12" stroke-width="1.8"/>
+<rect x="215.7" y="203.3" width="9.2" height="9.2" rx="1.6" fill="#a86b12" stroke="#a86b12" stroke-width="1.8"/>
+<circle cx="174.8" cy="204.0" r="5" fill="none" stroke="#a86b12" stroke-width="1.8"/>
+<rect x="229.8" y="205.3" width="9.2" height="9.2" rx="1.6" fill="none" stroke="#a86b12" stroke-width="1.8"/>
+<text class="an" x="292.7" y="141.9" text-anchor="start">J arm · 881k tok · 87 steps</text>
+<text class="lb" x="483.0" y="77.0">verifier tests passed</text>
+<line class="g" x1="483.0" y1="322.0" x2="862.0" y2="322.0" opacity="0.95"/>
+<text class="ax" x="475.0" y="325.5" text-anchor="end">0</text>
+<line class="g" x1="483.0" y1="282.7" x2="862.0" y2="282.7" opacity="0.5"/>
+<text class="ax" x="475.0" y="286.2" text-anchor="end">1</text>
+<line class="g" x1="483.0" y1="243.3" x2="862.0" y2="243.3" opacity="0.5"/>
+<text class="ax" x="475.0" y="246.8" text-anchor="end">2</text>
+<line class="g" x1="483.0" y1="204.0" x2="862.0" y2="204.0" opacity="0.5"/>
+<text class="ax" x="475.0" y="207.5" text-anchor="end">3</text>
+<line class="g" x1="483.0" y1="164.7" x2="862.0" y2="164.7" opacity="0.5"/>
+<text class="ax" x="475.0" y="168.2" text-anchor="end">4</text>
+<line class="g" x1="483.0" y1="125.3" x2="862.0" y2="125.3" opacity="0.5"/>
+<text class="ax" x="475.0" y="128.8" text-anchor="end">5</text>
+<line class="g" x1="483.0" y1="86.0" x2="862.0" y2="86.0" opacity="0.5"/>
+<text class="ax" x="475.0" y="89.5" text-anchor="end">6</text>
+<line class="g" x1="483.0" y1="86.0" x2="483.0" y2="322.0" opacity="0.5"/>
+<text class="ax" x="483.0" y="336.0" text-anchor="middle">0</text>
+<line class="g" x1="546.2" y1="86.0" x2="546.2" y2="322.0" opacity="0.5"/>
+<text class="ax" x="546.2" y="336.0" text-anchor="middle">250</text>
+<line class="g" x1="609.3" y1="86.0" x2="609.3" y2="322.0" opacity="0.5"/>
+<text class="ax" x="609.3" y="336.0" text-anchor="middle">500</text>
+<line class="g" x1="672.5" y1="86.0" x2="672.5" y2="322.0" opacity="0.5"/>
+<text class="ax" x="672.5" y="336.0" text-anchor="middle">750</text>
+<line class="g" x1="735.7" y1="86.0" x2="735.7" y2="322.0" opacity="0.5"/>
+<text class="ax" x="735.7" y="336.0" text-anchor="middle">1000</text>
+<line class="g" x1="798.8" y1="86.0" x2="798.8" y2="322.0" opacity="0.5"/>
+<text class="ax" x="798.8" y="336.0" text-anchor="middle">1250</text>
+<line class="g" x1="862.0" y1="86.0" x2="862.0" y2="322.0" opacity="0.5"/>
+<text class="ax" x="862.0" y="336.0" text-anchor="middle">1500</text>
+<text class="ax" x="672.5" y="352.0" text-anchor="middle">thousand input tokens</text>
+<circle cx="557.2" cy="125.3" r="5" fill="#3f5b78" stroke="#3f5b78" stroke-width="1.8"/>
+<rect x="552.7" y="238.7" width="9.2" height="9.2" rx="1.6" fill="#3f5b78" stroke="#3f5b78" stroke-width="1.8"/>
+<circle cx="558.2" cy="125.3" r="5" fill="none" stroke="#3f5b78" stroke-width="1.8"/>
+<rect x="552.0" y="238.7" width="9.2" height="9.2" rx="1.6" fill="none" stroke="#3f5b78" stroke-width="1.8"/>
+<circle cx="705.7" cy="125.3" r="5" fill="#96242a" stroke="#96242a" stroke-width="1.8"/>
+<rect x="628.7" y="238.7" width="9.2" height="9.2" rx="1.6" fill="#96242a" stroke="#96242a" stroke-width="1.8"/>
+<circle cx="836.7" cy="164.7" r="5" fill="none" stroke="#96242a" stroke-width="1.8"/>
+<rect x="607.7" y="238.7" width="9.2" height="9.2" rx="1.6" fill="none" stroke="#96242a" stroke-width="1.8"/>
+<circle cx="628.3" cy="125.3" r="5" fill="#a86b12" stroke="#a86b12" stroke-width="1.8"/>
+<rect x="640.7" y="238.7" width="9.2" height="9.2" rx="1.6" fill="#a86b12" stroke="#a86b12" stroke-width="1.8"/>
+<circle cx="599.8" cy="125.3" r="5" fill="none" stroke="#a86b12" stroke-width="1.8"/>
+<rect x="654.8" y="199.4" width="9.2" height="9.2" rx="1.6" fill="none" stroke="#a86b12" stroke-width="1.8"/>
+<circle cx="63.0" cy="366.0" r="5" fill="#3f5b78"/>
+<text class="ax" x="74.0" y="370.0">control · 300k gross · 60 steps</text>
+<circle cx="286.1" cy="366.0" r="5" fill="#a86b12"/>
+<text class="ax" x="297.1" y="370.0">shape · 300k miss+out · 60 steps</text>
+<circle cx="515.3" cy="366.0" r="5" fill="#96242a"/>
+<text class="ax" x="526.3" y="370.0">joint · 300k miss+out · 120 steps</text>
+<circle cx="63.0" cy="383.0" r="5" fill="none" stroke="#64748b" stroke-width="1.8"/>
+<text class="ax" x="74.0" y="387.0">circle = mcmc-sampling-stan (6 tests)</text>
+<rect x="394.0" y="378.4" width="9.2" height="9.2" rx="1.6" fill="none" stroke="#64748b" stroke-width="1.8"/>
+<text class="ax" x="410.0" y="387.0">square = video-processing (5 tests)</text>
+</svg>
