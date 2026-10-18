@@ -3,6 +3,27 @@
 Ordered and spend-gated. Design decisions anchor to `docs/decisions.md`;
 measured numbers carry a date and live with the run artifacts.
 
+## Current state (2026-10-16)
+
+- A second experiment endpoint is wired: `deepseek-ai/DeepSeek-V4.1-Flash`
+  behind a vLLM gateway (`lighthouse.dphn.ai/run/text-v/v1`). Verified by
+  live probes: tool calls work, prefix-cache reads are reported, thinking
+  arrives under `reasoning` (the adapter now reads that as a fallback and
+  still prefers `reasoning_content` when both keys are present), and
+  DeepSeek's `thinking:{type:disabled}` knob is accepted but ignored. The
+  endpoint is **unpriced** for this harness (it reports a cost on only
+  some routes), so dollars are `null` there by design and the token/step
+  caps are the operative guards.
+- The **compaction premise was refuted by measurement before spend**: the
+  landed `--compaction FRAC` trigger compares a *per-request* prompt
+  estimate against `frac x token budget`, but the frozen recipe's budget
+  is *cumulative billed tokens*. Measured per-request prompts in the
+  banked arms top out at 18.0k tokens (median 2-3k), so the registered
+  0.7 x 300k = 210k trigger cannot fire, and the 20k verbatim-keep budget
+  exceeds a whole prompt. The knob is a context-window guard mis-keyed to
+  a spend cap; the registered validation arm is inert and returns to
+  design.
+
 ## Current state (2026-10-12)
 
 - The live frontier is in-container eval: `rof eval --agent
@@ -40,10 +61,37 @@ measured numbers carry a date and live with the run artifacts.
 1. **Near-miss rep top-ups** (if they earn the spend): the
    partial-credit cells (1/3, 1/2, 2/4, 2/3 test shapes) are the
    cheapest capability information per cell.
-2. **S-1 compaction experiment**: the `--compaction` knob is landed
-   OFF by default and unvalidated; the first paid run validates
-   `frac`/`keep_tokens` or revises them.
-3. **Budget-shape arm run** — MEASURED 2026-10-14 (first arm,
+2. **S-1 compaction experiment** — BLOCKED, premise refuted
+   2026-10-16 (see Current state): the landed trigger keys on per-request
+   prompt size while the recipe's budget is cumulative billed tokens, so
+   it cannot fire at any plausible `frac`. Re-design first (trigger on
+   spent-vs-cap, keep-budget scaled to real prompts), then re-register a
+   pass rule; do not run the original arm.
+3. **In-container exec policy (queued, 2026-10-16)**: measured on 53
+   banked in-container rows, 83% hit at least one tool denial and the
+   denied set includes the tools the tasks' own tests require
+   (task toolchains, `./release`, `valgrind`, `sqlite3`, `pip`,
+   `apt-get`, `bash`). The allowlist is a host-exec hygiene guard; in
+   in-container mode every exec is wrapped through `docker exec`, so the
+   container is the boundary and the list only removes capability.
+   Planned: an explicit opt-in trust policy, honored only when an exec
+   wrapper is installed and recorded in report provenance (relaxed rows
+   never pool with strict rows), then a pre-registered arm on the cells
+   whose zero is a denial artifact. The flag itself has LANDED
+   (`--exec-policy allowlist|any`, default allowlist, recorded in
+   provenance); the arm starts after the envelope arm below finishes,
+   since rows must not straddle two binaries.
+4. **Envelope arm — MEASURED 2026-10-16/18, KILL RULE TRIGGERED.** Three
+   matched arms (control = frozen recipe; shape = miss-plus-out at the
+   same cap; joint = miss-plus-out plus a doubled step/action envelope)
+   over two headroom cells and one already-solved regression cell. The
+   envelope moved walls but not capability: on one cell it converted a
+   token-death into a step-death and then into 87 of 120 steps (1.85x
+   steps, 3.0x gross input) while the same single failing test survived in
+   every arm — a semantic requirement, not budget. Tests per treated cell
+   were flat, tokens per test passed were 1.85x/2.35x against a 1.3x rule.
+   No further cap/envelope arms; near-miss top-ups stay parked.
+5. **Budget-shape arm run** — MEASURED 2026-10-14 (first arm,
    4 near-miss cells, owner-authorized): the pre-registered gate
    (more solves at ≤1.3× dollars-per-solved) **failed** — 0/4
    solves on both shapes, arm cost 1.42×, tests flat-to-down. The
@@ -54,7 +102,7 @@ measured numbers carry a date and live with the run artifacts.
    just moves the wall. The knob stays OFF by default, opt-in via
    `--budget-shape`, flagged mechanism-validated /
    capability-unconverted.
-4. **Rivals grid comparisons** — DONE 2026-10-14 (free): the legal
+6. **Rivals grid comparisons** — DONE 2026-10-14 (free): the legal
    tables are computed and published in the local analysis artifact
    (L1/L2 screening, L4/L5 single-arm cost+solve tables). Cross-harness
    cost is not computable (rival logs carry no usage fields); pass-rate
@@ -89,8 +137,12 @@ literature on 2026-10-13 and deliberately stay closed.
   scope by the no-planner/no-MAS rule.
 - **Bet C (candidate racing)**: unbuilt until a workload shows
   proof-gate interventions (zero in all measured runs to date).
-- **Unpriced-model spend warning**: deferred until a non-test unpriced
-  model runs for real.
+- **Unpriced-model spend warning**: gate TRIGGERED 2026-10-16 — the
+  dphn endpoint is unpriced and runs for real there, so dollars are
+  `null` and the `$` cap cannot bind. The endpoint's own reported cost is
+  unreliable (present on only some routes), so the honest fix is either a
+  run-start warning that the spend cap is inert, or a per-endpoint price
+  book; no price is invented.
 - **Parked nits** (only if they earn it): search depth cap, `/app`
   word-boundary in goal mapping, assemble budget accounting,
   finalize_dump exit code.
@@ -102,8 +154,10 @@ literature on 2026-10-13 and deliberately stay closed.
 - Timeout/cancel kill the docker-exec client; the in-container process
   may outlive it (upgrade: docker kill or exec-session tracking).
 - Root-owned in-container artifacts survive host-side `git clean`
-  during batch rollback (fail-soft, no verdicts affected), and —
-  measured 2026-10-14, budget-shape arm 1 — can also **hard-halt a
-  run** when the end-of-run patch digest (`git diff --no-index`)
-  cannot read them (`halt=snapshot` on install-windows-3.11; upgrade:
-  digest via a root-readable copy or chmod at harvest).
+  during batch rollback. Measured across 70 banked in-container rows:
+  snapshot-class halts in 5, of which 4 are this class — fail-soft in
+  3 (the row still grades) but a **hard halt** in 2, including one that
+  voided a run at step 3 (2026-10-16) and one at the end-of-run patch
+  digest (`halt=snapshot` on install-windows-3.11, 2026-10-14).
+  Upgrade: make the workdir agent-owned inside the container (chown
+  before rollback/digest) or digest via a root-readable copy.

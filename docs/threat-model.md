@@ -5,6 +5,8 @@ CLI guards (`crates/rof/src/workdir.rs`).
 
 ## What the tools enforce
 
+- Command allowlist for `exec`/`test`: `--allow-cmd` binary prefixes,
+  skipped only by the explicit `--exec-policy any` (see below).
 - Path policy for `view`/`edit`/`write` only: root-anchored to the
   policy root, symlink-safe (a symlinked directory must not launder
   writes out of the tree), secrets-denied file access.
@@ -21,7 +23,12 @@ CLI guards (`crates/rof/src/workdir.rs`).
 
 - `exec` and `test` run allowlisted host commands, but allowlisting is
   not isolation: permitting `cargo test`, `sh`, or any test runner
-  hands the agent arbitrary code execution on the host.
+  hands the agent arbitrary code execution on the host. The list can be
+  skipped entirely with `--exec-policy any`, which is recorded in the
+  report provenance; it exists for callers whose process boundary is
+  elsewhere (in-container eval wraps every exec as
+  `docker exec <container>`, so the container — not the list — is the
+  boundary), and it removes even the hygiene the list provides.
 - The path policy does not extend to `exec`/`test`; there is no
   filesystem sandbox.
 - OS-level isolation (container/namespace, no network, read-only

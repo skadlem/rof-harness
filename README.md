@@ -159,6 +159,7 @@ model — an unpriced model reports `null` cost, never zero.
 |---|---|
 | `--endpoint URL` | OpenAI-compatible base URL (env `OPENAI_BASE_URL`) |
 | `--allow-cmd CMD` | allowlisted command (repeatable; binary-prefix match) |
+| `--exec-policy allowlist\|any` | `any` skips the command list (only where the process boundary is elsewhere — in-container eval runs each exec in the task container); recorded in report provenance |
 | `--budget-steps/-actions/-tokens N` | caps; any explicit flag lifts the 900s wall to 3600s |
 | `--max-tokens N` | per-request output ceiling |
 | `--context-file PATH` | pinned file context (repeatable) |
@@ -195,7 +196,11 @@ responsibility:
   symlink-safe, secrets-denied file access.
 - `exec` and `test` run allowlisted host commands, but allowlisting is
   not isolation: permitting `cargo test`, `sh`, or any test runner hands
-  the agent arbitrary code execution on the host. Agent-spawned children
+  the agent arbitrary code execution on the host. `--exec-policy any`
+  skips the list entirely, for callers whose process boundary is
+  elsewhere (in-container eval runs every exec inside the task
+  container); it removes even that hygiene and is recorded in the
+  report provenance. Agent-spawned children
   run at the lowest scheduling priority (nice 19) so unattended sweeps
   yield to interactive work; memory stays uncapped.
 - OS-level isolation (container, namespaces, no network, read-only

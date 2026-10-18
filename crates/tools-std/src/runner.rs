@@ -294,7 +294,8 @@ pub(crate) async fn run_allowed_argv(
     // apart after it. (An exact-allowlisted command with irregular internal
     // whitespace no longer matches; prefixes are unaffected.)
     let canonical = argv.join(" ");
-    if !policy.allowed_commands.iter().any(|a| a == &canonical)
+    if !policy.allow_any_cmd
+        && !policy.allowed_commands.iter().any(|a| a == &canonical)
         && !prefix_allowed(&policy.allowed_prefixes, &canonical)
     {
         return Err(ToolError::Denied(format!(

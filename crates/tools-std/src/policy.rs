@@ -1,5 +1,34 @@
 use std::path::{Component, Path, PathBuf};
 
+/// Command-allowlist policy for `exec`/`test`.
+///
+/// `Allowlist` (default) is the strict prefix list built from `--allow-cmd`.
+/// `Any` skips the list entirely and is for callers that own a real process
+/// boundary: in-container eval wraps every exec as `docker exec <container>`,
+/// so the container is the isolation boundary and the list only removes
+/// capability (measured: 83% of in-container rows hit a denial, including the
+/// task's own toolchains). `FromStr` is the single spelling source, so the run
+/// and eval flag tables cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecPolicy {
+    Allowlist,
+    Any,
+}
+
+impl std::str::FromStr for ExecPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "allowlist" => Ok(Self::Allowlist),
+            "any" => Ok(Self::Any),
+            other => Err(format!(
+                "--exec-policy needs allowlist or any, got {other:?}"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Policy {
     pub root: PathBuf,
@@ -14,6 +43,14 @@ pub struct Policy {
     /// fixed pass-through set. A provider key must never go here: names
     /// ending in `_API_KEY` (and malformed names) are dropped at spawn.
     pub pass_env: Vec<String>,
+    /// Skip the command allowlist entirely (exec/test accept any argv).
+    /// The caller is asserting the process boundary is elsewhere: the
+    /// allowlist is hygiene, not isolation (it already admits `gcc`,
+    /// `cargo`, `node`, `rm`), so where a real sandbox exists it only
+    /// removes capability — measured in-container: 83% of rows hit a
+    /// denial, including the task's own toolchains. Default `false`
+    /// keeps the strict list byte-identical.
+    pub allow_any_cmd: bool,
     /// Optional argv prefix prepended at spawn only (in-container eval:
     /// `"docker", "exec", <container>` so every exec/test tool call lands
     /// inside the container). The shell-op guard, the allowlist check, and

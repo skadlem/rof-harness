@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{parse_table, resolve_endpoint, Flag};
 
-pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--max-tokens N] [--keep-thinking] [--in-container]
+pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--keep-thinking] [--in-container]
 --lenient-apply: record Lenient patch-apply provenance in the report (default Strict; Strict grades are not comparable with earlier fuzz-lenient numbers)
 --agent: run the agent leg per instance instead of the oracle-container leg (fresh workdir, in-process rof-run wiring, harbor-CLI grading). Requires --model ID and --endpoint URL (or OPENAI_BASE_URL); mutually exclusive with --winnability-only. Agent budgets default to the frozen pilot recipe: 300000 tokens / 60 steps / 120 actions; explicit flags win.
 --keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default keeps the DeepSeek thinking-off knob, sent only on compaction-summary calls and the truncation ladder first rung; ordinary requests carry no thinking fragment)
 --in-container: with --agent, the agent works inside the task environment container (started before the run; workdir bind-mounted at /app, cpus/memory capped at 2/4096m; agent exec/test calls wrapped with docker exec; the verifier execs the same live container, so installed packages and running services persist to grading). Verdict provenance in this mode is the task-written reward file (/logs/verifier/reward.txt) with the verifier exit code as the no-artifact fallback, never the harbor result.json reward;
+--exec-policy allowlist|any: command-allowlist policy forwarded to the agent leg. `any` skips the prefix list entirely (the in-container agent's process boundary is the task container, not this harness); the value is recorded in the report provenance, so relaxed rows never pool with strict rows
 --budget-shape: token-cap accounting, recorded on the report's provenance block. gross = input+output (default, the frozen recipe); miss-plus-out = (input - cache_read) + output, so provider-cached prompt re-reads stop spending the token cap. A miss-plus-out arm is a DIFFERENT ESTIMAND from a gross arm: never mix the two shapes in one table. Reported usage totals and dollars are unchanged by either shape";
 
 #[derive(Debug, PartialEq)]
@@ -32,6 +33,10 @@ pub(crate) struct EvalArgs {
     pub api_key_env: Option<String>,
     pub headers: Vec<String>,
     pub allow_cmd: Vec<String>,
+    /// Command-allowlist policy for exec/test (`Allowlist` default). `Any`
+    /// skips the list; recorded in the provenance block so relaxed rows
+    /// never pool with strict rows.
+    pub exec_policy: tools_std::ExecPolicy,
     pub budget_steps: Option<u32>,
     pub budget_actions: Option<u32>,
     pub budget_tokens: Option<u64>,
@@ -72,6 +77,7 @@ struct EvalBuilder {
     api_key_env: Option<String>,
     headers: Vec<String>,
     allow_cmd: Vec<String>,
+    exec_policy: Option<tools_std::ExecPolicy>,
     budget_steps: Option<u32>,
     budget_actions: Option<u32>,
     budget_tokens: Option<u64>,
@@ -162,6 +168,12 @@ fn set_budget_tokens(b: &mut EvalBuilder, v: Option<String>) -> Result<(), Strin
         s.parse()
             .map_err(|_| format!("--budget-tokens needs a positive integer, got {s:?}"))?,
     );
+    Ok(())
+}
+
+fn set_exec_policy(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    b.exec_policy = Some(s.parse()?);
     Ok(())
 }
 
@@ -294,6 +306,11 @@ const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
         set: set_budget_tokens,
     },
     Flag {
+        name: "--exec-policy",
+        takes_value: true,
+        set: set_exec_policy,
+    },
+    Flag {
         name: "--budget-shape",
         takes_value: true,
         set: set_budget_shape,
@@ -360,6 +377,7 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
         api_key_env: b.api_key_env,
         headers: b.headers,
         allow_cmd: b.allow_cmd,
+        exec_policy: b.exec_policy.unwrap_or(tools_std::ExecPolicy::Allowlist),
         budget_steps: b.budget_steps,
         budget_actions: b.budget_actions,
         budget_tokens: b.budget_tokens,
@@ -413,6 +431,13 @@ pub(crate) fn estimand_for(args: &EvalArgs) -> eval::Estimand {
 /// Token-cap shape recorded on the report (see
 /// [`eval::BudgetShapeLabel`]): an absent flag records `Gross`, the
 /// frozen-recipe default the run used.
+pub(crate) fn exec_policy_for(args: &EvalArgs) -> eval::ExecPolicyLabel {
+    match args.exec_policy {
+        tools_std::ExecPolicy::Allowlist => eval::ExecPolicyLabel::Allowlist,
+        tools_std::ExecPolicy::Any => eval::ExecPolicyLabel::Any,
+    }
+}
+
 pub(crate) fn budget_shape_for(args: &EvalArgs) -> eval::BudgetShapeLabel {
     match args.budget_shape {
         Some(agent_loop::BudgetShape::MissPlusOut) => eval::BudgetShapeLabel::MissPlusOut,
@@ -525,6 +550,7 @@ pub(crate) fn finish_report(args: &EvalArgs, reports: Vec<eval::InstanceReport>)
             budget_steps,
             budget_actions,
             budget_shape: budget_shape_for(args),
+            exec_policy: exec_policy_for(args),
             apply_mode: apply_mode_for(args),
         }),
     };
@@ -570,6 +596,30 @@ mod tests {
         assert_eq!(a.report, Some(PathBuf::from("/tmp/eval-out/report.json")));
         assert!(!a.winnability_only);
         assert!(!a.lenient_apply, "Strict provenance by default");
+    }
+
+    #[test]
+    fn cli_eval_parses_exec_policy_and_labels_it() {
+        let mut words = vec![
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/tasks",
+            "--agent",
+            "--model",
+            "m",
+            "--endpoint",
+            "https://e",
+            "--exec-policy",
+            "any",
+        ];
+        let a = parse_eval(&argv(&words)).unwrap();
+        assert_eq!(a.exec_policy, tools_std::ExecPolicy::Any);
+        assert_eq!(exec_policy_for(&a), eval::ExecPolicyLabel::Any);
+        words.truncate(words.len() - 2);
+        let a = parse_eval(&argv(&words)).unwrap();
+        assert_eq!(a.exec_policy, tools_std::ExecPolicy::Allowlist);
+        assert_eq!(exec_policy_for(&a), eval::ExecPolicyLabel::Allowlist);
     }
 
     #[test]
@@ -834,6 +884,7 @@ mod tests {
             api_key_env: None,
             headers: Vec::new(),
             allow_cmd: Vec::new(),
+            exec_policy: tools_std::ExecPolicy::Allowlist,
             budget_steps: None,
             budget_actions: None,
             budget_tokens: None,

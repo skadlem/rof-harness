@@ -74,7 +74,23 @@ pub struct RunProvenance {
     /// Required field: a provenance block without it fails loudly rather
     /// than silently reading as `Gross`.
     pub budget_shape: BudgetShapeLabel,
+    /// Command-allowlist policy the agent leg ran under. A row produced with
+    /// the allowlist skipped is a different protocol from a strict-list row
+    /// (the agent could reach tools the task's tests require), so the two
+    /// never pool in one table. Required field: a provenance block without
+    /// it fails loudly rather than silently reading as `Allowlist`.
+    pub exec_policy: ExecPolicyLabel,
     pub apply_mode: ApplyMode,
+}
+
+/// Report-side spelling of the command-allowlist policy. `Allowlist` = the
+/// `--allow-cmd` prefix list; `Any` = the list is skipped (in-container eval,
+/// where every exec is wrapped through the task container). Mirrors the tool
+/// policy enum without a dependency edge; `rof` converts at the report site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecPolicyLabel {
+    Allowlist,
+    Any,
 }
 
 /// Report-side spelling of the token-cap shape (`Gross` = input+output,

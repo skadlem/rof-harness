@@ -21,8 +21,8 @@ pub use oracle::{
     swe_test_status, ApplyMode, ApplyOutcome, Verdict,
 };
 pub use report::{
-    instance_report, instance_report_with_mode, BudgetShapeLabel, Estimand, InstanceReport,
-    RunProvenance, RunReport, APPLY_COMPARABILITY_NOTE,
+    instance_report, instance_report_with_mode, BudgetShapeLabel, Estimand, ExecPolicyLabel,
+    InstanceReport, RunProvenance, RunReport, APPLY_COMPARABILITY_NOTE,
 };
 pub use slices::{
     check_winnability, load_swe_slice, load_tb_slice, slice_path, Instance, SweInstance, ToolCaps,
@@ -491,6 +491,7 @@ mod tests {
                 budget_steps: 60,
                 budget_actions: 120,
                 budget_shape: BudgetShapeLabel::MissPlusOut,
+                exec_policy: ExecPolicyLabel::Any,
                 apply_mode: ApplyMode::Strict,
             }),
         };
@@ -500,6 +501,7 @@ mod tests {
         assert_eq!(v["provenance"]["budget_steps"], 60);
         assert_eq!(v["provenance"]["budget_actions"], 120);
         assert_eq!(v["provenance"]["budget_shape"], "MissPlusOut");
+        assert_eq!(v["provenance"]["exec_policy"], "Any");
         assert_eq!(v["provenance"]["apply_mode"], "Strict");
         let back: RunReport = serde_json::from_value(v).unwrap();
         assert_eq!(

@@ -11,12 +11,13 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
 --keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default keeps the DeepSeek thinking-off knob, sent only on compaction-summary calls and the truncation ladder first rung; ordinary requests carry no thinking fragment)
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget
+--exec-policy allowlist|any: command-allowlist policy for exec/test. `any` skips the list entirely and is for callers whose process boundary is elsewhere (in-container eval wraps exec as `docker exec <container>`, so the allowlist is not a boundary there, only capability loss); the choice is recorded in the report provenance so relaxed rows never pool with strict rows
 --compaction FRAC: checkpoint the older context once the estimate crosses FRAC of the token budget (0 < FRAC <= 1). OFF-BY-DEFAULT and UNVALIDATED: the S-1 compaction experiment has not run yet, so leave it unset unless running that experiment.
 --thinking-keep N: echoed-reasoning rows kept per assistant message (flag wins over THINKING_KEEP; unset leaves the loop default)
 --collapse-hysteresis N: collapse-boundary hysteresis rows (flag wins over COLLAPSE_HYSTERESIS; unset leaves the loop default)
@@ -36,6 +37,10 @@ pub(crate) struct Args {
     /// Extra request headers as NAME:VALUE (e.g. x-opencode-session:<id>).
     pub headers: Vec<String>,
     pub allow_cmd: Vec<String>,
+    /// Command-allowlist policy for exec/test (`Allowlist` default). `Any`
+    /// skips the list: the caller owns a real process boundary (in-container
+    /// eval wraps exec as `docker exec <container>`).
+    pub exec_policy: tools_std::ExecPolicy,
     pub budget_steps: Option<u32>,
     pub budget_actions: Option<u32>,
     pub budget_tokens: Option<u64>,
@@ -138,6 +143,7 @@ struct RunBuilder {
     api_key_env: Option<String>,
     headers: Vec<String>,
     allow_cmd: Vec<String>,
+    exec_policy: Option<tools_std::ExecPolicy>,
     budget_steps: Option<u32>,
     budget_actions: Option<u32>,
     budget_tokens: Option<u64>,
@@ -227,6 +233,12 @@ fn set_budget_tokens(b: &mut RunBuilder, v: Option<String>) -> Result<(), String
         s.parse()
             .map_err(|_| format!("--budget-tokens needs a positive integer, got {s:?}"))?,
     );
+    Ok(())
+}
+
+fn set_exec_policy(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    b.exec_policy = Some(s.parse()?);
     Ok(())
 }
 
@@ -406,6 +418,11 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_budget_tokens,
     },
     Flag {
+        name: "--exec-policy",
+        takes_value: true,
+        set: set_exec_policy,
+    },
+    Flag {
         name: "--budget-shape",
         takes_value: true,
         set: set_budget_shape,
@@ -491,6 +508,7 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         api_key_env: b.api_key_env.unwrap_or_else(|| "OPENAI_API_KEY".into()),
         headers: b.headers,
         allow_cmd: b.allow_cmd,
+        exec_policy: b.exec_policy.unwrap_or(tools_std::ExecPolicy::Allowlist),
         budget_steps: b.budget_steps,
         budget_actions: b.budget_actions,
         budget_tokens: b.budget_tokens,
@@ -675,6 +693,7 @@ mod tests {
                 api_key_env: "OPENAI_API_KEY".into(),
                 headers: Vec::new(),
                 allow_cmd: vec!["cargo test".into(), "true".into()],
+                exec_policy: tools_std::ExecPolicy::Allowlist,
                 budget_steps: Some(7),
                 budget_actions: Some(9),
                 budget_tokens: None,
@@ -849,6 +868,40 @@ mod tests {
         ] {
             assert!(parse_args(&argv(&words)).is_err(), "{words:?}");
         }
+    }
+
+    #[test]
+    fn exec_policy_flag_defaults_to_allowlist_and_parses_any() {
+        let base = [
+            "rof",
+            "run",
+            "--goal",
+            "g",
+            "--workdir",
+            "/w",
+            "--model",
+            "m",
+        ];
+        assert_eq!(
+            parse_args(&argv(&base)).unwrap().exec_policy,
+            tools_std::ExecPolicy::Allowlist,
+            "absent flag keeps the strict list"
+        );
+        let mut words = base.to_vec();
+        words.extend(["--exec-policy", "any"]);
+        assert_eq!(
+            parse_args(&argv(&words)).unwrap().exec_policy,
+            tools_std::ExecPolicy::Any
+        );
+        let mut words = base.to_vec();
+        words.extend(["--exec-policy", "allowlist"]);
+        assert_eq!(
+            parse_args(&argv(&words)).unwrap().exec_policy,
+            tools_std::ExecPolicy::Allowlist
+        );
+        let mut words = base.to_vec();
+        words.extend(["--exec-policy", "trust"]);
+        assert!(parse_args(&argv(&words)).is_err(), "typos must be loud");
     }
 
     #[test]

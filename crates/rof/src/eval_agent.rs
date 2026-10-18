@@ -123,6 +123,7 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
             .unwrap_or_else(|| "OPENAI_API_KEY".into()),
         headers: a.headers.clone(),
         allow_cmd: a.allow_cmd.clone(),
+        exec_policy: a.exec_policy,
         budget_steps: Some(
             a.budget_steps
                 .unwrap_or(crate::eval_cmd::PILOT_BUDGET_STEPS),

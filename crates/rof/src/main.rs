@@ -77,6 +77,7 @@ fn policy_for(args: &Args) -> tools_std::Policy {
         syntax_cmd: None,
         denied_globs: tools_std::default_denied_globs(),
         pass_env: args.pass_env.clone(),
+        allow_any_cmd: args.exec_policy == tools_std::ExecPolicy::Any,
         exec_wrap: args.exec_wrap.clone(),
     }
 }

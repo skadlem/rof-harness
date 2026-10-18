@@ -33,7 +33,9 @@ mod write;
 pub use common::{apply_hunk, prefix_allowed};
 pub use edit::{edit_tool, EditTool};
 pub use exec::{exec_tool, ExecTool};
-pub use policy::{default_denied_globs, glob_match, resolve_under, Policy, ToolPathError};
+pub use policy::{
+    default_denied_globs, glob_match, resolve_under, ExecPolicy, Policy, ToolPathError,
+};
 pub use search::{search_tool, SearchTool};
 pub use test_tool::{test_tool, TestTool};
 pub use view::{view_tool, ViewTool};
@@ -76,6 +78,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            allow_any_cmd: false,
             exec_wrap: None,
         })
     }
@@ -91,6 +94,7 @@ mod tests {
             syntax_cmd: Some(argv.iter().map(|s| s.to_string()).collect()),
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            allow_any_cmd: false,
             exec_wrap: None,
         })
     }
@@ -805,6 +809,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            allow_any_cmd: false,
             exec_wrap: None,
         };
         let err = run_allowed(
@@ -837,6 +842,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            allow_any_cmd: false,
             exec_wrap: None,
         };
         let (ok, out, _) = run_allowed(
@@ -865,6 +871,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            allow_any_cmd: false,
             exec_wrap: None,
         };
         let err = run_allowed(
@@ -893,6 +900,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            allow_any_cmd: false,
             exec_wrap: None,
         };
         let cancel = CancellationToken::new();
@@ -934,6 +942,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            allow_any_cmd: false,
             exec_wrap: None,
         };
         let start = std::time::Instant::now();
@@ -978,6 +987,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            allow_any_cmd: false,
             exec_wrap: None,
         };
         for cmd in [
@@ -1041,6 +1051,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            allow_any_cmd: false,
             exec_wrap: None,
         };
         let (ok, out, _) = run_allowed(
@@ -1076,6 +1087,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            allow_any_cmd: false,
             exec_wrap: None,
         };
         let (ok, out, _) = run_allowed(
@@ -1104,6 +1116,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            allow_any_cmd: false,
             exec_wrap: Some(vec!["/nonexistent-rof-wrap/bin".to_string()]),
         };
         let err = run_allowed(&pol, "echo hi", EXEC_TIMEOUT, &CancellationToken::new())
@@ -1141,6 +1154,37 @@ mod tests {
             spawn_argv(&plain, &["echo".to_string(), "hi".to_string()]),
             vec!["echo".to_string(), "hi".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn exec_policy_any_skips_the_allowlist_and_nothing_else() {
+        // In-container eval owns a real process boundary (every exec is
+        // wrapped through the task container), so `Any` must let a command
+        // run that the strict list denies.
+        let root = tmp_root();
+        let strict = (*policy(&root)).clone();
+        let err = run(
+            &reg(Arc::new(strict.clone())),
+            "exec",
+            json!({"cmd": "ls ."}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("not allowlisted"), "{err}");
+
+        let mut any = strict.clone();
+        any.allow_any_cmd = true;
+        let out = run(&reg(Arc::new(any.clone())), "exec", json!({"cmd": "ls ."}))
+            .await
+            .unwrap();
+        assert!(out.success, "any-cmd runs ls: {}", out.content);
+
+        // The shell-op guard is a correctness teaching error, not an
+        // allowlist rule: it still fires under `Any`.
+        let err = run(&reg(Arc::new(any)), "exec", json!({"cmd": "ls | wc -l"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no shell"), "{}", err);
     }
 
     #[tokio::test]
@@ -1187,6 +1231,7 @@ mod tests {
             syntax_cmd: Some(vec!["cat".to_string()]),
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            allow_any_cmd: false,
             exec_wrap: None,
         };
         stage_and_check(
@@ -1273,6 +1318,7 @@ mod tests {
             syntax_cmd: None,
             denied_globs: default_denied_globs(),
             pass_env: Vec::new(),
+            allow_any_cmd: false,
             exec_wrap: None,
         });
         let out = run(&reg(pol), "test", json!({"cmd": "cat noisy.txt"}))

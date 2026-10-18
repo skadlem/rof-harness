@@ -189,3 +189,86 @@ says so explicitly.
   (no measurements in-tree).
 - When Strict-by-default eval grading becomes the permanent baseline.
 - Whether Bet C will be built, and on what timeline.
+- **Compaction premise refuted before spend (2026-10-16).** The landed
+  `--compaction FRAC` trigger compares a *per-request* prompt estimate
+  against `frac x token budget`, while the frozen recipe's token budget is
+  *cumulative billed tokens* — different units. Measured over 1064 settled
+  requests in the banked arms, per-request prompts top out at 18.0k tokens
+  (median 2-3k), so the registered 0.7 x 300k = 210k trigger cannot fire,
+  and the 20k verbatim-keep budget exceeds an entire prompt so the cut
+  point is never valid either. The registered validation arm is inert (it
+  would compare a treatment arm against itself); the knob stays OFF by
+  default and S-1 returns to design, keyed on spent-vs-cap rather than
+  prompt size.
+- **Prompt composition of the frozen recipe (2026-10-16, inferred from a
+  reconstruction calibrated against measured per-request token counts).**
+  Of a typical mid-run prompt: system + tools + goal ~1.1k tokens, ~21
+  tokens of wire scaffolding per history row (~2.1k at 50 rows), tool
+  result bodies at ~2.7 chars/token, older tool results stubbed to one
+  line, and no cumulative reasoning echo in the pre-trim arms (so the
+  "echo bill" figure belongs to the pinned-context runs, not the slice
+  arms). The largest *uncollapsed* component is assistant tool-call
+  arguments: the request fold stubs old results but never old call
+  arguments, so every patch body is re-sent on every later request.
+- **Second experiment endpoint wired (2026-10-16).** A vLLM-fronted
+  gateway now serves `deepseek-ai/DeepSeek-V4.1-Flash` for experiments.
+  Live probes + a smoke agent run: tool calls execute, prefix-cache reads
+  are reported, thinking arrives under `reasoning` and the adapter reads
+  it as a fallback (`reasoning_content` still wins when both keys are
+  present; two-field parse rather than a serde alias so a body carrying
+  both keys parses), and DeepSeek's thinking-off knob is accepted and
+  ignored there. The endpoint is unpriced for this harness — it reports a
+  cost on only some routes, so a partial sum is not meterable and dollars
+  stay `null`; the token/step caps are the guards and the unpriced-model
+  gate in the roadmap is now open.
+- **Envelope arm pre-registered (2026-10-16), amended before its second
+  launch.** Three matched arms over two clean in-container headroom cells
+  (test fractions 2/5 and 2/6 on the reference model) plus one
+  already-solved regression cell, two reps each, in-container reward
+  estimand: control = frozen recipe (300k gross / 60 / 120); shape =
+  300k miss-plus-out at the same envelope; joint = miss-plus-out plus a
+  doubled step/action envelope. Pass rules: per-cell test counts up in
+  the joint arm for two of three cells, at least one cell solved, and
+  internal tokens per test passed within 1.3x of control. Kill rule: if
+  neither the shape nor the joint arm raises test counts, the envelope
+  axis is dead for this workload and further spend goes to
+  capability-side levers. Amendment: the original cell set was picked
+  from host-side partial-credit rows; the in-container table shows the
+  first cell at 0/6 for every model measured in that mode, so it has no
+  delta to show. One wasted run, cells fixed, arms/reps/gates unchanged.
+- **In-container exec policy landed (2026-10-16).** `--exec-policy
+  allowlist|any` on `rof run` and `rof eval` (default `allowlist`, the
+  strict `--allow-cmd` prefix list; the previous behavior). `any` skips
+  the list, for callers whose process boundary is elsewhere: in-container
+  eval wraps every exec as `docker exec <container>`, so the container is
+  the boundary and the allowlist only removes capability — measured on 53
+  banked in-container rows, 83% hit at least one denial and the denied
+  set includes the toolchains the tasks' own tests require. The value is
+  a required provenance field, so relaxed rows can never pool with strict
+  rows; the shell-syntax guard (a correctness teaching error) still
+  applies under `any`, and the threat model now states that `any` removes
+  even the hygiene the list provides. Tokens/steps remain the guards on an
+  unpriced endpoint. Gates: tools-std 60/0, eval 31/0, rof 56/0, clippy
+  `-D warnings` and fmt clean.
+- **Pre-registered arm for that policy (`dphn-trust`, queued).** Same
+  model/endpoint/binary/recipe/estimand as the envelope arm; cells chosen
+  because their zero is a denial artifact (make-mips-interpreter, custom
+  memory-heap-crash, query-optimize) plus one already-solved regression
+  cell; two arms (strict list vs trust) x 2 reps. Pass: the treatment
+  passes a test those cells never passed under the strict list, or solves
+  one, within 1.3x the control's tokens per test passed. Kill: every
+  treated cell stays at zero tests, i.e. the zeros are capability rather
+  than policy.
+- **Envelope arm closed (2026-10-16/18): the kill rule fired.** Control
+  (frozen recipe) vs miss-plus-out accounting at the same cap vs the same
+  plus a doubled step/action envelope, on two headroom cells and one
+  already-solved regression cell, in-container reward estimand. The
+  envelope moved walls and not capability: the shape converted one cell's
+  token-death into a step-death and the joint arm then reached 87 of 120
+  steps (1.85x steps, 3.0x gross input), yet every arm on that cell failed
+  the identical verifier test — the missing deliverable is semantic, not
+  budget — while the other headroom cell's single test gain was an
+  import-check test. Test counts per cell were flat where it mattered and
+  gross tokens per test passed came out at 1.85x and 2.35x against the
+  1.3x rule. No further envelope arms; the parked near-miss top-ups stay
+  parked because their prior was envelope-shaped.

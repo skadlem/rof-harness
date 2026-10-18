@@ -183,6 +183,7 @@ pub(crate) fn args_for(dir: &std::path::Path, steps: Option<u32>) -> Args {
         api_key_env: "OPENAI_API_KEY".into(),
         headers: Vec::new(),
         allow_cmd: vec![],
+        exec_policy: tools_std::ExecPolicy::Allowlist,
         budget_steps: steps,
         budget_actions: None,
         budget_tokens: None,
