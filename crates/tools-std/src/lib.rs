@@ -143,6 +143,48 @@ mod tests {
     // --- containment matrix ---
 
     #[test]
+    fn app_prefixed_paths_resolve_to_the_root_and_traversal_still_denied() {
+        let root = tmp_root();
+        std::fs::write(root.join("hello.txt"), "hi").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("x.py"), "x").unwrap();
+        // `/app/...` is the workspace spelled as the task statements spell it.
+        assert_eq!(
+            resolve_under(&root, "/app/hello.txt", false, &[]).unwrap(),
+            root.join("hello.txt")
+        );
+        assert_eq!(
+            resolve_under(&root, "/app/sub/x.py", true, &[]).unwrap(),
+            root.join("sub").join("x.py")
+        );
+        // Traversal out of the root is still refused, and so is any other
+        // absolute path: the strip only ever removes a leading `/app/`.
+        for bad in ["/app/../escape", "/etc/passwd", "/tests/test.sh"] {
+            match resolve_under(&root, bad, false, &[]) {
+                Err(ToolPathError::Denied(_)) => {}
+                other => panic!("{bad} must be denied, got {other:?}"),
+            }
+        }
+        // Secrets and the git substrate stay denied through the alias too.
+        std::fs::write(root.join(".env"), "SECRET=1").unwrap();
+        assert!(matches!(
+            resolve_under(&root, "/app/.env", false, &default_denied_globs()),
+            Err(ToolPathError::Denied(_))
+        ));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git").join("HEAD"), "ref").unwrap();
+        assert!(matches!(
+            resolve_under(&root, "/app/.git/HEAD", true, &[]),
+            Err(ToolPathError::Denied(_))
+        ));
+        // Relative spellings are untouched.
+        assert_eq!(
+            resolve_under(&root, "hello.txt", false, &[]).unwrap(),
+            root.join("hello.txt")
+        );
+    }
+
+    #[test]
     fn git_write_denied_read_allowed() {
         let root = tmp_root();
         std::fs::create_dir_all(root.join(".git")).unwrap();

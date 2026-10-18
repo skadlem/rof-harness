@@ -308,3 +308,16 @@ says so explicitly.
   checklist arms run. The remaining failures on that slice are semantic and
   capability-bound at this model tier, so the next honest experiment is a
   stronger-model ceiling read, not another prompt variant.
+- **File-tool `/app` path parity fixed (2026-10-18).** Task statements and
+  the harness's own goal text spell the workspace `/app/<file>`, but the
+  host-side file tools root at the host workdir, so the largest denial class
+  across 96 in-container rows was agents being refused the very files they
+  were told to edit (`view:/app/Dockerfile` and friends). The resolver now
+  strips a leading `/app/` before joining the root — strictly additive,
+  since absolute `/app/...` was always refused — while traversal out of the
+  root, secrets deny-globs and the git-substrate refusal still apply. A
+  two-binary A/B (12 rows) shows the denial class gone, no test moved on the
+  cells that fail, and the already-solved regression cell reaching the same
+  verdict in about half the steps and tokens. Container-only paths
+  (`/tests`) stay refused: serving them would mean letting the agent read
+  the verifier's tests, which is a fairness decision rather than a bug fix.

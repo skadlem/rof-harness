@@ -81,6 +81,18 @@ measured numbers carry a date and live with the run artifacts.
    it cannot fire at any plausible `frac`. Re-design first (trigger on
    spent-vs-cap, keep-budget scaled to real prompts), then re-register a
    pass rule; do not run the original arm.
+3a. **File-tool `/app` parity — FIXED 2026-10-18 (correctness, no capability
+   claim).** Joining denials to their tool arguments showed the largest
+   file-tool denial class was the workspace spelled the way task statements
+   spell it (`/app/<file>`): the host-side tools root elsewhere, so agents
+   were refused the files they were told to edit and fell back to `exec cat`.
+   The resolver now strips a leading `/app/` (strictly additive, traversal /
+   secrets / git refusals unchanged, pinned by test). A two-binary A/B (12
+   rows) shows the class gone, no test moved on the failing cells, and the
+   already-solved regression cell reached the same result in about half the
+   steps and tokens. What is left is container-only paths (`/tests`), which
+   host-side tools cannot serve — serving them would let the agent read the
+   verifier's tests, a fairness decision deliberately not taken.
 3. **In-container exec policy — MEASURED 2026-10-18: mechanism confirmed,
    capability unconverted.** `--exec-policy allowlist|any` landed (default
    allowlist, recorded as a required provenance field). The measured

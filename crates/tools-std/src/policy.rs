@@ -181,6 +181,16 @@ pub fn resolve_under(
     write: bool,
     denied_globs: &[String],
 ) -> Result<PathBuf, ToolPathError> {
+    // `/app/...` is the workspace, spelled the way the task statements and the
+    // harness's own goal text spell it (the in-container bind mount; the goal
+    // maps "/app" to the workdir root). Host-side these paths used to be
+    // denied as "escapes tool root" - measured: it was the single largest
+    // denial class across 96 in-container rows (`view:/app/Dockerfile` x16,
+    // `write:/app/make_summary.py`, ...), i.e. agents addressing the files
+    // they were told to edit. Stripping the prefix is strictly additive:
+    // absolute `/app/...` paths were always refused, so no working call
+    // changes, and `under()` still catches `..` traversal out of the root.
+    let path = path.strip_prefix("/app/").unwrap_or(path);
     let p = root.join(path);
     if !under(root, &p) {
         return Err(ToolPathError::Denied("path escapes tool root".to_string()));
