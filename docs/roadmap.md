@@ -190,21 +190,24 @@ self-describe through the provenance block; no arm's rows pool with another's.
    shape-based belt. The item itself is a **diff, not a port**: read the
    vendor's conversion for the shapes we construct, and pin any disagreement
    with a test. No dependency, no rewrite.
-4. **Native effort channel (`dphn-effort2`) — PRE-REGISTERED and RUNNING
-   2026-10-19.** The `dphn-effort` kill measured the JSON field, not the
-   model's channel: one prompt through the same gateway gives 576 reasoning
-   tokens plain, 1,038 with `reasoning_effort:"max"`, and **2,327** with the
-   vendor's own prompt marker; one in-loop probe row gave **19,495** vs
-   4,816-7,055 control (2.8-4.0x). So the capability half of that verdict is
-   inconclusive for effort and stands only for the field. This arm sends the
-   vendor line (`Reasoning Effort: 100 (range 1-100, ...)`) prepended to a
-   task copy's instruction, control vs marker x 3 reps over video (2/5),
-   mcmc (5/6) and log-summary (2/2 regression) = 18 rows, same binary.
-   MECHANISM: median reasoning tokens >=1.5x. PASS: a named test no prior
-   control row passed flips in >=2 of 3 treated reps. GUARDRAIL: tokens per
-   test-passed <=1.3x. KILL: zero flips => the effort axis is dead **with a
-   properly delivered treatment**, which is a far stronger statement than the
-   field arm's kill.
+4. **Native effort channel (`dphn-effort2`) — MEASURED 2026-10-19, KILL
+   RULE TRIGGERED: the effort axis is dead with a *delivered* treatment.**
+   18 rows, same binary, the arms differing only by the vendor line
+   (`Reasoning Effort: 100 (range 1-100, ...)`) prepended to a task copy's
+   instruction. One named-test flip in 9 treated rows
+   (`test_jump_analyzer_imports`, video r1, 3/5) — 1 of 3 reps, so the
+   registered >=2-of-3 rule fails, and that test has flipped as variance
+   before. Mechanism did not deliver either: median reasoning tokens 6,558 →
+   8,283 = **1.26x** against a >=1.5x rule, even though the same marker
+   measures 4.0x on an ungrounded prompt — because rows die on the token cap
+   and reasoning length is set by the task, not the marker. Guardrail 1.26x
+   tokens per test-passed with *fewer* tests passed, and the solved
+   regression cell got slower (17-23 steps / 71-107k control vs 26-38 /
+   129-270k treatment). Caveat: mcmc is rstan-bimodal and all three treatment
+   rows hit the env-failure class, so that cell is uninformative again.
+   Portable finding: **in-loop reasoning effort is only weakly steerable**,
+   which is what both channels measured. No further effort work at this
+   model/endpoint.
 5. **Reasoning-effort arm (`dphn-effort`) — MEASURED 2026-10-19, KILL RULE
    TRIGGERED: the effort dial is not a capability lever.** 18 in-container
    rows on one binary, the arms differing by one flag (control vs
