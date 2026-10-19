@@ -35,13 +35,15 @@ fn budget_nudge_appends_to_tool_result_tail_once() {
     }));
     let warn = s.budget.config().warn_steps.get();
     s.budget.counters_mut().steps = warn;
-    let text = s.apply_budget_nudge().expect("nudge due at warn");
+    let text = s
+        .apply_budget_nudge(&crate::RunConfig::default())
+        .expect("nudge due at warn");
     assert!(text.contains("wrap up"));
     match s.items.last().map(|i| &i.kind) {
         Some(ItemKind::ToolResult { content, .. }) => assert!(content.contains(&text)),
         other => panic!("nudge must land on the ToolResult tail, got {other:?}"),
     }
-    assert!(s.apply_budget_nudge().is_none()); // latched
+    assert!(s.apply_budget_nudge(&crate::RunConfig::default()).is_none()); // latched
 }
 
 #[test]
@@ -49,7 +51,7 @@ fn no_tail_keeps_directive_queued_and_nudge_latch_unburned() {
     let mut s = LoopState::new();
     // Nudge due at warn steps, but tailless: the latch is not consumed.
     s.budget.counters_mut().steps = s.budget.config().warn_steps.get();
-    assert!(s.apply_budget_nudge().is_none());
+    assert!(s.apply_budget_nudge(&crate::RunConfig::default()).is_none());
     // A queued directive with no tail stays queued (retry, not drop).
     s.budget.counters_mut().actions_this_trial = s.budget.config().actions_per_trial / 2;
     s.queue_directives(&RunConfig::default());
@@ -72,7 +74,7 @@ fn no_tail_keeps_directive_queued_and_nudge_latch_unburned() {
     }));
     assert_eq!(s.deliver_directives(), 1);
     let nudge = s
-        .apply_budget_nudge()
+        .apply_budget_nudge(&crate::RunConfig::default())
         .expect("latch survived the tailless attempt");
     assert!(nudge.contains("wrap up"));
     match s.items.last().map(|i| &i.kind) {
@@ -538,4 +540,48 @@ async fn run_seeds_budget_shape_from_config() {
     assert_eq!(state.usage_totals.input_tokens, 100); // totals never follow the shape
     assert_eq!(state.usage_totals.cache_read_tokens, 60);
     assert_eq!(state.usage_totals.output_tokens, 10);
+}
+
+/// The `steer` ablation knob must silence every initiative nudge without
+/// touching the workflow contract, the rollback notice or the budget caps.
+#[test]
+fn steer_off_silences_the_declare_hold_and_the_action_directives() {
+    let mut on = crate::LoopState::new();
+    let cfg_on = crate::RunConfig::default();
+    on.edits = 1;
+    assert!(
+        on.verify_nudge_due(&cfg_on).is_some(),
+        "default: an unverified declare is held"
+    );
+
+    let mut off = crate::LoopState::new();
+    let cfg_off = crate::RunConfig {
+        steer: false,
+        ..crate::RunConfig::default()
+    };
+    off.edits = 1;
+    assert!(
+        off.verify_nudge_due(&cfg_off).is_none(),
+        "ablation arm: no declare hold"
+    );
+
+    // Half/late action directives: zero edits at the action cap's midpoint.
+    let mut on2 = crate::LoopState::new();
+    let mut off2 = crate::LoopState::new();
+    let cap = on2.budget.config().actions_per_trial;
+    for st in [&mut on2, &mut off2] {
+        st.edits = 0;
+        st.budget.counters_mut().actions_this_trial = cap / 2;
+    }
+    on2.queue_directives(&cfg_on);
+    assert_eq!(
+        on2.pending_directives.len(),
+        1,
+        "default queues the 0-edit line"
+    );
+    off2.queue_directives(&cfg_off);
+    assert!(
+        off2.pending_directives.is_empty(),
+        "ablation queued nothing"
+    );
 }

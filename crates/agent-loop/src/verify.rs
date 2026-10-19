@@ -169,7 +169,7 @@ impl LoopState {
     /// so an exhausted budget gets no grace hold via `VerifyHold => continue`).
     /// Returns the directive text and burns one nudge when due.
     pub(crate) fn verify_nudge_due(&mut self, cfg: &RunConfig) -> Option<String> {
-        if cfg.incentives < IncentivesLevel::Full {
+        if !cfg.steer || cfg.incentives < IncentivesLevel::Full {
             return None;
         }
         if self.verify.nudges_used >= VERIFY_NUDGE_CAP {

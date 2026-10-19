@@ -55,6 +55,9 @@ impl LoopState {
     /// Action-counter directives, checked after every recorded action so the
     /// text rides that action's own not-yet-synced row. One-shot per run.
     pub fn queue_directives(&mut self, cfg: &RunConfig) {
+        if !cfg.steer {
+            return; // ablation arm: no initiative nudges (contract still ships)
+        }
         let cap = self.budget.config().actions_per_trial;
         let actions = self.budget.counters().actions_this_trial;
         if cap == 0 {
@@ -128,7 +131,10 @@ impl LoopState {
     /// newest ToolResult tail in place, never as a synthetic user/system row.
     /// With no tail the nudge stays latched (not burned) and returns `None`,
     /// so a later batch can still deliver it.
-    pub fn apply_budget_nudge(&mut self) -> Option<String> {
+    pub fn apply_budget_nudge(&mut self, cfg: &RunConfig) -> Option<String> {
+        if !cfg.steer {
+            return None;
+        }
         if !self.has_tool_tail() {
             return None;
         }

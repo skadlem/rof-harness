@@ -493,6 +493,7 @@ mod tests {
                 budget_shape: BudgetShapeLabel::MissPlusOut,
                 exec_policy: ExecPolicyLabel::Any,
                 reasoning_effort: Some("max".into()),
+                steer: Some(true),
                 apply_mode: ApplyMode::Strict,
             }),
         };

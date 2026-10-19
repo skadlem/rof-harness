@@ -11,11 +11,12 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
 --keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default keeps the DeepSeek thinking-off knob, sent only on compaction-summary calls and the truncation ladder first rung; ordinary requests carry no thinking fragment)
+--steer on|off: initiative steering nudges (unverified-declare hold, half/late action directives, wrap-up nudge). `off` is the ablation arm; the workflow contract and the rollback notice still ship. Default on
 --reasoning-effort LEVEL (none|low|high|xhigh|max): send `reasoning_effort` on every request (default: none sent = endpoint default). Measured on the vLLM gateway 2026-10-19: 0/722/1060/1149/2976 reasoning tokens on one prompt for none/low/high/xhigh/max; api.deepseek.com ignores the field
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget
 --exec-policy allowlist|any: command-allowlist policy for exec/test. `any` skips the list entirely and is for callers whose process boundary is elsewhere (in-container eval wraps exec as `docker exec <container>`, so the allowlist is not a boundary there, only capability loss); the choice is recorded in the report provenance so relaxed rows never pool with strict rows
@@ -63,6 +64,11 @@ pub(crate) struct Args {
     /// `reasoning_effort` level sent on every request (`None` = endpoint
     /// default). Validated at the edge against [`EFFORT_LEVELS`].
     pub reasoning_effort: Option<String>,
+    /// Initiative steering nudges (default `true` = the shipped behavior:
+    /// unverified-declare hold, half/late action directives, wrap-up nudge).
+    /// `--steer off` is the ablation arm; the workflow contract and the
+    /// rollback notice still ship.
+    pub steer: bool,
     pub proof_cmd: Option<String>,
     pub incentives: agent_loop::IncentivesLevel,
     pub bets: bool,
@@ -159,6 +165,7 @@ struct RunBuilder {
     no_log: bool,
     keep_thinking: bool,
     reasoning_effort: Option<String>,
+    steer: Option<bool>,
     proof_cmd: Option<String>,
     incentives: Option<agent_loop::IncentivesLevel>,
     bets: bool,
@@ -213,6 +220,15 @@ fn set_keep_thinking(b: &mut RunBuilder, _: Option<String>) -> Result<(), String
 /// 2026-10-19). Validated here so a typo fails loudly instead of sending
 /// junk the endpoint ignores.
 pub(crate) const EFFORT_LEVELS: [&str; 5] = ["none", "low", "high", "xhigh", "max"];
+
+fn set_steer(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.steer = Some(match v.as_deref() {
+        Some("on") => true,
+        Some("off") => false,
+        other => return Err(format!("--steer expects on|off, got {other:?}")),
+    });
+    Ok(())
+}
 
 fn set_reasoning_effort(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
     let level = v.ok_or("--reasoning-effort needs a level")?;
@@ -425,6 +441,11 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_reasoning_effort,
     },
     Flag {
+        name: "--steer",
+        takes_value: true,
+        set: set_steer,
+    },
+    Flag {
         name: "--allow-cmd",
         takes_value: true,
         set: set_allow_cmd,
@@ -545,6 +566,7 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         no_log: b.no_log,
         keep_thinking: b.keep_thinking,
         reasoning_effort: b.reasoning_effort,
+        steer: b.steer.unwrap_or(true),
         proof_cmd: b.proof_cmd,
         incentives: b.incentives.unwrap_or(agent_loop::IncentivesLevel::Full),
         bets: b.bets,
@@ -679,6 +701,7 @@ pub(crate) fn run_config(args: &Args) -> RunConfig {
         max_tokens: args.max_tokens.unwrap_or(8_000),
         incentives: args.incentives,
         proof_cmd: args.proof_cmd.clone(),
+        steer: args.steer,
         ..RunConfig::default()
     };
     let dflt = RunConfig::default();
@@ -761,6 +784,7 @@ mod tests {
                 no_log: false,
                 keep_thinking: false,
                 reasoning_effort: None,
+                steer: true,
                 bets: false,
                 incentives: agent_loop::IncentivesLevel::Full,
                 proof_cmd: None,
@@ -1244,6 +1268,19 @@ mod tests {
         let err = parse_args(&run_min(&["--reasoning-effort", "turbo"])).unwrap_err();
         assert!(err.contains("none|low|high|xhigh|max"), "{err}");
         assert!(parse_args(&run_min(&["--reasoning-effort"])).is_err());
+    }
+
+    #[test]
+    fn steer_flag_defaults_on_and_records_the_ablation_arm() {
+        let plain = parse_args(&run_min(&[])).unwrap();
+        assert!(plain.steer, "default ships the shipped steering behavior");
+        assert!(run_config(&plain).steer, "loop config carries it");
+        let off = parse_args(&run_min(&["--steer", "off"])).unwrap();
+        assert!(!off.steer);
+        assert!(!run_config(&off).steer);
+        assert!(parse_args(&run_min(&["--steer", "on"])).unwrap().steer);
+        let err = parse_args(&run_min(&["--steer", "sometimes"])).unwrap_err();
+        assert!(err.contains("on|off"), "{err}");
     }
 
     #[test]

@@ -343,6 +343,12 @@ pub struct RunConfig {
     /// recipe's gross input+output). Arms set the field directly; the loop
     /// never reads the environment.
     pub budget_shape: BudgetShape,
+    /// Steering interventions (default ON = current behavior): the
+    /// unverified-declare hold, the half/late action directives and the
+    /// budget wrap-up nudge. `false` is the ablation arm that keeps the
+    /// workflow contract and the rollback notice but ships no initiative
+    /// nudges, so "does steering earn its place?" becomes measurable.
+    pub steer: bool,
 }
 
 impl Default for RunConfig {
@@ -361,6 +367,7 @@ impl Default for RunConfig {
             thinking_keep: THINKING_KEEP,
             collapse_hysteresis: context::COLLAPSE_HYSTERESIS,
             budget_shape: BudgetShape::Gross,
+            steer: true,
         }
     }
 }

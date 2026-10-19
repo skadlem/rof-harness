@@ -86,6 +86,12 @@ pub struct RunProvenance {
     /// which is true. An effort arm never pools with frozen-recipe rows.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Initiative steering nudges the agent leg ran with (`Some(false)` =
+    /// the ablation arm: no unverified-declare hold, no action directives, no
+    /// wrap-up nudge; the workflow contract and rollback notice still ship).
+    /// `None` = a report written before the knob existed.
+    #[serde(default)]
+    pub steer: Option<bool>,
     pub apply_mode: ApplyMode,
 }
 

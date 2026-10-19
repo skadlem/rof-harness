@@ -129,36 +129,30 @@ self-describe through the provenance block; no arm's rows pool with another's.
 
 ## Next (ordered, spend-gated)
 
-0. **State-triggered gate arm (`dphn-gate`) — PRE-REGISTERED 2026-10-19,
-   awaiting a go; not launched.** The one class the six measured arms never
-   tested (they are all passive). Deterministic rule, no LLM in the loop:
-   when the next action is a Done/declare and no *successful re-execution of
-   the agent's own deliverable from a foreign working directory* has happened
-   since the last write, block the declare and inject one fixed,
-   task-agnostic line naming that requirement (max 2 fires/run, anti-repeat
-   latch, cap-tail suppression; reuses the `VerifyHold` shape from
-   `nudge-verify`). The gate never points at `/tests`: it asks for the
-   agent's own artifact only, so no verifier visibility is granted. Cells
-   mcmc-sampling-stan (5/6; the failing test is a deliverable requirement),
-   video-processing (2/5; `test_jump_analyzer_imports` has failed in all
-   eight prior rows), query-optimize (1/6; correctness control where the
-   gate should do nothing) + log-summary-date-ranges (2/2) as regression;
-   control vs gate, 3 reps, same-window pairs, one binary, 24 rows. PASS: a
-   named test that no control row of *any* prior arm passed flips in >=1
-   treated rep **and** in a second rep of the same cell (a single flip is
-   inside the per-test noise floor: at a 0.86 % flake base rate a 6-test cell
-   sees one spurious flip ~5 % of the time, and 3 reps cannot certify a test
-   non-flaky), with a visible change in the deliverable that test names and
-   the regression cell unchanged. MECHANISM: the gate fires in every
-   treated row that declares without re-execution. GUARDRAIL: tokens per
-   test-passed <=1.3x and solves not lower. KILL: zero flips over 3 cells x
-   3 reps => the class joins the passive dials as measured out. Prior is
-   mixed and cheap to resolve: LivePlan's monitor-only subset is +1.7..+5.8
-   pp (n~220 instances), this repo's own `VerifyHold` gate no-shipped on two
-   cells that could not show the effect (one container-only task where local
-   verification was impossible, one voided grading instrument), and the
-   checklist converted this exact defect class as *text* once (5/6 -> 6/6).
-   The question is narrow: does enforcing the ritual beat suggesting it?
+0. **Steering ablation (`dphn-steer`) — PRE-REGISTERED 2026-10-19, running.**
+   The state-triggered gate as originally registered was **unbuildable, and
+   the forensics are the finding**: `VerifyHold` (the declare hold) is an
+   ancestor of the current branch, so it has shipped in every in-container
+   arm — it just emits no event and is invisible in our dumps. Counting the
+   hold text in banked WALs: it fires **6/6, 3/4, 4/4, 3/4** on
+   log-summary-date-ranges and **0/6, 0/4, 0/4, 0/4** on mcmc, video,
+   cmhc and make-mips. A declare-keyed gate needs a *declare*, and every
+   headroom row dies on the token cap before issuing one — so gates of that
+   shape are structurally unreachable on the cells we fail. What *is*
+   reachable is read-only starvation: cmhc runs 55-68 steps with 23-33 reads
+   and 0-1 writes; query-optimize 9-20 reads with 0-7 writes; the solved
+   cell never exceeds a 2-read streak. And that nudge exists too ("0 edits so
+   far after N actions. Stop reading. Apply your first edit NOW."). So the
+   real open question is a **deletion test**: three initiative nudges ship by
+   default (declare hold, half/late action directives, wrap-up) and none has
+   ever been ablated in-container. New knob `--steer on|off` (default on =
+   byte-identical; `off` keeps the workflow contract and rollback notice, so
+   the ablation isolates the nudges). Arms on/off x 3 reps over cmhc (nudges
+   fire), query-optimize (1/6) and log-summary (2/2, where the hold fires
+   6/6) = 18 rows. PASS: `on` passes a named test `off` never passes in >=2
+   of 3 reps at <=1.3x tokens per test-passed. KILL: `off` >= `on` everywhere
+   => the default flips to off and the nudges are flagged measured-dead (they
+   remain the substrate for a future gate).
 1. **Model swap — RETIRED 2026-10-19 (owner directive + vendor card).**
    `deepseek-v4.1-flash` is the frontier-tier model here, and its **1017
    snapshot (2026-10-17)** is a large step above its predecessor on agentic

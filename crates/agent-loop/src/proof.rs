@@ -209,7 +209,7 @@ pub(crate) fn note_tool_execution(
 /// result.
 pub(crate) fn settle_tool_tail(state: &mut LoopState, cfg: &crate::RunConfig) {
     state.queue_directives(cfg);
-    state.apply_budget_nudge();
+    state.apply_budget_nudge(cfg);
     state.deliver_directives();
 }
 

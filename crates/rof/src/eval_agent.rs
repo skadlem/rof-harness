@@ -146,6 +146,7 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
         // directly (run_agent_leg); the run-Args copy stays consistent.
         keep_thinking: a.keep_thinking,
         reasoning_effort: a.reasoning_effort.clone(),
+        steer: a.steer,
         proof_cmd: None,
         incentives: agent_loop::IncentivesLevel::Full,
         bets: false,
