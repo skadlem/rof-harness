@@ -369,3 +369,37 @@ says so explicitly.
   survive more budget, more steps, a full toolchain, `/app`-correct paths, a
   stricter goal and more reasoning — they are capability-bound at this model
   tier, and the next question is a different model or a smaller slice.
+- **Literature sweep and the correction it forces (2026-10-19).** Four
+  researcher lanes read the Aug–Oct 2026 literature against this repo's
+  measured record (`research/lit-sweep-2026-10-19.md`, with the lane briefs
+  beside it). Three findings change the picture. (1) **Deterministic
+  state-triggered gating** is a real lever at our model class: LivePlan
+  (arXiv:2608.06701) runs a rule-based monitor over trajectory state and can
+  block the next action; the monitor-only variant — no advisor model, 0 s of
+  monitor cost — moves 21.76→25.00 / 13.17→18.94 / 52.50→54.17 % on
+  213–234 instances, while the full method (+12.33 pp and up) needs an
+  advisor *stronger* than the executor, which this project does not have.
+  (2) **Reward-free harness search works at our exact model family** —
+  SelfSearch (arXiv:2609.37968): 65.2→73.0 on Terminal-Bench 2.1 with a
+  deepseek-v4-flash executor at matched execution limits and 12% lower cost
+  per task, search cost $4.03 — but it requires an agent-editable substrate
+  and 20 search episodes, so it is a re-architecture rather than a knob.
+  (3) **Two levers are foreclosed by measurement**: an agent writing its own
+  tests *hurts* at a fixed model (ExecCritic, 61.2→57.3 %, because patch and
+  test errors correlate), and single prompt-instruction changes are null on
+  Terminal-Bench 2.1 at 13× our n (−1.50…+2.25 pp, arXiv:2610.22289).
+  Google's Harness² (arXiv:2610.14224) was reviewed at primary-source level
+  and the deferred search gate stays closed: no attempts-matched ablation is
+  reported, the cost floor is 4 executor rollouts + 3 improver sessions per
+  task against a 1.3× tokens-per-solved rule, its wins are per-task
+  workspace-fact injection over 34–100 tasks × 3 streams with several
+  deltas inside 1 SD, and it needs a mounted editable harness surface this
+  binary does not have. **Correction to our own record:** the claim "every
+  harness-side dial that does not need a different model has been measured"
+  is true only for *passive* dials; the state-triggered class was tested
+  once (`VerifyHold`, 2026-10-06) and no-shipped on two cells that could not
+  show the effect — a container-only task where local verification was
+  structurally impossible and a grading instrument later voided as
+  window-flaky. The roadmap now says "passive", and `dphn-gate` is
+  pre-registered as the arm that tests enforcement-vs-suggestion on cells
+  where a named verifier test is a deliverable requirement.

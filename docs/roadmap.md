@@ -21,10 +21,31 @@ measured numbers carry a date and live with the run artifacts.
   capability lever** (`dphn-effort`, 18 rows, 2026-10-19): zero named-test
   flips, and the manipulation itself only moved median reasoning tokens
   1.23x (per-pair 0.42x-2.4x), so the endpoint's default reasoner already
-  matches the task on real tool-loop turns. With no stronger model
-  available, the harness-side search space is now measured out: the same
-  named verifier failures survive more budget, more steps, a full
-  toolchain, `/app`-correct paths, a stricter goal and more reasoning.
+  matches the task on real tool-loop turns. Every **passive** dial — caps,
+  step envelope, tool allowlist, path resolution, goal text, reasoning
+  effort — is therefore measured out at this model tier. Passive is the
+  operative word: a **state-triggered** gate (a deterministic rule that
+  inspects trajectory state and blocks an action) is a different class,
+  only ever tested once here (`VerifyHold`, 2026-10-06, no-shipped on two
+  cells that could not show the effect) — see the literature sweep below.
+- **Literature sweep 2026-10-19** (`research/lit-sweep-2026-10-19.md`, four
+  researcher lanes, primary sources): three results change the picture and
+  two levers are now foreclosed by measurement. (a) Deterministic
+  state-triggered gating is real at our model class — LivePlan
+  (arXiv:2608.06701) monitor-only, no advisor LLM, +1.7 to +5.8 pp on
+  213-234 instances; the full method needs an advisor *stronger* than the
+  executor, which we do not have. (b) Reward-free harness search is real at
+  our exact family — SelfSearch (arXiv:2609.37968) 65.2 -> 73.0 on TB 2.1
+  with a deepseek-v4-flash executor at matched limits and 12% lower cost,
+  search $4.03 — but it is a re-architecture (editable substrate + 20
+  episodes), not a knob. (c) Agent-written oracles *hurt* at a fixed model
+  (ExecCritic, 61.2 -> 57.3), and prompt-text levers on TB 2.1 are null at
+  13x our n (-1.50 to +2.25 pp, arXiv:2610.22289). Google's Harness²
+  (arXiv:2610.14224) was reviewed at primary-source level and the deferred
+  search gate **stays closed**: no attempts-matched ablation is reported,
+  its floor is 4 executor rollouts + 3 importer sessions per task against a
+  1.3x tokens-per-solved rule, its wins are per-task workspace-fact
+  injection, and its release has no base fallback.
 
 ## Current state (2026-10-18)
 
@@ -95,7 +116,42 @@ self-describe through the provenance block; no arm's rows pool with another's.
 
 ## Next (ordered, spend-gated)
 
-0. **Reasoning-effort arm (`dphn-effort`) — MEASURED 2026-10-19, KILL RULE
+0. **State-triggered gate arm (`dphn-gate`) — PRE-REGISTERED 2026-10-19,
+   awaiting a go; not launched.** The one class the six measured arms never
+   tested (they are all passive). Deterministic rule, no LLM in the loop:
+   when the next action is a Done/declare and no *successful re-execution of
+   the agent's own deliverable from a foreign working directory* has happened
+   since the last write, block the declare and inject one fixed,
+   task-agnostic line naming that requirement (max 2 fires/run, anti-repeat
+   latch, cap-tail suppression; reuses the `VerifyHold` shape from
+   `nudge-verify`). The gate never points at `/tests`: it asks for the
+   agent's own artifact only, so no verifier visibility is granted. Cells
+   mcmc-sampling-stan (5/6; the failing test is a deliverable requirement),
+   video-processing (2/5; `test_jump_analyzer_imports` has failed in all
+   eight prior rows), query-optimize (1/6; correctness control where the
+   gate should do nothing) + log-summary-date-ranges (2/2) as regression;
+   control vs gate, 3 reps, same-window pairs, one binary, 24 rows. PASS: a
+   named test that no control row of *any* prior arm passed flips in >=1
+   treated rep, regression unchanged. MECHANISM: the gate fires in every
+   treated row that declares without re-execution. GUARDRAIL: tokens per
+   test-passed <=1.3x and solves not lower. KILL: zero flips over 3 cells x
+   3 reps => the class joins the passive dials as measured out. Prior is
+   mixed and cheap to resolve: LivePlan's monitor-only subset is +1.7..+5.8
+   pp (n~220 instances), this repo's own `VerifyHold` gate no-shipped on two
+   cells that could not show the effect (one container-only task where local
+   verification was impossible, one voided grading instrument), and the
+   checklist converted this exact defect class as *text* once (5/6 -> 6/6).
+   The question is narrow: does enforcing the ritual beat suggesting it?
+1. **Zero-cost instrumentation: a pairwise, answer-key-free judge.** From
+   Harness2's selector and RRSI (`research/harness-steals-2026h2.md` steal
+   1 + 2): score two anonymised deliverables of the same task against each
+   other instead of against a hidden verifier, so arms stop returning "tie at
+   zero solves". Validate it **for free** against the banked (solved, failed)
+   workdirs before trusting it, and add RRSI's noise-adjusted floor + cost
+   rule as pure functions in `eval`. Instrument only — it cannot make a
+   capability claim on its own.
+
+2. **Reasoning-effort arm (`dphn-effort`) — MEASURED 2026-10-19, KILL RULE
    TRIGGERED: the effort dial is not a capability lever.** 18 in-container
    rows on one binary, the arms differing by one flag (control vs
    `--reasoning-effort max`). No named verifier test flipped in any treatment
@@ -193,6 +249,18 @@ literature on 2026-10-13 and deliberately stay closed.
   published run costs ~60 harness candidates over hours with up to
   10M tokens of diagnostics per evaluation; at 21 tasks its gains
   would be indistinguishable from rerun noise.
+  **Reviewed and closed 2026-10-19** (`research/harness2-teardown.md`,
+  `research/harness-steals-2026h2.md`): Harness2 (arXiv:2610.14224) is the
+  verifier-free member of this cluster and does **not** open either
+  condition. It reports no attempts-matched ablation (best-of-k is defined
+  and never numbered), its cost floor is 4 executor rollouts + 3 importer
+  sessions per task, its wins are per-task workspace-fact injection on
+  34-100 tasks x 3 streams with deltas inside 1 SD, and it needs a mounted
+  8-file harness surface this binary does not have. SelfSearch
+  (arXiv:2609.37968) is the same shape without a reward signal and with a
+  10-generation, 2-lineage editable-substrate requirement. Condition (b)
+  is weakened, not satisfied: a reward-free search needs no suite to
+  *drive* it, but a suite is still needed to *validate* a gain.
 - **Orchestration / policy meta-layer above harnesses** (a layer that
   supervises running agents — cross-harness delegation, live policies,
   session control): deferred, reconsider when this harness runs
