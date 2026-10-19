@@ -403,3 +403,40 @@ says so explicitly.
   window-flaky. The roadmap now says "passive", and `dphn-gate` is
   pre-registered as the arm that tests enforcement-vs-suggestion on cells
   where a named verifier test is a deliverable requirement.
+- **What a 21-task slice can and cannot say (2026-10-19).** Binding rules from
+  the eval-methodology lane of the literature sweep. At n=21 the paired
+  minimum detectable effect (80 % power, α=0.05) is **40.8 pp at one rep,
+  32.2 at two, 28.8 at three**, and never below **20.4 pp** — so an arm is not
+  justified by a smaller expected solve-rate delta, and repetition is not a
+  power lever (task coverage is; at equal budget, task-covering designs cut
+  median estimation MSE 87 %). The honest headline for a single-attempt
+  harness claim is **pass^1 with a paired, task-clustered CI**; pass@k is an
+  order statistic (and on stateful agents a replay artifact), and applying it
+  with unit-test counts as `n` inflates scores by 0.85–0.97 absolute.
+  **Named-test counts are ledgers, never capability percentages**: one pilot
+  reads 0.80 macro test-pass against 0.20 task resolution, and 19.7 % of
+  previously passing patches are semantically wrong. A one-test delta at one
+  rep is not a capability unit — a named test that flips in more than one rep
+  with a causal deliverable change is. Verifier and environment variance is
+  larger than the effects we chase (a reward-function defect moved success
+  94.3 % → 65.5 % on replay; tool description text alone moves trajectories
+  −5.3…−9.2 pp), so pre-flight classification and a known-answer control
+  belong in provenance. Consequence applied here: the `dphn-gate` pass rule
+  now requires the named test to flip in at least two of three treated reps.
+- **There is a cheaper-than-incumbent candidate model after all (2026-10-19).**
+  The "no stronger model available" premise that parked the ceiling read is
+  wrong on price and unproven on capability. Primary pricing pages read
+  2026-10-19: `qwen3.8-flash` $0.15 in / $0.016 cached / $0.47 out (open
+  weights `Qwen3.8-Flash-Next`, 125B/6B active, 1M ctx, vendor SWE-bench Pro
+  62.5 vs DeepSeek-V4-Flash 56.0); `glm-5.3-flash` $0.15 / $0.03 / $0.50 (MIT
+  weights, honours `reasoning_effort`); `MiniMax-M3` $0.30 / $1.20;
+  `kimi-k2.6` $0.16 / $0.95 / $4.00. Every published benchmark row for these
+  is a **vendor** claim, no independent Terminal-Bench 2.1 row was found for
+  any candidate, and GLM's vendor 84.3 coexists with this repo's own 6/26 on
+  a different harness and envelope — so vendor numbers rank candidates and do
+  not predict our solve rate. Cached-token usage reporting is verified only
+  for the incumbent, so cache-based accounting must be re-probed per model.
+  The planned validation is a $0 pre-flight then 12 treatment rows on the four
+  semantic-failure cells (controls already banked), ~$1 of tokens, switch rule
+  ≥1 cell solved in ≥2 of 3 reps at ≤1.3× tokens-per-solved. It is blocked on
+  an Alibaba Model Studio credential, which this repo does not hold.
