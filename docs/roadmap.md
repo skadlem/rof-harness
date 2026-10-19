@@ -129,7 +129,8 @@ self-describe through the provenance block; no arm's rows pool with another's.
 
 ## Next (ordered, spend-gated)
 
-0. **Steering ablation (`dphn-steer`) — PRE-REGISTERED 2026-10-19, running.**
+0. **Steering ablation (`dphn-steer`) — PRE-REGISTERED 2026-10-19, PAUSED at
+   owner request after 1/18 rows; the pause found a design defect first.**
    The state-triggered gate as originally registered was **unbuildable, and
    the forensics are the finding**: `VerifyHold` (the declare hold) is an
    ancestor of the current branch, so it has shipped in every in-container
@@ -153,6 +154,21 @@ self-describe through the provenance block; no arm's rows pool with another's.
    of 3 reps at <=1.3x tokens per test-passed. KILL: `off` >= `on` everywhere
    => the default flips to off and the nudges are flagged measured-dead (they
    remain the substrate for a future gate).
+   **Pause finding (measured, 2026-10-19):** the two starvation nudges are
+   keyed to caps that never bind — the half directive needs 60 *actions* of a
+   120-action cap, but cmhc rows make only 54-68 tool calls before the 300k
+   token cap kills them, and the completed `on` row's WAL shows no
+   "Stop reading" text at all (only the budget wrap-up). So the ablation would
+   mostly compare the wrap-up nudge against nothing. This is the third
+   intervention measured to be mispositioned the same way (declare hold needs
+   a declare, which failing rows never reach; action directives need
+   60/96 actions; both are keyed to the envelope while the *token* cap binds).
+   **Resume requires re-keying the trigger to a reachable signal** — N
+   consecutive read-only file-tool calls (streak >= 6 is reached in cmhc rows,
+   7-9 observed, and the solved cell never exceeds 2) — not a fraction of a
+   non-binding action cap. Binary frozen at `pilot-steer/rof-steer`
+   (md5 `eedca26f`, build `ca2c164`); the driver is skip-guarded, so a rerun
+   executes only the 17 missing rows.
 1. **Model swap — RETIRED 2026-10-19 (owner directive + vendor card).**
    `deepseek-v4.1-flash` is the frontier-tier model here, and its **1017
    snapshot (2026-10-17)** is a large step above its predecessor on agentic
