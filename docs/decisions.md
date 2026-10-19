@@ -463,3 +463,27 @@ says so explicitly.
   item rather than an inference: a vendor Rust encoder exists for exactly the
   surface `provider-openai` hand-rolls, and it already corroborates our
   `reasoning_content` belt (always present in thinking mode, empty allowed).
+- **The initiative nudge layer is now ablatable, and the "state-triggered
+  gate" was already shipped (2026-10-19).** Forensics before building: the
+  `VerifyHold` declare gate is an ancestor of the current branch, so it has
+  run in every in-container arm — it emits no event, so our dumps never showed
+  it, but the WAL records the hold text: it fires **6/6, 3/4, 4/4, 3/4** on
+  the solved log-summary cell and **0/6, 0/4, 0/4, 0/4** on mcmc, video,
+  custom-memory-heap-crash and make-mips. A declare-keyed gate needs a
+  declare, and every headroom row dies on the token cap before issuing one,
+  so that whole shape is structurally unreachable on the cells we fail — the
+  pre-registered "add the gate" arm would have been gate-versus-gate. What is
+  reachable is read-only starvation: cmhc rows run 55-68 steps with 23-33
+  reads and 0-1 writes, query-optimize 9-20 reads with 0-7 writes, while the
+  solved cell never exceeds a 2-read streak — and that nudge also already
+  ships ("0 edits so far after N actions. Stop reading. Apply your first edit
+  NOW."). So the live question became a **deletion test**, and `--steer
+  on|off` now exists to run it (default on = byte-identical shipped behavior;
+  `off` keeps the workflow contract and the rollback notice, isolating the
+  nudges from the contract; the value is recorded in report provenance so
+  arms never pool). The registered arm, `dphn-steer`, runs on/off x 3 reps
+  over cmhc, query-optimize and log-summary; it passes for steering only if
+  `on` flips a named test `off` never flips, in at least two of three reps,
+  within 1.3x tokens per test-passed, and if `off` is never worse the default
+  flips off and the nudges are flagged measured-dead rather than deleted (they
+  remain the substrate for any future gate).
