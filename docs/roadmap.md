@@ -159,26 +159,16 @@ self-describe through the provenance block; no arm's rows pool with another's.
    verification was impossible, one voided grading instrument), and the
    checklist converted this exact defect class as *text* once (5/6 -> 6/6).
    The question is narrow: does enforcing the ritual beat suggesting it?
-1. **Model-swap ceiling read (`qwen38-ceiling`) — the "no stronger model"
-   premise has expired; needs an owner credential.** The 2026-10-19 model
-   sweep found a cheaper-than-incumbent candidate with a public vendor edge:
-   `qwen3.8-flash` (open weights `Qwen3.8-Flash-Next`, 125B/6B active, 1M
-   ctx, $0.15 in / $0.016 cached / $0.47 out) claims SWE-bench Pro 62.5 vs
-   DeepSeek-V4-Flash 56.0, and `glm-5.3-flash` claims Terminal-Bench 2.1
-   84.3 (MIT weights, honours `reasoning_effort`). Cautions that keep it a
-   candidate, not a promise: every such row is a **vendor** claim, no
-   independent TB2.1 row was found for any candidate, and GLM's vendor 84.3
-   coexists with our own 6/26 on a different harness and envelope — vendor
-   numbers rank candidates, they do not predict our solve rate. Plan: a $0
-   pre-flight (tool round-trip; the effort knob must actually change
-   reasoning tokens; `usage` must carry a cached-token field) then the four
-   semantic-failure cells x 3 reps = 12 treatment rows, controls already
-   banked at n=3, roughly $1 of tokens. Switch rule: >=1 cell at reward 1.0
-   in >=2 of 3 reps at <=1.3x tokens-per-solved; kill: 0 solves in 12 cells
-   => this price tier is exhausted. **Blocker: needs an Alibaba Model
-   Studio credential.** The gateway we already use serves one other model
-   (`unsloth/Qwen3.8-27B-NVFP4`) — a 27B, so probably weaker, but a $0 way
-   to see whether a model swap changes the failure profile at all.
+1. **Model swap — RETIRED 2026-10-19 (owner directive + vendor card).**
+   `deepseek-v4.1-flash` is the frontier-tier model here, and its **1017
+   snapshot (2026-10-17)** is a large step above its predecessor on agentic
+   benchmarks (vendor card: Terminal-Bench 4.0 **42.3** vs 31.2 for the prior
+   snapshot, 37.9 GLM-5.3, 39.9 GPT-5.6 Sol; DeepSWE v1.1 77.0 vs 74.2;
+   MIT weights, 1M context). A cheaper-tier substitute is therefore not the
+   lever, and no further model reps are bought. The sweep's shortlist stays in
+   `research/models-2026h2-shortlist.md` as a record, and one correction from
+   it survives: every published number for those candidates is a **vendor**
+   claim, so vendor rows rank candidates and never predict our solve rate.
 2. **Zero-cost instrumentation: a pairwise, answer-key-free judge.** From
    Harness2's selector and RRSI (`research/harness-steals-2026h2.md` steal
    1 + 2): score two anonymised deliverables of the same task against each
@@ -188,7 +178,34 @@ self-describe through the provenance block; no arm's rows pool with another's.
    rule as pure functions in `eval`. Instrument only — it cannot make a
    capability claim on its own.
 
-3. **Reasoning-effort arm (`dphn-effort`) — MEASURED 2026-10-19, KILL RULE
+3. **Wire fidelity against the vendor's own encoder.** DeepSeek released
+   `github.com/deepseek-ai/deepseek-recipe` (MIT, Rust) — a protocol-aware
+   toolkit that converts Chat Completions/Messages/Responses requests into
+   DeepSeek V4/V4.1 prompts and parses output back. `provider-openai`
+   hand-rolls exactly that surface and infers the wire from 400s. Two things
+   it already settled: (a) reasoning effort on V4.1 is a **prompt line**
+   (`Reasoning Effort: {1-100}`, low=50 / absent=75 / max=100), not a request
+   field — see Next 4; (b) `reasoning_content` presence in thinking mode is
+   vendor behavior with an empty string allowed, which corroborates our
+   shape-based belt. The item itself is a **diff, not a port**: read the
+   vendor's conversion for the shapes we construct, and pin any disagreement
+   with a test. No dependency, no rewrite.
+4. **Native effort channel (`dphn-effort2`) — PRE-REGISTERED and RUNNING
+   2026-10-19.** The `dphn-effort` kill measured the JSON field, not the
+   model's channel: one prompt through the same gateway gives 576 reasoning
+   tokens plain, 1,038 with `reasoning_effort:"max"`, and **2,327** with the
+   vendor's own prompt marker; one in-loop probe row gave **19,495** vs
+   4,816-7,055 control (2.8-4.0x). So the capability half of that verdict is
+   inconclusive for effort and stands only for the field. This arm sends the
+   vendor line (`Reasoning Effort: 100 (range 1-100, ...)`) prepended to a
+   task copy's instruction, control vs marker x 3 reps over video (2/5),
+   mcmc (5/6) and log-summary (2/2 regression) = 18 rows, same binary.
+   MECHANISM: median reasoning tokens >=1.5x. PASS: a named test no prior
+   control row passed flips in >=2 of 3 treated reps. GUARDRAIL: tokens per
+   test-passed <=1.3x. KILL: zero flips => the effort axis is dead **with a
+   properly delivered treatment**, which is a far stronger statement than the
+   field arm's kill.
+5. **Reasoning-effort arm (`dphn-effort`) — MEASURED 2026-10-19, KILL RULE
    TRIGGERED: the effort dial is not a capability lever.** 18 in-container
    rows on one binary, the arms differing by one flag (control vs
    `--reasoning-effort max`). No named verifier test flipped in any treatment
@@ -206,16 +223,16 @@ self-describe through the provenance block; no arm's rows pool with another's.
    more budget, more steps, a full toolchain, `/app`-correct paths, a stricter
    goal and more reasoning.
 
-4. **Near-miss rep top-ups** (if they earn the spend): the
+6. **Near-miss rep top-ups** (if they earn the spend): the
    partial-credit cells (1/3, 1/2, 2/4, 2/3 test shapes) are the
    cheapest capability information per cell.
-5. **S-1 compaction experiment** — BLOCKED, premise refuted
+7. **S-1 compaction experiment** — BLOCKED, premise refuted
    2026-10-16 (see Current state): the landed trigger keys on per-request
    prompt size while the recipe's budget is cumulative billed tokens, so
    it cannot fire at any plausible `frac`. Re-design first (trigger on
    spent-vs-cap, keep-budget scaled to real prompts), then re-register a
    pass rule; do not run the original arm.
-6. **File-tool `/app` parity — FIXED 2026-10-18 (correctness, no capability
+8. **File-tool `/app` parity — FIXED 2026-10-18 (correctness, no capability
    claim).** Joining denials to their tool arguments showed the largest
    file-tool denial class was the workspace spelled the way task statements
    spell it (`/app/<file>`): the host-side tools root elsewhere, so agents
@@ -227,7 +244,7 @@ self-describe through the provenance block; no arm's rows pool with another's.
    steps and tokens. What is left is container-only paths (`/tests`), which
    host-side tools cannot serve — serving them would let the agent read the
    verifier's tests, a fairness decision deliberately not taken.
-7. **In-container exec policy — MEASURED 2026-10-18: mechanism confirmed,
+9. **In-container exec policy — MEASURED 2026-10-18: mechanism confirmed,
    capability unconverted.** `--exec-policy allowlist|any` landed (default
    allowlist, recorded as a required provenance field). The measured
    friction is real — 83% of banked in-container rows hit a tool denial and
@@ -240,7 +257,7 @@ self-describe through the provenance block; no arm's rows pool with another's.
    the published in-container solve numbers do not need a re-label, the knob
    stays flagged mechanism-validated / capability-unconverted, and no
    further policy arms are planned.
-8. **Envelope arm — MEASURED 2026-10-16/18, KILL RULE TRIGGERED.** Three
+10. **Envelope arm — MEASURED 2026-10-16/18, KILL RULE TRIGGERED.** Three
    matched arms (control = frozen recipe; shape = miss-plus-out at the
    same cap; joint = miss-plus-out plus a doubled step/action envelope)
    over two headroom cells and one already-solved regression cell. The
@@ -250,7 +267,7 @@ self-describe through the provenance block; no arm's rows pool with another's.
    every arm — a semantic requirement, not budget. Tests per treated cell
    were flat, tokens per test passed were 1.85x/2.35x against a 1.3x rule.
    No further cap/envelope arms; near-miss top-ups stay parked.
-9. **Budget-shape arm run** — MEASURED 2026-10-14 (first arm,
+11. **Budget-shape arm run** — MEASURED 2026-10-14 (first arm,
    4 near-miss cells, owner-authorized): the pre-registered gate
    (more solves at ≤1.3× dollars-per-solved) **failed** — 0/4
    solves on both shapes, arm cost 1.42×, tests flat-to-down. The
@@ -261,7 +278,7 @@ self-describe through the provenance block; no arm's rows pool with another's.
    just moves the wall. The knob stays OFF by default, opt-in via
    `--budget-shape`, flagged mechanism-validated /
    capability-unconverted.
-10. **Rivals grid comparisons** — DONE 2026-10-14 (free): the legal
+12. **Rivals grid comparisons** — DONE 2026-10-14 (free): the legal
    tables are computed and published in the local analysis artifact
    (L1/L2 screening, L4/L5 single-arm cost+solve tables). Cross-harness
    cost is not computable (rival logs carry no usage fields); pass-rate

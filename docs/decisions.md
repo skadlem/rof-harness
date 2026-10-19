@@ -440,3 +440,26 @@ says so explicitly.
   semantic-failure cells (controls already banked), ~$1 of tokens, switch rule
   ≥1 cell solved in ≥2 of 3 reps at ≤1.3× tokens-per-solved. It is blocked on
   an Alibaba Model Studio credential, which this repo does not hold.
+
+- **Reasoning effort is a prompt line, and our first arm measured the wrong
+  channel (2026-10-19).** The vendor's own MIT Rust toolkit
+  (`github.com/deepseek-ai/deepseek-recipe`) renders effort *into the prompt*:
+  `Reasoning Effort: {score} (range 1-100, the higher the value, the more
+  thorough the reasoning)` prepended to the first message when thinking mode
+  is on, with low=50, absent/high/xhigh=75, max=100. Measured through the same
+  gateway on one prompt: **576** reasoning tokens plain, **1,038** with the
+  JSON field `reasoning_effort:"max"` (what the first arm sent), **2,327**
+  with the vendor marker. One in-loop probe row on video-processing gave
+  **19,495** reasoning tokens against 4,816-7,055 in every control row
+  (2.8-4.0x) at the same 2/5 test floor. So `dphn-effort`'s mechanism failure
+  (median 1.23x) was a **channel artifact**, its capability half is
+  inconclusive for effort, and the axis is re-tested by `dphn-effort2` with
+  the vendor line. Two further consequences. (i) The model premise is settled
+  the other way: `deepseek-v4.1-flash` is frontier-tier and its 1017 snapshot
+  (2026-10-17) is a large step up (vendor card: Terminal-Bench 4.0 42.3 vs
+  31.2 for the prior snapshot, against 37.9 GLM-5.3 and 39.9 GPT-5.6 Sol;
+  DeepSWE 77.0 vs 74.2), so model swapping is retired and the failures this
+  harness sees are its own to fix. (ii) Wire fidelity becomes a real work
+  item rather than an inference: a vendor Rust encoder exists for exactly the
+  surface `provider-openai` hand-rolls, and it already corroborates our
+  `reasoning_content` belt (always present in thinking mode, empty allowed).
