@@ -12,3 +12,6 @@ config.local.json
 # editor / OS noise
 .DS_Store
 *.swp
+
+# Isolated verification builds
+.build/
