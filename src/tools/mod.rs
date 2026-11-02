@@ -66,6 +66,10 @@ impl ToolRegistry {
         self.policy.allowed_commands.clone()
     }
 
+    pub fn command_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.policy.command_timeout_ms.max(1))
+    }
+
     /// The full v1 toolset in one place, so the CLI and the eval runner
     /// cannot drift apart when a tool is added (live-bitten once already).
     /// The workdir is anchored here; every other grant comes from `policy`.
@@ -85,7 +89,10 @@ impl ToolRegistry {
         r.register(FsWriteTool::new(root.clone()));
         r.register(
             ProcRunTool::new(root.clone(), p.allowed_commands.clone())
-                .with_prefixes(p.allowed_prefixes.clone()),
+                .with_prefixes(p.allowed_prefixes.clone())
+                .with_timeout(std::time::Duration::from_millis(
+                    p.command_timeout_ms.max(1),
+                )),
         );
         r.register(HttpGetTool::new(p.allowed_hosts.clone()));
         // A repo can ship skills with it (`<workdir>/skills/`), read-only.
@@ -487,6 +494,7 @@ pub struct ProcRunTool {
     root: PathBuf,
     allowed: Vec<String>,
     allowed_prefixes: Vec<String>,
+    timeout: std::time::Duration,
 }
 impl ProcRunTool {
     pub fn new(root: PathBuf, allowed: Vec<String>) -> Self {
@@ -494,7 +502,12 @@ impl ProcRunTool {
             root,
             allowed,
             allowed_prefixes: Vec::new(),
+            timeout: crate::process::DEFAULT_TIMEOUT,
         }
+    }
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
     pub fn with_prefixes(mut self, prefixes: Vec<String>) -> Self {
         self.allowed_prefixes = prefixes;
@@ -535,32 +548,34 @@ impl Tool for ProcRunTool {
         if !self.allowed.iter().any(|a| a == cmd) && !prefix_allowed(&self.allowed_prefixes, cmd) {
             return Err(ToolError::Denied(format!("command not allowlisted: {cmd}")));
         }
-        let mut parts = cmd.split_whitespace();
-        let bin = parts
-            .next()
-            .ok_or_else(|| ToolError::Failed("empty cmd".to_string()))?;
-        let fut = tokio::process::Command::new(bin)
-            .args(parts)
-            .current_dir(&self.root)
-            .output();
-        let out = tokio::time::timeout(std::time::Duration::from_secs(300), fut)
-            .await
-            .map_err(|_| ToolError::Failed("timeout after 300s".to_string()))?
-            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        let out = crate::process::run(
+            &self.root,
+            cmd,
+            &std::collections::HashMap::new(),
+            self.timeout,
+        )
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
         let mut s = String::from_utf8_lossy(&out.stdout).to_string();
         let err = String::from_utf8_lossy(&out.stderr);
         if !err.is_empty() {
             s.push_str("\n[stderr]\n");
             s.push_str(&err);
         }
-        let ok = out.status.success();
+        let ok = out.success;
         Ok(ToolOutput {
             ok,
-            output: s.chars().take(8_000).collect(),
+            output: {
+                let mut shown: String = s.chars().take(8_000).collect();
+                if out.truncated || s.chars().count() > 8_000 {
+                    shown.push_str("\n[output truncated]");
+                }
+                shown
+            },
             error: if ok {
                 None
             } else {
-                Some(format!("exit {}", out.status.code().unwrap_or(-1)))
+                Some(format!("exit {}", out.code.unwrap_or(-1)))
             },
         })
     }

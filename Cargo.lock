@@ -1578,6 +1578,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "crossterm",
+ "libc",
  "ratatui",
  "reqwest",
  "serde",

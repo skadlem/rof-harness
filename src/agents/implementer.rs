@@ -377,54 +377,39 @@ impl ImplementerAgent<'_> {
 /// correct and the oracle still rejects it, and nothing in the loop says why.
 /// Only runs when the policy allowlists the command, so a configuration that
 /// grants the implementer no shell is unchanged.
-fn run_tests_summary(root: &Path, allowed: &[String]) -> Option<String> {
-    // Compose the invocation from what the policy actually grants: a bare
-    // `python3` is the common case (`ROF_ALLOW_CMDS=python3`), and the
-    // runner must not require an exact `pytest` grant the configuration
-    // has no reason to name.
-    let has_py = allowed.iter().any(|a| a == "python3");
-    let cmd = allowed
-        .iter()
-        .find(|a| {
-            a.starts_with("python3 -m pytest")
-                || a.starts_with("pytest")
-                || a.as_str() == "python3 -m pytest"
-        })
-        .cloned()
-        .or_else(|| {
-            if has_py {
-                Some("python3 -m pytest tests/ -q".to_string())
-            } else {
-                None
-            }
-        })?;
-    let mut parts = cmd.split_whitespace();
-    let bin = parts.next()?;
-    // A `src/`-layout package is not importable from the repo root unless its
-    // src dir is on the path: the suite then errors at *collection* and the
-    // report comes back empty, which reads to the model as "no signal" rather
-    // than "red suite". Add it when the layout calls for it, matching what a
-    // developer would get from an installed editable package.
+#[cfg(test)]
+async fn run_tests_summary(root: &Path, allowed: &[String]) -> Option<String> {
+    run_tests_summary_with_timeout(root, allowed, crate::process::DEFAULT_TIMEOUT).await
+}
+
+async fn run_tests_summary_with_timeout(
+    root: &Path,
+    allowed: &[String],
+    timeout: std::time::Duration,
+) -> Option<String> {
+    // Harness-owned probes obey the same exact command grant as tool calls.
+    let cmd = allowed.iter().find(|cmd| {
+        let args: Vec<_> = cmd.split_whitespace().collect();
+        args.first() == Some(&"pytest") || args.starts_with(&["python3", "-m", "pytest"])
+    })?;
     let src_layout = root.join("src").is_dir();
-    let out = std::process::Command::new(bin)
-        .args(parts)
-        .current_dir(root)
-        .env("PYTHONPATH", {
-            let base = std::env::var("PYTHONPATH").unwrap_or_default();
-            if src_layout {
-                let src = root.join("src");
-                if base.is_empty() {
-                    src.to_string_lossy().into_owned()
-                } else {
-                    format!("{}:{}", src.display(), base)
-                }
-            } else {
-                base
-            }
-        })
-        .output()
-        .ok()?;
-    if out.status.success() {
+    let base = std::env::var("PYTHONPATH").unwrap_or_default();
+    let path = if src_layout {
+        let src = root.join("src");
+        if base.is_empty() {
+            src.to_string_lossy().into_owned()
+        } else {
+            format!("{}:{}", src.display(), base)
+        }
+    } else {
+        base
+    };
+    let env = std::collections::HashMap::from([("PYTHONPATH".to_string(), path)]);
+    let out = match crate::process::run(root, cmd, &env, timeout).await {
+        Ok(out) => out,
+        Err(e) => return Some(format!("Test probe did not finish: {e}")),
+    };
+    if out.success {
         return None;
     }
     let body = String::from_utf8_lossy(&out.stdout);
@@ -918,7 +903,11 @@ impl ImplementerAgent<'_> {
     async fn run_tests(&self, ctx: &AgentCtx<'_>, _writes: &[String]) -> Option<String> {
         let root = ctx.workdir?;
         let allowed = ctx.tools.map(|t| t.allowed_commands()).unwrap_or_default();
-        run_tests_summary(root, &allowed)
+        let timeout = ctx
+            .tools
+            .map(|t| t.command_timeout())
+            .unwrap_or(crate::process::DEFAULT_TIMEOUT);
+        run_tests_summary_with_timeout(root, &allowed, timeout).await
     }
 
     async fn apply_patches(
@@ -1093,8 +1082,8 @@ mod tests {
     /// bug — `assert total() == 22` in a suite that was green because the bug
     /// was present — which the model otherwise cannot see and the oracle then
     /// rejects a correct fix for.
-    #[test]
-    fn a_red_suite_reports_the_rejected_assertion() {
+    #[tokio::test]
+    async fn a_red_suite_reports_the_rejected_assertion() {
         let dir = temp_dir_for("red-suite");
         std::fs::create_dir_all(dir.join("tests")).unwrap();
         std::fs::write(
@@ -1107,7 +1096,7 @@ mod tests {
             "from store import total\ndef test_buggy():\n    assert total() == 22\n",
         )
         .unwrap();
-        let report = run_tests_summary(&dir, &["python3".to_string()]);
+        let report = run_tests_summary(&dir, &["python3 -m pytest tests/ -q".to_string()]).await;
         // No pytest installed is an environment gap, not a seeded-assertion
         // failure: the runner must stay silent rather than report one as the
         // other.
@@ -1120,10 +1109,22 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn python_binary_grant_does_not_authorize_pytest_arguments() {
+        let dir = temp_dir_for("no-implicit-pytest");
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("tests/test_fail.py"),
+            "raise RuntimeError('unauthorized probe ran')\n",
+        )
+        .unwrap();
+        assert!(run_tests_summary(&dir, &["python3".into()]).await.is_none());
+    }
+
     /// A green suite is not a report: the signal must only appear when a
     /// seeded assertion actually rejects the fix.
-    #[test]
-    fn a_green_suite_reports_nothing() {
+    #[tokio::test]
+    async fn a_green_suite_reports_nothing() {
         let dir = temp_dir_for("green-suite");
         std::fs::create_dir_all(dir.join("tests")).unwrap();
         std::fs::write(
@@ -1138,7 +1139,7 @@ mod tests {
         .unwrap();
         if which_pytest() {
             assert_eq!(
-                run_tests_summary(&dir, &["python3".to_string()]),
+                run_tests_summary(&dir, &["python3 -m pytest tests/ -q".to_string()]).await,
                 None,
                 "a green suite is silent"
             );
@@ -1147,13 +1148,13 @@ mod tests {
 
     /// No allowed command, no run: a configuration that grants the
     /// implementer no shell must behave exactly as before.
-    #[test]
-    fn no_allowed_command_means_no_run() {
+    #[tokio::test]
+    async fn no_allowed_command_means_no_run() {
         let dir = temp_dir_for("no-shell");
         std::fs::create_dir_all(dir.join("tests")).unwrap();
         std::fs::write(dir.join("store.py"), "x = 1\n").unwrap();
         assert_eq!(
-            run_tests_summary(&dir, &[]),
+            run_tests_summary(&dir, &[]).await,
             None,
             "nothing is granted, nothing runs"
         );
@@ -1166,8 +1167,8 @@ mod tests {
     /// report never fires — measured on a real SWE-smith task, where rof read
     /// the source, correctly refused to invent a patch, and left the suite red
     /// for four consecutive reps.
-    #[test]
-    fn a_red_suite_reports_without_writes() {
+    #[tokio::test]
+    async fn a_red_suite_reports_without_writes() {
         let dir = temp_dir_for("red-no-writes");
         std::fs::create_dir_all(dir.join("tests")).unwrap();
         std::fs::write(dir.join("store.py"), "def total():\n    return 22\n").unwrap();
@@ -1177,7 +1178,8 @@ mod tests {
         )
         .unwrap();
         if which_pytest() {
-            let r = run_tests_summary(&dir, &["python3".to_string()])
+            let r = run_tests_summary(&dir, &["python3 -m pytest tests/ -q".to_string()])
+                .await
                 .expect("a red suite is reported with no writes on disk");
             assert!(r.contains("assert"), "the report names the assertion: {r}");
         }
@@ -1188,8 +1190,8 @@ mod tests {
     /// comes back empty, which the model reads as "no signal" while the real
     /// suite is red — the exact failure that hid the regression for five reps
     /// on python-dotenv.
-    #[test]
-    fn a_src_layout_suite_is_importable() {
+    #[tokio::test]
+    async fn a_src_layout_suite_is_importable() {
         let dir = temp_dir_for("src-layout");
         std::fs::create_dir_all(dir.join("src/pkg")).unwrap();
         std::fs::create_dir_all(dir.join("tests")).unwrap();
@@ -1201,7 +1203,8 @@ mod tests {
         )
         .unwrap();
         if which_pytest() {
-            let r = run_tests_summary(&dir, &["python3".to_string()])
+            let r = run_tests_summary(&dir, &["python3 -m pytest tests/ -q".to_string()])
+                .await
                 .expect("a red src-layout suite must be reported, not silently blank");
             // The header prose contains the word "assert", so it cannot be the
             // thing this checks: strip it and require a real failure line.
@@ -1219,8 +1222,8 @@ mod tests {
     /// suite is red. This is the failure that hid the click bug: pytest 9
     /// rejects the repo's parametrize style at import time. The report must
     /// name the collection error, not swallow it.
-    #[test]
-    fn a_suite_that_errors_at_collection_is_reported_not_blank() {
+    #[tokio::test]
+    async fn a_suite_that_errors_at_collection_is_reported_not_blank() {
         let dir = temp_dir_for("collect-error");
         std::fs::create_dir_all(dir.join("tests")).unwrap();
         // Not an assertion failure — an ImportError at collection time.
@@ -1230,7 +1233,8 @@ mod tests {
         )
         .unwrap();
         if which_pytest() {
-            let r = run_tests_summary(&dir, &["python3".to_string()])
+            let r = run_tests_summary(&dir, &["python3 -m pytest tests/ -q".to_string()])
+                .await
                 .expect("a suite that cannot be collected must still be reported");
             assert!(
                 r.contains("did not run") && r.contains("collection"),
