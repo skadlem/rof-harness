@@ -254,6 +254,8 @@ pub enum TraceEvent {
 pub struct TraceSink {
     inner: Mutex<Vec<TraceEvent>>,
     file: Option<(Arc<Mutex<std::fs::File>>, PathBuf)>,
+    /// First recording error, shared with task forks using the same file.
+    recording_error: Arc<Mutex<Option<String>>>,
     /// Sum of `input_tokens + output_tokens` over every `ModelCall` emitted
     /// here. §4.3: the per-task budget reads this instead of rescanning the
     /// event stream, so spend accounting is O(1) per round, not O(rounds²).
@@ -273,6 +275,7 @@ impl TraceSink {
         Self {
             inner: Mutex::new(Vec::new()),
             file: None,
+            recording_error: Arc::new(Mutex::new(None)),
             total: AtomicU64::new(0),
             live: Mutex::new(None),
             emit_order: Mutex::new(()),
@@ -285,6 +288,7 @@ impl TraceSink {
         Ok(Self {
             inner: Mutex::new(Vec::new()),
             file: Some((Arc::new(Mutex::new(file)), path.to_path_buf())),
+            recording_error: Arc::new(Mutex::new(None)),
             total: AtomicU64::new(0),
             live: Mutex::new(None),
             emit_order: Mutex::new(()),
@@ -327,6 +331,7 @@ impl TraceSink {
             Some((f, p)) => Self {
                 inner: Mutex::new(Vec::new()),
                 file: Some((f.clone(), p.clone())),
+                recording_error: self.recording_error.clone(),
                 // A fork counts only what it emits itself; the parent's total
                 // already holds the events being handed over.
                 total: AtomicU64::new(0),
@@ -352,13 +357,20 @@ impl TraceSink {
             self.total
                 .fetch_add(*input_tokens + *output_tokens, Ordering::Relaxed);
         }
-        if let Some((file, _)) = &self.file {
-            if let Ok(line) = serde_json::to_string(&ev) {
-                if let Ok(mut f) = file.lock() {
-                    // One write per event: body + newline in a single buffer.
-                    let mut buf = line.into_bytes();
+        if let Some((file, path)) = &self.file {
+            let result = serde_json::to_vec(&ev)
+                .map_err(|e| e.to_string())
+                .and_then(|mut buf| {
+                    // Body and newline share one write and one file lock.
                     buf.push(b'\n');
-                    let _ = f.write_all(&buf);
+                    file.lock()
+                        .map_err(|_| "trace file lock poisoned".to_string())?
+                        .write_all(&buf)
+                        .map_err(|e| e.to_string())
+                });
+            if let Err(error) = result {
+                if let Ok(mut first_error) = self.recording_error.lock() {
+                    first_error.get_or_insert_with(|| format!("trace {}: {error}", path.display()));
                 }
             }
         }
@@ -369,6 +381,15 @@ impl TraceSink {
         if let Ok(mut guard) = self.inner.lock() {
             guard.push(ev);
         }
+    }
+
+    /// A persistent recording failure makes any report from this sink or a
+    /// sibling fork incomplete. In-memory events remain available for diagnosis.
+    pub fn recording_error(&self) -> Option<String> {
+        self.recording_error
+            .lock()
+            .map(|error| error.clone())
+            .unwrap_or_else(|_| Some("trace recording-health lock poisoned".to_string()))
     }
 
     pub fn len(&self) -> usize {

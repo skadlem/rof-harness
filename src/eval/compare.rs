@@ -450,6 +450,9 @@ fn label_delta(a: &RunLabel, b: &RunLabel) -> Vec<LabelDelta> {
 fn comparability_notes(a: &SuiteReport, b: &SuiteReport) -> Vec<String> {
     let mut notes = Vec::new();
     for (name, report) in [("a", a), ("b", b)] {
+        if let Some(error) = &report.recording_error {
+            notes.push(format!("{name}: incomplete evidence: {error}"));
+        }
         if report
             .tasks
             .iter()

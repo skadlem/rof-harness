@@ -168,6 +168,9 @@ pub struct TaskResult {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SuiteReport {
+    /// Persistent failure to record evidence; None for older reports.
+    #[serde(default)]
+    pub recording_error: Option<String>,
     #[serde(default)]
     pub tasks: Vec<TaskResult>,
     pub aggregate: EvalReport,
@@ -177,6 +180,10 @@ pub struct SuiteReport {
 }
 
 impl SuiteReport {
+    pub fn recording_complete(&self) -> bool {
+        self.recording_error.is_none()
+    }
+
     pub fn matched(&self) -> usize {
         self.tasks
             .iter()
@@ -514,6 +521,7 @@ impl EvaluationRunner {
             rep.aggregate = self.report();
             Self::record_reps(&mut rep.aggregate, &rep.tasks);
             rep.label = self.label(suite);
+            rep.recording_error = self.trace.recording_error();
             return rep;
         }
         let sem = Arc::new(tokio::sync::Semaphore::new(jobs));
@@ -560,6 +568,7 @@ impl EvaluationRunner {
         rep.aggregate = self.report();
         Self::record_reps(&mut rep.aggregate, &rep.tasks);
         rep.label = self.label(suite);
+        rep.recording_error = self.trace.recording_error();
         rep
     }
 

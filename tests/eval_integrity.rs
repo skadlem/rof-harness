@@ -86,3 +86,40 @@ async fn legacy_task_results_default_to_completed_execution() {
     assert_eq!(restored.status, ExecutionStatus::Completed);
     assert_eq!(restored.inconclusive_reps, 0);
 }
+
+/// /dev/full accepts opens but rejects writes, exercising a real recording
+/// failure without filesystem mocks. A fork's failure must taint the parent
+/// report while its in-memory evidence stays available.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_forked_trace_write_failure_marks_the_suite_incomplete() {
+    let trace = Arc::new(TraceSink::with_file(std::path::Path::new("/dev/full")).unwrap());
+    let child = trace.fork();
+    child.emit(rof::obs::TraceEvent::StateTransition {
+        from: "start".into(),
+        to: "running".into(),
+    });
+    assert_eq!(child.len(), 1);
+    let client = Arc::new(StubClient);
+    let runner = EvaluationRunner::new(
+        trace,
+        AppConfig::default(),
+        ContextService::new(client.clone(), "stub".into()),
+        ExecutorService::new(client.clone(), "stub".into(), None),
+        ExecutorService::new(client, "stub".into(), None),
+        std::env::temp_dir(),
+    );
+    let report = runner
+        .run_suite(&EvalSuite {
+            name: "recording-failure".into(),
+            tasks: Vec::new(),
+        })
+        .await;
+    let json = serde_json::to_value(report).unwrap();
+    assert!(
+        json["recording_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("/dev/full")),
+        "a report must expose failures to record its evidence"
+    );
+}
