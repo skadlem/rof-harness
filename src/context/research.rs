@@ -546,7 +546,7 @@ impl Research {
     /// must exist and carry the pin the index claims, and the tree must be
     /// readable and still AT that pin.
     fn note_freshness(&self, note: &Note, tree: &TreeState) -> Freshness {
-        let text = match std::fs::read_to_string(self.root.join(&note.path)) {
+        let text = match read_project(&self.root, &self.root.join(&note.path)) {
             Ok(text) => text,
             Err(e) => {
                 return Freshness::Stale(StaleReason::NoteUnreadable {
@@ -586,7 +586,7 @@ impl Research {
 
     /// The user's own text, verbatim.
     fn read_body(&self, note: &Note) -> Result<String, String> {
-        let text = std::fs::read_to_string(self.root.join(&note.path))
+        let text = read_project(&self.root, &self.root.join(&note.path))
             .map_err(|e| format!("{}: {e}", note.path))?;
         split_note(&text).map(|(_, _, body)| body)
     }
@@ -642,7 +642,7 @@ impl Research {
                 // The body is read back, not reconstructed, so a user's hand
                 // edit is what gets re-pinned. An unreadable note is refused
                 // rather than overwritten with something the harness wrote.
-                let current = std::fs::read_to_string(self.root.join(&path))
+                let current = read_project(&self.root, &self.root.join(&path))
                     .map_err(|e| format!("refused: {path} could not be read ({e})"))?;
                 let (file_kind, _, body) = split_note(&current)
                     .map_err(|detail| format!("refused: {path} has no usable pin ({detail})"))?;
@@ -689,10 +689,14 @@ impl Research {
     pub fn save(&mut self) -> std::io::Result<()> {
         for staged in std::mem::take(&mut self.staged) {
             match staged {
-                Staged::Body { note, body } => {
-                    write_atomic(&self.root.join(&note.path), &render_note(&note, &body))?
-                }
-                Staged::Delete { path } => match std::fs::remove_file(self.root.join(&path)) {
+                Staged::Body { note, body } => write_atomic(
+                    &self.root,
+                    &self.root.join(&note.path),
+                    &render_note(&note, &body),
+                )?,
+                Staged::Delete { path } => match project_path(&self.root, &self.root.join(&path))
+                    .and_then(std::fs::remove_file)
+                {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e),
@@ -700,7 +704,7 @@ impl Research {
             }
         }
         let index = self.root.join(DIR).join(INDEX_FILE);
-        write_atomic(&index, &render_index(self))
+        write_atomic(&self.root, &index, &render_index(self))
     }
 
     /// Read the store from a work root. A missing folder is an EMPTY store
@@ -710,7 +714,7 @@ impl Research {
     pub fn load(work_root: &Path) -> Research {
         let mut store = Research::empty(work_root);
         let path = work_root.join(DIR).join(INDEX_FILE);
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(text) = read_project(work_root, &path) else {
             return store;
         };
         let Some((block, notes_text)) = split_index(&text) else {
@@ -869,16 +873,59 @@ fn split_index(text: &str) -> Option<(String, String)> {
 
 /// A temp file in the same directory, then a rename: a reader never sees half
 /// a note, and a failed write leaves the old one.
-fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| INDEX_FILE.to_string());
-    let temp = parent.join(format!("{name}.tmp"));
+fn project_path(root: &Path, path: &Path) -> std::io::Result<std::path::PathBuf> {
+    crate::tools::path::resolve(root, path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
+}
+
+fn read_project(root: &Path, path: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(project_path(root, path)?)
+}
+
+fn write_atomic(root: &Path, path: &Path, body: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    // Resolve every ancestor before creating the next directory: mkdir itself
+    // must not cross a pre-existing symlink outside the work root.
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
+    let mut parent = std::fs::canonicalize(root)?;
+    if let Some(dirs) = relative.parent() {
+        for component in dirs.components() {
+            if !matches!(component, std::path::Component::Normal(_)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "invalid research directory",
+                ));
+            }
+            let next = project_path(root, &parent.join(component))?;
+            match std::fs::create_dir(&next) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && next.is_dir() => {}
+                Err(e) => return Err(e),
+            }
+            parent = project_path(root, &next)?;
+        }
+    }
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing research filename",
+        )
+    })?;
+    let path = project_path(root, &parent.join(name))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing research parent"))?;
+    // Exclusive creation prevents pre-planted temporary symlinks from being
+    // followed. Same-directory rename preserves atomic replacement.
+    let temp = parent.join(format!(".rof-{}.tmp", uuid::Uuid::new_v4()));
     let written = (|| {
-        std::fs::write(&temp, body.as_bytes())?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(body.as_bytes())?;
         std::fs::rename(&temp, path)
     })();
     if written.is_err() {

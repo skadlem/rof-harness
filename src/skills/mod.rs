@@ -217,8 +217,14 @@ impl SkillManager {
     fn roots(&self) -> Vec<(PathBuf, &'static str)> {
         let mut v = vec![(self.root.clone(), "user")];
         if let Some(x) = &self.extra_root {
-            if x.is_dir() && *x != self.root {
-                v.push((x.clone(), "repo"));
+            // Repo-shipped skills are anchored to the containing workdir;
+            // an explicit user store remains a separately trusted root.
+            if let Some(parent) = x.parent() {
+                if let Ok(safe) = crate::tools::path::resolve(parent, x) {
+                    if safe.is_dir() && *x != self.root {
+                        v.push((safe, "repo"));
+                    }
+                }
             }
         }
         v
@@ -263,6 +269,13 @@ impl SkillManager {
                     ));
                     continue;
                 }
+                let md = match read_child(&dir, "SKILL.md") {
+                    Ok(path) => path,
+                    Err(e) => {
+                        warnings.push(format!("{name}: unreadable SKILL.md: {e}"));
+                        continue;
+                    }
+                };
                 let text = match std::fs::read_to_string(&md) {
                     Ok(t) => t,
                     Err(e) => {
@@ -338,11 +351,11 @@ impl SkillManager {
         let files = list_files(&dir);
         let (file, body) = match file {
             None => {
-                let md = std::fs::read_to_string(&meta.path)?;
+                let md = std::fs::read_to_string(read_child(&dir, "SKILL.md")?)?;
                 (None, parse_skill(&md)?.1)
             }
             Some(rel) => {
-                let p = safe_child(&dir, rel)?;
+                let p = read_child(&dir, rel)?;
                 let data = std::fs::read_to_string(&p)?;
                 if data.len() > SUPPORT_FILE_CAP {
                     return Err(SkillError::Invalid(format!(
@@ -850,6 +863,11 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<SkillFile>, depth: usize
             out.push(SkillFile { rel, bytes });
         }
     }
+}
+
+fn read_child(dir: &Path, rel: &str) -> Result<PathBuf, SkillError> {
+    let path = safe_child(dir, rel)?;
+    crate::tools::path::resolve(dir, &path).map_err(|e| SkillError::Denied(e.to_string()))
 }
 
 /// A path relative to a skill directory, refused if it could leave it.

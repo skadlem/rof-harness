@@ -29,7 +29,10 @@ const CAP: usize = 4000;
 pub fn load(workdir: &Path) -> Memory {
     let project = ["AGENTS.md", "agents.md", "CLAUDE.md"]
         .iter()
-        .find_map(|n| std::fs::read_to_string(workdir.join(n)).ok())
+        .find_map(|n| {
+            let path = crate::tools::path::resolve(workdir, &workdir.join(n)).ok()?;
+            std::fs::read_to_string(path).ok()
+        })
         .unwrap_or_default();
     let user = std::env::var("HOME")
         .ok()
