@@ -128,3 +128,73 @@ fn source_fingerprints_hash_symlinks_without_reading_their_targets() {
     let replaced = serde_json::to_value(label(&repo.0)).unwrap();
     assert_ne!(second["target_tree_hash"], replaced["target_tree_hash"]);
 }
+
+async fn provider_report(root: &Path, ctx: &str, exec: &str, verify: &str) -> SuiteReport {
+    use rof::llm::{ContextService, ExecutorService, OpenRouterClient};
+    use std::sync::Arc;
+    let client = |base: &str| {
+        Arc::new(OpenRouterClient::from_parts(
+            base.into(),
+            "bearer-secret".into(),
+        ))
+    };
+    rof::eval::EvaluationRunner::new(
+        Arc::new(rof::obs::TraceSink::new()),
+        AppConfig::default(),
+        ContextService::new(client(ctx), "same-model".into()),
+        ExecutorService::new(client(exec), "same-model".into(), None),
+        ExecutorService::new(client(verify), "same-model".into(), None),
+        root.into(),
+    )
+    .run_suite(&EvalSuite {
+        name: "providers".into(),
+        tasks: Vec::new(),
+    })
+    .await
+}
+
+#[tokio::test]
+async fn labels_distinguish_actual_role_providers_without_credentials() {
+    let repo = fixture();
+    let first = provider_report(
+        &repo.0,
+        "https://Context.Example/v1/",
+        "https://alice:password@Provider.Example:443/v1/?api_key=private#hidden",
+        "https://judge.example/v2",
+    )
+    .await;
+    let second = provider_report(
+        &repo.0,
+        "https://context.example/v1",
+        "https://another-provider.example/v1",
+        "https://independent-judge.example/v2",
+    )
+    .await;
+    assert_eq!(first.label.config_hash, second.label.config_hash);
+    assert_eq!(first.label.exec_model, second.label.exec_model);
+    let first_json = serde_json::to_value(&first.label).unwrap();
+    let second_json = serde_json::to_value(&second.label).unwrap();
+    assert_ne!(first_json["exec_endpoint"], second_json["exec_endpoint"]);
+    assert_eq!(first_json["ctx_endpoint"], "https://context.example/v1");
+    assert_eq!(first_json["exec_endpoint"], "https://provider.example/v1");
+    assert_eq!(first_json["verify_endpoint"], "https://judge.example/v2");
+    let rendered = first.label.render();
+    for secret in [
+        "alice",
+        "password",
+        "api_key",
+        "private",
+        "hidden",
+        "bearer-secret",
+    ] {
+        assert!(!rendered.contains(secret));
+        assert!(!first_json.to_string().contains(secret));
+    }
+    let comparison = compare(&first, &second);
+    for field in ["exec_endpoint", "verify_endpoint"] {
+        assert!(comparison
+            .labels
+            .iter()
+            .any(|delta| delta.field == field && delta.changed()));
+    }
+}

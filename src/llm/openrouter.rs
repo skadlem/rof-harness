@@ -352,6 +352,20 @@ impl OpenRouterClient {
 
 #[async_trait]
 impl LlmClient for OpenRouterClient {
+    fn endpoint(&self) -> Option<String> {
+        let url = reqwest::Url::parse(&self.base).ok()?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return None;
+        }
+        // Origin excludes userinfo; path excludes query and fragment. Keep the
+        // API path because one host can serve multiple provider deployments.
+        Some(format!(
+            "{}{}",
+            url.origin().ascii_serialization(),
+            url.path().trim_end_matches('/')
+        ))
+    }
+
     async fn complete(&self, model: &str, mut req: LlmReq) -> Result<LlmResp, LlmError> {
         let t = Instant::now();
         // ponytail: retry lives here, not in every caller. Free tiers 429 often.

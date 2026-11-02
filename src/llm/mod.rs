@@ -166,6 +166,11 @@ impl LlmError {
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    /// Credential-free endpoint identity for reproducible run labels.
+    fn endpoint(&self) -> Option<String> {
+        None
+    }
+
     async fn complete(&self, model: &str, req: LlmReq) -> Result<LlmResp, LlmError>;
 }
 
@@ -180,6 +185,10 @@ impl ContextService {
     pub fn new(client: Arc<dyn LlmClient>, model: String) -> Self {
         Self { client, model }
     }
+    pub fn endpoint(&self) -> Option<String> {
+        self.client.endpoint()
+    }
+
     pub async fn complete(&self, req: LlmReq) -> Result<LlmResp, LlmError> {
         self.client.complete(&self.model, req).await
     }
@@ -237,6 +246,10 @@ impl ExecutorService {
         self.generation = generation;
         self
     }
+    pub fn endpoint(&self) -> Option<String> {
+        self.client.endpoint()
+    }
+
     pub async fn complete(&self, req: LlmReq) -> Result<LlmResp, LlmError> {
         match self.client.complete(&self.model, req.clone()).await {
             Ok(r) => Ok(r),

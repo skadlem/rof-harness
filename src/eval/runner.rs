@@ -35,6 +35,14 @@ pub struct RunLabel {
     pub suite_hash: String,
     pub ctx_model: String,
     pub exec_model: String,
+    /// Sanitized origin + API path from each actual wired client. Empty for
+    /// legacy reports and clients that do not expose endpoint provenance.
+    #[serde(default)]
+    pub ctx_endpoint: String,
+    #[serde(default)]
+    pub exec_endpoint: String,
+    #[serde(default)]
+    pub verify_endpoint: String,
     /// §4.5: the judge model. Defaults to exec (self-review); a report that
     /// predates the field loads as empty and renders as exec, which is what
     /// it was. The label must render it because `config_hash` alone is not
@@ -65,6 +73,9 @@ impl RunLabel {
             suite_hash: fnv1a_hex(serde_json::to_string(suite).unwrap_or_default().as_bytes()),
             ctx_model,
             exec_model: cfg.routing.executor_model.clone(),
+            ctx_endpoint: String::new(),
+            exec_endpoint: String::new(),
+            verify_endpoint: String::new(),
             verify_model: cfg
                 .routing
                 .verify_model
@@ -92,7 +103,7 @@ impl RunLabel {
             &self.verify_model
         };
         format!(
-            "git {} tree {}{} harness {} cfg {} suite {} ctx {} exec {} verify {} v{}",
+            "git {} tree {}{} harness {} cfg {} suite {} ctx {}@{} exec {}@{} verify {}@{} v{}",
             self.git_head,
             if self.target_tree_hash.is_empty() {
                 "unknown"
@@ -108,8 +119,23 @@ impl RunLabel {
             self.config_hash,
             self.suite_hash,
             self.ctx_model,
+            if self.ctx_endpoint.is_empty() {
+                "unknown"
+            } else {
+                &self.ctx_endpoint
+            },
             self.exec_model,
+            if self.exec_endpoint.is_empty() {
+                "unknown"
+            } else {
+                &self.exec_endpoint
+            },
             verify,
+            if self.verify_endpoint.is_empty() {
+                "unknown"
+            } else {
+                &self.verify_endpoint
+            },
             self.harness_version
         )
     }
@@ -630,6 +656,9 @@ impl EvaluationRunner {
         // config's intent: `ROF_VERIFY_MODEL` and the judge's own client are
         // both resolved in `main`, so the report must say what ran.
         l.verify_model = self.verify.model.clone();
+        l.ctx_endpoint = self.context.endpoint().unwrap_or_default();
+        l.exec_endpoint = self.executor.endpoint().unwrap_or_default();
+        l.verify_endpoint = self.verify.endpoint().unwrap_or_default();
         l
     }
 }

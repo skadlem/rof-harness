@@ -436,6 +436,9 @@ fn label_delta(a: &RunLabel, b: &RunLabel) -> Vec<LabelDelta> {
         ("ctx_model", &a.ctx_model, &b.ctx_model),
         ("exec_model", &a.exec_model, &b.exec_model),
         ("verify_model", &a.verify_model, &b.verify_model),
+        ("ctx_endpoint", &a.ctx_endpoint, &b.ctx_endpoint),
+        ("exec_endpoint", &a.exec_endpoint, &b.exec_endpoint),
+        ("verify_endpoint", &a.verify_endpoint, &b.verify_endpoint),
         ("harness_version", &a.harness_version, &b.harness_version),
     ];
     fields
@@ -485,6 +488,15 @@ fn comparability_notes(a: &SuiteReport, b: &SuiteReport) -> Vec<String> {
         if a.label.config_hash != b.label.config_hash {
             notes.push(
                 "config_hash differs: the config (or an env override) changed between the runs"
+                    .to_string(),
+            );
+        }
+        if a.label.ctx_endpoint != b.label.ctx_endpoint
+            || a.label.exec_endpoint != b.label.exec_endpoint
+            || a.label.verify_endpoint != b.label.verify_endpoint
+        {
+            notes.push(
+                "provider endpoints differ: the model provider or API deployment changed"
                     .to_string(),
             );
         }

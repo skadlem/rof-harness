@@ -998,6 +998,9 @@ fn labelled_report(suite_hash: &str, tasks: Vec<TaskResult>) -> SuiteReport {
     SuiteReport {
         tasks,
         label: RunLabel {
+            ctx_endpoint: String::new(),
+            exec_endpoint: String::new(),
+            verify_endpoint: String::new(),
             harness_revision: String::new(),
             target_tree_hash: String::new(),
             target_dirty: false,
