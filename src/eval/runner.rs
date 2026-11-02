@@ -117,9 +117,24 @@ pub fn git_head(dir: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Whether execution produced a task verdict. Infrastructure failures and
+/// cancellations must not be counted as agent failures (or expected failures).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStatus {
+    #[default]
+    Completed,
+    Inconclusive,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
     pub name: String,
+    #[serde(default)]
+    pub status: ExecutionStatus,
+    /// Repetitions without a verdict, excluded from capability metrics.
+    #[serde(default)]
+    pub inconclusive_reps: u32,
     pub passed: bool,
     pub expected: bool,
     pub matched: bool,
@@ -163,13 +178,22 @@ pub struct SuiteReport {
 
 impl SuiteReport {
     pub fn matched(&self) -> usize {
-        self.tasks.iter().filter(|t| t.matched).count()
+        self.tasks
+            .iter()
+            .filter(|t| t.status == ExecutionStatus::Completed && t.matched)
+            .count()
     }
+    pub fn completed(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|t| t.status == ExecutionStatus::Completed)
+            .count()
+    }
+
     pub fn success_rate(&self) -> f64 {
-        if self.tasks.is_empty() {
-            0.0
-        } else {
-            self.matched() as f64 / self.tasks.len() as f64
+        match self.completed() {
+            0 => 0.0,
+            completed => self.matched() as f64 / completed as f64,
         }
     }
     /// Load a `--report` dump back. Old reports (no label, no per-task context)
@@ -361,6 +385,8 @@ impl EvaluationRunner {
         let passed = orch_passed && oracle.unwrap_or(true);
         TaskResult {
             name: task.name.clone(),
+            status: ExecutionStatus::Completed,
+            inconclusive_reps: 0,
             passed,
             expected: task.expect_pass,
             matched: passed == task.expect_pass,
@@ -388,9 +414,11 @@ impl EvaluationRunner {
             Err(e) => {
                 return TaskResult {
                     name: task.name.clone(),
+                    status: ExecutionStatus::Inconclusive,
+                    inconclusive_reps: 1,
                     passed: false,
                     expected: task.expect_pass,
-                    matched: !task.expect_pass,
+                    matched: false,
                     rounds: 0,
                     feedback: format!("harness: task-dir copy failed: {e:#}"),
                     context: ContextMetrics::default(),
@@ -422,22 +450,30 @@ impl EvaluationRunner {
         self.run_suite_with_reps(suite, jobs, 1).await
     }
 
-    /// One task, `reps` isolated times. The row keeps the first rep's detail
-    /// (feedback, checks, baseline, context); rounds sum across reps; passed
-    /// is pass^k and matched folds it against expectation. reps=1 is the
-    /// legacy rule exactly.
+    /// Repeat in fresh trees. Preserve the first inconclusive result's evidence,
+    /// otherwise the first mismatch's, otherwise the first result's. A row with
+    /// any inconclusive repetition cannot satisfy either expectation.
     async fn run_task_reps(&self, task: EvalTask, reps: usize) -> TaskResult {
         let reps = reps.max(1) as u32;
         let mut row: Option<TaskResult> = None;
         let mut passes = 0u32;
         let mut rounds = 0u32;
+        let mut inconclusive = 0u32;
         for _ in 0..reps {
             let r = self.run_task_isolated(task.clone()).await;
-            if r.passed {
+            if r.status == ExecutionStatus::Inconclusive {
+                inconclusive += 1;
+            } else if r.passed {
                 passes += 1;
             }
             rounds += r.rounds;
-            if row.is_none() {
+            let replace = match &row {
+                None => true,
+                Some(previous) if previous.status == ExecutionStatus::Inconclusive => false,
+                Some(_) if r.status == ExecutionStatus::Inconclusive => true,
+                Some(previous) => previous.matched && !r.matched,
+            };
+            if replace {
                 row = Some(r);
             }
         }
@@ -445,8 +481,14 @@ impl EvaluationRunner {
         row.reps = reps;
         row.passes = passes;
         row.rounds = rounds;
-        row.passed = passes == reps;
-        row.matched = row.passed == row.expected;
+        row.inconclusive_reps = inconclusive;
+        row.status = if inconclusive == 0 {
+            ExecutionStatus::Completed
+        } else {
+            ExecutionStatus::Inconclusive
+        };
+        row.passed = inconclusive == 0 && passes == reps;
+        row.matched = inconclusive == 0 && row.passed == row.expected;
         row
     }
 
@@ -480,13 +522,17 @@ impl EvaluationRunner {
             let runner = self.clone();
             let task = t.clone();
             let permit_slot = sem.clone();
-            handles.push(tokio::spawn(async move {
-                let _permit = permit_slot.acquire_owned().await;
-                runner.run_task_reps(task, reps).await
-            }));
+            handles.push((
+                t.name.clone(),
+                t.expect_pass,
+                tokio::spawn(async move {
+                    let _permit = permit_slot.acquire_owned().await;
+                    runner.run_task_reps(task, reps).await
+                }),
+            ));
         }
         let mut rep = SuiteReport::default();
-        for h in handles {
+        for (name, expected, h) in handles {
             match h.await {
                 Ok(r) => rep.tasks.push(r),
                 // v4: a join/timeout cancellation is inconclusive, not failed —
@@ -494,9 +540,11 @@ impl EvaluationRunner {
                 // cancelled runs had already produced one). Name it so no
                 // caller reads a timeout as a capability verdict.
                 Err(e) => rep.tasks.push(TaskResult {
-                    name: "<join>".to_string(),
+                    name,
+                    status: ExecutionStatus::Inconclusive,
+                    inconclusive_reps: reps as u32,
                     passed: false,
-                    expected: true,
+                    expected,
                     matched: false,
                     rounds: 0,
                     feedback: format!("harness: task join failed (inconclusive, not failed): {e}"),
@@ -504,7 +552,7 @@ impl EvaluationRunner {
                     checks: Vec::new(),
                     check_baseline: Vec::new(),
                     oracle_ok: None,
-                    reps: 1,
+                    reps: reps as u32,
                     passes: 0,
                 }),
             }
@@ -520,7 +568,10 @@ impl EvaluationRunner {
     /// once, exactly as it always did.
     fn record_reps(agg: &mut super::metrics::EvalReport, tasks: &[TaskResult]) {
         for task in tasks {
-            let r = task.reps.max(1);
+            let total = task.reps.max(1);
+            let inconclusive = task.inconclusive_reps.min(total);
+            agg.inconclusive_tasks += inconclusive as usize;
+            let r = total - inconclusive;
             let p = task.passes.min(r);
             for _ in 0..p {
                 agg.record_task(true);

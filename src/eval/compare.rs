@@ -1,5 +1,5 @@
 use super::metrics::ContextMetrics;
-use super::runner::{RunLabel, SuiteReport, TaskResult};
+use super::runner::{ExecutionStatus, RunLabel, SuiteReport, TaskResult};
 
 /// How one task's matched result moved between two reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7,6 +7,8 @@ pub enum TaskChange {
     Gained,
     Lost,
     Same,
+    /// At least one execution has no verdict; never a capability gain/loss.
+    Inconclusive,
     /// Present in one report only (a different `--limit`, or a different suite).
     OnlyInA,
     OnlyInB,
@@ -18,6 +20,7 @@ impl TaskChange {
             TaskChange::Gained => '+',
             TaskChange::Lost => '-',
             TaskChange::Same => '=',
+            TaskChange::Inconclusive => '?',
             TaskChange::OnlyInA => '<',
             TaskChange::OnlyInB => '>',
         }
@@ -59,6 +62,8 @@ impl MetricDelta {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskDelta {
     pub name: String,
+    pub a_status: Option<ExecutionStatus>,
+    pub b_status: Option<ExecutionStatus>,
     pub a_matched: Option<bool>,
     pub b_matched: Option<bool>,
     pub a_rounds: Option<u32>,
@@ -96,6 +101,11 @@ impl CheckFlip {
 
 impl TaskDelta {
     pub fn change(&self) -> TaskChange {
+        if self.a_status == Some(ExecutionStatus::Inconclusive)
+            || self.b_status == Some(ExecutionStatus::Inconclusive)
+        {
+            return TaskChange::Inconclusive;
+        }
         match (self.a_matched, self.b_matched) {
             (Some(x), Some(y)) => match (x, y) {
                 (true, false) => TaskChange::Lost,
@@ -190,8 +200,8 @@ impl Comparison {
                 "  {} {:<30}{:<7}-> {:<7}rounds {} -> {}\n",
                 t.change().marker(),
                 t.name,
-                matched_word(t.a_matched),
-                matched_word(t.b_matched),
+                matched_word(t.a_matched, t.a_status),
+                matched_word(t.b_matched, t.b_status),
                 rounds_word(t.a_rounds),
                 rounds_word(t.b_rounds)
             ));
@@ -265,7 +275,12 @@ pub fn compare(a: &SuiteReport, b: &SuiteReport) -> Comparison {
         });
     };
     push("matched", a.matched() as f64, b.matched() as f64);
-    push("tasks", a.tasks.len() as f64, b.tasks.len() as f64);
+    push("tasks", a.completed() as f64, b.completed() as f64);
+    push(
+        "inconclusive_tasks",
+        a.aggregate.inconclusive_tasks as f64,
+        b.aggregate.inconclusive_tasks as f64,
+    );
     push("matched_rate", a.success_rate(), b.success_rate());
     push(
         "est_cost_usd",
@@ -402,8 +417,8 @@ pub fn compare(a: &SuiteReport, b: &SuiteReport) -> Comparison {
         b: b.label.clone(),
         matched_a: a.matched(),
         matched_b: b.matched(),
-        total_a: a.tasks.len(),
-        total_b: b.tasks.len(),
+        total_a: a.completed(),
+        total_b: b.completed(),
         labels,
         notes,
         metrics,
@@ -434,6 +449,17 @@ fn label_delta(a: &RunLabel, b: &RunLabel) -> Vec<LabelDelta> {
 /// means the per-task table is a set difference, not an effect.
 fn comparability_notes(a: &SuiteReport, b: &SuiteReport) -> Vec<String> {
     let mut notes = Vec::new();
+    for (name, report) in [("a", a), ("b", b)] {
+        if report
+            .tasks
+            .iter()
+            .any(|t| t.status == ExecutionStatus::Inconclusive)
+        {
+            notes.push(format!(
+                "{name}: inconclusive executions excluded from capability comparisons"
+            ));
+        }
+    }
     if a.label.is_unlabeled() {
         notes.push(
             "a: unlabeled report (written before stage 0 — no git/config/suite hash)".to_string(),
@@ -507,6 +533,8 @@ fn task_deltas(a: &SuiteReport, b: &SuiteReport) -> Vec<TaskDelta> {
         let tb = b.tasks.iter().find(|t| t.name == ta.name);
         out.push(TaskDelta {
             name: ta.name.clone(),
+            a_status: Some(ta.status),
+            b_status: tb.map(|t| t.status),
             a_matched: Some(ta.matched),
             b_matched: tb.map(|t| t.matched),
             a_rounds: Some(ta.rounds),
@@ -524,6 +552,8 @@ fn task_deltas(a: &SuiteReport, b: &SuiteReport) -> Vec<TaskDelta> {
         if !a.tasks.iter().any(|t| t.name == tb.name) {
             out.push(TaskDelta {
                 name: tb.name.clone(),
+                a_status: None,
+                b_status: Some(tb.status),
                 a_matched: None,
                 b_matched: Some(tb.matched),
                 a_rounds: None,
@@ -573,7 +603,10 @@ fn empty_as<'a>(s: &'a str, fallback: &'a str) -> &'a str {
     }
 }
 
-fn matched_word(m: Option<bool>) -> String {
+fn matched_word(m: Option<bool>, status: Option<ExecutionStatus>) -> String {
+    if status == Some(ExecutionStatus::Inconclusive) {
+        return "inconclusive".to_string();
+    }
     match m {
         Some(true) => "pass".to_string(),
         Some(false) => "fail".to_string(),

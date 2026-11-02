@@ -843,6 +843,8 @@ fn context_metrics_count_only_what_matched_and_never_panic_on_an_old_run() {
 fn labelled_task(name: &str, matched: bool, rounds: u32, feedback: &str) -> TaskResult {
     TaskResult {
         name: name.to_string(),
+        status: rof::eval::ExecutionStatus::Completed,
+        inconclusive_reps: 0,
         passed: matched,
         expected: true,
         matched,

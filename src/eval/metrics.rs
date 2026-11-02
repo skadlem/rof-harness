@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalReport {
     pub tasks: usize,
+    /// Executions without a task verdict; excluded from `tasks` and success rate.
+    #[serde(default)]
+    pub inconclusive_tasks: usize,
     pub passed: usize,
     #[serde(default)]
     pub verdicts: usize,
@@ -108,6 +111,7 @@ impl Default for EvalReport {
     fn default() -> Self {
         Self {
             tasks: 0,
+            inconclusive_tasks: 0,
             passed: 0,
             verdicts: 0,
             passed_verdicts: 0,
