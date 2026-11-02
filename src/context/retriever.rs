@@ -82,13 +82,16 @@ impl Retriever {
             if !self.ext_ok(&f) || named.contains(&f) {
                 continue;
             }
-            let Ok(meta) = std::fs::metadata(&f) else {
+            let Ok(safe) = crate::tools::path::resolve(&self.root, &f) else {
+                continue;
+            };
+            let Ok(meta) = std::fs::metadata(&safe) else {
                 continue;
             };
             if meta.len() > 256 * 1024 {
                 continue;
             }
-            let Ok(data) = std::fs::read(&f) else {
+            let Ok(data) = std::fs::read(&safe) else {
                 continue;
             };
             let raw = String::from_utf8_lossy(&data).to_string();
@@ -140,7 +143,9 @@ impl Retriever {
                 continue;
             }
             let p = self.root.join(t);
-            if p.is_file() && !v.contains(&p) {
+            if crate::tools::path::resolve(&self.root, &p).is_ok_and(|safe| safe.is_file())
+                && !v.contains(&p)
+            {
                 v.push(p);
             }
         }
@@ -157,7 +162,10 @@ impl Retriever {
     pub(crate) fn named_file_contents(&self, query: &str) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for p in self.named_paths(query) {
-            let Ok(content) = std::fs::read_to_string(&p) else {
+            let Ok(safe) = crate::tools::path::resolve(&self.root, &p) else {
+                continue;
+            };
+            let Ok(content) = std::fs::read_to_string(&safe) else {
                 continue;
             };
             // Same whole-file cap as a requested file: a bigger file is not a
@@ -177,11 +185,12 @@ impl Retriever {
         budget_chars: usize,
         used: &mut usize,
     ) -> Option<Snippet> {
-        let meta = std::fs::metadata(path).ok()?;
+        let safe = crate::tools::path::resolve(&self.root, path).ok()?;
+        let meta = std::fs::metadata(&safe).ok()?;
         if meta.len() > 256 * 1024 {
             return None;
         }
-        let content = std::fs::read_to_string(path).ok()?;
+        let content = std::fs::read_to_string(&safe).ok()?;
         // A file the goal names is worth more context than a keyword hit: the
         // default per-file cap cut the anchor out of a 18 KB file and the model
         // then reported "anchor text not retrieved" instead of editing.
@@ -245,7 +254,7 @@ impl Retriever {
         for e in rd.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
+            if name.starts_with('.') || crate::tools::path::resolve(&self.root, &p).is_err() {
                 continue;
             }
             if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {

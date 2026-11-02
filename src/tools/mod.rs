@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+pub(crate) mod path;
 pub mod skills;
 pub use skills::{SkillsListTool, SkillsManageTool, SkillsViewTool};
 
@@ -173,79 +174,7 @@ pub(crate) fn under(root: &Path, cand: &Path) -> bool {
 }
 
 fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, ToolError> {
-    let p = root.join(rel);
-    if !under(root, &p) {
-        return Err(ToolError::Denied("path escapes tool root".to_string()));
-    }
-    // §4.2: `.git` is the tree-state substrate the write gate and rollback
-    // read. An agent that reaches it could forge the gate's evidence or undo a
-    // rollback, so no path naming it is readable or writable, at any depth.
-    if p.components().any(|c| c.as_os_str() == ".git") {
-        return Err(ToolError::Denied(
-            "path is the git substrate (.git): harness-only".to_string(),
-        ));
-    }
-    symlink_safe(root, &p)?;
-    Ok(p)
-}
-
-/// §4.6: `under()` is lexical, so a symlink inside the root can point anywhere
-/// — deny-by-default must hold for symlinks, not just spellings. Resolve the
-/// containing directory (and a symlinked final name) against the canonical root.
-/// Reads and writes both route here: a link out of the root leaks data one way
-/// and corrupts it the other.
-fn symlink_safe(root: &Path, target: &Path) -> Result<(), ToolError> {
-    // The root may itself be a link; compare canonical to canonical.
-    let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    // The root is the trust anchor: only what hangs under it gets resolved.
-    if normalize(target) == normalize(root) {
-        return Ok(());
-    }
-    let parent = target.parent().unwrap_or(root);
-    // Writes create no parent dirs, so this exists for every real call; a
-    // failure means a dangling link in the path, and that path is not writable.
-    //
-    // A missing parent is *not* a security denial: it is a recoverable
-    // contract error, and reporting it as one made the model treat a fixable
-    // write as permanently refused -- then claim success anyway. Say which.
-    let canon = match std::fs::canonicalize(parent) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ToolError::Denied(format!(
-                "parent directory does not exist: create {} first, then re-issue the write",
-                parent.display()
-            )))
-        }
-        Err(e) => return Err(ToolError::Denied(format!("path is not resolvable: {e}"))),
-    };
-    if !canon.starts_with(&canon_root) {
-        return Err(ToolError::Denied(
-            "symlink escapes the tool root".to_string(),
-        ));
-    }
-    // A verified directory is not enough: writing through `/root/link -> /etc/x`
-    // still lands in /etc.
-    if std::fs::symlink_metadata(target)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        let link = std::fs::read_link(target)
-            .map_err(|e| ToolError::Denied(format!("unreadable symlink: {e}")))?;
-        let resolved = if link.is_absolute() {
-            link
-        } else {
-            canon.join(link)
-        };
-        // Chains resolve fully when the target exists; a dangling link still
-        // names where the write would land, so it is checked, not trusted.
-        let real = std::fs::canonicalize(&resolved).unwrap_or(resolved);
-        if !under(&canon_root, &real) {
-            return Err(ToolError::Denied(
-                "symlink escapes the tool root".to_string(),
-            ));
-        }
-    }
-    Ok(())
+    path::resolve(root, &root.join(rel))
 }
 
 /// Safe tool 1: list files under root (read-only).
@@ -271,7 +200,7 @@ impl Tool for FsListTool {
         for e in rd.flatten() {
             // The substrate stays invisible even in a listing: the gate denies
             // it, and a name the model cannot see is a name it cannot probe.
-            if e.file_name() == ".git" {
+            if e.file_name() == ".git" || path::resolve(&self.root, &e.path()).is_err() {
                 continue;
             }
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);

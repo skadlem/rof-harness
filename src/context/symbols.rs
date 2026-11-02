@@ -18,7 +18,10 @@ pub fn index_workdir(root: &Path, max_files: usize) -> Vec<Symbol> {
     let mut out = Vec::new();
     for f in files {
         let rel = rel(root, &f);
-        let Ok(text) = std::fs::read_to_string(&f) else {
+        let Ok(safe) = crate::tools::path::resolve(root, &f) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&safe) else {
             continue;
         };
         let is_py = f.extension().and_then(|e| e.to_str()) == Some("py");
@@ -62,7 +65,10 @@ pub fn expand(root: &Path, query: &str, symbols: &[Symbol]) -> Vec<String> {
         if out.iter().any(|p| p == &rel) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&f) else {
+        let Ok(safe) = crate::tools::path::resolve(root, &f) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&safe) else {
             continue;
         };
         let hit = text.lines().take(60).any(|l| {
