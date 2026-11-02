@@ -371,6 +371,7 @@ impl LlmClient for OpenRouterClient {
         // ponytail: retry lives here, not in every caller. Free tiers 429 often.
         let mut last = LlmError::Transport("no attempts".to_string());
         let mut usage = LlmUsage::default();
+        let mut interrupted = super::accounting::InterruptedUsage::new(model);
         // Five shapes: the plain request, then four reshapes — low effort,
         // the vLLM thinking switch, reasoning off, and a roomier re-ask
         // (or a shrink re-ask when zero content shipped). The loop bound
@@ -385,9 +386,11 @@ impl LlmClient for OpenRouterClient {
                     usage.attempts = attempt as u64 + 1;
                     usage.latency_ms = t.elapsed().as_millis() as u64;
                     usage.apply_to(&mut r);
+                    interrupted.disarm();
                     return Ok(r);
                 }
                 Err(e) => {
+                    interrupted.observe(&e.usage());
                     usage.add(&e.usage());
                     usage.attempts = attempt as u64 + 1;
                     let text = e.to_string();
@@ -420,6 +423,7 @@ impl LlmClient for OpenRouterClient {
             }
         }
         usage.latency_ms = t.elapsed().as_millis() as u64;
+        interrupted.disarm();
         Err(last.with_usage(usage))
     }
 }

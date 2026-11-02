@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+mod accounting;
+pub use accounting::with_usage_trace;
 pub mod openrouter;
 pub mod profile;
 pub use openrouter::{
@@ -256,7 +258,13 @@ impl ExecutorService {
             Err(e) => match &self.fallback {
                 Some(fb) => {
                     let mut usage = e.usage();
-                    match self.client.complete(fb, req).await {
+                    // The primary returned normally, so its own guard is
+                    // disarmed. Retain its spend while awaiting the fallback.
+                    let mut interrupted = accounting::InterruptedUsage::new(&self.model);
+                    interrupted.observe(&usage);
+                    let result = self.client.complete(fb, req).await;
+                    interrupted.disarm();
+                    match result {
                         Ok(mut response) => {
                             usage.add(&LlmUsage::from_response(&response));
                             usage.apply_to(&mut response);

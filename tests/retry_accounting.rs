@@ -60,10 +60,15 @@ async fn chat_retry_includes_usage_from_truncated_attempt() {
         serde_json::json!({"choices":[{"message":{"content":null,"reasoning_content":"thinking"},"finish_reason":"length"}],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_cache_hit_tokens":40,"cost":0.01}}),
         serde_json::json!({"choices":[{"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":200,"completion_tokens":30,"prompt_tokens_details":{"cached_tokens":80},"cost":0.02}}),
     ]);
-    let response = OpenRouterClient::from_parts(base, "test".into())
-        .complete("test", request())
+    let trace = std::sync::Arc::new(rof::obs::TraceSink::new());
+    let client = OpenRouterClient::from_parts(base, "test".into());
+    let response = rof::llm::with_usage_trace(trace.clone(), client.complete("test", request()))
         .await
         .unwrap();
+    assert!(
+        trace.is_empty(),
+        "normal success is recorded only by its caller"
+    );
     server.join().unwrap();
     assert_eq!(response.text, "answer");
     assert_eq!(response.input_tokens, 300, "every billed attempt counts");
@@ -106,7 +111,14 @@ async fn exhausted_completion_retains_usage_for_trace_and_budget() {
             ..Default::default()
         },
     );
-    let error = client.complete("test", request()).await.unwrap_err();
+    let trace = std::sync::Arc::new(rof::obs::TraceSink::new());
+    let error = rof::llm::with_usage_trace(trace.clone(), client.complete("test", request()))
+        .await
+        .unwrap_err();
+    assert!(
+        trace.is_empty(),
+        "normal errors are recorded only by their caller"
+    );
     server.join().unwrap();
     assert!(error.to_string().contains("finish_reason=length"));
     let usage = error.usage();
@@ -115,7 +127,6 @@ async fn exhausted_completion_retains_usage_for_trace_and_budget() {
     assert_eq!(usage.cached_input_tokens, 40);
     assert_eq!(usage.cost_usd, Some(0.01));
     assert_eq!(usage.attempts, 1);
-    let trace = rof::obs::TraceSink::new();
     error.record_usage(&trace, "implementer", "test");
     assert_eq!(
         trace.total_tokens(),
@@ -225,4 +236,92 @@ async fn failed_summary_retains_spend_without_claiming_delivered_summary() {
     assert_eq!(mid.summarize.input_tokens, 100);
     assert_eq!(mid.summarize.output_tokens, 20);
     assert!(view.prompt.contains("RRRR"));
+}
+
+fn stalled_retry_server() -> (
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let mut buf = [0; 8192];
+        assert!(first.read(&mut buf).unwrap() > 0);
+        let body = serde_json::json!({"choices":[{"message":{"content":null,"reasoning_content":"thinking"},"finish_reason":"length"}],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_cache_hit_tokens":40,"cost":0.01}}).to_string();
+        write!(first,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+        drop(first);
+        let (mut stalled, _) = listener.accept().unwrap();
+        assert!(stalled.read(&mut buf).unwrap() > 0);
+        let _ = entered_tx.send(());
+        let _ = stop_rx.recv_timeout(std::time::Duration::from_secs(10));
+    });
+    (base, entered_rx, stop_tx, thread)
+}
+
+async fn check_interrupted_usage(fallback: bool) {
+    let (base, entered, stop, server) = stalled_retry_server();
+    let client = OpenRouterClient::from_parts(base, "test".into());
+    let client = if fallback {
+        client.with_profile(rof::llm::profile::EndpointProfile {
+            ladder: vec![],
+            ..Default::default()
+        })
+    } else {
+        client
+    };
+    let service = rof::llm::ExecutorService::new(
+        std::sync::Arc::new(client),
+        "primary".into(),
+        fallback.then(|| "fallback".into()),
+    );
+    let trace = std::sync::Arc::new(rof::obs::TraceSink::new());
+    let worker_trace = trace.clone();
+    let task = tokio::spawn(async move {
+        rof::llm::with_usage_trace(worker_trace, service.complete(request())).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    let _ = task.await;
+    stop.send(()).unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        trace.total_tokens(),
+        120,
+        "cancelling a retry must retain known paid usage"
+    );
+    let events = trace.events();
+    assert_eq!(events.len(), 1, "record completed attempts exactly once");
+    match &events[0] {
+        rof::obs::TraceEvent::ModelCall {
+            agent,
+            model,
+            cost_usd,
+            cached_input_tokens,
+            ..
+        } => {
+            assert_eq!(agent, "interrupted");
+            assert_eq!(model, "primary");
+            assert_eq!(*cost_usd, Some(0.01));
+            assert_eq!(*cached_input_tokens, 40);
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cancelling_stalled_retry_preserves_completed_attempt_spend() {
+    check_interrupted_usage(false).await;
+}
+
+#[tokio::test]
+async fn cancelling_fallback_preserves_primary_spend() {
+    check_interrupted_usage(true).await;
 }
