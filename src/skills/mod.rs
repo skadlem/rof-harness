@@ -297,7 +297,7 @@ impl SkillManager {
                             description: parsed.description.unwrap_or_default(),
                             version: parsed.version,
                             tags: parsed.tags,
-                            path: md,
+                            path: dir.join("SKILL.md"),
                             source: source.to_string(),
                         });
                     }

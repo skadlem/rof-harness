@@ -169,3 +169,100 @@ fn skill_markdown_and_support_reads_cannot_follow_external_aliases() {
     std::os::unix::fs::symlink(tree.0.join("private"), skills.join("secret/support.md")).unwrap();
     assert!(manager.view("secret", Some("support.md")).is_err());
 }
+
+#[test]
+fn safe_skill_markdown_alias_keeps_logical_support_directory() {
+    let tree = Tree::new();
+    let skills = tree.work().join("skills");
+    std::fs::create_dir_all(skills.join("sample/content")).unwrap();
+    std::fs::write(
+        skills.join("sample/content/body.md"),
+        "---\nname: sample\ndescription: safe\n---\nSkill body\n",
+    )
+    .unwrap();
+    std::fs::write(skills.join("sample/support.md"), "Support body").unwrap();
+    std::os::unix::fs::symlink("content/body.md", skills.join("sample/SKILL.md")).unwrap();
+    let manager = rof::skills::SkillManager::new(
+        tree.0.join("user"),
+        Some(skills.clone()),
+        rof::skills::SkillPolicy::ReadOnly,
+    );
+    assert_eq!(manager.list()[0].path, skills.join("sample/SKILL.md"));
+    assert_eq!(
+        manager.view("sample", None).unwrap().body.trim(),
+        "Skill body"
+    );
+    assert_eq!(
+        manager.view("sample", Some("support.md")).unwrap().body,
+        "Support body"
+    );
+}
+
+#[test]
+fn forgetting_note_with_missing_parent_still_updates_index() {
+    let tree = Tree::new();
+    let state = TreeState::at("abc");
+    let mut store = Research::empty(&tree.work());
+    store
+        .apply(
+            Edit::Write {
+                topic: "tests/suite".into(),
+                body: "note".into(),
+            },
+            &state,
+        )
+        .unwrap();
+    store.save().unwrap();
+    std::fs::remove_dir_all(tree.work().join(".rof/research/tests")).unwrap();
+    store
+        .apply(
+            Edit::Forget {
+                topic: "tests/suite".into(),
+            },
+            &state,
+        )
+        .unwrap();
+    assert!(
+        store.save().is_ok(),
+        "deleting an already absent note is idempotent"
+    );
+    assert!(!Research::load(&tree.work())
+        .needs_research("tests/suite", &state)
+        .is_answered());
+}
+
+#[test]
+fn forgetting_missing_note_through_external_alias_is_denied() {
+    let tree = Tree::new();
+    let state = TreeState::at("abc");
+    let mut store = Research::empty(&tree.work());
+    store
+        .apply(
+            Edit::Write {
+                topic: "tests/suite".into(),
+                body: "note".into(),
+            },
+            &state,
+        )
+        .unwrap();
+    store.save().unwrap();
+    std::fs::remove_dir_all(tree.work().join(".rof/research/tests")).unwrap();
+    std::fs::create_dir(tree.0.join("outside")).unwrap();
+    std::os::unix::fs::symlink(
+        tree.0.join("outside"),
+        tree.work().join(".rof/research/tests"),
+    )
+    .unwrap();
+    store
+        .apply(
+            Edit::Forget {
+                topic: "tests/suite".into(),
+            },
+            &state,
+        )
+        .unwrap();
+    assert!(
+        store.save().is_err(),
+        "missing targets do not make an external symlink safe"
+    );
+}

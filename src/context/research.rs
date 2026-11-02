@@ -694,8 +694,7 @@ impl Research {
                     &self.root.join(&note.path),
                     &render_note(&note, &body),
                 )?,
-                Staged::Delete { path } => match project_path(&self.root, &self.root.join(&path))
-                    .and_then(std::fs::remove_file)
+                Staged::Delete { path } => match remove_project(&self.root, &self.root.join(&path))
                 {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -873,6 +872,29 @@ fn split_index(text: &str) -> Option<(String, String)> {
 
 /// A temp file in the same directory, then a rename: a reader never sees half
 /// a note, and a failed write leaves the old one.
+// Missing note directories are a normal idempotent delete. Validate the
+// nearest existing ancestor before treating the missing suffix as harmless:
+// an existing external directory alias must still be rejected.
+fn remove_project(root: &Path, path: &Path) -> std::io::Result<()> {
+    let mut ancestor = path;
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let checked = project_path(root, ancestor)?;
+                return if ancestor == path {
+                    std::fs::remove_file(checked)
+                } else {
+                    Ok(())
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn project_path(root: &Path, path: &Path) -> std::io::Result<std::path::PathBuf> {
     crate::tools::path::resolve(root, path)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))
