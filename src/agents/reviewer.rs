@@ -51,11 +51,10 @@ impl Agent for ReviewerAgent<'_> {
             shrunk: false,
             thinking_off,
         };
-        let resp = self
-            .llm
-            .complete(req)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let resp = self.llm.complete(req).await.map_err(|e| {
+            e.record_usage(ctx.trace, self.name(), &self.llm.model);
+            anyhow::anyhow!(e.to_string())
+        })?;
         ctx.trace.emit(TraceEvent::ModelCall {
             agent: self.name().to_string(),
             model: self.llm.model.clone(),

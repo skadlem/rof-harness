@@ -66,6 +66,53 @@ pub struct LlmResp {
     pub attempts: u64,
 }
 
+/// Provider-reported usage retained even when a completion has no usable text.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct LlmUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cost_usd: Option<f64>,
+    pub attempts: u64,
+    pub latency_ms: u64,
+}
+
+impl LlmUsage {
+    pub fn add(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.cost_usd = match (self.cost_usd, other.cost_usd) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        };
+        self.attempts = self.attempts.saturating_add(other.attempts);
+        self.latency_ms = self.latency_ms.saturating_add(other.latency_ms);
+    }
+
+    pub fn from_response(response: &LlmResp) -> Self {
+        Self {
+            input_tokens: response.input_tokens,
+            output_tokens: response.output_tokens,
+            cached_input_tokens: response.cached_input_tokens,
+            cost_usd: response.cost_usd,
+            attempts: response.attempts,
+            latency_ms: response.latency_ms,
+        }
+    }
+
+    pub fn apply_to(&self, response: &mut LlmResp) {
+        response.input_tokens = self.input_tokens;
+        response.output_tokens = self.output_tokens;
+        response.cached_input_tokens = self.cached_input_tokens;
+        response.cost_usd = self.cost_usd;
+        response.attempts = self.attempts;
+        response.latency_ms = self.latency_ms;
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
     #[error("transport: {0}")]
@@ -75,6 +122,46 @@ pub enum LlmError {
     /// is not a diagnosis and hid the reasoning-budget bug for weeks.
     #[error("all models in fallback chain failed; last error: {0}")]
     AllFailed(String),
+    #[error("{source}")]
+    WithUsage {
+        source: Box<LlmError>,
+        usage: LlmUsage,
+    },
+}
+
+impl LlmError {
+    pub fn usage(&self) -> LlmUsage {
+        match self {
+            Self::WithUsage { usage, .. } => usage.clone(),
+            _ => LlmUsage::default(),
+        }
+    }
+
+    /// Attach the complete usage for this operation; nested causes retain their
+    /// diagnostics but callers account only this outer total.
+    pub fn with_usage(self, usage: LlmUsage) -> Self {
+        Self::WithUsage {
+            source: Box::new(self),
+            usage,
+        }
+    }
+
+    pub fn record_usage(&self, trace: &crate::obs::TraceSink, agent: &str, model: &str) {
+        let usage = self.usage();
+        if usage.attempts == 0 {
+            return;
+        }
+        trace.emit(crate::obs::TraceEvent::ModelCall {
+            agent: agent.to_string(),
+            model: model.to_string(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cost_usd: usage.cost_usd,
+            attempts: usage.attempts,
+            latency_ms: usage.latency_ms,
+        });
+    }
 }
 
 #[async_trait]
@@ -148,8 +235,24 @@ impl ExecutorService {
         match self.client.complete(&self.model, req.clone()).await {
             Ok(r) => Ok(r),
             Err(e) => match &self.fallback {
-                Some(fb) => self.client.complete(fb, req).await,
-                None => Err(LlmError::AllFailed(e.to_string())),
+                Some(fb) => {
+                    let mut usage = e.usage();
+                    match self.client.complete(fb, req).await {
+                        Ok(mut response) => {
+                            usage.add(&LlmUsage::from_response(&response));
+                            usage.apply_to(&mut response);
+                            Ok(response)
+                        }
+                        Err(fallback) => {
+                            usage.add(&fallback.usage());
+                            Err(fallback.with_usage(usage))
+                        }
+                    }
+                }
+                None => {
+                    let usage = e.usage();
+                    Err(LlmError::AllFailed(e.to_string()).with_usage(usage))
+                }
             },
         }
     }

@@ -102,6 +102,7 @@ impl ContextBuilder {
             let raw = texts[i];
             let mut delivered = raw.to_string();
             let mut stat = SummaryStat::default();
+            let mut summary_failed = false;
             if self.policy.wants_summary(*kind, raw.chars().count()) {
                 let key = summary_key(*kind, raw);
                 let hit = self.summaries.lock().unwrap().get(&key).cloned();
@@ -112,25 +113,45 @@ impl ContextBuilder {
                     }
                     None => {
                         let est_tokens = (raw.chars().count() / 16).max(64).min(pol.budget);
-                        if let Ok(r) = ctx.summarize(raw, est_tokens).await {
-                            self.summaries.lock().unwrap().insert(key, r.text.clone());
-                            delivered = r.text;
-                            stat = SummaryStat {
-                                call: true,
-                                cached: false,
-                                input_tokens: r.input_tokens,
-                                output_tokens: r.output_tokens,
-                                cached_input_tokens: r.cached_input_tokens,
-                                latency_ms: r.latency_ms,
-                                cost_usd: r.cost_usd,
-                                attempts: r.attempts,
-                            };
+                        match ctx.summarize(raw, est_tokens).await {
+                            Ok(r) => {
+                                self.summaries.lock().unwrap().insert(key, r.text.clone());
+                                delivered = r.text;
+                                stat = SummaryStat {
+                                    call: true,
+                                    cached: false,
+                                    input_tokens: r.input_tokens,
+                                    output_tokens: r.output_tokens,
+                                    cached_input_tokens: r.cached_input_tokens,
+                                    latency_ms: r.latency_ms,
+                                    cost_usd: r.cost_usd,
+                                    attempts: r.attempts,
+                                };
+                            }
+                            Err(error) => {
+                                summary_failed = true;
+                                let usage = error.usage();
+                                stat = SummaryStat {
+                                    call: usage.attempts > 0,
+                                    cached: false,
+                                    input_tokens: usage.input_tokens,
+                                    output_tokens: usage.output_tokens,
+                                    cached_input_tokens: usage.cached_input_tokens,
+                                    latency_ms: usage.latency_ms,
+                                    cost_usd: usage.cost_usd,
+                                    attempts: usage.attempts,
+                                };
+                            }
                         }
                     }
                 }
             }
             let (text, truncated) = self.shape(*kind, &delivered);
-            reports.push(self.report(*kind, &text, truncated, stat));
+            let mut report = self.report(*kind, &text, truncated, stat);
+            if summary_failed {
+                report.summarized = false;
+            }
+            reports.push(report);
             fitted.push(text);
         }
         (join(fitted, &reports), reports)

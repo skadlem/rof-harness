@@ -338,7 +338,10 @@ async fn buy(
         .await
     {
         Ok(r) => r,
-        Err(e) => return declined(format!("the research call failed: {e}")),
+        Err(e) => {
+            e.record_usage(trace, "researcher", &executor.model);
+            return declined(format!("the research call failed: {e}"));
+        }
     };
     trace.emit(TraceEvent::ModelCall {
         agent: "researcher".to_string(),

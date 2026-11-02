@@ -676,7 +676,18 @@ impl ImplementerAgent<'_> {
                 thinking_off,
             })
             .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            .map_err(|e| {
+                e.record_usage(
+                    ctx.trace,
+                    if system == DIRECT_SYSTEM {
+                        "executor"
+                    } else {
+                        self.name()
+                    },
+                    &self.llm.model,
+                );
+                anyhow::anyhow!(e.to_string())
+            })?;
         ctx.trace.emit(TraceEvent::ModelCall {
             agent: if system == DIRECT_SYSTEM {
                 "executor"

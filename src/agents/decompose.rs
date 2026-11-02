@@ -243,11 +243,10 @@ impl<'a> DecomposerAgent<'a> {
             shrunk: false,
             thinking_off: true,
         };
-        let resp = self
-            .llm
-            .complete(req)
-            .await
-            .map_err(|e| format!("decomposition call failed: {e}"))?;
+        let resp = self.llm.complete(req).await.map_err(|e| {
+            e.record_usage(trace, "decomposer", &self.llm.model);
+            format!("decomposition call failed: {e}")
+        })?;
         trace.emit(TraceEvent::ModelCall {
             agent: "decomposer".to_string(),
             model: self.llm.model.clone(),

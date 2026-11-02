@@ -1,4 +1,4 @@
-use super::{LlmClient, LlmError, LlmReq, LlmResp};
+use super::{LlmClient, LlmError, LlmReq, LlmResp, LlmUsage};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -57,6 +57,22 @@ struct Usage {
 struct PromptDetails {
     #[serde(default)]
     cached_tokens: Option<u64>,
+}
+
+impl Usage {
+    fn into_usage(self) -> LlmUsage {
+        LlmUsage {
+            input_tokens: self.prompt_tokens,
+            output_tokens: self.completion_tokens,
+            cached_input_tokens: self
+                .prompt_cache_hit_tokens
+                .or_else(|| self.prompt_tokens_details.and_then(|d| d.cached_tokens))
+                .unwrap_or(0),
+            cost_usd: self.cost,
+            attempts: 1,
+            latency_ms: 0,
+        }
+    }
 }
 
 /// A completion that hit the output ceiling is not a completion: the
@@ -319,6 +335,7 @@ impl LlmClient for OpenRouterClient {
         let t = Instant::now();
         // ponytail: retry lives here, not in every caller. Free tiers 429 often.
         let mut last = LlmError::Transport("no attempts".to_string());
+        let mut usage = LlmUsage::default();
         // Five shapes: the plain request, then four reshapes — low effort,
         // the vLLM thinking switch, reasoning off, and a roomier re-ask
         // (or a shrink re-ask when zero content shipped). The loop bound
@@ -328,14 +345,16 @@ impl LlmClient for OpenRouterClient {
                 tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
             }
             match self.once(model, &req).await {
-                Ok(r) => {
-                    return Ok(LlmResp {
-                        latency_ms: t.elapsed().as_millis() as u64,
-                        attempts: attempt as u64 + 1,
-                        ..r
-                    })
+                Ok(mut r) => {
+                    usage.add(&LlmUsage::from_response(&r));
+                    usage.attempts = attempt as u64 + 1;
+                    usage.latency_ms = t.elapsed().as_millis() as u64;
+                    usage.apply_to(&mut r);
+                    return Ok(r);
                 }
                 Err(e) => {
+                    usage.add(&e.usage());
+                    usage.attempts = attempt as u64 + 1;
                     let text = e.to_string();
                     let truncated = text.contains(FINISH_LENGTH);
                     last = e;
@@ -365,7 +384,8 @@ impl LlmClient for OpenRouterClient {
                 }
             }
         }
-        Err(last)
+        usage.latency_ms = t.elapsed().as_millis() as u64;
+        Err(last.with_usage(usage))
     }
 }
 
@@ -541,6 +561,10 @@ impl OpenRouterClient {
             .json()
             .await
             .map_err(|e| LlmError::Transport(e.to_string()))?;
+        let usage = body.usage.map(Usage::into_usage).unwrap_or(LlmUsage {
+            attempts: 1,
+            ..Default::default()
+        });
         let choice = body.choices.into_iter().next();
         // A truncation is reported as an error, not as an empty answer: the
         // retry loop above then re-asks, and a caller that counts model
@@ -570,7 +594,7 @@ impl OpenRouterClient {
                 req.max_tokens,
                 text.trim().len(),
                 reasoning
-            )));
+            )).with_usage(usage));
         }
         // A reply with no text is not an answer: some compat endpoints ship a
         // null `content` alongside a `reasoning_content` they never move out
@@ -585,26 +609,16 @@ impl OpenRouterClient {
         if text.trim().is_empty() {
             return Err(LlmError::Transport(format!(
                 "empty content from {model} (finish_reason={finish:?}; reasoning_content={reasoning} chars); the endpoint shipped no text"
-            )));
+            )).with_usage(usage));
         }
-        let (inp, out, cost, cached) = body
-            .usage
-            .map(|u| {
-                let cached = u
-                    .prompt_cache_hit_tokens
-                    .or_else(|| u.prompt_tokens_details.and_then(|d| d.cached_tokens))
-                    .unwrap_or(0);
-                (u.prompt_tokens, u.completion_tokens, u.cost, cached)
-            })
-            .unwrap_or((0, 0, None, 0));
         Ok(LlmResp {
             text,
-            input_tokens: inp,
-            output_tokens: out,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
             latency_ms: 0, // set by complete(), which owns the timer
-            cost_usd: cost,
-            cached_input_tokens: cached,
-            attempts: 1, // overwritten by complete() with the real attempt count
+            cost_usd: usage.cost_usd,
+            cached_input_tokens: usage.cached_input_tokens,
+            attempts: 1,
         })
     }
 }
@@ -667,8 +681,24 @@ impl OpenRouterClient {
             .map_err(|e| LlmError::Transport(e.to_string()))?;
         // The reasoning count is consumed inside `parse_responses` error
         // strings (the ladder's budget signal); `LlmResp` carries no row.
-        let (text, inp, out, cached, _reasoning) =
-            parse_responses(&parsed, req.max_tokens).map_err(LlmError::Transport)?;
+        let usage = LlmUsage {
+            input_tokens: parsed
+                .pointer("/usage/input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            output_tokens: parsed
+                .pointer("/usage/output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            cached_input_tokens: parsed
+                .pointer("/usage/input_tokens_details/cached_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            attempts: 1,
+            ..Default::default()
+        };
+        let (text, inp, out, cached, _reasoning) = parse_responses(&parsed, req.max_tokens)
+            .map_err(|error| LlmError::Transport(error).with_usage(usage))?;
         Ok(LlmResp {
             text,
             input_tokens: inp,
