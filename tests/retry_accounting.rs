@@ -325,3 +325,48 @@ async fn cancelling_stalled_retry_preserves_completed_attempt_spend() {
 async fn cancelling_fallback_preserves_primary_spend() {
     check_interrupted_usage(true).await;
 }
+
+#[tokio::test]
+async fn orchestrator_deadline_records_known_retry_spend() {
+    let (base, server) = server(vec![serde_json::json!({
+        "choices":[{"message":{"content":null,"reasoning_content":"thinking"},"finish_reason":"length"}],
+        "usage":{"prompt_tokens":100,"completion_tokens":20,"cost":0.01}
+    })]);
+    let root = std::env::temp_dir().join(format!("rof-usage-deadline-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let client = std::sync::Arc::new(OpenRouterClient::from_parts(base, "test".into()));
+    let trace = std::sync::Arc::new(rof::obs::TraceSink::new());
+    let mut cfg = rof::config::AppConfig::default();
+    cfg.limits.task_timeout_ms = 1000;
+    let registry = rof::tools::ToolRegistry::with_defaults(
+        root.clone(),
+        cfg.permissions.clone(),
+        cfg.skills.clone(),
+    );
+    let orch = rof::engine::Orchestrator::new(
+        cfg,
+        trace.clone(),
+        rof::llm::ContextService::new(client.clone(), "test".into()),
+        rof::llm::ExecutorService::new(client.clone(), "test".into(), None),
+        rof::llm::ExecutorService::new(client, "test".into(), None),
+    );
+    let result = orch
+        .run_outcome(
+            &rof::engine::Session::new("explain".into()).expecting_writes(false),
+            &registry,
+            &root,
+        )
+        .await;
+    server.join().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("deadline"));
+    assert_eq!(
+        trace.total_tokens(),
+        120,
+        "orchestrator must scope interrupted model usage"
+    );
+}

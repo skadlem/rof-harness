@@ -132,7 +132,7 @@ impl TreeService {
     /// attempt's checks still need. Called only when a retry follows, so the
     /// final state of a task stays in the copy for post-mortem reading.
     pub fn rollback(&self) -> anyhow::Result<()> {
-        self.git(["checkout", "--", "."])?;
+        self.git(["reset", "--hard", "--quiet", "HEAD"])?;
         self.git(["clean", "-fdq"])?;
         Ok(())
     }
@@ -218,7 +218,11 @@ impl TreeService {
     /// baseline wants, so HEAD already *is* the baseline.
     fn commit_all(&self, message: &str) -> anyhow::Result<()> {
         self.git(["add", "-A"])?;
-        let out = self.git_status(["commit", "--quiet", "-m", message])?;
+        let out = if self.head_unborn()? {
+            self.git_status(["commit", "--allow-empty", "--quiet", "-m", message])?
+        } else {
+            self.git_status(["commit", "--quiet", "-m", message])?
+        };
         if out.status.success() {
             return Ok(());
         }

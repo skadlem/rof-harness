@@ -343,6 +343,45 @@ impl EvaluationRunner {
     /// `run_suite`, which copies first.
     pub async fn run_task_in(&self, task: &EvalTask, workdir: PathBuf) -> TaskResult {
         let sink = Arc::new(self.trace.fork());
+        let timeout = std::time::Duration::from_millis(self.cfg.limits.task_timeout_ms.max(1));
+        let result =
+            tokio::time::timeout(timeout, self.run_task_in_inner(task, workdir, &sink)).await;
+        let row = match result {
+            Ok(row) => row,
+            Err(_) => {
+                let feedback = format!("harness: task deadline exceeded after {}ms (including baseline checks); inconclusive", timeout.as_millis());
+                sink.emit(crate::obs::TraceEvent::ModelError {
+                    agent: "harness".into(),
+                    error: feedback.clone(),
+                });
+                TaskResult {
+                    name: task.name.clone(),
+                    status: ExecutionStatus::Inconclusive,
+                    inconclusive_reps: 1,
+                    passed: false,
+                    expected: task.expect_pass,
+                    matched: false,
+                    rounds: 0,
+                    feedback,
+                    context: ContextMetrics::default(),
+                    checks: Vec::new(),
+                    check_baseline: Vec::new(),
+                    oracle_ok: None,
+                    reps: 1,
+                    passes: 0,
+                }
+            }
+        };
+        self.trace.extend(sink.events());
+        row
+    }
+
+    async fn run_task_in_inner(
+        &self,
+        task: &EvalTask,
+        workdir: PathBuf,
+        sink: &Arc<TraceSink>,
+    ) -> TaskResult {
         let mut cfg = self.cfg.clone();
         // Task-copy isolation: the agent sees only its own copy, never the
         // source tree and never config-declared extra dirs. Deliberate — a
@@ -368,7 +407,7 @@ impl EvaluationRunner {
             let probe = Session::new(task.goal.clone()).with_checks(oracle_names);
             let svc0 = crate::engine::session::RoundServices {
                 cfg: &cfg,
-                trace: &sink,
+                trace: sink,
                 context: &self.context,
                 executor: &self.executor,
                 verify: &self.verify,
@@ -386,7 +425,7 @@ impl EvaluationRunner {
             self.verify.clone(),
         );
         let out = orch
-            .run_loop(
+            .run_outcome(
                 &Session::new(task.goal.clone())
                     .with_checks(task.checks.clone())
                     .expecting_writes(task.expect_writes)
@@ -395,37 +434,18 @@ impl EvaluationRunner {
                 &workdir,
             )
             .await;
-        self.trace.extend(sink.events());
-        let orch_passed = out["passed"].as_bool().unwrap_or(false);
-        // The orchestrator records one entry per plan task, each with its own
-        // feedback and checks. Surface the first failure's reason and its
-        // checks (else the last entry's), so a MISMATCH line in the report is
-        // never blank and the flipped-check row names the task that failed.
-        let (feedback, checks): (String, Vec<crate::engine::CheckResult>) = {
-            let entries = out["tasks"].as_array().cloned().unwrap_or_default();
-            let failed = entries.iter().find(|t| {
-                !t["passed"].as_bool().unwrap_or(false)
-                    && !t["feedback"].as_str().unwrap_or("").is_empty()
-            });
-            let pick = failed.or_else(|| {
-                entries
-                    .iter()
-                    .rev()
-                    .find(|t| !t["feedback"].as_str().unwrap_or("").is_empty())
-            });
-            (
-                pick.and_then(|t| t["feedback"].as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                pick.and_then(|t| t["check_results"].as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|c| serde_json::from_value(c.clone()).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            )
-        };
+        let orch_passed = out.passed;
+        let inconclusive = out.error.is_some();
+        let pick = out
+            .tasks
+            .iter()
+            .find(|t| !t.passed && !t.feedback.is_empty())
+            .or_else(|| out.tasks.iter().rev().find(|t| !t.feedback.is_empty()));
+        let feedback = out
+            .error
+            .clone()
+            .unwrap_or_else(|| pick.map(|t| t.feedback.clone()).unwrap_or_default());
+        let checks = pick.map(|t| t.check_results.clone()).unwrap_or_default();
         // Oracle fold over the same final outcomes the report surfaces: a
         // declared split that did not hold fails the task even when the loop
         // passed. No declared split scores exactly as before.
@@ -442,14 +462,18 @@ impl EvaluationRunner {
         let passed = orch_passed && oracle.unwrap_or(true);
         TaskResult {
             name: task.name.clone(),
-            status: ExecutionStatus::Completed,
-            inconclusive_reps: 0,
+            status: if inconclusive {
+                ExecutionStatus::Inconclusive
+            } else {
+                ExecutionStatus::Completed
+            },
+            inconclusive_reps: u32::from(inconclusive),
             passed,
             expected: task.expect_pass,
-            matched: passed == task.expect_pass,
-            rounds: out["rounds"].as_u64().unwrap_or(0) as u32,
+            matched: !inconclusive && passed == task.expect_pass,
+            rounds: out.rounds,
             feedback,
-            context: ContextMetrics::from_run(&out),
+            context: ContextMetrics::from_run(&out.to_json()),
             checks,
             check_baseline: baseline,
             oracle_ok: oracle,

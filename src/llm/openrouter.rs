@@ -206,6 +206,12 @@ impl OpenRouterClient {
         // HTTP-library name; harmless everywhere else.
         reqwest::Client::builder()
             .user_agent(format!("rof/{}", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(std::time::Duration::from_millis(
+                crate::config::ExecutionLimits::default().connect_timeout_ms,
+            ))
+            .timeout(std::time::Duration::from_millis(
+                crate::config::ExecutionLimits::default().request_timeout_ms,
+            ))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     }

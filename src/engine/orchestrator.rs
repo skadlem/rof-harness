@@ -89,21 +89,6 @@ impl Orchestrator {
         }
     }
 
-    /// A successful rollback leaves an empty change set, and the snapshot must
-    /// say so: a pane still showing the reverted diff is exactly the
-    /// disagreement the engine-owned evidence exists to prevent.
-    ///
-    /// Only called on success — a failed rollback is best-effort and the tree
-    /// still holds the changes, so the previous snapshot remains true.
-    fn emit_rollback_cleared(&self) {
-        self.trace.emit(TraceEvent::DiffSnapshot {
-            names: Vec::new(),
-            stat: String::new(),
-            patch: String::new(),
-            truncated: false,
-        });
-    }
-
     /// §P3 item 6: does this task's oracle DISCRIMINATE?
     ///
     /// After a task's checks pass, the same commands are re-run against the
@@ -281,6 +266,67 @@ impl Orchestrator {
         workdir: &std::path::Path,
         hooks: &mut RunHooks<'_>,
     ) -> serde_json::Value {
+        self.run_outcome_with_hooks(session, tools, workdir, hooks)
+            .await
+            .to_json()
+    }
+
+    pub async fn run_outcome(
+        &self,
+        session: &Session,
+        tools: &ToolRegistry,
+        workdir: &std::path::Path,
+    ) -> super::RunOutcome {
+        let mut hooks = RunHooks::none();
+        self.run_outcome_with_hooks(session, tools, workdir, &mut hooks)
+            .await
+    }
+
+    pub async fn run_outcome_with_hooks(
+        &self,
+        session: &Session,
+        tools: &ToolRegistry,
+        workdir: &std::path::Path,
+        hooks: &mut RunHooks<'_>,
+    ) -> super::RunOutcome {
+        let limit = std::time::Duration::from_millis(self.cfg.limits.task_timeout_ms.max(1));
+        let result = tokio::time::timeout(
+            limit,
+            crate::llm::with_usage_trace(
+                self.trace.clone(),
+                self.run_inner_json(session, tools, workdir, hooks),
+            ),
+        )
+        .await;
+        let value = match result {
+            Ok(value) => value,
+            Err(_) => {
+                let error = format!(
+                    "task deadline exceeded after {}ms; outcome is inconclusive",
+                    limit.as_millis()
+                );
+                self.trace.emit(TraceEvent::ModelError {
+                    agent: "harness".into(),
+                    error: error.clone(),
+                });
+                let mut feedback = String::new();
+                self.emit_control_acks(hooks.apply_boundary(&mut feedback, true));
+                super::RunOutcome::failed(error).to_json()
+            }
+        };
+        let mut outcome = super::RunOutcome::decode(value);
+        outcome.recording_error = self.trace.recording_error();
+        outcome
+    }
+
+    async fn run_inner_json(
+        &self,
+        session: &Session,
+        tools: &ToolRegistry,
+        workdir: &std::path::Path,
+        hooks: &mut RunHooks<'_>,
+    ) -> serde_json::Value {
+        let mut infrastructure_error: Option<String> = None;
         self.trace.emit(TraceEvent::SessionStart {
             session_id: session.id.clone(),
             goal: session.goal.clone(),
@@ -548,7 +594,7 @@ impl Orchestrator {
             // round notes. Reset per attempt like the rest of the round
             // state, so attempts stay independent sequences.
             let mut digest = crate::engine::digest::RoundDigest::new();
-            let compact_on = crate::engine::digest::compact_enabled();
+            let compact_on = self.cfg.generation.compact;
             // Fresh-read evidence from a refused patch, for the next round.
             let mut refused = String::new();
             let mut artifact = serde_json::Value::Null;
@@ -603,13 +649,10 @@ impl Orchestrator {
                     to: format!("attempt_{attempt_no}"),
                 });
                 if attempt_no > 1 {
-                    if let Err(e) = tree.rollback() {
-                        self.trace.emit(TraceEvent::ModelError {
-                            agent: "tree".to_string(),
-                            error: format!("attempt rollback failed (continuing): {e}"),
-                        });
-                    } else {
-                        self.emit_rollback_cleared();
+                    if let Err(error) = super::round::rollback(&self.trace, &tree) {
+                        infrastructure_error =
+                            Some(format!("harness: git rollback failed: {error}"));
+                        break;
                     }
                     feedback = String::new();
                     digest = crate::engine::digest::RoundDigest::new();
@@ -632,30 +675,22 @@ impl Orchestrator {
                 let mut round = 1u32;
                 let mut poked = false;
                 while round <= rounds {
-                    // Token guard: stop before spending another expensive round.
-                    // O(1) — the sink totals at the emit choke point (§4.3).
-                    if let Some(spent) = budget.exceeded() {
-                        self.trace.emit(TraceEvent::BudgetExceeded {
-                            task: task.clone(),
-                            tokens: spent,
-                            limit,
-                        });
-                        budget_hit = Some(spent);
-                        break;
-                    }
-                    ran = round;
-                    // The baseline this attempt starts from and rolls back to
-                    // (§4.2), committed before the implementer touches anything.
-                    if let Err(e) = tree.baseline() {
-                        self.trace.emit(TraceEvent::ModelError {
-                            agent: "tree".to_string(),
-                            error: e.to_string(),
-                        });
-                        verdict = Verdict {
-                            pass: false,
-                            feedback: format!("harness: git baseline failed: {e}"),
-                        };
-                        break;
+                    match super::round::begin(&self.trace, task, limit, &budget, &tree) {
+                        Ok(()) => {
+                            ran = round;
+                        }
+                        Err(super::round::RoundStartError::Budget { spent, .. }) => {
+                            budget_hit = Some(spent);
+                            break;
+                        }
+                        Err(error) => {
+                            infrastructure_error = Some(error.to_string());
+                            verdict = Verdict {
+                                pass: false,
+                                feedback: error.to_string(),
+                            };
+                            break;
+                        }
                     }
                     // Digest prefix: raw below the floor, one cheap-model call
                     // at/above it, head+tail cut when that call fails. File
@@ -692,10 +727,17 @@ impl Orchestrator {
                                     );
                                     format!("ROUND HISTORY (compacted):\n{}\n", r.text)
                                 }
-                                Err(_) => format!(
-                                    "ROUND HISTORY:\n{}\n",
-                                    crate::engine::digest::head_tail(&raw, 1600)
-                                ),
+                                Err(error) => {
+                                    error.record_usage(
+                                        &self.trace,
+                                        "summarizer",
+                                        &self.context.model,
+                                    );
+                                    format!(
+                                        "ROUND HISTORY:\n{}\n",
+                                        crate::engine::digest::head_tail(&raw, 1600)
+                                    )
+                                }
                             }
                         } else {
                             format!("ROUND HISTORY:\n{raw}\n")
@@ -762,7 +804,13 @@ impl Orchestrator {
                                 agent: "implementer".to_string(),
                                 error: e.to_string(),
                             });
-                            artifact = serde_json::json!({"error": e.to_string()});
+                            let error = format!("harness: implementer failed: {e}");
+                            infrastructure_error = Some(error.clone());
+                            verdict = Verdict {
+                                pass: false,
+                                feedback: error,
+                            };
+                            break;
                         }
                     };
                     // The end-of-goal teaching step, reached only while
@@ -810,13 +858,10 @@ impl Orchestrator {
                     // artifact claims. A new file the model wrote counts; prose-only
                     // work reads back as zero; a self-report that disagrees with the
                     // tree loses to the tree. The same names feed recall (§4.4).
-                    let diff = match tree.diff() {
+                    let diff = match super::round::diff(&self.trace, &tree) {
                         Ok(diff) => diff,
                         Err(e) => {
-                            self.trace.emit(TraceEvent::ModelError {
-                                agent: "tree".to_string(),
-                                error: e.to_string(),
-                            });
+                            infrastructure_error = Some(format!("harness: git diff failed: {e}"));
                             verdict = Verdict {
                                 pass: false,
                                 feedback: format!("harness: git diff failed: {e}"),
@@ -901,10 +946,13 @@ impl Orchestrator {
                                 agent: "reviewer".to_string(),
                                 error: e.to_string(),
                             });
+                            let error = format!("harness: reviewer failed: {e}");
+                            infrastructure_error = Some(error.clone());
                             verdict = Verdict {
                                 pass: false,
-                                feedback: e.to_string(),
+                                feedback: error,
                             };
+                            break;
                         }
                     }
                     // Harness-side write gate: defense in depth against a
@@ -1019,16 +1067,10 @@ impl Orchestrator {
                             from: "reviewing".to_string(),
                             to: "rolled_back".to_string(),
                         });
-                        if let Err(e) = tree.rollback() {
-                            // Best effort: a failed rollback leaves the tree as it
-                            // is, the next baseline re-commits it, and the run
-                            // continues — the substrate is a means, not a result.
-                            self.trace.emit(TraceEvent::ModelError {
-                                agent: "tree".to_string(),
-                                error: format!("rollback failed (continuing): {e}"),
-                            });
-                        } else {
-                            self.emit_rollback_cleared();
+                        if let Err(error) = super::round::rollback(&self.trace, &tree) {
+                            infrastructure_error =
+                                Some(format!("harness: git rollback failed: {error}"));
+                            break;
                         }
                     }
                     // The retry's evidence, after the rollback: the tool verdicts,
@@ -1056,7 +1098,7 @@ impl Orchestrator {
                 // First pass wins: sequential attempts bill in order, so the
                 // first pass is the cheapest. A failed sequence falls through to
                 // the next attempt with a rolled-back tree.
-                if verdict.pass {
+                if verdict.pass || infrastructure_error.is_some() {
                     break;
                 }
             } // end attempts loop
@@ -1066,7 +1108,7 @@ impl Orchestrator {
               // rolled it back; this one did not). Reported, never a gate: a
               // null result means the probe did not apply, a filled one never
               // changes `verdict.pass` above.
-            let oracle_probe = if verdict.pass {
+            let oracle_probe = if verdict.pass && infrastructure_error.is_none() {
                 self.probe_oracle_discrimination(session, &svc, &tree, workdir, task)
                     .await
             } else {
@@ -1097,7 +1139,8 @@ impl Orchestrator {
             // `expect_writes`, same. A protected path modified, same. An
             // aborted task never appeals — the budget, not the judge, decided
             // that one.
-            let deterministics_green = !check_results.is_empty()
+            let deterministics_green = infrastructure_error.is_none()
+                && !check_results.is_empty()
                 && crate::engine::session::checks_pass(&check_results)
                 && (!session.expect_writes || writes_made > 0)
                 && task_oracle_tampered.is_empty();
@@ -1162,7 +1205,7 @@ impl Orchestrator {
             from: "reviewing".to_string(),
             to: "done".to_string(),
         });
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "plan": plan_out.data,
             "tasks": task_results,
             "rounds": total_rounds,
@@ -1184,6 +1227,10 @@ impl Orchestrator {
             // were never folded into the layer accounts anyway.
             "ctx_tokens": 0,
         });
+        if let Some(error) = infrastructure_error {
+            out["error"] = error.into();
+            out["passed"] = false.into();
+        }
         // The run's terminal boundary for the research note: after the last
         // change-set read and after the drain above, so a `.rof/` entry can
         // never be the change that opened a write-gated task, and so the next
@@ -1201,6 +1248,7 @@ impl Orchestrator {
         hooks: &mut RunHooks<'_>,
         research: &crate::agents::research::Consulted,
     ) -> serde_json::Value {
+        let mut infrastructure_error: Option<String> = None;
         let builder = ContextBuilder::with_policy(self.cfg.context_policy());
         let retriever = Retriever::new(workdir.to_path_buf(), self.cfg.retrieval.clone());
         let snips = retriever.retrieve(&session.goal, self.cfg.retrieval.max_total_chars);
@@ -1283,13 +1331,9 @@ impl Orchestrator {
             // Fresh per-attempt state; the tree rolls back between attempts
             // so each sequence starts from the baseline.
             if attempt_no > 1 {
-                if let Err(e) = tree.rollback() {
-                    self.trace.emit(TraceEvent::ModelError {
-                        agent: "tree".to_string(),
-                        error: format!("attempt rollback failed (continuing): {e}"),
-                    });
-                } else {
-                    self.emit_rollback_cleared();
+                if let Err(error) = super::round::rollback(&self.trace, tree) {
+                    infrastructure_error = Some(format!("harness: git rollback failed: {error}"));
+                    break;
                 }
                 feedback = String::new();
                 artifact = serde_json::Value::Null;
@@ -1304,23 +1348,13 @@ impl Orchestrator {
             let mut cap = max_rounds;
             while round <= cap {
                 rounds = round;
-                // Token guard: O(1) — the sink totals at the emit choke point.
-                if let Some(spent) = budget.exceeded() {
-                    self.trace.emit(TraceEvent::BudgetExceeded {
-                        task: session.goal.clone(),
-                        tokens: spent,
-                        limit,
-                    });
-                    feedback = format!("aborted: token budget exceeded ({spent} > {limit})");
-                    break;
-                }
-                // The baseline this attempt starts from and rolls back to (§4.2).
-                if let Err(e) = tree.baseline() {
-                    self.trace.emit(TraceEvent::ModelError {
-                        agent: "tree".to_string(),
-                        error: e.to_string(),
-                    });
-                    feedback = format!("harness: git baseline failed: {e}");
+                if let Err(error) =
+                    super::round::begin(&self.trace, &session.goal, limit, &budget, tree)
+                {
+                    if matches!(error, super::round::RoundStartError::Baseline(_)) {
+                        infrastructure_error = Some(error.to_string());
+                    }
+                    feedback = error.to_string();
                     break;
                 }
                 let state = CtxState {
@@ -1364,7 +1398,8 @@ impl Orchestrator {
                             agent: "executor".to_string(),
                             error: e.to_string(),
                         });
-                        feedback = e.to_string();
+                        feedback = format!("harness: executor failed: {e}");
+                        infrastructure_error = Some(feedback.clone());
                         break;
                     }
                 }
@@ -1381,13 +1416,10 @@ impl Orchestrator {
                 check_results = task_checks;
                 // Write gate (§4.2): git's change set is the count, not the
                 // artifact's self-report; the same names feed recall (§4.4).
-                let diff = match tree.diff() {
+                let diff = match super::round::diff(&self.trace, tree) {
                     Ok(diff) => diff,
                     Err(e) => {
-                        self.trace.emit(TraceEvent::ModelError {
-                            agent: "tree".to_string(),
-                            error: e.to_string(),
-                        });
+                        infrastructure_error = Some(format!("harness: git diff failed: {e}"));
                         feedback = format!("harness: git diff failed: {e}");
                         break;
                     }
@@ -1496,13 +1528,10 @@ impl Orchestrator {
                         from: "direct_executing".to_string(),
                         to: "rolled_back".to_string(),
                     });
-                    if let Err(e) = tree.rollback() {
-                        self.trace.emit(TraceEvent::ModelError {
-                            agent: "tree".to_string(),
-                            error: format!("rollback failed (continuing): {e}"),
-                        });
-                    } else {
-                        self.emit_rollback_cleared();
+                    if let Err(error) = super::round::rollback(&self.trace, tree) {
+                        infrastructure_error =
+                            Some(format!("harness: git rollback failed: {error}"));
+                        break;
                     }
                 }
                 // P1b round boundary, the same place the pipeline loop drains:
@@ -1517,7 +1546,7 @@ impl Orchestrator {
             // v4 verify guard: one post-hoc independent-judge pass over a task
             // the inner loop scored as pass. A veto turns the attempt back into
             // a failure with the veto note as feedback (off by default).
-            if passed {
+            if passed && infrastructure_error.is_none() {
                 if let Some(veto) = svc
                     .verify_guard(&session.goal, &artifact, &check_results)
                     .await
@@ -1540,7 +1569,7 @@ impl Orchestrator {
             // the same reason its protected-oracle gate is applied there
             // unconditionally: with no reviewer, the configured check suite
             // IS the oracle, so a vacuous one is at least as dangerous here.
-            let oracle_probe = if passed {
+            let oracle_probe = if passed && infrastructure_error.is_none() {
                 self.probe_oracle_discrimination(session, svc, tree, workdir, &session.goal)
                     .await
             } else {
@@ -1579,7 +1608,7 @@ impl Orchestrator {
                 }));
                 break;
             }
-            if attempt_no >= attempts {
+            if attempt_no >= attempts || infrastructure_error.is_some() {
                 best_billed = billed_now;
                 best_json = Some(serde_json::json!({
                     "tasks": [{
@@ -1601,6 +1630,9 @@ impl Orchestrator {
                     "lesson": goal_lesson,
                 }));
             }
+            if infrastructure_error.is_some() {
+                break;
+            }
         } // end attempts loop
         let _ = best_billed;
 
@@ -1619,13 +1651,26 @@ impl Orchestrator {
         });
         // The per-attempt snapshot above carries tasks/rounds/passed; fold
         // the accumulator counters into it so reports keep their fields.
-        let mut out = best_json.unwrap_or_else(|| serde_json::json!({"passed": false}));
+        let mut out = best_json.unwrap_or_else(|| {
+            serde_json::json!({
+                "passed": false, "rounds": rounds, "tasks": [{
+                    "task": session.goal, "passed": false, "rounds": rounds,
+                    "feedback": feedback, "check_results": check_results,
+                    "artifact": artifact, "writes_made": writes_made,
+                    "changed_files": changed_files, "diff_stat": diff_stat,
+                }],
+            })
+        });
         out["summarize_calls"] = serde_json::json!(acc.summarize_calls);
         out["summarize_tokens"] = serde_json::json!(acc.summarize_tokens);
         out["truncated_views"] = serde_json::json!(acc.truncated_views);
         out["layer_summaries"] = serde_json::json!(acc.layer_summaries);
         out["layer_truncations"] = serde_json::json!(acc.layer_truncations);
         out["eliminated_chars"] = serde_json::json!(acc.eliminated_chars);
+        if let Some(error) = infrastructure_error {
+            out["error"] = error.into();
+            out["passed"] = false.into();
+        }
         // Terminal boundary for the research note, for the same reason the
         // pipeline loop does it there: after every change-set read.
         research.write_back(workdir, &self.trace);

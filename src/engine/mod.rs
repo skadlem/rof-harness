@@ -9,3 +9,6 @@ pub use orchestrator::Orchestrator;
 pub use router::{ModelRouter, Role};
 pub use session::{render_checks, veto_note_for_test, Budget, CheckResult, RoundServices, Session};
 pub use tree::{PatchText, TreeDiff, TreeService};
+pub mod outcome;
+pub use outcome::{RunOutcome, TaskOutcome};
+mod round;

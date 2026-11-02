@@ -99,8 +99,8 @@ impl GoalRunner {
             cfg.skills.clone(),
         );
         let orch = Orchestrator::new(cfg, self.trace.clone(), context, executor, verify);
-        let value = orch
-            .run_loop_with_hooks(
+        let outcome = orch
+            .run_outcome_with_hooks(
                 &Session::new(goal.to_string())
                     .with_checks(checks)
                     .expecting_writes(expect_writes),
@@ -109,11 +109,14 @@ impl GoalRunner {
                 hooks,
             )
             .await;
-        let passed = value["passed"].as_bool().unwrap_or(false);
-        let error = value
-            .get("error")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let passed = outcome.passed;
+        let error = outcome.error.clone().or_else(|| {
+            outcome
+                .recording_error
+                .as_ref()
+                .map(|e| format!("trace recording incomplete: {e}"))
+        });
+        let value = outcome.to_json();
         Ok(GoalResult {
             value,
             passed,
@@ -787,7 +790,13 @@ async fn main() -> anyhow::Result<()> {
             for t in &rep.tasks {
                 println!(
                     "  [{}] {} rounds={} recall={}/{} {}",
-                    if t.matched { "OK" } else { "MISMATCH" },
+                    if t.status == rof::eval::ExecutionStatus::Inconclusive {
+                        "INCONCLUSIVE"
+                    } else if t.matched {
+                        "OK"
+                    } else {
+                        "MISMATCH"
+                    },
                     t.name,
                     t.rounds,
                     t.context.recalled_files,
@@ -798,7 +807,7 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "matched {}/{} ({:.0}%) | tool accuracy: {:.0}% | tokens in/out {}/{} | billed {} | cache-hit {:.0}% | utility {:.3}",
                 rep.matched(),
-                rep.tasks.len(),
+                rep.completed(),
                 rep.success_rate() * 100.0,
                 rep.aggregate.tool_accuracy() * 100.0,
                 rep.aggregate.est_input_tokens,
@@ -807,6 +816,15 @@ async fn main() -> anyhow::Result<()> {
                 rep.aggregate.cache_hit_rate() * 100.0,
                 rep.aggregate.utility(),
             );
+            if rep.aggregate.inconclusive_tasks > 0 {
+                println!(
+                    "inconclusive executions: {} (excluded from verdict rate)",
+                    rep.aggregate.inconclusive_tasks
+                );
+            }
+            if let Some(error) = &rep.recording_error {
+                eprintln!("evidence incomplete: trace recording failed: {error}");
+            }
             println!(
                 "cost: est ${:.5} (table) | provider-reported {}",
                 rep.aggregate.est_cost_usd,
@@ -1499,7 +1517,14 @@ mod tests {
         assert_eq!(
             implementer_rounds(&worker.runner.trace),
             4,
-            "expected two rounds per goal, not one: the first boundary was terminal"
+            "expected two rounds per goal, not one: the first boundary was terminal; errors={:?}",
+            worker
+                .runner
+                .trace
+                .events()
+                .iter()
+                .filter(|event| matches!(event, TraceEvent::ModelError { .. }))
+                .collect::<Vec<_>>()
         );
 
         // With the control acks projected out, the goal/session sequence is
