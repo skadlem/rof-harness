@@ -221,6 +221,7 @@ pub struct ExecutorService {
     client: Arc<dyn LlmClient>,
     pub model: String,
     pub fallback: Option<String>,
+    pub generation: crate::config::GenerationConfig,
 }
 
 impl ExecutorService {
@@ -229,7 +230,12 @@ impl ExecutorService {
             client,
             model,
             fallback,
+            generation: crate::config::GenerationConfig::from_env(),
         }
+    }
+    pub fn with_generation(mut self, generation: crate::config::GenerationConfig) -> Self {
+        self.generation = generation;
+        self
     }
     pub async fn complete(&self, req: LlmReq) -> Result<LlmResp, LlmError> {
         match self.client.complete(&self.model, req.clone()).await {

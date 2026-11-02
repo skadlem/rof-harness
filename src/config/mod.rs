@@ -54,6 +54,7 @@ impl Default for RoutingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PermissionPolicy {
+    pub command_timeout_ms: u64,
     pub allowed_dirs: Vec<PathBuf>,
     /// BTreeMap (not HashMap): identical configs must dump byte-identically,
     /// or versioned configs cannot be diffed.
@@ -108,6 +109,7 @@ impl Default for PermissionPolicy {
             ],
         );
         Self {
+            command_timeout_ms: 300_000,
             allowed_dirs: Vec::new(),
             agents_tools,
             allowed_commands: Vec::new(),
@@ -185,9 +187,98 @@ impl Default for SkillsConfig {
     }
 }
 
+/// Behavior-changing generation settings captured once per goal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GenerationConfig {
+    pub thinking: String,
+    pub implementer_max_tokens: usize,
+    pub reviewer_max_tokens: usize,
+    pub reask_budget: Option<usize>,
+    pub compact: bool,
+    pub reasoning_effort: Option<String>,
+}
+
+impl Default for GenerationConfig {
+    fn default() -> Self {
+        Self {
+            thinking: "on".to_string(),
+            implementer_max_tokens: 8192,
+            reviewer_max_tokens: 4096,
+            reask_budget: None,
+            compact: false,
+            reasoning_effort: None,
+        }
+    }
+}
+
+impl GenerationConfig {
+    /// Preserve config-file values when an override is absent or invalid.
+    pub fn apply_env(&mut self) {
+        let mode = |key| {
+            std::env::var(key)
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+        };
+        if let Some(v) = mode("ROF_THINKING").filter(|v| matches!(v.as_str(), "on" | "off" | "low"))
+        {
+            self.thinking = v;
+        }
+        for (key, cap) in [
+            (
+                "ROF_IMPLEMENTER_MAX_TOKENS",
+                &mut self.implementer_max_tokens,
+            ),
+            ("ROF_REVIEWER_MAX_TOKENS", &mut self.reviewer_max_tokens),
+        ] {
+            if let Some(n) = mode(key).and_then(|v| v.parse::<usize>().ok()) {
+                *cap = n.clamp(1024, 32768);
+            }
+        }
+        if let Some(n) = mode("ROF_REASK_BUDGET").and_then(|v| v.parse().ok()) {
+            self.reask_budget = Some(n);
+        }
+        if let Some(v) = mode("ROF_COMPACT") {
+            self.compact = matches!(v.as_str(), "yes" | "true" | "1");
+        }
+        if let Some(v) = mode("ROF_REASONING_EFFORT")
+            .filter(|v| matches!(v.as_str(), "low" | "medium" | "high" | "none"))
+        {
+            self.reasoning_effort = Some(v);
+        }
+    }
+
+    /// Convenience for embedders; CLI runs use the resolved AppConfig snapshot.
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        cfg.apply_env();
+        cfg
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExecutionLimits {
+    pub connect_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub task_timeout_ms: u64,
+}
+
+impl Default for ExecutionLimits {
+    fn default() -> Self {
+        Self {
+            connect_timeout_ms: 10_000,
+            request_timeout_ms: 120_000,
+            task_timeout_ms: 900_000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    pub generation: GenerationConfig,
+    pub limits: ExecutionLimits,
     pub budgets: TokenBudgets,
     /// Stage 2 per-layer policy (budgets, strategy, summarize threshold).
     /// `None` = derive from `budgets`, so a config file that never mentions
@@ -438,6 +529,8 @@ impl AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            generation: GenerationConfig::default(),
+            limits: ExecutionLimits::default(),
             budgets: TokenBudgets::default(),
             context: None,
             routing: RoutingConfig::default(),

@@ -325,6 +325,24 @@ fn report_arg(args: &[String]) -> Option<String> {
 
 /// Env overrides. Seeded empty strings are ignored so `VAR= rof ...` is a no-op.
 fn apply_env(cfg: &mut AppConfig) {
+    cfg.generation.apply_env();
+    for (key, limit) in [
+        ("ROF_CONNECT_TIMEOUT_MS", &mut cfg.limits.connect_timeout_ms),
+        ("ROF_REQUEST_TIMEOUT_MS", &mut cfg.limits.request_timeout_ms),
+        ("ROF_TASK_TIMEOUT_MS", &mut cfg.limits.task_timeout_ms),
+        (
+            "ROF_COMMAND_TIMEOUT_MS",
+            &mut cfg.permissions.command_timeout_ms,
+        ),
+    ] {
+        if let Some(n) = std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+        {
+            *limit = n;
+        }
+    }
     let get = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
     if let Some(m) = get("ROF_CTX_MODEL") {
         cfg.routing.context_model = m;
@@ -499,11 +517,7 @@ fn split_list(s: &str) -> Vec<String> {
 /// into a dedicated client; a bare id (or a provider with no base/key)
 /// rides the shared client. Never a startup error — an unresolvable binding
 /// falls back to shared, and the call fails at call time naming the model.
-fn role_client(
-    model_id: &str,
-    shared: &Arc<dyn LlmClient>,
-    profile: &rof::llm::profile::EndpointProfile,
-) -> Arc<dyn LlmClient> {
+fn role_client(model_id: &str, shared: &Arc<dyn LlmClient>, cfg: &AppConfig) -> Arc<dyn LlmClient> {
     let (prov, _) = rof::tui::auth::split_provider_model(model_id);
     if prov.is_empty() {
         return shared.clone();
@@ -511,10 +525,11 @@ fn role_client(
     let base = rof::tui::auth::base_for_test(prov);
     let key = rof::tui::auth::key_for(prov);
     match (base, key) {
-        (Ok(b), Some(k)) => {
-            Arc::new(OpenRouterClient::from_parts(b, k).with_profile(profile.clone()))
-                as Arc<dyn LlmClient>
-        }
+        (Ok(b), Some(k)) => Arc::new(
+            OpenRouterClient::from_parts(b, k)
+                .with_profile(cfg.endpoint.clone())
+                .with_runtime(&cfg.generation, &cfg.limits),
+        ) as Arc<dyn LlmClient>,
         _ => shared.clone(),
     }
 }
@@ -530,10 +545,19 @@ fn build_services(
     // clients, so a model move re-tunes config, not code. Defaults keep
     // every existing run byte-identical.
     let real: Option<Arc<dyn LlmClient>> = OpenRouterClient::from_compat_env()
-        .map(|c| Arc::new(c.with_profile(cfg.endpoint.clone())) as Arc<dyn LlmClient>)
+        .map(|c| {
+            Arc::new(
+                c.with_profile(cfg.endpoint.clone())
+                    .with_runtime(&cfg.generation, &cfg.limits),
+            ) as Arc<dyn LlmClient>
+        })
         .or_else(|| {
-            OpenRouterClient::from_env()
-                .map(|c| Arc::new(c.with_profile(cfg.endpoint.clone())) as Arc<dyn LlmClient>)
+            OpenRouterClient::from_env().map(|c| {
+                Arc::new(
+                    c.with_profile(cfg.endpoint.clone())
+                        .with_runtime(&cfg.generation, &cfg.limits),
+                ) as Arc<dyn LlmClient>
+            })
         });
     let (ctx_model, _) = router.resolve(Role::Context);
     let (exec_model, exec_fb) = router.resolve(Role::Executor);
@@ -542,14 +566,19 @@ fn build_services(
         Some(c) => {
             let via = std::env::var("ROF_CHAT_BASE").unwrap_or("openrouter".to_string());
             // BYOK bindings ride per role; everything else shares `c`.
-            let ctx_client = role_client(ctx_model, c, &cfg.endpoint);
-            let exec_client = role_client(exec_model, c, &cfg.endpoint);
+            let ctx_client = role_client(ctx_model, c, cfg);
+            let exec_client = role_client(exec_model, c, cfg);
             // §4.5 arm #4: the judge may sit on a different provider than
             // the executor. Its own client changes nothing when the env is
             // unset — same shared client, identical run.
             let judge = OpenRouterClient::from_verify_env()
-                .map(|j| Arc::new(j.with_profile(cfg.endpoint.clone())) as Arc<dyn LlmClient>)
-                .unwrap_or_else(|| role_client(verify_model, c, &cfg.endpoint));
+                .map(|j| {
+                    Arc::new(
+                        j.with_profile(cfg.endpoint.clone())
+                            .with_runtime(&cfg.generation, &cfg.limits),
+                    ) as Arc<dyn LlmClient>
+                })
+                .unwrap_or_else(|| role_client(verify_model, c, cfg));
             if announce {
                 if verify_model == exec_model {
                     println!("llm: {via} (ctx={ctx_model}, exec={exec_model})");
@@ -565,12 +594,14 @@ fn build_services(
                     exec_client,
                     exec_model.to_string(),
                     exec_fb.map(str::to_string),
-                ),
+                )
+                .with_generation(cfg.generation.clone()),
                 ExecutorService::new(
                     judge,
                     verify_model.to_string(),
                     verify_fb.map(str::to_string),
-                ),
+                )
+                .with_generation(cfg.generation.clone()),
             )
         }
         None => {
@@ -579,8 +610,10 @@ fn build_services(
             }
             (
                 ContextService::new(Arc::new(StubClient), "context-stub".to_string()),
-                ExecutorService::new(Arc::new(StubClient), "executor-stub".to_string(), None),
-                ExecutorService::new(Arc::new(StubClient), "verify-stub".to_string(), None),
+                ExecutorService::new(Arc::new(StubClient), "executor-stub".to_string(), None)
+                    .with_generation(cfg.generation.clone()),
+                ExecutorService::new(Arc::new(StubClient), "verify-stub".to_string(), None)
+                    .with_generation(cfg.generation.clone()),
             )
         }
     }

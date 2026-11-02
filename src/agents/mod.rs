@@ -62,7 +62,7 @@ pub(crate) fn thinking_start() -> (bool, bool, bool) {
     )
 }
 
-fn thinking_flags(mode: &str) -> (bool, bool, bool) {
+pub(crate) fn thinking_flags(mode: &str) -> (bool, bool, bool) {
     match mode {
         "off" => (true, true, false),
         "low" => (false, false, true),

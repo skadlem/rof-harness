@@ -1,4 +1,4 @@
-use super::{max_tokens_from_env, reask_diet_budget, thinking_start, Agent, AgentCtx, AgentOutput};
+use super::{reask_diet_budget, thinking_flags, Agent, AgentCtx, AgentOutput};
 use crate::context::retriever::window_on;
 use crate::context::{Assembly, ContextAssembler, ContextItem, Fidelity, ItemKey};
 use crate::llm::LlmReq;
@@ -270,7 +270,11 @@ impl ImplementerAgent<'_> {
                 // ROF_REASK_BUDGET assembles the re-ask lean with the turn's
                 // own evidence first; unset is the historical full re-send.
                 let diet = reask_diet_budget(
-                    std::env::var("ROF_REASK_BUDGET").ok().as_deref(),
+                    self.llm
+                        .generation
+                        .reask_budget
+                        .map(|n| n.to_string())
+                        .as_deref(),
                     ctx.volatile_budget,
                 );
                 let assembly = match diet {
@@ -662,13 +666,18 @@ impl ImplementerAgent<'_> {
         prompt: &str,
         system: &str,
     ) -> anyhow::Result<serde_json::Value> {
-        let (thinking_off, reasoning_off, reasoning_low) = thinking_start();
+        let (thinking_off, reasoning_off, reasoning_low) =
+            thinking_flags(&self.llm.generation.thinking);
         let resp = self
             .llm
             .complete(LlmReq {
                 system: system.to_string(),
                 prompt: prompt.to_string(),
-                max_tokens: max_tokens_from_env("ROF_IMPLEMENTER_MAX_TOKENS", 8192),
+                max_tokens: self
+                    .llm
+                    .generation
+                    .implementer_max_tokens
+                    .clamp(1024, 32768),
                 reasoning_off,
                 reasoning_low,
                 roomier: false,

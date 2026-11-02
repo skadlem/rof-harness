@@ -225,6 +225,27 @@ impl OpenRouterClient {
         }
     }
 
+    /// Bind the effective goal configuration rather than reading ambient env
+    /// while a request is in flight. Both HTTP phases have finite deadlines.
+    pub fn with_runtime(
+        mut self,
+        generation: &crate::config::GenerationConfig,
+        limits: &crate::config::ExecutionLimits,
+    ) -> Self {
+        self.effort = generation.reasoning_effort.clone();
+        self.http = reqwest::Client::builder()
+            .user_agent(format!("rof/{}", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(std::time::Duration::from_millis(
+                limits.connect_timeout_ms.max(1),
+            ))
+            .timeout(std::time::Duration::from_millis(
+                limits.request_timeout_ms.max(1),
+            ))
+            .build()
+            .expect("valid runtime HTTP client configuration");
+        self
+    }
+
     /// Override the endpoint capability (wired from config in `main`).
     pub fn with_profile(mut self, profile: crate::llm::profile::EndpointProfile) -> Self {
         self.profile = profile;

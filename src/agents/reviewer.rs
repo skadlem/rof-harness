@@ -1,4 +1,4 @@
-use super::{max_tokens_from_env, thinking_start, Agent, AgentCtx, AgentOutput};
+use super::{thinking_flags, Agent, AgentCtx, AgentOutput};
 use crate::llm::LlmReq;
 use crate::obs::TraceEvent;
 use async_trait::async_trait;
@@ -29,7 +29,8 @@ impl Agent for ReviewerAgent<'_> {
         "reviewer"
     }
     async fn run(&self, ctx: AgentCtx<'_>) -> anyhow::Result<AgentOutput> {
-        let (thinking_off, reasoning_off, reasoning_low) = thinking_start();
+        let (thinking_off, reasoning_off, reasoning_low) =
+            thinking_flags(&self.llm.generation.thinking);
         // §6: the reviewer's turn is exactly `ctx.view.prompt` — nothing is
         // appended below it — so the view is the whole context and measuring
         // it here is measuring the request, not a proxy for it. The reviewer
@@ -44,7 +45,7 @@ impl Agent for ReviewerAgent<'_> {
             system: "You are a reviewer. Given PLAN and ARTIFACT, output JSON {pass: bool, feedback: string}. Rules: (1) if EXPECT WRITES is yes and WRITES MADE is 0, fail — prose is not a deliverable; (2) if CHECKS shows real command output, a failure there means fail; (3) if CHECKS says (none configured), judge the artifact itself and never fail merely for missing evidence. When the round taught a rule that generalizes beyond this task (a mistake to avoid, a procedure that worked), name it in feedback as `SKILL: <when to use it> — <the one rule>`; the implementer records those as skills a human approves."
                 .to_string(),
             prompt: ctx.view.prompt.clone(),
-            max_tokens: max_tokens_from_env("ROF_REVIEWER_MAX_TOKENS", 4096),
+            max_tokens: self.llm.generation.reviewer_max_tokens.clamp(1024, 32768),
             reasoning_off,
             reasoning_low,
             roomier: false,
