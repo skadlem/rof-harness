@@ -429,10 +429,13 @@ pub fn compare(a: &SuiteReport, b: &SuiteReport) -> Comparison {
 fn label_delta(a: &RunLabel, b: &RunLabel) -> Vec<LabelDelta> {
     let fields = [
         ("git_head", &a.git_head, &b.git_head),
+        ("harness_revision", &a.harness_revision, &b.harness_revision),
+        ("target_tree_hash", &a.target_tree_hash, &b.target_tree_hash),
         ("config_hash", &a.config_hash, &b.config_hash),
         ("suite_hash", &a.suite_hash, &b.suite_hash),
         ("ctx_model", &a.ctx_model, &b.ctx_model),
         ("exec_model", &a.exec_model, &b.exec_model),
+        ("verify_model", &a.verify_model, &b.verify_model),
         ("harness_version", &a.harness_version, &b.harness_version),
     ];
     fields
@@ -485,9 +488,15 @@ fn comparability_notes(a: &SuiteReport, b: &SuiteReport) -> Vec<String> {
                     .to_string(),
             );
         }
+        if a.label.harness_revision != b.label.harness_revision {
+            notes.push("harness_revision differs: the harness binary changed".to_string());
+        }
+        if a.label.target_tree_hash != b.label.target_tree_hash {
+            notes.push("target_tree_hash differs: the target source inputs changed".to_string());
+        }
         if a.label.git_head != b.label.git_head {
             notes.push(format!(
-                "git_head differs: harness revision moved {} -> {}",
+                "git_head differs: target revision moved {} -> {}",
                 a.label.git_head, b.label.git_head
             ));
         }

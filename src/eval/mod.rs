@@ -1,5 +1,6 @@
 pub mod compare;
 pub mod metrics;
+mod provenance;
 pub mod runner;
 pub mod suite;
 pub use compare::{compare, CheckFlip, Comparison, LabelDelta, MetricDelta, TaskChange, TaskDelta};

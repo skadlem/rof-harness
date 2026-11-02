@@ -22,6 +22,15 @@ use std::sync::Arc;
 pub struct RunLabel {
     /// Short HEAD of the tree the suite ran against; "unknown" outside a repo.
     pub git_head: String,
+    /// Revision of the harness binary, independent of the target repository.
+    #[serde(default)]
+    pub harness_revision: String,
+    /// Git-visible tracked/untracked target inputs, including dirty content.
+    /// Empty means provenance is unavailable, including older reports.
+    #[serde(default)]
+    pub target_tree_hash: String,
+    #[serde(default)]
+    pub target_dirty: bool,
     pub config_hash: String,
     pub suite_hash: String,
     pub ctx_model: String,
@@ -46,8 +55,12 @@ impl RunLabel {
         } else {
             cfg.routing.context_model.clone()
         };
+        let target = super::provenance::snapshot(workdir);
         Self {
             git_head: git_head(workdir),
+            harness_revision: env!("ROF_BUILD_REVISION").to_string(),
+            target_dirty: target.as_ref().is_some_and(|state| state.dirty),
+            target_tree_hash: target.map(|state| state.hash).unwrap_or_default(),
             config_hash: fnv1a_hex(cfg.to_json().as_bytes()),
             suite_hash: fnv1a_hex(serde_json::to_string(suite).unwrap_or_default().as_bytes()),
             ctx_model,
@@ -79,8 +92,19 @@ impl RunLabel {
             &self.verify_model
         };
         format!(
-            "git {} cfg {} suite {} ctx {} exec {} verify {} v{}",
+            "git {} tree {}{} harness {} cfg {} suite {} ctx {} exec {} verify {} v{}",
             self.git_head,
+            if self.target_tree_hash.is_empty() {
+                "unknown"
+            } else {
+                &self.target_tree_hash
+            },
+            if self.target_dirty { " (dirty)" } else { "" },
+            if self.harness_revision.is_empty() {
+                "unknown"
+            } else {
+                &self.harness_revision
+            },
             self.config_hash,
             self.suite_hash,
             self.ctx_model,
