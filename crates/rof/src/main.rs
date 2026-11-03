@@ -82,6 +82,44 @@ fn policy_for(args: &Args) -> tools_std::Policy {
     }
 }
 
+fn preserve_log(path: &Path, workdir: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+        Ok(_) => {}
+    }
+    let canonical_workdir = workdir.canonicalize()?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = parent.canonicalize()?;
+    let archive_dir = if canonical_parent.starts_with(&canonical_workdir) {
+        canonical_workdir
+            .parent()
+            .ok_or_else(|| std::io::Error::other("workdir has no parent"))?
+    } else {
+        &canonical_parent
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("log has no file name"))?
+        .to_string_lossy();
+    for n in 0u64.. {
+        let archive = archive_dir.join(format!("{name}.{}.{}.bak", std::process::id(), n));
+        match std::fs::hard_link(path, &archive) {
+            Ok(()) => {
+                std::fs::remove_file(path)?;
+                eprintln!("preserved previous WAL at {}", archive.display());
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
 async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     let policy = Arc::new(policy_for(args));
     let mut reg = tool_core::Registry::new(Arc::new(GrantGate::new(HashMap::from([(
@@ -116,14 +154,20 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
             }
         }
     });
-    // One run, one log / one dump: truncate stale sidecars BEFORE the initial
-    // `ensure()` commit so they are never staged into it. The WAL truncate is
-    // load-bearing beyond git: `seq` restarts per run while `LogWriter` only
-    // appends, so a kept stale log would fail gapless-from-1 validation — the
-    // shipped path replaces it, same documented deal as `--dump-events`.
+    // A fresh run restarts log sequence numbers; preserve the prior WAL
+    // outside the workdir before creating a new one.
     let log_path = resolve_log_path(args);
     if let Some(p) = log_path.as_deref() {
-        let _ = std::fs::remove_file(p);
+        if let Err(e) = preserve_log(p, &args.workdir) {
+            return RunResult {
+                outcome: Outcome::Failed {
+                    kind: FailureKind::Log,
+                    message: format!("cannot preserve WAL: {e}"),
+                },
+                patch: Err("run did not start".into()),
+                events: Vec::new(),
+            };
+        }
     }
     if let Some(path) = args.dump_events.as_deref() {
         let _ = std::fs::remove_file(path);
@@ -310,6 +354,49 @@ mod tests {
             Path::new("/tmp/w"),
             "policy root still the workdir"
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_run_preserves_previous_wal_outside_workdir() {
+        let parent = tmp();
+        let dir = parent.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
+        let args = args_for(&dir, None);
+        let first = execute(&ScriptClient::new(vec![text_resp()]), &args).await;
+        assert!(matches!(first.outcome, Outcome::Done));
+        let old = std::fs::read_to_string(dir.join(".rof-events.jsonl")).unwrap();
+        let second = execute(&ScriptClient::new(vec![text_resp()]), &args).await;
+        assert!(matches!(second.outcome, Outcome::Done));
+        assert!(
+            std::fs::read_dir(&parent).unwrap().flatten().any(|e| {
+                e.path().is_file()
+                    && std::fs::read_to_string(e.path()).ok().as_deref() == Some(&old)
+            }),
+            "previous WAL must survive outside the workdir"
+        );
+    }
+
+    #[test]
+    fn custom_log_archives_are_unique_and_preservation_fails_closed() {
+        let parent = tmp();
+        let work = parent.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let path = work.join("custom.jsonl");
+        for data in ["first", "second"] {
+            std::fs::write(&path, data).unwrap();
+            preserve_log(&path, &work).unwrap();
+        }
+        let archived: Vec<String> = std::fs::read_dir(&parent)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .collect();
+        assert!(archived.contains(&"first".to_string()));
+        assert!(archived.contains(&"second".to_string()));
+        std::fs::create_dir(&path).unwrap();
+        assert!(preserve_log(&path, &work).is_err());
+        assert!(path.is_dir());
     }
 
     #[tokio::test]

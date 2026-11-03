@@ -820,7 +820,7 @@ async fn run_post_batch_aborted_rolls_back_the_whole_batch() {
 /// `verify.verified_since_write` return to the pre-batch snapshot on a full
 /// rollback, so rolled-back edits leave no stale counters behind.
 #[test]
-fn rollback_refunds_edits_actions_and_verified() {
+fn rollback_refunds_edits_and_verified_but_keeps_actions() {
     let mut s = LoopState::new();
     // Verified baseline: one write covered by a passing test.
     ok_round(&mut s, "w0", "write", serde_json::json!({"path": "a"}));
@@ -861,16 +861,7 @@ fn rollback_refunds_edits_actions_and_verified() {
     // The tree rolled the batch back: refund to the snapshot.
     refund_batch(&mut s, &snap);
     assert_eq!(s.edits, snap.edits);
-    assert_eq!(
-        s.budget.counters().actions_this_trial,
-        snap.actions_this_trial
-    );
-    assert_eq!(
-        s.budget.counters().same_action_streak,
-        snap.same_action_streak
-    );
-    assert_eq!(s.last_sig, snap.last_sig);
-    assert_eq!(s.last_obs, snap.last_obs);
+    assert_eq!(s.budget.counters().actions_this_trial, actions_before + 1);
     assert_eq!(s.verify.verified_since_write, snap.verified_since_write);
     assert!(s.verify.verified_since_write);
 }
@@ -978,4 +969,89 @@ async fn char_rollback_event_and_log_sequence() {
     );
     assert!(check_pairing(emitter.history()));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn incremental_proof_rejects_truncated_patch_without_losing_edits() {
+    let root = run_tmp("proof-truncated");
+    std::fs::write(root.join("seed"), "seed\n").unwrap();
+    let tree = Arc::new(snapshot::TreeService::new(&root));
+    tree.ensure().unwrap();
+    tree.baseline().unwrap();
+    std::fs::write(root.join("a"), "small\n").unwrap();
+    let large = "large line\n".repeat(300);
+    std::fs::write(root.join("b"), &large).unwrap();
+    assert!(crate::incremental_hunks(tree, &root, "true", None)
+        .await
+        .is_err());
+    assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "small\n");
+    assert_eq!(std::fs::read_to_string(root.join("b")).unwrap(), large);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn proof_deadline_kills_descendants_and_restores_full_patch() {
+    let root = run_tmp("proof-deadline");
+    std::fs::write(root.join("seed"), "seed\n").unwrap();
+    let tree = Arc::new(snapshot::TreeService::new(&root));
+    tree.ensure().unwrap();
+    tree.baseline().unwrap();
+    std::fs::write(root.join("a"), "one\n").unwrap();
+    std::fs::write(root.join("b"), "two\n").unwrap();
+    let script = root.with_extension("py");
+    std::fs::write(&script, "import subprocess, sys, time\nsubprocess.Popen([sys.executable, '-c', \"import time; time.sleep(0.4); open('escaped', 'w').write('bad')\"])\ntime.sleep(10)\n").unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(120);
+    let result = crate::incremental_hunks(
+        tree,
+        &root,
+        &format!("python3 {}", script.display()),
+        Some(deadline),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "one\n");
+    assert_eq!(std::fs::read_to_string(root.join("b")).unwrap(), "two\n");
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(
+        !root.join("escaped").exists(),
+        "proof descendant survived timeout"
+    );
+    let _ = std::fs::remove_file(script);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn proof_spawn_failure_restores_full_patch() {
+    let root = run_tmp("proof-spawn");
+    std::fs::write(root.join("seed"), "seed\n").unwrap();
+    let tree = Arc::new(snapshot::TreeService::new(&root));
+    tree.ensure().unwrap();
+    tree.baseline().unwrap();
+    std::fs::write(root.join("a"), "one\n").unwrap();
+    std::fs::write(root.join("b"), "two\n").unwrap();
+    assert!(
+        crate::incremental_hunks(tree, &root, "rof-nonexistent-proof-command", None)
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "one\n");
+    assert_eq!(std::fs::read_to_string(root.join("b")).unwrap(), "two\n");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn empty_proof_command_preserves_full_patch() {
+    let root = run_tmp("proof-empty");
+    std::fs::write(root.join("seed"), "seed\n").unwrap();
+    let tree = Arc::new(snapshot::TreeService::new(&root));
+    tree.ensure().unwrap();
+    tree.baseline().unwrap();
+    std::fs::write(root.join("a"), "one\n").unwrap();
+    std::fs::write(root.join("b"), "two\n").unwrap();
+    assert!(crate::incremental_hunks(tree, &root, "  ", None)
+        .await
+        .is_err());
+    assert_eq!(std::fs::read_to_string(root.join("a")).unwrap(), "one\n");
+    assert_eq!(std::fs::read_to_string(root.join("b")).unwrap(), "two\n");
+    let _ = std::fs::remove_dir_all(root);
 }

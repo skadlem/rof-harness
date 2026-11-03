@@ -7,7 +7,7 @@ use tool_core::{
 
 use crate::common::{dispatch, parse_args, EXEC_TIMEOUT};
 use crate::policy::Policy;
-use crate::runner::{cmd_schema, run_allowed, CmdArgs};
+use crate::runner::{cmd_schema, run_allowed_raw, CmdArgs};
 
 pub struct ExecTool {
     policy: Arc<Policy>,
@@ -32,7 +32,7 @@ impl Tool for ExecTool {
     ) -> Result<ToolOutcome, ToolError> {
         let args: CmdArgs = parse_args(&inv.args)?;
         let (ok, content, truncated) =
-            run_allowed(&self.policy, &args.cmd, EXEC_TIMEOUT, &cancel).await?;
+            run_allowed_raw(&self.policy, &args.cmd, EXEC_TIMEOUT, &cancel).await?;
         Ok(ToolOutcome {
             content,
             truncated,

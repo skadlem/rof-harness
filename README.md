@@ -2,11 +2,10 @@
 
 **A coding-agent harness that runs the agent inside the task's own container, unattended,
 at flash-model prices** — and pays for that with the boring guarantees unattended runs need:
-a write-ahead log written before every effect, rollback to the last proven hunk,
+a write-ahead log persisted before tool dispatch, batch rollback with optional proof gating,
 budgets denominated in dollars, and a verdict taken from the task's own verifier.
 
 [![CI](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml/badge.svg?branch=v2-core)](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml)
-![tests](https://img.shields.io/badge/tests-396%20passing-brightgreen)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![shape](https://img.shields.io/badge/14%20crates-26.7k%20lines-lightgrey)
 
@@ -61,11 +60,15 @@ flowchart TD
 Three properties fall out of that shape, and they are why the loop stays small:
 
 - **The log is the truth, the prompt is a view.** Every request is derived from an append-only
-  log that is written and flushed *before* the effect it describes. A crash mid-run replays.
-- **A failed batch cannot poison the tree.** Edits land in a git overlay; a batch that fails its
-  proof rolls back, and the proven prefix survives as a savepoint.
-- **Budgets are the kill switch, and they are priced.** Unknown costs are `null`, never `$0.00`,
-  so a spend cap can never silently fail open.
+  log whose tool calls are flushed *before* dispatch. The CLI starts fresh and replaces the
+  previous WAL in a uniquely named archive before starting; crash resume is not implemented.
+- **Failed batches attempt filesystem rollback.** Git restores the batch baseline while earlier
+  batches survive. Installed packages, running services, and ignored files are outside that
+  rollback; proof-gated hunk retention is opt-in.
+- **Budgets bound admission at loop boundaries.** Unknown prices report `null` and leave the dollar
+  cap inactive. Spend is accumulated before conversion to cents and action caps are checked before each
+  dispatch. Provider, tool, and proof commands observe the run deadline; blocking Git operations
+  may extend it. Interrupted provider usage may be unknown.
 
 ## What's in the box
 
@@ -119,9 +122,11 @@ pooled, because they are not the same measurement.
   rollback, verifier network timeouts, transport errors).
 - **Statistics.** Wilson 95% intervals on every rate; a seeded paired bootstrap (no `rand`
   dependency) for comparisons; `Flaky` and saturation flags rather than silent averaging.
-- **Provenance.** Every report self-describes: binary git sha, the resolved budget recipe, the
-  token-cap shape, the exec policy, the apply mode, and the estimand. A row can be identified by
-  its own file, without the driver script that produced it.
+- **Provenance.** Every report records binary git sha, the resolved budget recipe, the token-cap
+  shape, the exec policy, the apply mode, and the estimand. Agent reports also record the model,
+  nonsecret endpoint, allowlist, output limit, and thinking setting. Per-attempt task digests and
+  live-container image IDs are recorded when available; unsupported task inputs and Harbor-owned
+  images remain unknown.
 - **Frozen slices.** Task ids and `task.toml` digests are pinned in-tree; a re-frozen slice fails
   `cargo test` before any spend.
 
@@ -200,6 +205,7 @@ Agent budgets default to 300k tokens / 60 steps / 120 actions.
   cumulative billed tokens), so it awaits a redesign rather than a run.
 - `--bets` / `--proof-cmd` — proof-gated batch commits and per-hunk savepoints. Zero gate
   interventions across six measured runs; available, unexercised, flagged.
+  Incremental proof rejects a truncated evidence patch before modifying the tree.
 - `--budget-shape miss-plus-out` — charges `(input − cache_read) + output` against the token cap.
   Mechanism confirmed, capability unconverted; a different estimand from `gross`, so the two never
   share a table.
@@ -215,9 +221,9 @@ responsibility.
 
 **Security posture, stated plainly.**
 
-- File tools (`view`/`search`/`edit`/`write`) are root-anchored, symlink-safe, secrets-denied, and
-  resolve `/app/…` to the workdir root so the workspace can be addressed the way task statements
-  spell it. They are not a sandbox for `exec`.
+- File tools resolve `/app/…` to the workdir root and check path containment. Secrets denials
+  apply to requested and resolved paths and to recursive search descendants. They are not a
+  sandbox for `exec`.
 - `exec`/`test` run allowlisted commands, but allowlisting is hygiene, not isolation: permitting
   `cargo test` or `sh` is arbitrary host code execution. `--exec-policy any` removes even that
   hygiene, for callers whose boundary is a container; the choice is recorded in every report.

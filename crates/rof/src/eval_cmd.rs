@@ -599,6 +599,16 @@ pub(crate) fn finish_report(args: &EvalArgs, reports: Vec<eval::InstanceReport>)
             reasoning_effort: args.reasoning_effort.clone(),
             steer: Some(args.steer),
             apply_mode: apply_mode_for(args),
+            run_config: args.agent.then(|| {
+                serde_json::json!({
+                    "model": args.model,
+                    "endpoint": args.endpoint.as_deref().filter(|s| !s.contains(['@', '?', '#'])),
+                    "allow_cmd": args.allow_cmd,
+                    "max_tokens": args.max_tokens.unwrap_or(8_000),
+                    "keep_thinking": args.keep_thinking,
+                    "task_identity": "per_instance",
+                })
+            }),
         }),
     };
     if let Some(path) = args.report.as_deref() {
@@ -896,10 +906,21 @@ mod tests {
         assert_eq!(p["budget_actions"], 120);
         assert_eq!(p["budget_shape"], "MissPlusOut", "flag recorded");
         assert_eq!(p["apply_mode"], "Strict");
+        assert_eq!(p["run_config"]["model"], "m");
+        assert_eq!(p["run_config"]["endpoint"], "http://x");
+        assert_eq!(p["run_config"]["max_tokens"], 8000);
         assert!(
             p["binary_git_sha"].as_str().is_some_and(|s| !s.is_empty()),
             "sha embedded by build.rs (real or 'unknown'), never silently absent: {p}"
         );
+        let mut sensitive = a;
+        sensitive.endpoint = Some("https://user:secret@example.com/v1?token=secret".into());
+        sensitive.headers = vec!["Authorization:secret".into()];
+        assert_eq!(finish_report(&sensitive, Vec::new()), 0);
+        let report = std::fs::read_to_string(&path).unwrap();
+        assert!(!report.contains("secret"));
+        let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert!(report["provenance"]["run_config"]["endpoint"].is_null());
         std::fs::remove_dir_all(&dir).ok();
     }
 

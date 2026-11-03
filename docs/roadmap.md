@@ -28,7 +28,7 @@ measured numbers carry a date and live with the run artifacts.
   inspects trajectory state and blocks an action) is a different class,
   only ever tested once here (`VerifyHold`, 2026-10-06, no-shipped on two
   cells that could not show the effect) — see the literature sweep below.
-- **Literature sweep 2026-10-19** (`research/lit-sweep-2026-10-19.md`, four
+- **Literature sweep 2026-10-19** (local report `lit-sweep-2026-10-19.md`, four
   researcher lanes, primary sources): three results change the picture and
   two levers are now foreclosed by measurement. (a) Deterministic
   state-triggered gating is real at our model class — LivePlan
@@ -176,11 +176,11 @@ self-describe through the provenance block; no arm's rows pool with another's.
    snapshot, 37.9 GLM-5.3, 39.9 GPT-5.6 Sol; DeepSWE v1.1 77.0 vs 74.2;
    MIT weights, 1M context). A cheaper-tier substitute is therefore not the
    lever, and no further model reps are bought. The sweep's shortlist stays in
-   `research/models-2026h2-shortlist.md` as a record, and one correction from
+   local report `models-2026h2-shortlist.md` as a record, and one correction from
    it survives: every published number for those candidates is a **vendor**
    claim, so vendor rows rank candidates and never predict our solve rate.
 2. **Zero-cost instrumentation: a pairwise, answer-key-free judge.** From
-   Harness2's selector and RRSI (`research/harness-steals-2026h2.md` steal
+   Harness2's selector and RRSI (local report `harness-steals-2026h2.md` steal
    1 + 2): score two anonymised deliverables of the same task against each
    other instead of against a hidden verifier, so arms stop returning "tie at
    zero solves". Validate it **for free** against the banked (solved, failed)
@@ -316,8 +316,8 @@ literature on 2026-10-13 and deliberately stay closed.
   published run costs ~60 harness candidates over hours with up to
   10M tokens of diagnostics per evaluation; at 21 tasks its gains
   would be indistinguishable from rerun noise.
-  **Reviewed and closed 2026-10-19** (`research/harness2-teardown.md`,
-  `research/harness-steals-2026h2.md`): Harness2 (arXiv:2610.14224) is the
+  **Reviewed and closed 2026-10-19** (local report `harness2-teardown.md`,
+  local report `harness-steals-2026h2.md`): Harness2 (arXiv:2610.14224) is the
   verifier-free member of this cluster and does **not** open either
   condition. It reports no attempts-matched ablation (best-of-k is defined
   and never numbered), its cost floor is 4 executor rollouts + 3 importer

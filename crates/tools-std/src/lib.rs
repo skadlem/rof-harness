@@ -798,7 +798,7 @@ mod tests {
         let out = run(&r, "exec", json!({"cmd": "echo hello; echo PWNED error"}))
             .await
             .unwrap();
-        assert_eq!(out.content, "hello; echo PWNED error");
+        assert_eq!(out.content.trim_end(), "hello; echo PWNED error");
     }
 
     #[tokio::test]
@@ -819,9 +819,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_condensed_under_cap_not_truncated() {
-        // >80 matched lines is condensation (kept-lines omitted), not a cut:
-        // no bytes were discarded by OUT_CAP, so truncated must stay false.
+    async fn exec_raw_output_under_cap_not_truncated() {
+        // Output within the cap remains intact, even with many error lines.
         let root = tmp_root();
         let mut pol = (*policy(&root)).clone();
         pol.allowed_prefixes.push("cat".to_string());
@@ -831,12 +830,8 @@ mod tests {
         let out = run(&r, "exec", json!({"cmd": "cat many.txt"}))
             .await
             .unwrap();
-        assert!(
-            out.content.contains("kept-lines over cap omitted"),
-            "{}",
-            out.content
-        );
-        assert!(!out.truncated, "condensed output is not a truncation");
+        assert!(out.content.lines().count() == 100, "{}", out.content);
+        assert!(!out.truncated, "output below cap is not truncated");
     }
 
     #[tokio::test]
@@ -1514,5 +1509,65 @@ mod tests {
                 d.name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn search_and_alias_cannot_read_denied_files() {
+        let root = tmp_root();
+        std::fs::write(root.join(".env"), "secret needle").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(".env", root.join("alias")).unwrap();
+        let r = reg(policy(&root));
+        assert!(!run(&r, "search", json!({"pattern":"needle"}))
+            .await
+            .unwrap()
+            .content
+            .contains("needle"));
+        #[cfg(unix)]
+        assert!(run(&r, "view", json!({"path":"alias"})).await.is_err());
+    }
+
+    #[test]
+    fn single_quotes_preserve_backslashes() {
+        assert_eq!(
+            split_cmd(r#"python3 -c 'print(r"\n")'"#)[2],
+            r#"print(r"\n")"#
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_preserves_non_error_output() {
+        let root = tmp_root();
+        let mut p = (*policy(&root)).clone();
+        p.allowed_prefixes.push("printf".into());
+        let r = reg(Arc::new(p));
+        let out = run(
+            &r,
+            "exec",
+            json!({"cmd":"printf 'result=42\\nerror_count=0\\n'"}),
+        )
+        .await
+        .unwrap();
+        assert!(out.content.contains("result=42"), "{}", out.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_covers_pipe_drain_after_parent_exit() {
+        let root = tmp_root();
+        let mut p = (*policy(&root)).clone();
+        p.allowed_prefixes.push("sh".into());
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            c.cancel();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_allowed(&p, "sh -c 'sleep 2 &'", Duration::from_secs(5), &cancel),
+        )
+        .await;
+        assert!(matches!(result, Ok(Err(_))));
     }
 }

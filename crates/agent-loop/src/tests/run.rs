@@ -1219,6 +1219,12 @@ async fn cancel_during_provider_complete_aborts_promptly_as_cancelled() {
         AgentEvent::Error { error } if error.code == "provider-failed"
             && error.message.contains("cancelled")
     )));
+    assert!(
+        emitter.history().iter().any(|e| matches!(e,
+            AgentEvent::Error { error } if error.code == "provider-usage-unknown"
+        )),
+        "cancelled in-flight call must mark usage unknown"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1635,4 +1641,92 @@ async fn failure_kinds_pin_snapshot_ensure_site() {
         other => panic!("expected Failed, got {other:?}"),
     }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn wallclock_deadline_interrupts_inflight_provider() {
+    let root = run_tmp("wallclock-provider");
+    std::fs::write(root.join("seed"), "seed").unwrap();
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([Scripted::Hang])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut config = agent_budget::config_for(agent_budget::Capability::UnattendedBatch);
+    config.max_wallclock = Duration::from_millis(100);
+    state.budget = agent_budget::BudgetGuard::new(config, Instant::now());
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut Emitter::new(),
+                bets: &NoBets,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("go".into())],
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("provider exceeded deadline");
+    assert!(
+        matches!(outcome, Outcome::Halted(ref s) if s == "wallclock"),
+        "{outcome:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn wallclock_deadline_interrupts_inflight_tool() {
+    let root = run_tmp("wallclock-tool");
+    std::fs::write(root.join("seed"), "seed").unwrap();
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([script_resp(
+            vec![("one", "hang", serde_json::json!({}))],
+            StopReason::ToolUse,
+        )])),
+    };
+    let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+        [("agent".to_string(), vec!["hang".to_string()])].into(),
+    )));
+    registry.register(Arc::new(HangingTool));
+    let mut state = LoopState::new();
+    let mut config = agent_budget::config_for(agent_budget::Capability::UnattendedBatch);
+    config.max_wallclock = Duration::from_millis(100);
+    state.budget = agent_budget::BudgetGuard::new(config, Instant::now());
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut Emitter::new(),
+                bets: &NoBets,
+                cfg: RunConfig::default(),
+            },
+            vec![Input::User("go".into())],
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("tool exceeded deadline");
+    assert!(
+        matches!(result, Outcome::Halted(ref s) if s == "wallclock"),
+        "{result:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
 }

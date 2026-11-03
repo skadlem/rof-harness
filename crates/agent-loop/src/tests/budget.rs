@@ -585,3 +585,62 @@ fn steer_off_silences_the_declare_hold_and_the_action_directives() {
         "ablation queued nothing"
     );
 }
+
+#[test]
+fn subcent_costs_accumulate_toward_spend_cap() {
+    let mut state = LoopState::new();
+    let usage = Usage {
+        input: 1,
+        output: 1,
+        cache_read: 0,
+        cache_write: 0,
+        reasoning: None,
+        cost_usd: Some(0.004),
+    };
+    for _ in 0..1000 {
+        state.record_usage(&usage);
+    }
+    assert_eq!(state.budget.counters().spent_cents, 400);
+}
+
+#[tokio::test]
+async fn action_cap_stops_mid_batch_without_reverting_admitted_edits() {
+    let root = run_tmp("action-cap-batch");
+    std::fs::write(root.join("seed"), "seed\n").unwrap();
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([script_resp(
+            vec![
+                ("a", "write", serde_json::json!({"path":"a", "content":"a"})),
+                ("b", "write", serde_json::json!({"path":"b", "content":"b"})),
+            ],
+            StopReason::ToolUse,
+        )])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut config = agent_budget::config_for(agent_budget::Capability::UnattendedBatch);
+    config.actions_per_trial = 1;
+    state.budget = agent_budget::BudgetGuard::new(config, std::time::Instant::now());
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut Emitter::new(),
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Halted(_)), "{outcome:?}");
+    assert!(root.join("a").exists());
+    assert!(!root.join("b").exists());
+    assert_eq!(state.budget.counters().actions_this_trial, 1);
+    let _ = std::fs::remove_dir_all(root);
+}

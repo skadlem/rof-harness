@@ -308,6 +308,27 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_provider_usage_is_unknown_in_report() {
+        let dir = tmp();
+        let events = dir.join("events.jsonl");
+        std::fs::write(&events, concat!(
+            "{\"type\":\"Error\",\"error\":{\"code\":\"wallclock-usage-unknown\",\"message\":\"interrupted\"}}\n",
+            "{\"type\":\"TurnEnd\",\"turn\":1,\"reason\":\"BudgetExceeded\",\"usage_totals\":{\"input_tokens\":50,\"output_tokens\":10,\"cache_read_tokens\":0,\"reasoning_tokens\":null,\"cost_usd\":null}}\n"
+        )).unwrap();
+        for code in ["wallclock-usage-unknown", "provider-usage-unknown"] {
+            let text = std::fs::read_to_string(&events)
+                .unwrap()
+                .replace("wallclock-usage-unknown", code);
+            std::fs::write(&events, &text).unwrap();
+            let report = instance_report("t", Verdict::Unresolved, &events, 1, "").unwrap();
+            assert_eq!(
+                (report.tokens_in, report.tokens_out, report.dollars),
+                (None, None, None)
+            );
+        }
+    }
+
+    #[test]
     fn paired_bootstrap_hand_checkable_and_deterministic() {
         assert!(paired_bootstrap(&[], 100, 1).is_none());
         let one = paired_bootstrap(&[(1.0, 0.0)], 100, 7).unwrap();
@@ -432,6 +453,8 @@ mod tests {
     fn tokens_per_solved_guards_division() {
         let rep = |id: &str, v: Verdict, t: Option<u64>| InstanceReport {
             id: id.into(),
+            task_digest: None,
+            image_id: None,
             verdict: v,
             tokens_in: t,
             tokens_out: Some(0),
@@ -485,6 +508,7 @@ mod tests {
         let r = RunReport {
             instances: vec![],
             provenance: Some(RunProvenance {
+                run_config: None,
                 binary_git_sha: Some("b3a2597".into()),
                 estimand: Estimand::InContainerReward,
                 budget_tokens: 300_000,
@@ -510,6 +534,20 @@ mod tests {
             back.provenance.unwrap().estimand,
             Estimand::InContainerReward
         );
+    }
+
+    #[test]
+    fn old_provenance_has_unknown_run_config() {
+        let value = serde_json::json!({"instances":[], "provenance": {
+            "binary_git_sha": "abc", "estimand": "InContainerReward",
+            "budget_tokens": 1, "budget_steps": 1, "budget_actions": 1,
+            "budget_shape": "Gross", "exec_policy": "Allowlist", "apply_mode": "Strict"
+        }});
+        let report: RunReport = serde_json::from_value(value).unwrap();
+        assert!(serde_json::to_value(report).unwrap()["provenance"]
+            .as_object()
+            .unwrap()
+            .contains_key("run_config"));
     }
 
     #[test]

@@ -18,3 +18,4 @@ agent-budget = { path = "../agent-budget" }
 snapshot = { path = "../snapshot" }
 context = { path = "../context" }
 bets = { path = "../bets" }
+libc = "0.2"

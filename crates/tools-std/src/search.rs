@@ -43,6 +43,7 @@ fn search_dir(
     hits: &mut Vec<String>,
     limit: usize,
     skipped: &mut usize,
+    denied: &[String],
 ) {
     if hits.len() >= limit {
         return;
@@ -61,8 +62,15 @@ fn search_dir(
         }
         let Ok(ft) = e.file_type() else { continue };
         let p = e.path();
+        let rel = match p.strip_prefix(root) {
+            Ok(r) => r.to_string_lossy(),
+            Err(_) => continue,
+        };
+        if resolve_under(root, &rel, false, denied).is_err() {
+            continue;
+        }
         if ft.is_dir() {
-            search_dir(&p, root, pat, hits, limit, skipped);
+            search_dir(&p, root, pat, hits, limit, skipped, denied);
         } else if ft.is_file() {
             search_file(&p, root, pat, hits, limit, skipped);
         }
@@ -154,6 +162,7 @@ impl Tool for SearchTool {
                 &mut hits,
                 limit,
                 &mut skipped,
+                &self.policy.denied_globs,
             );
         }
         // Fail-loud honesty: skipped oversized files are never silently

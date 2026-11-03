@@ -359,6 +359,7 @@ pub(crate) async fn checkpoint<P: LlmClient>(
     provider: &P,
     cfg: &RunConfig,
     emitter: &mut Emitter,
+    started: &mut bool,
 ) -> bool {
     let cc = &cfg.compaction;
     if !cc.enabled || state.compacted_turn == Some(state.turn) {
@@ -400,7 +401,10 @@ pub(crate) async fn checkpoint<P: LlmClient>(
         thinking: Thinking::Off,
         extras: Value::Null,
     };
-    let summary = match provider.complete(&cfg.model, &req).await {
+    *started = true;
+    let result = provider.complete(&cfg.model, &req).await;
+    *started = false;
+    let summary = match result {
         Ok(resp) => {
             state.record_usage(&resp.billed_usage());
             match resp.stop {

@@ -515,8 +515,10 @@ impl LoopState {
             BudgetShape::MissPlusOut => usage.input.saturating_sub(usage.cache_read) + usage.output,
         });
         if let Some(cost) = usage.cost_usd {
+            let before = self.usage_totals.cost_usd.unwrap_or(0.0);
+            let cents = |v: f64| (v.mul_add(100.0, 1e-9)).floor().max(0.0) as u64;
             self.budget
-                .record_spend_cents((cost * 100.0).round().max(0.0) as u64);
+                .record_spend_cents(cents(before + cost).saturating_sub(cents(before)));
         }
         let totals = &mut self.usage_totals;
         totals.input_tokens = totals.input_tokens.saturating_add(usage.input);

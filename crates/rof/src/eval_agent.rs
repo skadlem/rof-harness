@@ -90,6 +90,83 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Freeze a regular task tree without changing file or directory modes.
+/// Symlinks and special files may depend on their original location, so the
+/// caller keeps the original task path and withholds identity for those.
+fn snapshot_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(src)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "task symlink",
+        ));
+    }
+    if metadata.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            snapshot_tree(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        std::fs::set_permissions(dst, metadata.permissions())?;
+    } else if metadata.is_file() {
+        std::fs::copy(src, dst)?;
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "special task file",
+        ));
+    }
+    Ok(())
+}
+
+/// Hash a frozen task tree with paths, file bytes and executable modes.
+fn task_digest(root: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    fn walk(dir: &Path, h: &mut ring::digest::Context) -> std::io::Result<()> {
+        let mut entries = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            let name = name.as_encoded_bytes();
+            h.update(&(name.len() as u64).to_be_bytes());
+            h.update(name);
+            let metadata = entry.metadata()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                h.update(&(metadata.permissions().mode() & 0o777).to_be_bytes());
+            }
+            if metadata.is_dir() {
+                h.update(b"D");
+                walk(&entry.path(), h)?;
+                h.update(b"E");
+            } else if metadata.is_file() {
+                h.update(b"F");
+                h.update(&metadata.len().to_be_bytes());
+                let mut file = std::fs::File::open(entry.path())?;
+                let mut buf = [0; 8192];
+                loop {
+                    let n = file.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    h.update(&buf[..n]);
+                }
+            } else {
+                return Err(std::io::Error::other("unsupported task input type"));
+            }
+        }
+        Ok(())
+    }
+    let mut h = ring::digest::Context::new(&ring::digest::SHA256);
+    walk(root, &mut h)?;
+    Ok(h.finish()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
 /// Fresh workdir per run (driver parity: `rm -rf` then `mkdir`), seeded with
 /// the CONTENTS of `<task>/environment` when it exists, else left empty
 /// (can_create tasks).
@@ -273,6 +350,29 @@ fn docker_exec_wrap(container: &str) -> Vec<String> {
     vec!["docker".into(), "exec".into(), container.into()]
 }
 
+fn parse_image_id(text: &str) -> Option<String> {
+    let id = text.trim();
+    let digest = id.strip_prefix("sha256:")?;
+    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_owned())
+}
+
+async fn container_image_id(container: &str) -> Option<String> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("docker")
+            .args(["inspect", "--format", "{{.Image}}", container])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_image_id(std::str::from_utf8(&output.stdout).ok()?)
+}
+
 /// Exact `docker run` argv for one in-container instance: detached, named,
 /// workdir bind-mounted at /app, task tests read-only at /tests, /app as
 /// the container workdir, cpus/memory capped, and the image entrypoint
@@ -407,9 +507,8 @@ fn grade_exit_verdict(status: &std::process::ExitStatus, stderr: &str) -> eval::
 /// every TB2.1 slice test.sh ends with `echo 1|0 > /logs/verifier/reward.txt`,
 /// so its exit code is ALWAYS 0 and cannot carry the suite outcome — the
 /// exit-code-only estimand graded workless runs Resolved). The reward file
-/// is written by THIS grading: the instance home is fresh per cell and
-/// holds exactly one grading, so a present file means test.sh reached its
-/// final echo. Absence (or an unreadable file) falls back to the exit
+/// is written by THIS grading after clearing the verifier directory.
+/// Verifier machinery failures always take precedence. Absence (or an unreadable file) falls back to the exit
 /// code, so tasks that propagate their suite exit stay byte-identical.
 /// A junk reward withholds as Ambiguous — it never falls back to the
 /// lying exit code. Pure so tests pin the precedence.
@@ -418,6 +517,9 @@ fn grade_live_verdict(
     stderr: &str,
     reward: Option<eval::Verdict>,
 ) -> eval::Verdict {
+    if grade_exit_verdict(status, stderr) == eval::Verdict::InfraFailure {
+        return eval::Verdict::InfraFailure;
+    }
     match reward {
         Some(v) => v,
         None => grade_exit_verdict(status, stderr),
@@ -437,6 +539,10 @@ async fn grade_live_container(
     container: &str,
     home: &Path,
 ) -> eval::Verdict {
+    if let Err(e) = reset_verifier_dir(home) {
+        eprintln!("infra {}: cannot clear verifier artifacts: {e}", inst.id);
+        return eval::Verdict::InfraFailure;
+    }
     // ponytail: 300s slack above the instance timeout is chosen (same slack
     // as the harbor path); upgrade path: a per-task verifier timeout.
     let out = tokio::time::timeout(
@@ -489,10 +595,25 @@ async fn grade_live_container(
     verdict
 }
 
+fn reset_verifier_dir(home: &Path) -> std::io::Result<()> {
+    let dir = home.join("verifier-logs").join("verifier");
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::create_dir_all(dir)
+}
+
 /// Grade one agent run via harbor: build the grade tree, run
 /// `harbor run -c <job> -y -q`, read the reward. Spawn failure, timeout, or
 /// a non-zero exit without result.json is infra (never capability).
-async fn grade(inst: &eval::Instance, args: &EvalArgs, work: &Path) -> eval::Verdict {
+async fn grade(
+    inst: &eval::Instance,
+    args: &EvalArgs,
+    task_dir: &Path,
+    work: &Path,
+) -> eval::Verdict {
     let home = args.out_dir.join(&inst.id);
     let grade_dir = home.join("grade-task");
     let jobs = args.out_dir.join("jobs").join(format!("eval-{}", inst.id));
@@ -502,7 +623,7 @@ async fn grade(inst: &eval::Instance, args: &EvalArgs, work: &Path) -> eval::Ver
     };
     // Grade task tree: whole task copy, solution replaced by files/ + solve.sh.
     let _ = std::fs::remove_dir_all(&grade_dir);
-    if let Err(e) = copy_tree(&args.tasks_dir.join(&inst.id), &grade_dir) {
+    if let Err(e) = copy_tree(task_dir, &grade_dir) {
         return infra(format!("cannot build {}: {e}", grade_dir.display()));
     }
     let _ = std::fs::remove_dir_all(grade_dir.join("solution"));
@@ -596,8 +717,8 @@ pub(crate) async fn run_agent_leg(
     }
     let mut reports = Vec::new();
     for inst in instances {
-        let task_dir = args.tasks_dir.join(&inst.id);
-        for bad in eval::check_winnability(&task_dir, caps) {
+        let source_task = args.tasks_dir.join(&inst.id);
+        for bad in eval::check_winnability(&source_task, caps) {
             eprintln!("unwinnable {}: {bad}", inst.id);
         }
         let home = args.out_dir.join(&inst.id);
@@ -605,6 +726,64 @@ pub(crate) async fn run_agent_leg(
             eprintln!("cannot create {}", home.display());
             return 2;
         }
+        // Freeze exactly the task used to seed, prompt, mount and grade this
+        // attempt; hashing the mutable source after the run is not provenance.
+        let frozen_root = home.join("task-inputs");
+        let frozen_dir = frozen_root.join(&inst.id);
+        if std::fs::remove_dir_all(&frozen_root).is_err() && frozen_root.exists() {
+            eprintln!("infra {}: cannot clear task snapshot", inst.id);
+            reports.push(infra_report(
+                inst,
+                args,
+                &home,
+                eval::Verdict::InfraFailure,
+                0,
+            ));
+            continue;
+        }
+        let (snapshot_root, task_dir, digest, frozen) =
+            match snapshot_tree(&source_task, &frozen_dir) {
+                Ok(()) => {
+                    let digest = task_digest(&frozen_dir).ok();
+                    let frozen =
+                        match eval::load_tb_slice(&frozen_root, std::slice::from_ref(&inst.id)) {
+                            Ok(mut rows) if rows.len() == 1 => rows.remove(0),
+                            _ => {
+                                reports.push(infra_report(
+                                    inst,
+                                    args,
+                                    &home,
+                                    eval::Verdict::InfraFailure,
+                                    0,
+                                ));
+                                continue;
+                            }
+                        };
+                    (frozen_root, frozen_dir, digest, frozen)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                    // Preserve the original task semantics when paths may escape
+                    // the task tree; no digest can identify those external inputs.
+                    (
+                        args.tasks_dir.clone(),
+                        source_task.clone(),
+                        None,
+                        inst.clone(),
+                    )
+                }
+                Err(e) => {
+                    eprintln!("infra {}: cannot snapshot task: {e}", inst.id);
+                    reports.push(infra_report(
+                        inst,
+                        args,
+                        &home,
+                        eval::Verdict::InfraFailure,
+                        0,
+                    ));
+                    continue;
+                }
+            };
+        let inst = &frozen;
         let work = home.join("work");
         // In-container mode: root-owned leftovers from a previous run's
         // container writes (bind-mounted /app) survive a host-side rm;
@@ -663,7 +842,7 @@ pub(crate) async fn run_agent_leg(
                 ));
                 continue;
             }
-            match start_env_container(inst, &work, &args.tasks_dir).await {
+            match start_env_container(inst, &work, &snapshot_root).await {
                 Ok(name) => {
                     run_args.exec_wrap = Some(docker_exec_wrap(&name));
                     Some(name)
@@ -681,6 +860,11 @@ pub(crate) async fn run_agent_leg(
                     continue;
                 }
             }
+        } else {
+            None
+        };
+        let image_id = if let Some(name) = &container {
+            container_image_id(name).await
         } else {
             None
         };
@@ -714,7 +898,7 @@ pub(crate) async fn run_agent_leg(
         } else if let Some(name) = &container {
             grade_live_container(inst, name, &home).await
         } else {
-            grade(inst, args, &work).await
+            grade(inst, args, &task_dir, &work).await
         };
         // The env container dies on every path, including infra grading.
         if container.is_some() {
@@ -730,7 +914,14 @@ pub(crate) async fn run_agent_leg(
             apply_mode_for(args),
             None,
         ) {
-            Ok(row) => reports.push(row),
+            Ok(mut row) => {
+                // Snapshot is mounted read-only for tests, but host-mode exec
+                // has no jail. Withhold identity if the input changed.
+                row.task_digest =
+                    digest.filter(|d| task_digest(&task_dir).ok().as_ref() == Some(d));
+                row.image_id = image_id;
+                reports.push(row)
+            }
             Err(e) => {
                 eprintln!("cannot report {}: {e}", inst.id);
                 return 2;
@@ -763,6 +954,8 @@ fn infra_report(
         Ok(r) => r,
         Err(_) => eval::InstanceReport {
             id: inst.id.clone(),
+            task_digest: None,
+            image_id: None,
             verdict,
             tokens_in: None,
             tokens_out: None,
@@ -781,6 +974,60 @@ fn infra_report(
 mod tests {
     use super::*;
     use crate::fixtures::argv;
+
+    #[test]
+    fn task_digest_changes_with_task_bytes() {
+        let root = tmp_created();
+        std::fs::write(root.join("instruction.md"), "first").unwrap();
+        let before = task_digest(&root).unwrap();
+        std::fs::write(root.join("instruction.md"), "second").unwrap();
+        assert_ne!(before, task_digest(&root).unwrap());
+        assert_eq!(task_digest(&root).unwrap(), task_digest(&root).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_snapshot_preserves_modes_and_rejects_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tmp_created();
+        let source = root.join("source");
+        let frozen = root.join("frozen");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("test.sh"), "echo ok\n").unwrap();
+        std::fs::set_permissions(
+            source.join("test.sh"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+        snapshot_tree(&source, &frozen).unwrap();
+        assert_eq!(
+            std::fs::metadata(frozen.join("test.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+        let digest = task_digest(&frozen).unwrap();
+        std::fs::write(source.join("test.sh"), "changed\n").unwrap();
+        assert_eq!(task_digest(&frozen).unwrap(), digest);
+        symlink("test.sh", source.join("alias")).unwrap();
+        assert_eq!(
+            snapshot_tree(&source, &root.join("second"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_id_requires_full_docker_digest() {
+        assert!(parse_image_id(&format!("sha256:{}\n", "a".repeat(64))).is_some());
+        assert!(parse_image_id("latest").is_none());
+        assert!(parse_image_id("sha256:123").is_none());
+    }
 
     fn tmp() -> std::path::PathBuf {
         let n = std::time::SystemTime::now()
@@ -1179,6 +1426,20 @@ mod tests {
     }
 
     #[test]
+    fn verifier_reset_discards_old_reward_and_recreates_directory() {
+        let home = tmp_created();
+        let dir = home.join("verifier-logs/verifier");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("reward.txt"), "1").unwrap();
+        std::fs::write(dir.join("ctrf.json"), "old").unwrap();
+        reset_verifier_dir(&home).unwrap();
+        assert!(dir.is_dir());
+        assert!(!dir.join("reward.txt").exists());
+        assert!(!dir.join("ctrf.json").exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn live_container_verdict_maps_exit_and_infra() {
         #[cfg(unix)]
         fn est(code: i32) -> std::process::ExitStatus {
@@ -1243,6 +1504,11 @@ mod tests {
         }
         #[cfg(unix)]
         {
+            assert_eq!(
+                grade_live_verdict(&est(127), "missing verifier", Some(eval::Verdict::Resolved)),
+                eval::Verdict::InfraFailure,
+                "a stale success must not override a verifier that never ran"
+            );
             assert_eq!(
                 grade_live_verdict(&est(0), "", Some(eval::Verdict::Unresolved)),
                 eval::Verdict::Unresolved,

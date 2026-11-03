@@ -7,11 +7,11 @@ CLI guards (`crates/rof/src/workdir.rs`).
 
 - Command allowlist for `exec`/`test`: `--allow-cmd` binary prefixes,
   skipped only by the explicit `--exec-policy any` (see below).
-- Path policy for `view`/`edit`/`write` only: root-anchored to the
+- Path policy for file tools: root-anchored to the
   policy root (a leading `/app/` is that root, so the workspace can be
   addressed as task statements spell it), symlink-safe (a symlinked
-  directory must not launder writes out of the tree), secrets-denied file
-  access.
+  directory must not launder writes out of the tree). Secrets globs apply
+  to requested and resolved paths and to recursive search descendants.
 - `--workdir` must be a disposable scratch directory; refused (exit 2)
   for `/`, `$HOME`, the harness checkout, and repos with uncommitted
   changes unless `--allow-dirty-workdir` is passed.
@@ -35,6 +35,10 @@ CLI guards (`crates/rof/src/workdir.rs`).
   filesystem sandbox.
 - OS-level isolation (container/namespace, no network, read-only
   mounts) is the operator's job; the tools build no sandbox.
+- In-container evaluation mounts `/tests` during the agent leg and makes
+  `/logs` writable there. Read-only tests prevent direct writes through
+  that mount, but do not hide tests or protect reward files from agent
+  commands. Verifier artifacts are cleared immediately before grading.
 
 ## Trust boundaries
 

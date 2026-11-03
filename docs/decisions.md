@@ -71,8 +71,10 @@ says so explicitly.
   reward withholds as Ambiguous, never falling back to the lying exit
   code; absence keeps the exit-code fallback so exit-propagating tasks
   stay byte-identical. A present reward file is trusted because the
-  instance home is fresh per cell with exactly one grading (no staleness
-  window). Ceiling: timeout/cancel kill the docker-exec client; the
+  instance home is fresh per cell with exactly one grading. Review
+  correction (2026-11-03): a reused output directory could retain a stale
+  reward. The verifier directory is now cleared before each grade, and
+  infrastructure failure takes precedence. Ceiling: timeout/cancel kill the docker-exec client; the
   in-container process may outlive it (upgrade path: docker kill or
   exec-session tracking).
 - **The harbor CLI is the agent-leg grading seam.** `rof eval --agent`
@@ -371,7 +373,7 @@ says so explicitly.
   tier, and the next question is a different model or a smaller slice.
 - **Literature sweep and the correction it forces (2026-10-19).** Four
   researcher lanes read the Aug–Oct 2026 literature against this repo's
-  measured record (`research/lit-sweep-2026-10-19.md`, with the lane briefs
+  measured record (local report `lit-sweep-2026-10-19.md`, with the lane briefs
   beside it). Three findings change the picture. (1) **Deterministic
   state-triggered gating** is a real lever at our model class: LivePlan
   (arXiv:2608.06701) runs a rule-based monitor over trajectory state and can

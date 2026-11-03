@@ -26,7 +26,7 @@ pub(crate) fn split_cmd(cmd: &str) -> Vec<String> {
             (None, '\'') => quote = Some('\''),
             (None, '"') => quote = Some('"'),
             (Some(q), c) if c == q => quote = None,
-            (Some(_), '\\') => {
+            (Some('"'), '\\') => {
                 if let Some(n) = chars.next() {
                     cur.push(n);
                 }
@@ -254,25 +254,23 @@ async fn kill_tree(child: &mut tokio::process::Child) {
 /// group; `kill_on_drop` alone would only reap the direct child.
 struct GroupGuard {
     child: Option<tokio::process::Child>,
+    pgid: Option<u32>,
 }
 
 impl Drop for GroupGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Some(c) = self.child.as_ref() {
-            if let Some(pid) = c.id() {
-                unsafe {
-                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-                }
+        if let Some(pid) = self.pgid {
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
             }
         }
     }
 }
 
 /// Tool-output bound: each pipe keeps 64KB head + 64KB tail (dropped middle
-/// counted, `truncated` set), then `condense_output` keeps signal lines
-/// anywhere in the retained output (noise dropped, ≤80 kept lines), then
-/// `OUT_CAP` chars is the outer cap whose bool also reports a real cut (the
+/// counted, `truncated` set). Test commands condense signal lines; exec
+/// returns raw output. `OUT_CAP` chars is the outer cap whose bool reports a real cut (the
 /// loop marks that result `[truncated]`); the `ok` verdict is exit-status on
 /// the raw output, decided before condensing.
 pub(crate) async fn run_allowed_argv(
@@ -280,6 +278,7 @@ pub(crate) async fn run_allowed_argv(
     argv: &[String],
     timeout: Duration,
     cancel: &CancellationToken,
+    raw: bool,
 ) -> Result<(bool, String, bool), ToolError> {
     // Before the allowlist: a whole-token shell operator is a semantics
     // trap (no shell, null stdin), so it fails with the fix on the line
@@ -304,10 +303,13 @@ pub(crate) async fn run_allowed_argv(
     }
     let mut guard = GroupGuard {
         child: Some(spawn_allowed(policy, argv)?),
+        pgid: None,
     };
+    guard.pgid = guard.child.as_ref().and_then(|c| c.id());
+    let deadline = tokio::time::Instant::now() + timeout;
     let child = guard.child.as_mut().expect("child just spawned");
-    let out_task = tokio::spawn(drain_pipe(child.stdout.take()));
-    let err_task = tokio::spawn(drain_pipe(child.stderr.take()));
+    let mut out_task = tokio::spawn(drain_pipe(child.stdout.take()));
+    let mut err_task = tokio::spawn(drain_pipe(child.stderr.take()));
     enum End {
         Exited(std::process::ExitStatus),
         Timeout,
@@ -318,19 +320,21 @@ pub(crate) async fn run_allowed_argv(
         res = child.wait() => res
             .map(End::Exited)
             .map_err(|e| ToolError::Failed(e.to_string()))?,
-        _ = tokio::time::sleep(timeout) => End::Timeout,
+        _ = tokio::time::sleep_until(deadline) => End::Timeout,
         _ = cancel.cancelled() => End::Cancelled,
     };
     let child = guard.child.as_mut().expect("child just spawned");
     let status = match end {
         End::Timeout => {
             kill_tree(child).await;
-            let _ = tokio::join!(out_task, err_task);
+            out_task.abort();
+            err_task.abort();
             return Err(ToolError::Failed(format!("timeout after {timeout:?}")));
         }
         End::Cancelled => {
             kill_tree(child).await;
-            let _ = tokio::join!(out_task, err_task);
+            out_task.abort();
+            err_task.abort();
             return Err(ToolError::Failed("cancelled".to_string()));
         }
         End::Exited(status) => status,
@@ -338,12 +342,21 @@ pub(crate) async fn run_allowed_argv(
     // Exit first, then join the readers: the pipes still hold buffered bytes
     // after the child is gone, and on unix the group kill above guarantees
     // no grandchild keeps them open.
-    let out = out_task
-        .await
-        .map_err(|e| ToolError::Failed(format!("output reader failed: {e}")))?;
-    let err = err_task
-        .await
-        .map_err(|e| ToolError::Failed(format!("output reader failed: {e}")))?;
+    let drained = tokio::select! {
+        result = async { tokio::join!(&mut out_task, &mut err_task) } => Some(result),
+        _ = tokio::time::sleep_until(deadline) => None,
+        _ = cancel.cancelled() => None,
+    };
+    let Some((out, err)) = drained else {
+        out_task.abort();
+        err_task.abort();
+        return Err(ToolError::Failed(
+            "timeout or cancelled while draining output".into(),
+        ));
+    };
+    let out = out.map_err(|e| ToolError::Failed(format!("output reader failed: {e}")))?;
+    let err = err.map_err(|e| ToolError::Failed(format!("output reader failed: {e}")))?;
+    guard.pgid = None;
     let mut s = String::from_utf8_lossy(&out.bytes()).to_string();
     let err_bytes = err.bytes();
     let err_text = String::from_utf8_lossy(&err_bytes);
@@ -352,7 +365,7 @@ pub(crate) async fn run_allowed_argv(
         s.push_str(&err_text);
     }
     let ok = status.success();
-    let (content, cap_cut) = cap_chars(condense_output(&s, None), OUT_CAP);
+    let (content, cap_cut) = cap_chars(if raw { s } else { condense_output(&s, None) }, OUT_CAP);
     Ok((ok, content, cap_cut || out.dropped() + err.dropped() > 0))
 }
 
@@ -365,7 +378,16 @@ pub(crate) async fn run_allowed(
     cancel: &CancellationToken,
 ) -> Result<(bool, String, bool), ToolError> {
     let argv = split_cmd(cmd);
-    run_allowed_argv(policy, &argv, timeout, cancel).await
+    run_allowed_argv(policy, &argv, timeout, cancel, false).await
+}
+
+pub(crate) async fn run_allowed_raw(
+    policy: &Policy,
+    cmd: &str,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<(bool, String, bool), ToolError> {
+    run_allowed_argv(policy, &split_cmd(cmd), timeout, cancel, true).await
 }
 
 static SYNTAX_N: AtomicUsize = AtomicUsize::new(0);
@@ -399,7 +421,7 @@ pub(crate) async fn stage_and_check(
     let (dir, file) = stage_candidate(staging_parent, candidate).await?;
     let mut full = argv.to_vec();
     full.push(file.to_string_lossy().into_owned());
-    let res = run_allowed_argv(policy, &full, EXEC_TIMEOUT, cancel).await;
+    let res = run_allowed_argv(policy, &full, EXEC_TIMEOUT, cancel, false).await;
     let _ = tokio::fs::remove_dir_all(&dir).await;
     match res {
         Ok((true, _, _)) => Ok(()),

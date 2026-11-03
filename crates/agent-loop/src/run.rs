@@ -458,6 +458,13 @@ enum Head {
     Exit(Outcome),
 }
 
+async fn wait_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// One executed tool batch: the proof gate's input plus the pre-batch
 /// counter snapshot a full rollback refunds to.
 struct BatchReport {
@@ -716,33 +723,55 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
     /// One provider round: checkpoint race, request build, cancel-raced
     /// `complete`, then settle (failure or claim).
     async fn provider_round(&mut self, turn_token: CancellationToken) -> Result<(), Outcome> {
+        let wall = self.state.budget.config().max_wallclock;
+        let deadline = (!wall.is_zero()).then(|| {
+            tokio::time::Instant::now() + wall.saturating_sub(self.state.budget.elapsed())
+        });
         // Checkpoint before the real request, after the budget admitted the
         // step: the summary request is real spend and must never be paid for
         // a step the guard would have refused. Raced against cancel so Ctrl-C
         // during the summary call returns promptly (parent-side only; the
         // race drops the summary future and cancels the per-turn child token).
-        tokio::select! {
+        let mut checkpoint_started = false;
+        let expired = tokio::select! {
             biased;
-            _ = self.cancel.cancelled() => {}
-            _ = checkpoint(self.state, self.provider, &self.cfg, self.emitter) => {}
+            _ = self.cancel.cancelled() => false,
+            _ = wait_deadline(deadline) => true,
+            _ = checkpoint(self.state, self.provider, &self.cfg, self.emitter, &mut checkpoint_started) => false,
+        };
+        if expired {
+            turn_token.cancel();
+            return self.wallclock_halt(checkpoint_started).await;
         }
         if self.cancel.is_cancelled() {
+            if checkpoint_started {
+                self.provider_usage_unknown();
+            }
             turn_token.cancel();
             self.state.stop_hard = true;
             self.state.gate.begin_abort();
+            return self.settle_provider_error(LlmError::Cancelled).await;
         }
         let req = build_request(self.state, self.registry, self.workdir, &self.cfg);
         // Parent-side cancel race: Ctrl-C during a model call returns promptly
         // instead of waiting out the adapter's 8x60s ladder. The `LlmClient`
         // trait is frozen (no token param), so the cancel branch drops the
         // `complete` future and cancels the per-turn child token.
+        let mut provider_started = false;
         let completed = tokio::select! {
             biased;
             _ = self.cancel.cancelled() => None,
-            res = self.provider.complete(&self.cfg.model, &req) => Some(res),
+            _ = wait_deadline(deadline) => {
+                turn_token.cancel();
+                return self.wallclock_halt(provider_started).await;
+            }
+            res = async { provider_started = true; self.provider.complete(&self.cfg.model, &req).await } => Some(res),
         };
         let completed = match completed {
             None => {
+                if provider_started {
+                    self.provider_usage_unknown();
+                }
                 turn_token.cancel();
                 self.state.stop_hard = true;
                 self.state.gate.begin_abort();
@@ -758,6 +787,43 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             Err(e) => self.settle_provider_error(e).await,
             Ok(resp) => self.settle_success(resp, req, &turn_token).await,
         }
+    }
+
+    fn provider_usage_unknown(&mut self) {
+        self.state.usage_totals.cost_usd = None;
+        self.emitter.emit(AgentEvent::Error {
+            error: AgentError {
+                code: "provider-usage-unknown".into(),
+                message: "provider request was interrupted; usage may be incomplete".into(),
+            },
+        });
+    }
+
+    async fn wallclock_halt(&mut self, provider_started: bool) -> Result<(), Outcome> {
+        self.state.in_flight = None;
+        let message = if provider_started {
+            self.state.usage_totals.cost_usd = None;
+            "wallclock deadline interrupted a provider request; usage may be incomplete"
+        } else {
+            "wallclock deadline exceeded before a provider request started"
+        };
+        self.record(
+            ItemKind::Attempt {
+                error: message.into(),
+                will_retry: false,
+            },
+            None,
+        )
+        .await?;
+        if provider_started {
+            self.emitter.emit(AgentEvent::Error {
+                error: AgentError {
+                    code: "wallclock-usage-unknown".into(),
+                    message: message.into(),
+                },
+            });
+        }
+        Err(Outcome::Halted("wallclock".into()))
     }
 
     /// Provider failure: meter the billed attempts, record the Attempt row,
@@ -916,13 +982,18 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         match self.registry.resolve(&inv.name) {
             Some(tool) => {
                 let tool_token = turn_token.child_token();
+                let wall = self.state.budget.config().max_wallclock;
+                let deadline = (!wall.is_zero()).then(|| {
+                    tokio::time::Instant::now() + wall.saturating_sub(self.state.budget.elapsed())
+                });
                 let raced = tokio::select! {
                     biased;
-                    _ = self.cancel.cancelled() => None,
-                    r = tool.execute(inv, tool_token) => Some(r),
+                    _ = self.cancel.cancelled() => Some(None),
+                    _ = wait_deadline(deadline) => None,
+                    r = tool.execute(inv, tool_token) => Some(Some(r)),
                 };
                 match raced {
-                    None => {
+                    Some(None) => {
                         turn_token.cancel();
                         self.state.stop_hard = true;
                         self.state.gate.begin_abort();
@@ -931,8 +1002,15 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                             is_error: true,
                         }
                     }
-                    Some(Ok(o)) => outcome_to_result(o),
-                    Some(Err(e)) => ToolResult::from(e),
+                    None => {
+                        turn_token.cancel();
+                        ToolResult {
+                            content: "wallclock deadline exceeded during tool execution".into(),
+                            is_error: true,
+                        }
+                    }
+                    Some(Some(Ok(o))) => outcome_to_result(o),
+                    Some(Some(Err(e))) => ToolResult::from(e),
                 }
             }
             None => ToolResult {
@@ -958,11 +1036,31 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             });
         }
         let mut batch_failed = false;
-        // Pre-batch counters: a full rollback refunds `edits` /
-        // `actions` / `verify.verified_since_write` past the verdict.
+        // Rollback restores edit and verification state; executed actions
+        // remain charged against the run budget.
         let batch_snap = snapshot_batch(self.state);
         for c in &calls {
-            if self.cancel.is_cancelled() {
+            let action_cap = self.state.budget.config().actions_per_trial;
+            let wall = self.state.budget.config().max_wallclock;
+            if !wall.is_zero() && self.state.budget.elapsed() >= wall {
+                self.state.record_tool_result(ToolMsg {
+                    call_id: c.call_id.clone(),
+                    result: ToolResult {
+                        content: "wallclock budget exhausted before dispatch".into(),
+                        is_error: true,
+                    },
+                });
+            } else if action_cap > 0
+                && self.state.budget.counters().actions_this_trial >= action_cap
+            {
+                self.state.record_tool_result(ToolMsg {
+                    call_id: c.call_id.clone(),
+                    result: ToolResult {
+                        content: "action budget exhausted before dispatch".into(),
+                        is_error: true,
+                    },
+                });
+            } else if self.cancel.is_cancelled() {
                 let content = "aborted before dispatch".to_owned();
                 self.state.record_tool_result(ToolMsg {
                     call_id: c.call_id.clone(),
@@ -1031,12 +1129,34 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             on_mismatch: "roll back the batch; keep only proven hunks".to_owned(),
         };
         let hunks = {
-            let probe = match &self.cfg.proof_cmd {
-                Some(cmd) => incremental_hunks(self.tree.clone(), self.workdir, cmd).await,
+            let wall = self.state.budget.config().max_wallclock;
+            if self.cfg.proof_cmd.is_some()
+                && !batch_failed
+                && !wall.is_zero()
+                && self.state.budget.elapsed() >= wall
+            {
+                return Err(Outcome::Halted("wallclock".into()));
+            }
+            let proof_cmd = self
+                .cfg
+                .proof_cmd
+                .as_ref()
+                .filter(|_| wall.is_zero() || self.state.budget.elapsed() < wall);
+            let probe = match proof_cmd {
+                Some(cmd) => {
+                    let deadline = (!wall.is_zero()).then(|| {
+                        tokio::time::Instant::now()
+                            + wall.saturating_sub(self.state.budget.elapsed())
+                    });
+                    incremental_hunks(self.tree.clone(), self.workdir, cmd, deadline).await
+                }
                 None => batch_hunks(self.tree.clone(), !batch_failed).await,
             };
             match probe {
                 Ok(h) => h,
+                Err(e) if e == "proof wallclock deadline exceeded" => {
+                    return Err(Outcome::Halted("wallclock".into()));
+                }
                 Err(e) => {
                     return Err(Outcome::Failed {
                         kind: FailureKind::Snapshot,

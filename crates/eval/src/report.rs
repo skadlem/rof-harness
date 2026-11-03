@@ -13,6 +13,12 @@ pub const APPLY_COMPARABILITY_NOTE: &str =
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceReport {
     pub id: String,
+    /// SHA-256 of the frozen task inputs used by this attempt.
+    #[serde(default)]
+    pub task_digest: Option<String>,
+    /// Immutable image ID of the running container, when inspected.
+    #[serde(default)]
+    pub image_id: Option<String>,
     pub verdict: Verdict,
     /// Cumulative `TurnEnd.usage_totals`: `None` = the dump carried no TurnEnd
     /// at all (missing/truncated), so the counts are unknown — `null`, never 0.
@@ -56,6 +62,9 @@ pub enum Estimand {
 /// which binary, which grading path, which budget recipe, which applier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunProvenance {
+    /// Nonsecret resolved run configuration, absent in older reports.
+    #[serde(default)]
+    pub run_config: Option<serde_json::Value>,
     /// Short git sha of the `rof` binary that produced the run, embedded
     /// at build time by `crates/rof/build.rs` (`git rev-parse --short
     /// HEAD`); `None` only if the value was not embedded, and "unknown"
@@ -189,10 +198,19 @@ pub fn instance_report_with_mode(
     let mut totals: Option<UsageReport> = None;
     let mut steps = 0u32;
     let mut halt: Option<String> = None;
+    let mut usage_unknown = false;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let ev: AgentEvent = serde_json::from_str(line)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         match ev {
+            AgentEvent::Error { error }
+                if matches!(
+                    error.code.as_str(),
+                    "wallclock-usage-unknown" | "provider-usage-unknown"
+                ) =>
+            {
+                usage_unknown = true;
+            }
             AgentEvent::MessageEnd { .. } => steps += 1,
             AgentEvent::TurnEnd { usage_totals, .. } => totals = Some(usage_totals),
             AgentEvent::RunEnd { outcome, .. } => {
@@ -207,10 +225,21 @@ pub fn instance_report_with_mode(
     }
     Ok(InstanceReport {
         id: id.into(),
+        task_digest: None,
+        image_id: None,
         verdict,
-        tokens_in: totals.as_ref().map(|t| t.input_tokens),
-        tokens_out: totals.as_ref().map(|t| t.output_tokens),
-        dollars: totals.as_ref().and_then(|t| t.cost_usd),
+        tokens_in: totals
+            .as_ref()
+            .filter(|_| !usage_unknown)
+            .map(|t| t.input_tokens),
+        tokens_out: totals
+            .as_ref()
+            .filter(|_| !usage_unknown)
+            .map(|t| t.output_tokens),
+        dollars: totals
+            .as_ref()
+            .filter(|_| !usage_unknown)
+            .and_then(|t| t.cost_usd),
         wall_secs,
         steps,
         halt_reason: halt,

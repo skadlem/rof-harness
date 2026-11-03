@@ -216,6 +216,29 @@ pub fn resolve_under(
         ));
     }
     symlink_safe(root, &p, write)?;
+    // Check the resolved spelling too, including symlinked parent directories.
+    let resolved = std::fs::canonicalize(&p).ok().or_else(|| {
+        Some(
+            std::fs::canonicalize(p.parent()?)
+                .ok()?
+                .join(p.file_name()?),
+        )
+    });
+    if let (Some(real), Ok(canon_root)) = (resolved, std::fs::canonicalize(root)) {
+        if let Ok(rel) = real.strip_prefix(canon_root) {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            for g in denied_globs {
+                if g.starts_with("**/.env") && is_env_template(&rel) {
+                    continue;
+                }
+                if glob_match(g, &rel) {
+                    return Err(ToolPathError::Denied(format!(
+                        "path matches denied glob: {rel}"
+                    )));
+                }
+            }
+        }
+    }
     Ok(p)
 }
 

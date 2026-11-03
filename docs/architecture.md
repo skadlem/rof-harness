@@ -70,10 +70,9 @@ capability, and the container is removed best-effort on every path.
 - `tool-core` — tool vocabulary, registry gate, `ToolOutcome` (`success`
   carries the exit status; serde default false = fail-closed).
 - `tools-std` — policy-gated `view/search/edit/write/exec/test` tools.
-  The path policy (root-anchored, symlink-safe, secrets-denied) covers
-  `view`/`edit`/`write` only, and resolves a leading `/app/` to the tool
-  root so the workspace can be addressed the way task statements spell
-  it.
+  The path policy checks containment and requested and resolved paths against
+  secrets globs, including recursive search descendants, and resolves a leading
+  `/app/` to the tool root.
 - `agent-budget` — step/action/token/spend caps, halts, `with_steps()`
   (warn clamp + refund re-derive live there). `config_for` presets per
   capability; run budgets resolve in `cli::budget_for`.
@@ -91,10 +90,36 @@ capability, and the container is removed best-effort on every path.
 
 ## Data flow
 
-Model response -> parsed tool call -> registry gate -> tool exec (policy
-checked) -> result folded back into context -> budget guard at the step
-head -> WAL append (pre-effect, fsync) -> next request. The stdout patch
+Model response -> WAL records assistant and tool calls (fsync) -> registry
+gate -> tool exec (policy checked) -> WAL tool result (fsync) -> next
+request's derived context. The budget guard admits provider steps and checks
+the action cap before each tool in a batch. The stdout patch
 is computed once at the end from the snapshot tree.
+
+## Current guarantee limits (reviewed 2026-11-03)
+
+- The CLI archives the previous WAL before startup and constructs fresh state.
+  `read_log` has no production caller; durable recording is implemented,
+  crash resume is not.
+- Spend is accumulated before conversion to cents. Provider calls and tool
+  execution and proof commands observe the run wall-clock deadline. In-flight
+  provider usage may be unknown on timeout or cancellation; blocking Git
+  operations can extend the wall-clock deadline.
+- Rollback restores Git-managed batch state, not installed packages,
+  services, or ignored files. File tools and snapshots run on the host;
+  in-container exec/test run in the container. Optional proof commands run
+  directly on the host.
+- Incremental proof rejects a truncated evidence patch before restoring any
+  prefix. Exec timeout and cancellation cover pipe draining; in-container
+  descendants may still outlive a killed docker-exec client.
+- Verifier artifacts are cleared before grading; verifier infrastructure
+  failures take precedence over a reward. Tests are mounted during the agent
+  leg and `/logs` is writable there, so tests and rewards are not isolated
+  from agent commands.
+- Reports record nonsecret model, endpoint, command allowlist, output-token
+  limit, and thinking setting. Each row records a SHA-256 task snapshot
+  digest and live-container image ID when available. Symlinks and special
+  inputs leave task identity unknown; Harbor-owned image identity is unknown.
 
 ## Budget defaults (`cli::budget_for`)
 

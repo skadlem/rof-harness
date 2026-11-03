@@ -10,6 +10,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tool_core::{ToolOutcome, ToolResult, TOOL_EDIT, TOOL_WRITE};
 
+#[cfg(unix)]
+struct ProofGroup(u32);
+
+#[cfg(unix)]
+impl Drop for ProofGroup {
+    fn drop(&mut self) {
+        unsafe {
+            libc::killpg(self.0 as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
 /// Model-facing notice when one failed tool reverts the whole batch.
 pub(crate) const ROLLBACK_NOTICE: &str = "a tool in your last batch failed and the whole batch was reverted — your successful changes in it are gone; re-apply them";
 
@@ -118,7 +130,11 @@ pub(crate) async fn incremental_hunks(
     tree: Arc<snapshot::TreeService>,
     workdir: &Path,
     proof_cmd: &str,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Vec<(String, bool)>, String> {
+    if proof_cmd.split_whitespace().next().is_none() {
+        return Err("proof-cmd empty".to_string());
+    }
     let hunks = blocking({
         let tree = tree.clone();
         move || {
@@ -126,38 +142,86 @@ pub(crate) async fn incremental_hunks(
             let patch = tree
                 .patch(&diff)
                 .map_err(|e| format!("snapshot patch: {e}"))?;
+            if patch.truncated {
+                return Err("snapshot patch truncated; refusing proof restoration".to_string());
+            }
             Ok::<_, String>(split_patch(&patch))
         }
     })
     .await?;
     let mut flags = Vec::with_capacity(hunks.len());
     for k in 0..hunks.len() {
+        if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+            let tree = tree.clone();
+            blocking(move || {
+                tree.restore_hunks(&hunks)
+                    .map_err(|e| format!("snapshot restore: {e}"))
+            })
+            .await?;
+            return Err("proof wallclock deadline exceeded".into());
+        }
         let prefix = hunks[..=k].to_vec();
-        let tree = tree.clone();
-        blocking(move || {
-            tree.restore_hunks(&prefix)
+        let restore_tree = tree.clone();
+        if let Err(error) = blocking(move || {
+            restore_tree
+                .restore_hunks(&prefix)
                 .map_err(|e| format!("snapshot restore: {e}"))
         })
-        .await?;
+        .await
+        {
+            let tree = tree.clone();
+            blocking(move || {
+                tree.restore_hunks(&hunks)
+                    .map_err(|e| format!("snapshot restore: {e}"))
+            })
+            .await?;
+            return Err(error);
+        }
         let mut argv = proof_cmd.split_whitespace();
         let bin = argv.next().ok_or_else(|| "proof-cmd empty".to_string())?;
-        let ok = tokio::time::timeout(
-            Duration::from_secs(60),
-            tokio::process::Command::new(bin)
-                .args(argv)
-                .current_dir(workdir)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                // kill_on_drop (tokio default false): a timed-out proof child
-                // must not keep running and mutating the workdir after we
-                // report timeout, mirroring tools-std's exec guard.
-                .kill_on_drop(true)
-                .status(),
-        )
-        .await
-        .map(|s| s.is_ok_and(|s| s.success()))
-        .unwrap_or(false);
+        let mut command = tokio::process::Command::new(bin);
+        command
+            .args(argv)
+            .current_dir(workdir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                let tree = tree.clone();
+                blocking(move || {
+                    tree.restore_hunks(&hunks)
+                        .map_err(|e| format!("snapshot restore: {e}"))
+                })
+                .await?;
+                return Err(format!("proof spawn: {e}"));
+            }
+        };
+        #[cfg(unix)]
+        let _group = child.id().map(ProofGroup);
+        let probe_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let until = deadline.map_or(probe_deadline, |d| d.min(probe_deadline));
+        let status = tokio::time::timeout_at(until, child.wait()).await;
+        if status.is_err() {
+            #[cfg(unix)]
+            drop(_group);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+                let tree = tree.clone();
+                blocking(move || {
+                    tree.restore_hunks(&hunks)
+                        .map_err(|e| format!("snapshot restore: {e}"))
+                })
+                .await?;
+                return Err("proof wallclock deadline exceeded".into());
+            }
+        }
+        let ok = status.is_ok_and(|s| s.is_ok_and(|s| s.success()));
         flags.push((hunks[k].clone(), ok));
     }
     Ok(flags)
@@ -240,19 +304,13 @@ pub(crate) fn settle_tool_msg(state: &mut LoopState, msg: ToolMsg, cfg: &crate::
     true
 }
 
-/// Batch-scope counter snapshot: the rows `tree.rollback` (or a gate
-/// `Aborted`) destroys must not linger in the counters. `edits`,
-/// `actions_this_trial` (+ the tripwire streak/sig that describes those
-/// actions), and `verify.verified_since_write` are refunded to this snapshot on a
-/// full-batch rollback. Directive one-shot latches are NOT refunded: fired
+/// Batch-scope edit and verification snapshot for a full rollback.
+/// Executed actions and the tripwire are retained even when edits roll back.
+/// Directive one-shot latches are NOT refunded: fired
 /// text is already durable on a `ToolResult` tail and must not repeat.
 #[derive(Debug, Clone)]
 pub(crate) struct BatchSnapshot {
     pub(crate) edits: u32,
-    pub(crate) actions_this_trial: u32,
-    pub(crate) same_action_streak: u32,
-    pub(crate) last_sig: String,
-    pub(crate) last_obs: u64,
     pub(crate) verified_since_write: bool,
 }
 
@@ -261,10 +319,6 @@ pub(crate) struct BatchSnapshot {
 pub(crate) fn snapshot_batch(state: &LoopState) -> BatchSnapshot {
     BatchSnapshot {
         edits: state.edits,
-        actions_this_trial: state.budget.counters().actions_this_trial,
-        same_action_streak: state.budget.counters().same_action_streak,
-        last_sig: state.last_sig.clone(),
-        last_obs: state.last_obs,
         verified_since_write: state.verify.verified_since_write,
     }
 }
@@ -276,9 +330,5 @@ pub(crate) fn snapshot_batch(state: &LoopState) -> BatchSnapshot {
 /// deferred).
 pub(crate) fn refund_batch(state: &mut LoopState, snap: &BatchSnapshot) {
     state.edits = snap.edits;
-    state.budget.counters_mut().actions_this_trial = snap.actions_this_trial;
-    state.budget.counters_mut().same_action_streak = snap.same_action_streak;
-    state.last_sig = snap.last_sig.clone();
-    state.last_obs = snap.last_obs;
     state.verify.verified_since_write = snap.verified_since_write;
 }
