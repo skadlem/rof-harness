@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{parse_table, resolve_endpoint, Flag};
 
-pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--keep-thinking] [--in-container]
+pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--keep-thinking] [--in-container]
 --lenient-apply: record Lenient patch-apply provenance in the report (default Strict; Strict grades are not comparable with earlier fuzz-lenient numbers)
 --agent: run the agent leg per instance instead of the oracle-container leg (fresh workdir, in-process rof-run wiring, harbor-CLI grading). Requires --model ID and --endpoint URL (or OPENAI_BASE_URL); mutually exclusive with --winnability-only. Agent budgets default to the frozen pilot recipe: 300000 tokens / 60 steps / 120 actions; explicit flags win.
 --keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default keeps the DeepSeek thinking-off knob, sent only on compaction-summary calls and the truncation ladder first rung; ordinary requests carry no thinking fragment)
 --in-container: with --agent, the agent works inside the task environment container (started before the run; workdir bind-mounted at /app, cpus/memory capped at 2/4096m; agent exec/test calls wrapped with docker exec; the verifier execs the same live container, so installed packages and running services persist to grading). Verdict provenance in this mode is the task-written reward file (/logs/verifier/reward.txt) with the verifier exit code as the no-artifact fallback, never the harbor result.json reward;
 --exec-policy allowlist|any: command-allowlist policy forwarded to the agent leg. `any` skips the prefix list entirely (the in-container agent's process boundary is the task container, not this harness); the value is recorded in the report provenance, so relaxed rows never pool with strict rows
 --budget-shape: token-cap accounting, recorded on the report's provenance block. gross = input+output (default, the frozen recipe); miss-plus-out = (input - cache_read) + output, so provider-cached prompt re-reads stop spending the token cap. A miss-plus-out arm is a DIFFERENT ESTIMAND from a gross arm: never mix the two shapes in one table. Reported usage totals and dollars are unchanged by either shape;
+--streak-steer on|off: enable the experimental six-read directive (default off);
 --steer on|off: initiative steering nudges for the agent leg (unverified-declare hold, half/late action directives, wrap-up nudge); `off` is the ablation arm and still ships the workflow contract and the rollback notice (default on);
 --reasoning-effort LEVEL (none|low|high|xhigh|max): send `reasoning_effort` on every request of the agent leg; recorded in the report provenance (default: none sent = endpoint default). Measured on the vLLM gateway 2026-10-19: 0/722/1060/1149/2976 reasoning tokens on one prompt for none/low/high/xhigh/max; the field is ignored by api.deepseek.com";
 
@@ -59,6 +60,8 @@ pub(crate) struct EvalArgs {
     /// `off` arm keeps the contract and rollback notice but ships no
     /// nudges. Recorded in provenance so arms never pool.
     pub steer: bool,
+    /// Experimental read-streak intervention, off by default.
+    pub streak_steer: bool,
     /// In-container agent mode: the agent works inside the task
     /// environment container (workdir bind-mounted at /app) and the
     /// verifier execs the same live container, so installed packages and
@@ -83,6 +86,7 @@ struct EvalBuilder {
     keep_thinking: bool,
     reasoning_effort: Option<String>,
     steer: Option<bool>,
+    streak_steer: Option<bool>,
     in_container: bool,
     model: Option<String>,
     endpoint: Option<String>,
@@ -245,6 +249,15 @@ fn set_steer(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
+fn set_streak_steer(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.streak_steer = Some(match v.as_deref() {
+        Some("on") => true,
+        Some("off") => false,
+        other => return Err(format!("--streak-steer expects on|off, got {other:?}")),
+    });
+    Ok(())
+}
+
 fn set_reasoning_effort(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
     let level = v.ok_or("--reasoning-effort needs a level")?;
     if !crate::cli::EFFORT_LEVELS.contains(&level.as_str()) {
@@ -369,6 +382,11 @@ const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
         set: set_steer,
     },
     Flag {
+        name: "--streak-steer",
+        takes_value: true,
+        set: set_streak_steer,
+    },
+    Flag {
         name: "--in-container",
         takes_value: false,
         set: set_in_container,
@@ -429,6 +447,7 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
         keep_thinking: b.keep_thinking,
         reasoning_effort: b.reasoning_effort,
         steer: b.steer.unwrap_or(true),
+        streak_steer: b.streak_steer.unwrap_or(false),
         in_container: b.in_container,
     })
 }
@@ -606,6 +625,7 @@ pub(crate) fn finish_report(args: &EvalArgs, reports: Vec<eval::InstanceReport>)
                     "allow_cmd": args.allow_cmd,
                     "max_tokens": args.max_tokens.unwrap_or(8_000),
                     "keep_thinking": args.keep_thinking,
+                    "streak_steer": args.streak_steer,
                     "task_identity": "per_instance",
                 })
             }),
@@ -632,6 +652,38 @@ pub(crate) fn finish_report(args: &EvalArgs, reports: Vec<eval::InstanceReport>)
 mod tests {
     use super::*;
     use crate::fixtures::argv;
+
+    #[test]
+    fn eval_accepts_streak_steer() {
+        let plain = parse_eval(&argv(&["rof", "eval", "--tasks-dir", "/tmp/tasks"])).unwrap();
+        assert!(!plain.streak_steer);
+        let on = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/tasks",
+            "--streak-steer",
+            "on",
+        ]))
+        .unwrap();
+        assert!(on.streak_steer);
+        let run = crate::eval_agent::agent_args(
+            &on,
+            std::path::Path::new("/tmp"),
+            "goal",
+            std::path::Path::new("/tmp/events"),
+        );
+        assert!(crate::cli::run_config(&run).streak_steer);
+        assert!(parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/tasks",
+            "--streak-steer",
+            "bad"
+        ]))
+        .is_err());
+    }
 
     #[test]
     fn cli_eval_parses_tasks_dir_and_report() {
@@ -892,6 +944,8 @@ mod tests {
             "12345",
             "--budget-shape",
             "miss-plus-out",
+            "--streak-steer",
+            "on",
             "--report",
             path.to_str().unwrap(),
         ]))
@@ -909,6 +963,7 @@ mod tests {
         assert_eq!(p["run_config"]["model"], "m");
         assert_eq!(p["run_config"]["endpoint"], "http://x");
         assert_eq!(p["run_config"]["max_tokens"], 8000);
+        assert_eq!(p["run_config"]["streak_steer"], true);
         assert!(
             p["binary_git_sha"].as_str().is_some_and(|s| !s.is_empty()),
             "sha embedded by build.rs (real or 'unknown'), never silently absent: {p}"
@@ -1005,6 +1060,7 @@ mod tests {
             keep_thinking: false,
             reasoning_effort: None,
             steer: true,
+            streak_steer: false,
             in_container: false,
         };
         let code = run_eval(&args).await;

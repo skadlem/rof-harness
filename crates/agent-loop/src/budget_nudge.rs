@@ -12,6 +12,31 @@ use std::hash::{Hash, Hasher};
 pub(crate) const DIRECTIVE_CAP: usize = 3;
 
 impl LoopState {
+    pub(crate) fn observe_read_streak(&mut self, name: &str, is_error: bool, treatment: bool) {
+        if !is_error && matches!(name, "write" | "edit") {
+            self.experiment.streak_write_seen = true;
+            self.experiment.streak_pending = false;
+        }
+        if !is_error && matches!(name, "view" | "search") {
+            self.experiment.streak_reads = self.experiment.streak_reads.saturating_add(1);
+        } else {
+            self.experiment.streak_reads = 0;
+        }
+        if !self.experiment.streak_crossed
+            && !self.experiment.streak_write_seen
+            && self.experiment.streak_reads == 6
+        {
+            self.experiment.streak_crossed = true;
+            self.experiment.streak_pending = treatment;
+            crate::append_to(
+                &mut self.items,
+                ItemKind::Attempt {
+                    error: "streak-crossed id=read-streak-1".into(),
+                    will_retry: false,
+                },
+            );
+        }
+    }
     /// Same-action tripwire + 30-action abort, wired to budget counters.
     pub fn observe_action(&mut self, sig: &str, observation: &str) -> Option<BudgetHalt> {
         let mut hasher = DefaultHasher::new();

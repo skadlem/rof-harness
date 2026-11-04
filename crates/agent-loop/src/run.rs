@@ -318,6 +318,8 @@ impl std::str::FromStr for BudgetShape {
 /// window until the histogram retunes it.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
+    /// Opt-in six-read intervention; counterfactual crossings are logged in both arms.
+    pub streak_steer: bool,
     pub goal: String,
     pub model: String,
     pub max_tokens: usize,
@@ -354,6 +356,7 @@ pub struct RunConfig {
 impl Default for RunConfig {
     fn default() -> Self {
         Self {
+            streak_steer: false,
             goal: "run".into(),
             model: "run-model".into(),
             max_tokens: 2000,
@@ -753,6 +756,16 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             return self.settle_provider_error(LlmError::Cancelled).await;
         }
         let req = build_request(self.state, self.registry, self.workdir, &self.cfg);
+        if self.state.experiment.streak_pending {
+            self.record(
+                ItemKind::Attempt {
+                    error: format!("streak-request id=read-streak-1 step={}", self.state.step),
+                    will_retry: true,
+                },
+                None,
+            )
+            .await?;
+        }
         // Parent-side cancel race: Ctrl-C during a model call returns promptly
         // instead of waiting out the adapter's 8x60s ladder. The `LlmClient`
         // trait is frozen (no token param), so the cancel branch drops the
@@ -886,6 +899,11 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         req: Request,
         turn_token: &CancellationToken,
     ) -> Result<(), Outcome> {
+        let streak_delivered = self.state.experiment.streak_pending
+            && req
+                .messages
+                .iter()
+                .any(|m| m.content == crate::request::READ_STREAK_DIRECTIVE);
         // The request (including any peeked hold row) reached the
         // provider: consume the hold now. A provider Err below keeps
         // it armed for the in-step retry.
@@ -909,6 +927,17 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             stop: resp.stop,
             usage: Some(billed.clone()),
         });
+        if streak_delivered {
+            self.state.experiment.streak_pending = false;
+            self.record(
+                ItemKind::Attempt {
+                    error: format!("streak-delivered id=read-streak-1 step={}", self.state.step),
+                    will_retry: false,
+                },
+                None,
+            )
+            .await?;
+        }
         let outcome = self
             .state
             .step_claim(resp.message.clone(), resp.stop, &self.cfg);
@@ -1095,6 +1124,15 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                         result: res.clone(),
                     });
                 }
+            }
+            if let Some(result) = self
+                .state
+                .tool_calls
+                .get(&c.call_id)
+                .and_then(|s| s.result.clone())
+            {
+                self.state
+                    .observe_read_streak(&c.name, result.is_error, self.cfg.streak_steer);
             }
             // Directives and the nudge land on the fresh tail
             // BEFORE the sync, so the file never holds a stale

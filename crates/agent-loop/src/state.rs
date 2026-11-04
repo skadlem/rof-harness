@@ -267,6 +267,10 @@ pub struct LoopState {
 /// `LoopState`'s surface stays on the base loop; no behavior change.
 #[derive(Debug, Clone, Default)]
 pub struct Experiment {
+    pub(crate) streak_reads: u32,
+    pub(crate) streak_crossed: bool,
+    pub(crate) streak_pending: bool,
+    pub(crate) streak_write_seen: bool,
     /// Ablation observability (Bet B→+A→+C): verdict/assessment counters
     /// for the run-end report. Never drives behavior.
     pub ablation: bets::AblationMetrics,

@@ -3,6 +3,22 @@
 Ordered and spend-gated. Design decisions anchor to `docs/decisions.md`;
 measured numbers carry a date and live with the run artifacts.
 
+## Budget update (2026-11-05)
+
+The owner authorized $5 additional spend for the steering pilot. The cumulative ceiling is $10, with the entire $4.30645020 previously accounted or reserved carried forward. The earlier incomplete pair is diagnostic only; the fresh matched campaign uses one new binary for both arms. The proxy's ceiling assumes regular DeepSeek V4.1 Flash 1017 peak rates, not an independently verified dphn account quota. The full protocol and historical records remain in `docs/steering-experiment.md`.
+
+## Current state (2026-11-05)
+
+- `--streak-steer on|off` implements the proposed treatment, default off; both arms log threshold crossings, and treatment logs request/response delivery. Local scripted and Docker rehearsals verified the paired driver and treatment markers without paid calls.
+- The paid pilot is stopped with one eligible heap control (Unresolved, 0/6 verifier tests, 286,477 input and 19,368 output tokens; threshold crossed). Its treatment crossed and was delivered but was interrupted before grading when one provider attempt had unknown usage. The pair is incomplete; no capability conclusion follows.
+- The budget ledger retains $3.80367360 for three prior HTTP 403/1010 attempts and a full reservation for the latest unknown-usage attempt. The current accounted-plus-reserved upper bound is $4.30645020 under the owner-approved DeepSeek peak-price and model-context assumptions; this is not the billed amount. No further paid calls until the latest unknown is reconciled or a newly registered campaign explicitly carries all unresolved reservations. The original 403 was reproduced without credentials as a Cloudflare block caused by the proxy's Python user agent; forwarding the harness user agent fixes that problem. The proxy now refuses the next request immediately after any unknown usage.
+
+## Current state (2026-11-03)
+
+- Reliability fixes landed in `32f6b36`. Historical event logs replayed against the old and new parser sources show 74 argument differences in 2,609 exec calls across 86 completed logs; the replay did not execute historical commands or establish a verdict change. The selection is completed logs, not a curated benchmark sample, and individual historical binaries were not verified against those two source versions. Recorded tool output was already condensed, so its raw-output counterfactual is unavailable.
+- A local scripted-provider check on real containers graded a synthetic known-answer task Resolved and a deliberately failing task Unresolved, with task/image identities recorded and containers cleaned up. A reused output directory with a planted stale success still graded Unresolved. This is a pipeline check, not a Terminal-Bench capability measurement.
+- The old `dphn-steer` driver stays paused: its frozen binary predates the reliability fixes and the banked row cannot be combined with new-binary results. The newly registered feasibility protocol is in `docs/steering-experiment.md`; the treatment is opt-in; subsequent pilot status is recorded above. The owner authorized paid calls up to $5, assuming regular DeepSeek V4.1 Flash 1017 pricing.
+
 ## Current state (2026-10-19)
 
 - **Reasoning effort is now a request knob** (`--reasoning-effort` on `run`

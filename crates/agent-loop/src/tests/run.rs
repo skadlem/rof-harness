@@ -28,8 +28,316 @@ use tool_core::{
 use super::{
     compaction, edit_registry, event_order, full_event_order, last_totals, response, run_kinds,
     run_registry, run_script, run_tmp, script_resp, summary_resp, text_resp, text_response,
-    tool_use_message, usage, write_round, FakeLlm, Scripted,
+    tool_use_message, usage, write_round, FakeLlm, Scripted, WriteFile,
 };
+
+struct StreakView;
+#[async_trait::async_trait]
+impl CoreTool for StreakView {
+    fn definition(&self) -> CoreToolDef {
+        CoreToolDef {
+            name: "view".into(),
+            description: "view".into(),
+            schema: serde_json::json!({"type":"object"}),
+        }
+    }
+    fn prepare(&self, call: &CoreToolCall) -> CoreCallStatus {
+        CoreCallStatus::Dispatch(CoreInvocation {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            args: call.args.clone(),
+        })
+    }
+    async fn execute(
+        &self,
+        inv: CoreInvocation,
+        _: CancellationToken,
+    ) -> Result<CoreToolOutcome, CoreToolError> {
+        Ok(CoreToolOutcome {
+            content: inv.args.to_string(),
+            truncated: false,
+            success: true,
+        })
+    }
+}
+
+#[tokio::test]
+async fn streak_crossing_and_response_delivery_are_distinct() {
+    for treatment in [false, true] {
+        let root = run_tmp("streak-e2e");
+        std::fs::write(root.join("seed"), "x").unwrap();
+        let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+            [("agent".to_owned(), vec!["view".to_owned()])].into(),
+        )));
+        registry.register(Arc::new(StreakView));
+        let calls: Vec<_> = (0..6)
+            .map(|n| (format!("c{n}"), serde_json::json!({"n":n})))
+            .collect();
+        let response_calls = calls
+            .iter()
+            .map(|(id, args)| (id.as_str(), "view", args.clone()))
+            .collect();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = FakeLlm {
+            order: Arc::new(Mutex::new(Vec::new())),
+            queue: Mutex::new(VecDeque::from(vec![
+                script_resp(response_calls, StopReason::ToolUse),
+                text_resp("done"),
+            ])),
+            requests: requests.clone(),
+        };
+        let mut state = LoopState::new();
+        let mut emitter = Emitter::new();
+        let outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: RunConfig {
+                    streak_steer: treatment,
+                    ..RunConfig::default()
+                },
+            },
+            vec![Input::User("go".into())],
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Done));
+        let attempts: Vec<String> = state
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Attempt { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|a| a.contains("streak-crossed"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|a| a.contains("streak-delivered"))
+                .count(),
+            usize::from(treatment)
+        );
+        let req = requests.lock().unwrap();
+        assert_eq!(
+            req[1]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("You have read six files")),
+            treatment
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[tokio::test]
+async fn streak_at_action_cap_never_claims_delivery() {
+    let root = run_tmp("streak-budget");
+    std::fs::write(root.join("seed"), "x").unwrap();
+    let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+        [("agent".to_owned(), vec!["view".to_owned()])].into(),
+    )));
+    registry.register(Arc::new(StreakView));
+    let calls: Vec<_> = (0..6)
+        .map(|n| (format!("c{n}"), serde_json::json!({"n":n})))
+        .collect();
+    let response_calls = calls
+        .iter()
+        .map(|(id, args)| (id.as_str(), "view", args.clone()))
+        .collect();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let client = FakeLlm {
+        order: Arc::new(Mutex::new(Vec::new())),
+        queue: Mutex::new(VecDeque::from(vec![script_resp(
+            response_calls,
+            StopReason::ToolUse,
+        )])),
+        requests: requests.clone(),
+    };
+    let mut state = LoopState::new();
+    state.budget = agent_budget::BudgetGuard::new(
+        agent_budget::BudgetConfig {
+            actions_per_trial: 6,
+            ..agent_budget::config_for(agent_budget::Capability::UnattendedBatch)
+        },
+        Instant::now(),
+    );
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                streak_steer: true,
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Halted(_)));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert!(state.items.iter().any(
+        |i| matches!(&i.kind, ItemKind::Attempt {error, ..} if error.contains("streak-crossed"))
+    ));
+    assert!(!state.items.iter().any(
+        |i| matches!(&i.kind, ItemKind::Attempt {error, ..} if error.contains("streak-delivered"))
+    ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn streak_cancelled_request_never_claims_delivery() {
+    let root = run_tmp("streak-cancel");
+    std::fs::write(root.join("seed"), "x").unwrap();
+    let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+        [("agent".to_owned(), vec!["view".to_owned()])].into(),
+    )));
+    registry.register(Arc::new(StreakView));
+    let calls: Vec<_> = (0..6)
+        .map(|n| (format!("c{n}"), serde_json::json!({"n":n})))
+        .collect();
+    let response_calls = calls
+        .iter()
+        .map(|(id, args)| (id.as_str(), "view", args.clone()))
+        .collect();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let client = FakeLlm {
+        order: Arc::new(Mutex::new(Vec::new())),
+        queue: Mutex::new(VecDeque::from(vec![
+            script_resp(response_calls, StopReason::ToolUse),
+            Scripted::Hang,
+        ])),
+        requests: requests.clone(),
+    };
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    let observer = requests.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            if observer.lock().unwrap().len() >= 2 {
+                trigger.cancel();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                streak_steer: true,
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("go".into())],
+        &cancel,
+    )
+    .await;
+    task.abort();
+    assert!(matches!(outcome, Outcome::Cancelled));
+    assert!(state.items.iter().any(
+        |i| matches!(&i.kind, ItemKind::Attempt {error, ..} if error.contains("streak-request"))
+    ));
+    assert!(!state.items.iter().any(
+        |i| matches!(&i.kind, ItemKind::Attempt {error, ..} if error.contains("streak-delivered"))
+    ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn streak_followed_by_write_in_batch_does_not_deliver() {
+    let root = run_tmp("streak-write");
+    std::fs::write(root.join("seed"), "x").unwrap();
+    let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+        [(
+            "agent".to_owned(),
+            vec!["view".to_owned(), "write".to_owned()],
+        )]
+        .into(),
+    )));
+    registry.register(Arc::new(StreakView));
+    registry.register(Arc::new(WriteFile { root: root.clone() }));
+    let calls: Vec<_> = (0..6)
+        .map(|n| (format!("c{n}"), serde_json::json!({"n":n})))
+        .collect();
+    let mut response_calls: Vec<_> = calls
+        .iter()
+        .map(|(id, args)| (id.as_str(), "view", args.clone()))
+        .collect();
+    response_calls.push((
+        "w",
+        "write",
+        serde_json::json!({"path":"result", "content":"ok"}),
+    ));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let client = FakeLlm {
+        order: Arc::new(Mutex::new(Vec::new())),
+        queue: Mutex::new(VecDeque::from(vec![
+            script_resp(response_calls, StopReason::ToolUse),
+            text_resp("done"),
+        ])),
+        requests: requests.clone(),
+    };
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                streak_steer: true,
+                steer: false,
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Done));
+    assert!(state.items.iter().any(
+        |i| matches!(&i.kind, ItemKind::Attempt {error, ..} if error.contains("streak-crossed"))
+    ));
+    assert!(!state.items.iter().any(
+        |i| matches!(&i.kind, ItemKind::Attempt {error, ..} if error.contains("streak-delivered"))
+    ));
+    assert!(!requests.lock().unwrap()[1]
+        .messages
+        .iter()
+        .any(|m| m.content.contains("You have read six files")));
+    let _ = std::fs::remove_dir_all(root);
+}
 
 #[tokio::test]
 async fn drive_tick_select_spine() {

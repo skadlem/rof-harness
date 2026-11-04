@@ -67,6 +67,8 @@ capability, and the container is removed best-effort on every path.
   `RunConfig` carries goal/model/context/max-tokens/incentives/proof-cmd
   plus the fold knobs (`thinking_keep`, `collapse_hysteresis`) and the
   WAL path; the loop itself never reads process env.
+  `--streak-steer` separately opts in to the unvalidated six-read directive;
+  crossings are recorded for both the control and treatment.
 - `tool-core` — tool vocabulary, registry gate, `ToolOutcome` (`success`
   carries the exit status; serde default false = fail-closed).
 - `tools-std` — policy-gated `view/search/edit/write/exec/test` tools.

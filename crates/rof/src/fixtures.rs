@@ -196,6 +196,7 @@ pub(crate) fn args_for(dir: &std::path::Path, steps: Option<u32>) -> Args {
         keep_thinking: false,
         reasoning_effort: None,
         steer: true,
+        streak_steer: false,
         bets: false,
         incentives: agent_loop::IncentivesLevel::Full,
         proof_cmd: None,

@@ -20,6 +20,38 @@ use super::{
 };
 
 #[test]
+fn streak_trigger_counts_successful_reads_and_resets() {
+    let mut s = LoopState::new();
+    for _ in 0..5 {
+        s.observe_read_streak("view", false, false);
+    }
+    s.observe_read_streak("search", true, false);
+    for _ in 0..5 {
+        s.observe_read_streak("search", false, false);
+    }
+    assert!(!s.experiment.streak_crossed);
+    s.observe_read_streak("view", false, false);
+    assert!(s.experiment.streak_crossed);
+    assert!(!s.experiment.streak_pending);
+    assert_eq!(s.items.iter().filter(|i| matches!(&i.kind, ItemKind::Attempt { error, .. } if error.contains("streak-crossed"))).count(), 1);
+}
+
+#[test]
+fn streak_treatment_is_one_shot_and_stops_after_successful_write() {
+    let mut s = LoopState::new();
+    for _ in 0..6 {
+        s.observe_read_streak("view", false, true);
+    }
+    assert!(s.experiment.streak_pending);
+    s.observe_read_streak("write", false, true);
+    assert!(!s.experiment.streak_pending);
+    for _ in 0..6 {
+        s.observe_read_streak("view", false, true);
+    }
+    assert!(!s.experiment.streak_pending);
+}
+
+#[test]
 fn budget_nudge_appends_to_tool_result_tail_once() {
     let mut s = LoopState::new();
     s.turn = 1;

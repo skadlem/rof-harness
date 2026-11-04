@@ -10,6 +10,44 @@ use tokio_util::sync::CancellationToken;
 use super::{run_registry, run_tmp, script_resp, text_resp, FakeLlm};
 
 #[test]
+fn read_streak_changes_only_treatment_request() {
+    let root = run_tmp("streak-request");
+    let registry = run_registry(&root);
+    let mut control = LoopState::new();
+    let mut treatment = LoopState::new();
+    for s in [&mut control, &mut treatment] {
+        s.apply_input(Input::User("go".into()));
+        s.admit_steering();
+    }
+    for _ in 0..6 {
+        control.observe_read_streak("view", false, false);
+        treatment.observe_read_streak("view", false, true);
+    }
+    let a = build_request(&mut control, &registry, &root, &RunConfig::default());
+    let b = build_request(
+        &mut treatment,
+        &registry,
+        &root,
+        &RunConfig {
+            streak_steer: true,
+            ..RunConfig::default()
+        },
+    );
+    assert_eq!(b.messages.len(), a.messages.len() + 1);
+    assert_eq!(
+        format!("{:?}", a.messages),
+        format!("{:?}", &b.messages[..a.messages.len()])
+    );
+    assert!(b
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .contains("You have read six files"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn build_request_system_is_static_and_budgets_ride_the_tail() {
     let root = run_tmp("contract");
     std::fs::write(root.join("a.rs"), "v1\n").unwrap();

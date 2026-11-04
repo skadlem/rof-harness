@@ -9,6 +9,8 @@ use provider_core::{
 use serde_json::Value;
 use std::path::Path;
 
+pub(crate) const READ_STREAK_DIRECTIVE: &str = "You have read six files or search results in a row without making a successful edit or write. Decide whether you have enough evidence to make a change; if so, make the smallest useful change and check it. Otherwise, state the specific missing evidence and obtain it.";
+
 impl LoopState {
     /// Transcript fold: the request is derived from the log, not held.
     /// Collapse-5 over tool observations (context economics): the last
@@ -298,6 +300,15 @@ pub(crate) fn build_request(
         messages.push(ProviderMessage {
             role: "user".into(),
             content: nudge,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            thinking: None,
+        });
+    }
+    if state.experiment.streak_pending {
+        messages.push(ProviderMessage {
+            role: "user".into(),
+            content: READ_STREAK_DIRECTIVE.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
             thinking: None,
