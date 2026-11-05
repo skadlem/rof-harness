@@ -375,11 +375,12 @@ async fn container_image_id(container: &str) -> Option<String> {
 }
 
 /// Exact `docker run` argv for one in-container instance: detached, named,
-/// workdir bind-mounted at /app, task tests read-only at /tests, /app as
-/// the container workdir, cpus/memory capped, and the image entrypoint
-/// overridden to `tail -f /dev/null` so a server-entrypoint image does not
-/// hijack the run. Pure so tests pin the flag list without docker.
-fn env_container_run_args(image: &str, work: &Path, tasks_dir: &Path, id: &str) -> Vec<String> {
+/// workdir bind-mounted at /app, /app as the container workdir, cpus/memory
+/// capped, and the image entrypoint overridden to `tail -f /dev/null` so a
+/// server-entrypoint image does not hijack the run. The task tests are NOT
+/// mounted: harbor uploads them inside `verify()`, and a live `/tests` would
+/// hand the agent the grader. Pure so tests pin the flag list without docker.
+fn env_container_run_args(image: &str, work: &Path, id: &str) -> Vec<String> {
     // /logs is the harbor verifier-artifact root: task test.sh scripts
     // write /logs/verifier/{ctrf.json,reward.txt}. Mounted writable at
     // <home>/verifier-logs (work's parent is the instance home) so the
@@ -393,8 +394,6 @@ fn env_container_run_args(image: &str, work: &Path, tasks_dir: &Path, id: &str) 
         env_container_name(id),
         "-v".into(),
         format!("{}:/app", work.display()),
-        "-v".into(),
-        format!("{}:/tests:ro", tasks_dir.join(id).join("tests").display()),
         "-v".into(),
         format!("{}:/logs", logs.display()),
         "-w".into(),
@@ -467,11 +466,7 @@ async fn reset_workdir_from_image(image: &str, work: &Path) {
 /// stale container from a crashed attempt, then run detached with the
 /// workdir bind-mounted at /app and tests read-only at /tests. Returns the
 /// container name; spawn/pull failure is infra (never capability).
-async fn start_env_container(
-    inst: &eval::Instance,
-    work: &Path,
-    tasks_dir: &Path,
-) -> Result<String, String> {
+async fn start_env_container(inst: &eval::Instance, work: &Path) -> Result<String, String> {
     rm_env_container(&inst.id).await;
     // The verifier artifact dir: harbor's compose pre-creates /logs/verifier;
     // pytest --ctrf will not mkdir it itself.
@@ -486,12 +481,7 @@ async fn start_env_container(
     // task.toml per task. The entrypoint override keeps task images with
     // server entrypoints from hijacking the run.
     let out = tokio::process::Command::new("docker")
-        .args(env_container_run_args(
-            &inst.image,
-            work,
-            tasks_dir,
-            &inst.id,
-        ))
+        .args(env_container_run_args(&inst.image, work, &inst.id))
         .output()
         .await
         .map_err(|e| format!("cannot spawn docker: {e}"))?;
@@ -564,9 +554,17 @@ async fn grade_live_container(
     inst: &eval::Instance,
     container: &str,
     home: &Path,
+    tasks_dir: &Path,
 ) -> eval::Verdict {
     if let Err(e) = reset_verifier_dir(home) {
         eprintln!("infra {}: cannot clear verifier artifacts: {e}", inst.id);
+        return eval::Verdict::InfraFailure;
+    }
+    // Harbor parity: the tests directory is uploaded inside `verify()`, never
+    // mounted for the agent phase — a mounted `/tests` lets the model read the
+    // grader (observed: one baseline row opened `/tests/test_outputs.py`).
+    if !copy_tests_into_container(&inst.id, container, tasks_dir).await {
+        eprintln!("infra {}: cannot upload tests into the container", inst.id);
         return eval::Verdict::InfraFailure;
     }
     // ponytail: 300s slack above the instance timeout is chosen (same slack
@@ -574,7 +572,7 @@ async fn grade_live_container(
     let out = tokio::time::timeout(
         Duration::from_secs(inst.timeout_secs + 300),
         tokio::process::Command::new("docker")
-            // bash-invoked: the ro tests mount carries no exec bit, and a
+            // bash-invoked: the uploaded tests carry no exec bit, and a
             // missing/unrunnable test.sh is 126/127 — machinery, not the
             // suite failing.
             .args(["exec", container, "bash", "/tests/test.sh"])
@@ -619,6 +617,30 @@ async fn grade_live_container(
         );
     }
     verdict
+}
+
+/// Upload the task's tests into a live container (`docker cp`), the way harbor's
+/// `verify()` does — `/tests` exists only from grading onward, so the agent
+/// cannot read the grader. Also settles the exec-bit question: test.sh is
+/// invoked through `bash`.
+async fn copy_tests_into_container(id: &str, container: &str, tasks_dir: &Path) -> bool {
+    let src = format!("{}/.", tasks_dir.join(id).join("tests").display());
+    let _ = tokio::process::Command::new("docker")
+        .args([
+            "exec",
+            container,
+            "sh",
+            "-c",
+            "rm -rf /tests; mkdir -p /tests",
+        ])
+        .output()
+        .await;
+    tokio::process::Command::new("docker")
+        .args(["cp", &src, &format!("{container}:/tests")])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn reset_verifier_dir(home: &Path) -> std::io::Result<()> {
@@ -767,7 +789,7 @@ pub(crate) async fn run_agent_leg(
             ));
             continue;
         }
-        let (snapshot_root, task_dir, digest, frozen) =
+        let (_snapshot_root, task_dir, digest, frozen) =
             match snapshot_tree(&source_task, &frozen_dir) {
                 Ok(()) => {
                     let digest = task_digest(&frozen_dir).ok();
@@ -866,7 +888,7 @@ pub(crate) async fn run_agent_leg(
                 ));
                 continue;
             }
-            match start_env_container(inst, &work, &snapshot_root).await {
+            match start_env_container(inst, &work).await {
                 Ok(name) => {
                     run_args.exec_wrap = Some(docker_exec_wrap(&name));
                     Some(name)
@@ -920,7 +942,7 @@ pub(crate) async fn run_agent_leg(
         let verdict = if !has_run_end(&events) {
             eval::Verdict::InfraFailure
         } else if let Some(name) = &container {
-            grade_live_container(inst, name, &home).await
+            grade_live_container(inst, name, &home, &task_dir).await
         } else {
             grade(inst, args, &task_dir, &work).await
         };
@@ -1435,12 +1457,7 @@ mod tests {
 
     #[test]
     fn env_container_run_args_exact_flag_list() {
-        let got = env_container_run_args(
-            "img:1",
-            Path::new("/out/id/work"),
-            Path::new("/tasks"),
-            "id",
-        );
+        let got = env_container_run_args("img:1", Path::new("/out/id/work"), "id");
         assert_eq!(
             got,
             [
@@ -1450,8 +1467,6 @@ mod tests {
                 "eval-id-env",
                 "-v",
                 "/out/id/work:/app",
-                "-v",
-                "/tasks/id/tests:/tests:ro",
                 "-v",
                 "/out/id/verifier-logs:/logs",
                 "-w",
@@ -1464,6 +1479,11 @@ mod tests {
                 "-f",
                 "/dev/null",
             ]
+        );
+        // Harbor parity: tests must not be visible during the agent phase.
+        assert!(
+            !got.iter().any(|a| a.contains("/tests")),
+            "tests are uploaded at grading, never mounted"
         );
     }
 

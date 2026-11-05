@@ -27,12 +27,30 @@ The owner authorized $5 additional spend for the steering pilot, raising the cum
   pristine workdir 0/6 reward 0, gold solve 6/6 reward 1; log-summary 2 tests,
   pristine 0/2, gold 2/2. Both verifiers run again (the earlier `uv` failure was
   transient network: `apt-get update` and the astral download both work).
+- **`/tests` was mounted for the whole run, so the agent could read the
+  grader.** Harbor mounts only `/logs`, the agent dir and artifacts for the
+  agent phase and uploads `tests/` inside `Verifier.verify()` (checked in the
+  installed harbor source). One baseline row opened `/tests/test.sh` and
+  `/tests/test_outputs.py` before working. Fixed the same way: the container
+  starts without `/tests` and the frozen snapshot's tests are `docker cp`-ed in
+  right before `bash /tests/test.sh`.
+- **Measured floor on the corrected workspace (3 rows, `dphn-seedfix-base`,
+  $0.32): cmhc 0/3 resolved and 5/6 named tests is the FLOOR.** A pristine
+  image-seeded workdir with no agent work already scores 5/6 reward 0 (only
+  `test_release_build_runs_without_crash` fails); the gold solution scores 6/6
+  reward 1. All three rows: Unresolved, 5/6, `halt=tokens`, 286-293k tokens,
+  41-44 steps, 14-19 reads / 0-3 writes, zero nudges. So pass^1 is 0/3 before
+  and after the seed fix, the fix restored the floor rather than exposing a
+  near-miss, and cmhc arms must be read as pass^1 plus "did it break the
+  floor". The old 0/6 was *below* floor — the build-context seed failed tests
+  the untouched sources pass.
 - Consequence: `dphn-effort`, `dphn-effort2` and the single banked `dphn-steer`
   row measured a *different task* on cmhc, mcmc and query-optimize (and a
   generator-reconstructed variant on log-summary). Their within-arm comparisons
   stay internally paired, but no capability claim about those benchmark tasks
   survives, and the read-starvation pathology (23-33 reads, 0-1 write on cmhc)
-  is at least partly the wrong workspace rather than a model habit.
+  is at least partly the wrong workspace rather than a model habit. Read-streak
+  counts on the corrected workspace: 14-19 reads per row, 0-3 writes.
 - No spend since the pause. The stopped ledger still reports `denied=true`
   ($4.8372735 of $10 accounted or reserved, five unknown-usage reservations); a
   new campaign must carry all of it.

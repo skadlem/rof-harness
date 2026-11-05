@@ -43,11 +43,18 @@ never capability). The container default is unchanged.
 With `--in-container` the per-instance shape changes (`eval_agent.rs`):
 the task environment container (`Instance.image`, from task.toml
 `docker_image`) is started before the agent run with the workdir
-bind-mounted at `/app` and the task tests read-only at `/tests`
-(cpus/memory capped at 2/4096m); the run's tool policy carries an exec
+bind-mounted at `/app` (cpus/memory capped at 2/4096m); the task tests
+are NOT mounted — harbor uploads `tests/` only inside `Verifier.verify()`,
+and a live `/tests` lets the agent read the grader, so the frozen snapshot's
+tests are `docker cp`-ed in immediately before `bash /tests/test.sh`. The
+run's tool policy carries an exec
 wrap (`docker exec <container>`) so exec/test tool calls land inside the
 container while the allowlist and shell-op guard still see the unwrapped
 argv, and file tools stay host-side on the bind-mounted workdir. The
+workdir is reset from the image's `/app` (`cp -a /app/.`, chowned to the
+host uid) — harbor parity: `<task>/environment` is the Docker build
+context, not the workspace, and the two differ on 4 of the 5 cells used
+so far (`docs/roadmap.md`, 2026-11-06). The
 verifier then execs the same live container (`/tests/test.sh`), so
 installed packages and running services persist to grading; the verdict
 is the task-written reward file (`/logs/verifier/reward.txt`, mounted

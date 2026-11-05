@@ -512,3 +512,30 @@ says so explicitly.
   is partly this bug. The registered streak campaign is dead under its own
   verifier-integrity stop rule and needs re-registration after a
   corrected-workspace baseline.
+- **`/tests` is uploaded at grading, never mounted for the agent phase
+  (2026-11-06, measured against harbor).** The in-container container mounted
+  the task's tests read-only at `/tests` for the whole run, and a baseline row
+  opened `/tests/test_outputs.py` before starting work — the grader was an
+  input. The installed harbor source is explicit: `Trial._agent_env_mounts`
+  binds only the verifier `/logs`, the agent dir and the artifacts, and
+  `Verifier.verify()` uploads `tests_dir` into the environment at grade time.
+  Decision: `env_container_run_args` no longer mounts `/tests` (unit-pinned) and
+  `copy_tests_into_container` uploads the *frozen snapshot's* tests via
+  `docker cp` immediately before `bash /tests/test.sh`, so identity is still the
+  snapshot's and not the mutable source's. Rehearsed without model calls on the
+  new sequence: no `/tests` at run start, pristine workdir 5/6 reward 0, gold
+  solution 6/6 reward 1. CONSEQUENCE: the three `dphn-seedfix-base` rows had the
+  grader visible; it did not change their outcome (0/3 resolved, all at the
+  5/6 floor) but no row run before this fix may be used as a leakage-free
+  capability reading.
+- **cmhc's floor is 5/6, so named-test counts alone are unreadable on that cell
+  (2026-11-06, measured).** An image-seeded pristine workdir with no agent work
+  scores 5/6 with reward 0: `test_protected_files_not_modified`,
+  `test_program_compiles_debug/_release`, `test_debug_build_runs_without_crash`
+  and `test_no_memory_leaks_with_valgrind` all pass on the shipped sources, and
+  only `test_release_build_runs_without_crash` — the task's bug — fails. The
+  gold `solve.sh` reaches 6/6 reward 1. So the corrected 3-row baseline
+  (Unresolved 5/6 x3, 286-293k tokens, halt=tokens, 41-44 steps, 0-3 writes)
+  shows the model did not solve it and did not break the floor; it is not a
+  near-miss. Rule for future cmhc arms: report pass^1 and the floor delta, never
+  a named-test count as if it were progress.
