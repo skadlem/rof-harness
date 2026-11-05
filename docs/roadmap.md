@@ -7,6 +7,36 @@ measured numbers carry a date and live with the run artifacts.
 
 The owner authorized $5 additional spend for the steering pilot, raising the cumulative ceiling to $10. The fresh campaign stopped without an eligible result: both heap-control verifiers lacked CTRF output after the `uv` download failed, and the retry also encountered an HTTP 524 with unknown usage. The proxy denied subsequent requests. Its ledger accounts for or reserves $4.83727350, including five unknown-usage reservations; this is not the billed amount. Verify the task verifiers before further paid work and carry all reservations into any newly registered campaign. The proxy assumes regular DeepSeek V4.1 Flash 1017 peak rates, not an independently verified dphn account quota. The full protocol and historical records remain in `docs/steering-experiment.md`.
 
+## Current state (2026-11-06)
+
+- **In-container workspaces were the Docker build context, not the task
+  workspace — fixed, and it invalidates in-container capability rows on four of
+  the five cells used so far.** `fresh_workdir` seeded `/app` from
+  `<task>/environment`; that directory is the build context. Measured with zero
+  model calls: `custom-memory-heap-crash` `environment/` = {Dockerfile,
+  patches/, program/} while image `/app` = {main.cpp, user.cpp, user.h}, and its
+  verifier md5-checks and compiles `/app/main.cpp` — a structurally impossible
+  0/6 whatever the model does. Same shape on mcmc ({Dockerfile, task-deps/} vs
+  {data.csv}), query-optimize ({Dockerfile, task-deps/} vs {my-sql-query.sql,
+  oewn.sqlite}) and log-summary ({Dockerfile, generator} vs {logs/, 164 files,
+  6 MB}); only video-processing coincided. A banked paid row shows it in-run: the
+  model's first `ls -la` in `/app` returned `Dockerfile patches program`.
+  In-container now resets the workdir from the image (`cp -a /app/.`, chowned to
+  the host uid so host-side `edit`/`write` keep working); host mode keeps
+  `environment/` because it has no image. Preflight after the fix: heap 6 tests,
+  pristine workdir 0/6 reward 0, gold solve 6/6 reward 1; log-summary 2 tests,
+  pristine 0/2, gold 2/2. Both verifiers run again (the earlier `uv` failure was
+  transient network: `apt-get update` and the astral download both work).
+- Consequence: `dphn-effort`, `dphn-effort2` and the single banked `dphn-steer`
+  row measured a *different task* on cmhc, mcmc and query-optimize (and a
+  generator-reconstructed variant on log-summary). Their within-arm comparisons
+  stay internally paired, but no capability claim about those benchmark tasks
+  survives, and the read-starvation pathology (23-33 reads, 0-1 write on cmhc)
+  is at least partly the wrong workspace rather than a model habit.
+- No spend since the pause. The stopped ledger still reports `denied=true`
+  ($4.8372735 of $10 accounted or reserved, five unknown-usage reservations); a
+  new campaign must carry all of it.
+
 ## Current state (2026-11-05)
 
 - `--streak-steer on|off` implements the proposed treatment, default off; both arms log threshold crossings, and treatment logs request/response delivery. Local scripted and Docker rehearsals verified the paired driver and treatment markers without paid calls.
@@ -147,6 +177,12 @@ self-describe through the provenance block; no arm's rows pool with another's.
 
 0. **Steering ablation (`dphn-steer`) — PRE-REGISTERED 2026-10-19, PAUSED at
    owner request after 1/18 rows; the pause found a design defect first.**
+   **SUPERSEDED 2026-11-06: its premise is void.** The workspace-seeding bug
+   above means cmhc/query-optimize rows were reading a Docker build context, so
+   the read-starvation streaks that motivate the re-keyed trigger are not
+   evidence about the benchmark task. Do not resume this arm or the frozen
+   `pilot-steer/rof-steer` binary; re-register after a corrected-workspace
+   baseline. The forensics before that stay valid as facts about the old code:
    The state-triggered gate as originally registered was **unbuildable, and
    the forensics are the finding**: `VerifyHold` (the declare hold) is an
    ancestor of the current branch, so it has shipped in every in-container
@@ -361,6 +397,23 @@ literature on 2026-10-13 and deliberately stay closed.
   predicate), so an unpriced run never looks guarded. The other half of the
   gate — a per-endpoint price book — is still unbuilt by choice: no price is
   invented.
+- **Dynamic / lossy context** (owner idea, 2026-11-06; idea only, nothing
+  built): keep a summary plus the extracted facts in context instead of the
+  long source, and re-acquire the source when it is needed again. There is no
+  web tool (`tools-std` ships `view`/`search`/`edit`/`write`/`exec`/`test`;
+  network is reachable only through `exec`), so the payloads this would shrink
+  are `view` bodies, `search` dumps and `exec` output — the same share the
+  token cap already binds on. Reconsider when BOTH (a) an offline replay of
+  banked event logs attributes the binding wall on failing cells to those
+  result bodies rather than to reasoning or tool round-trips (the cmhc rows
+  die at the 300k cap after 23-33 reads / 0-1 writes, so this is
+  candidate-visible, not measured) and (b) retention can be scored without a
+  judge — e.g. re-fetch fidelity against the banked workdirs. Two named costs:
+  the failure mode is silent (the dropped line is the one that mattered) and
+  an LLM-mediated summarizer adds one model call per long read whose selection
+  quality is unverifiable at fixed model. Cheaper first step if the gate ever
+  opens: `view` already caps and pages by offset, so measure the cap's hit rate
+  before adding a summarizer.
 - **Parked nits** (only if they earn it): search depth cap, `/app`
   word-boundary in goal mapping, assemble budget accounting,
   finalize_dump exit code.

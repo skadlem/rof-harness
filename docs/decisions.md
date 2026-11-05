@@ -489,3 +489,26 @@ says so explicitly.
   within 1.3x tokens per test-passed, and if `off` is never worse the default
   flips off and the nudges are flagged measured-dead rather than deleted (they
   remain the substrate for any future gate).
+- **In-container runs grade the image's `/app`, never the Docker build context
+  (2026-11-06, measured).** `fresh_workdir` seeded every workdir from
+  `<task>/environment`, which is the build context; harbor mounts the image's
+  `/app`. On the five cells the arms used, that seed differs from the real
+  workspace on four: heap `environment/` = {Dockerfile, patches/, program/} vs
+  image `/app` = {main.cpp, user.cpp, user.h} (its verifier md5-checks and
+  compiles `/app/main.cpp`, so every row was a structurally impossible 0/6);
+  mcmc {Dockerfile, task-deps/} vs {data.csv}; query-optimize {Dockerfile,
+  task-deps/} vs {my-sql-query.sql, oewn.sqlite}; log-summary {Dockerfile,
+  log_generator_deterministic.py} vs {logs/, 164 files}. Only video-processing
+  coincided. A banked paid row confirms it in-run: the model's first `ls -la`
+  in `/app` returned `Dockerfile patches program`. Decision: in-container
+  workspaces are reset from the image (`cp -a /app/.`) and chowned to the host
+  uid so host-side `edit`/`write` still work; host mode keeps `environment/`
+  because it has no image. Validated with zero model calls — heap: 6 tests
+  collected, pristine 0/6 reward 0, gold solve 6/6 reward 1; log-summary: 2
+  tests, pristine 0/2, gold 2/2. CONSEQUENCE: `dphn-effort`, `dphn-effort2` and
+  the banked `dphn-steer` row measured a different task on those cells; their
+  paired arms stay internally valid but no benchmark-task capability claim
+  survives, and the read-starvation pathology that motivates the streak trigger
+  is partly this bug. The registered streak campaign is dead under its own
+  verifier-integrity stop rule and needs re-registration after a
+  corrected-workspace baseline.

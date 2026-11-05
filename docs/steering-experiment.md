@@ -1,6 +1,10 @@
 # Steering feasibility experiment
 
-Registered before new model calls. Status: **implemented behind an opt-in flag; pilot stopped with an incomplete pair**. The previous `dphn-steer` arm remains paused; its binary and the single banked row are diagnostic only and must not be pooled with this experiment.
+Registered before new model calls. Status: **VOID as of 2026-11-06 — the pilot's premise was a workspace-seeding bug, not a model habit**. The previous `dphn-steer` arm remains paused; its binary and the single banked row are diagnostic only and must not be pooled with this experiment.
+
+## Void notice, 2026-11-06 (supersedes the diagnostic evidence below)
+
+Every in-container run before this date seeded `/app` from `<task>/environment` (the Docker build context) instead of the image's `/app` (the task workspace). On `custom-memory-heap-crash` those differ: `environment/` holds {Dockerfile, patches/, program/} while the image's `/app` holds {main.cpp, user.cpp, user.h}, and the verifier md5-checks and compiles `/app/main.cpp` — so any seeded run is a structurally impossible 0/6, and the read streaks recorded below were reads of a build context. A banked paid row shows it in-run (`ls -la` in `/app` returned `Dockerfile patches program`). Fix and its known-answer/failing-case preflight: `docs/roadmap.md`, 2026-11-06. **This triggers the campaign's own stop rule ("a verifier integrity problem appears")**: no pair from any earlier campaign is eligible, no treatment efficiency can be inferred, and the threshold and directive are unvalidated on a correct workspace. Re-registration needs a corrected-workspace baseline first (clean binary, image-seeded workdir) before any treatment arm is worth its spend.
 
 ## Evidence and limits
 

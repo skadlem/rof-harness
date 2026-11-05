@@ -418,22 +418,47 @@ async fn rm_env_container(id: &str) {
         .await;
 }
 
-/// Wipe the workdir inside a throwaway container: in-container runs write as
-/// root through the bind mount, and those files outlive a host-side rm.
-async fn wipe_workdir_via_docker(image: &str, work: &Path) {
-    let target = format!("{}:/w", work.display());
+/// `docker run` argv that resets the bind-mounted workdir to the image's
+/// `/app` (harbor parity). The task's runtime workspace lives in the image, not
+/// in `<task>/environment`: that dir is the Docker BUILD CONTEXT (heap's
+/// `program/main.cpp`), while the verifier compiles `/app/main.cpp`. Seeding the
+/// build context grades a task the model was never given. `chown` maps the
+/// copied tree back to the host owner so host-side file tools keep writing it;
+/// the wipe runs as root because a previous run's root-owned leftovers outlive
+/// a host-side rm. Pure so a test can pin the flag list without docker.
+fn workdir_reset_args(image: &str, work: &Path, owner: (u32, u32)) -> Vec<String> {
+    vec![
+        "run".into(),
+        "--rm".into(),
+        "-v".into(),
+        format!("{}:/w", work.display()),
+        "--entrypoint".into(),
+        "sh".into(),
+        image.into(),
+        "-c".into(),
+        format!(
+            "rm -rf /w/* /w/.[!.]* /w/..?* 2>/dev/null; cp -a /app/. /w/ 2>/dev/null; chown -R {}:{} /w 2>/dev/null; true",
+            owner.0, owner.1
+        ),
+    ]
+}
+
+/// Reset the in-container workdir to the image's `/app`. Also wipes: a previous
+/// run's root-owned writes through the bind mount survive a host-side rm, and
+/// the container-side command runs as root. Best effort — an image without
+/// `/app` leaves the workdir empty, which is what harbor would mount.
+async fn reset_workdir_from_image(image: &str, work: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::create_dir_all(work).is_err() {
+        return;
+    }
+    // Host uid/gid: the copied tree must belong to the user the host-side file
+    // tools run as, or `edit`/`write` hit EACCES.
+    let owner = std::fs::metadata(work)
+        .map(|m| (m.uid(), m.gid()))
+        .unwrap_or((0, 0));
     let _ = tokio::process::Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-v",
-            &target,
-            "--entrypoint",
-            "sh",
-            image,
-            "-c",
-            "rm -rf /w/* /w/.[!.]* /w/..?* 2>/dev/null; true",
-        ])
+        .args(workdir_reset_args(image, work, owner))
         .output()
         .await;
 }
@@ -786,16 +811,14 @@ pub(crate) async fn run_agent_leg(
             };
         let inst = &frozen;
         let work = home.join("work");
-        // In-container mode: root-owned leftovers from a previous run's
-        // container writes (bind-mounted /app) survive a host-side rm;
-        // wipe them inside a throwaway container from the task image BEFORE
-        // seeding, so reruns start clean. ponytail: the image is local (it
-        // is about to be run anyway); images without sh stay dirty — upgrade
-        // path: an Alpine helper image.
+        // In-container: the workspace IS the image's `/app` (harbor parity), so
+        // seed from there and never from `<task>/environment` — that dir is the
+        // Docker build context (heap ships `program/main.cpp` there while its
+        // verifier compiles and hashes `/app/main.cpp`). Host mode has no image,
+        // so `environment/` stays its only seed source.
         if args.in_container && !inst.image.is_empty() {
-            wipe_workdir_via_docker(&inst.image, &work).await;
-        }
-        if let Err(e) = fresh_workdir(&task_dir, &work) {
+            reset_workdir_from_image(&inst.image, &work).await;
+        } else if let Err(e) = fresh_workdir(&task_dir, &work) {
             eprintln!("infra {}: workdir: {e}", inst.id);
             reports.push(infra_report(
                 inst,
@@ -1378,6 +1401,36 @@ mod tests {
         assert_eq!(run.budget_tokens, Some(42));
         assert_eq!(run.budget_steps, Some(60));
         assert_eq!(run.budget_actions, Some(120));
+    }
+
+    #[test]
+    fn in_container_workdir_reset_copies_image_app_not_the_build_context() {
+        let got = workdir_reset_args("img:1", Path::new("/out/id/work"), (1000, 1000));
+        assert_eq!(
+            got,
+            [
+                "run",
+                "--rm",
+                "-v",
+                "/out/id/work:/w",
+                "--entrypoint",
+                "sh",
+                "img:1",
+                "-c",
+                "rm -rf /w/* /w/.[!.]* /w/..?* 2>/dev/null; cp -a /app/. /w/ 2>/dev/null; chown -R 1000:1000 /w 2>/dev/null; true",
+            ]
+        );
+        // The seed source is the image (`/app`), never `<task>/environment`:
+        // custom-memory-heap-crash ships `program/main.cpp` there while its
+        // verifier compiles and md5-checks `/app/main.cpp`.
+        assert!(
+            got.last().unwrap().contains("cp -a /app/."),
+            "in-container seeding must copy the image's /app"
+        );
+        assert!(
+            !got.last().unwrap().contains("environment"),
+            "in-container seeding must not read the Docker build context"
+        );
     }
 
     #[test]
