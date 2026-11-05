@@ -5,13 +5,13 @@ measured numbers carry a date and live with the run artifacts.
 
 ## Budget update (2026-11-05)
 
-The owner authorized $5 additional spend for the steering pilot. The cumulative ceiling is $10, with the entire $4.30645020 previously accounted or reserved carried forward. The earlier incomplete pair is diagnostic only; the fresh matched campaign uses one new binary for both arms. The proxy's ceiling assumes regular DeepSeek V4.1 Flash 1017 peak rates, not an independently verified dphn account quota. The full protocol and historical records remain in `docs/steering-experiment.md`.
+The owner authorized $5 additional spend for the steering pilot, raising the cumulative ceiling to $10. The fresh campaign stopped without an eligible result: both heap-control verifiers lacked CTRF output after the `uv` download failed, and the retry also encountered an HTTP 524 with unknown usage. The proxy denied subsequent requests. Its ledger accounts for or reserves $4.83727350, including five unknown-usage reservations; this is not the billed amount. Verify the task verifiers before further paid work and carry all reservations into any newly registered campaign. The proxy assumes regular DeepSeek V4.1 Flash 1017 peak rates, not an independently verified dphn account quota. The full protocol and historical records remain in `docs/steering-experiment.md`.
 
 ## Current state (2026-11-05)
 
 - `--streak-steer on|off` implements the proposed treatment, default off; both arms log threshold crossings, and treatment logs request/response delivery. Local scripted and Docker rehearsals verified the paired driver and treatment markers without paid calls.
 - The paid pilot is stopped with one eligible heap control (Unresolved, 0/6 verifier tests, 286,477 input and 19,368 output tokens; threshold crossed). Its treatment crossed and was delivered but was interrupted before grading when one provider attempt had unknown usage. The pair is incomplete; no capability conclusion follows.
-- The budget ledger retains $3.80367360 for three prior HTTP 403/1010 attempts and a full reservation for the latest unknown-usage attempt. The current accounted-plus-reserved upper bound is $4.30645020 under the owner-approved DeepSeek peak-price and model-context assumptions; this is not the billed amount. No further paid calls until the latest unknown is reconciled or a newly registered campaign explicitly carries all unresolved reservations. The original 403 was reproduced without credentials as a Cloudflare block caused by the proxy's Python user agent; forwarding the harness user agent fixes that problem. The proxy now refuses the next request immediately after any unknown usage.
+- The earlier budget ledger retained $3.80367360 for three HTTP 403/1010 attempts and a full reservation for another unknown-usage attempt, totaling $4.30645020 accounted or reserved before the fresh campaign. The original 403 was reproduced without credentials as a Cloudflare block caused by the proxy's Python user agent; forwarding the harness user agent fixes that problem. The proxy refuses the next request immediately after any unknown usage.
 
 ## Current state (2026-11-03)
 

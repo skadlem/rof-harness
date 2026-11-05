@@ -16,6 +16,10 @@ The first provider attempt returned three HTTP 403/1010 responses, with unknown 
 
 The owner authorized **$5 more**, raising the cumulative ceiling from $5 to **$10**, not resetting prior spend. Start a fresh matched campaign and carry the entire $4.30645020 already accounted or reserved, including all four unresolved provider attempts. The new campaign's ledger records those reservations separately; a new unknown-usage attempt stops that campaign. The old control and interrupted treatment remain diagnostic only and are not included in the fresh comparison. This budget amendment does not change the treatment, task selection, matched order, or evaluation rules.
 
+The fresh campaign stopped with no eligible outcomes: both heap-control verifiers failed to produce CTRF output after the `uv` download failed. The retry also encountered an upstream HTTP 524 with unknown usage; the proxy denied subsequent requests. No treatment ran. The ledger now accounts for or reserves **$4.83727350 of $10**, including five unknown-usage reservations; this is not a provider billing receipt. Records are under `.local/share/rof-tb/work/pilot-streak-run-20261104T220645Z-2842978/` and `.local/share/rof-tb/work/pilot-streak-budget-plus5-1pmo22co/`.
+
+Before another paid campaign, demonstrate that the actual task verifiers can run and produce valid output. Any new campaign must carry all accounted spend and unresolved reservations, and preserve or explicitly register any change to the verifier environment.
+
 The guard assumes DeepSeek V4.1 Flash 1017 peak prices of $0.30 per million uncached input tokens and $1.20 per million output tokens ([DeepSeek price table](https://api-docs.deepseek.com/quick_start/pricing/)), as authorized by the owner for this endpoint. It is a conservative model-based ceiling, not a verified provider account quota; actual dphn pricing may differ.
 
 ## Treatment and control
