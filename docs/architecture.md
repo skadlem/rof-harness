@@ -35,7 +35,9 @@ identified by its own report file. With `--agent` the per-instance
 engine is the agent leg (`eval_agent.rs`) — the real grading path: fresh
 seeded workdir,
 the loop executed in-process through the same `execute()` wiring as
-`rof run`, then the harbor CLI as the grading seam (job yaml +
+`rof run` (bounded by the task's `[agent] timeout_sec` through
+`execute_with_deadline`, while the verifier and the harbor run use
+`[verifier] timeout_sec`), then the harbor CLI as the grading seam (job yaml +
 `harbor run -c <job> -y -q`; spawn failure, grading timeout, workdir
 refusal, and a run with no RunEnd in the events dump are infra failures,
 never capability). The container default is unchanged.

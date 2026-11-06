@@ -251,6 +251,22 @@ self-describe through the provenance block; no arm's rows pool with another's.
 
 ## Next (ordered, spend-gated)
 
+0a. **Re-measure the completion checklist in the goal — the only lever that was
+   ever capability-positive, and the top spend item (2026-11-06).** `dphn-goalchk`
+   converted a 5/6 into a 6/6 solve (its deliverable worked where it was written
+   but not where an evaluator runs it); the verdict is void because it ran under
+   the build-context seed. Re-register on the faithful pipeline against a cell
+   with a measured floor: `hf-model-inference` (2/3, wall-bound, live-server
+   deliverable, ~24s verifier) first, then `kv-store-grpc` (3/3, ceiling control).
+   PASS = a named test the control never passes in >=2 of 3 pairs; KILL = no
+   named-test difference, in which case the lever is retired with a measured
+   basis instead of a void one. Estimated $0.15-0.30.
+0b. **Broader pass-rate baseline on the valid portfolio cells** (dna-assembly
+   ~$0.05/row, raman-fitting, model-extraction-relu-logits, break-filter-js-from-html,
+   make-mips-interpreter; all pristine 0/N with gold passing). One number — pass^1
+   per cell at 3 reps — that every future lever gets measured against. ~$0.60 for
+   five cells. Do this before any second lever, not after.
+
 0. **Steering ablation (`dphn-steer`) — PRE-REGISTERED 2026-10-19, PAUSED at
    owner request after 1/18 rows; the pause found a design defect first.**
    **SUPERSEDED 2026-11-06: its premise is void.** The workspace-seeding bug
@@ -321,7 +337,12 @@ self-describe through the provenance block; no arm's rows pool with another's.
    local report `models-2026h2-shortlist.md` as a record, and one correction from
    it survives: every published number for those candidates is a **vendor**
    claim, so vendor rows rank candidates and never predict our solve rate.
-2. **Zero-cost instrumentation: a pairwise, answer-key-free judge.** From
+2. **Zero-cost instrumentation: a pairwise, answer-key-free judge — PARKED
+   2026-11-06.** The motivation was "arms stop returning tie-at-zero-solves", but
+   every graded row now carries per-test CTRF named results, which are a stronger
+   and cheaper signal than a judge; the free validation surgery (banked solved vs
+   failed workdirs) stays available if a future arm needs a signal where tests are
+   uninformative. Original note: From
    Harness2's selector and RRSI (local report `harness-steals-2026h2.md` steal
    1 + 2): score two anonymised deliverables of the same task against each
    other instead of against a hidden verifier, so arms stop returning "tie at

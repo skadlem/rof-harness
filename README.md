@@ -19,6 +19,13 @@ budgets denominated in dollars, and a verdict taken from the task's own verifier
 measured across 18 runs and killed. The figure is regenerated from the committed run data by
 `tools/readme_chart.py`; the tables are transcribed from the arm reports.*
 
+> [!WARNING]
+> **Void, re-measured pending.** These 18 runs predate the workspace-fidelity fixes below: the
+> agent was seeded with the task's Docker build context instead of the image's `/app`, so on
+> these cells the verifier tests it was measured against could not move. The mechanism finding
+> (steps climb, tokens climb, no test moves) stands; the capability conclusion needs a re-run on
+> the faithful pipeline.
+
 ## Why running inside the container is the whole point
 
 Most harnesses hand the agent a scratch directory and then copy files into a fresh container to
@@ -32,6 +39,18 @@ then runs the task's verifier in that same live container. On the frozen slice, 
 family (the verifier literally asserts "imported a package the agent installed" and "a port is
 listening") went from **structurally 0/8 under file-copy grading to 8/8 in-container**, for
 $0.11 across the eight cells.
+
+### Grading fidelity (five defects found and fixed on 2026-11-06)
+
+Each of these silently changed what was being measured, and each now has a test:
+
+| Defect | Effect before the fix | Fix |
+|---|---|---|
+| Workdir seeded from `<task>/environment` (the Docker **build context**) instead of the image's `/app` | The agent solved a different workspace than the verifier graded. accumulator: heap's verifier md5-checks and compiles `/app/main.cpp`, which the build-context seed never contained — a structurally impossible 0/6 | `reset_workdir_from_image` (`cp -a /app/.`), chowned to the host uid so host-side file tools keep writing |
+| Task tests mounted at `/tests` for the whole run | The agent could read the grader; one row opened `test_outputs.py` before working | Container starts without `/tests`; the frozen snapshot's tests are `docker cp`-ed in immediately before `bash /tests/test.sh`, like harbor's `Verifier.verify()` |
+| No wall clock on the agent phase | Rows ran until the token/step caps: an mcmc row was still working at ~2,100s where harbor stops it at 1,800s | `execute_with_deadline` cancels through the Ctrl-C token (clean `Outcome::Cancelled`, `RunEnd` still emitted, workdir still graded) |
+| `task.toml` timeouts never parsed (`timeout_sec` ≠ `timeout_secs`, and it appears in both `[verifier]` and `[agent]`) | Every cell silently ran on the 1800s default — too tight for video-processing (3600), too loose for query-optimize (900) | Section-aware parsing feeds separate verifier and agent budgets |
+| Seeded `/app` is host-owned while the container is root; empty images have no baseline commit | In-container `git` refused the repo (`dubious ownership`); an empty `/app` (kv-store-grpc) left HEAD unborn, so a row that **resolved 7/7** still carried a `snapshot rollback: … no start HEAD` halt reason | `git config --system --add safe.directory /app` after start; empty trees get an empty baseline commit and `rollback` skips the pathspec restore |
 
 > [!NOTE]
 > The verdict is the **task-written reward file**, with the verifier's exit code only as a
@@ -98,6 +117,27 @@ flowchart BT
 Every row is one arm — a fixed model, endpoint, budget recipe and grading path. Arms are never
 pooled, because they are not the same measurement.
 
+### On the faithful pipeline (2026-11-06, `deepseek-v4.1-flash` 1017, 300k/60/120)
+
+| Cell | Result | Note |
+|---|---|---|
+| log-summary-date-ranges | **3/3 solved** | ceiling cell |
+| kv-store-grpc | **3/3 solved** | fresh 0/7 cell; ~$0.01 per row; the deliverable runs in the container |
+| hf-model-inference | **2/3 solved** | r1 lost to the task's own 900s agent wall at 28 steps; r2/r3 solved in 309-352s |
+| custom-memory-heap-crash | 0/3, at its 5/6 floor | the crux test fails even with `--exec-policy any` and `gdb`/`valgrind` actually used |
+| video-processing | 0/1, at its 2/5 floor | token-capped at 33 steps |
+| query-optimize | 0/1 | wall-clocked at its 900s agent budget after 12 steps |
+| Steering nudges (`--steer on` vs `off`, 12 rows) | **Killed** | capability identical in all 6 matched pairs; 2.64x tokens per solved task with the nudges on |
+| `--exec-policy any` (3 heap rows) | **Mechanism only** | zero denials, `gdb`/`valgrind` used, crux test still fails |
+| Excluded cells | — | mcmc-sampling-stan (no rstan in-image), protein-assembly (gold 0/1, stochastic), sanitize-git-repo (gold 2/3, trips its own "no other files changed") |
+
+### Before the fidelity fixes (2026-10-12 … 2026-10-19) — mechanism stands, capability void
+
+Every in-container row below ran with the build-context seed, so on heap, mcmc and
+query-optimize the verifier tests it was measured against could not move; log-summary ran a
+generator-reconstructed variant; video-processing was the only cell whose workspace matched its
+image. Read the capability column as unmeasured, not as zero.
+
 | Arm | Result |
 |---|---|
 | 26-cell in-container slice, glm-5.3-flash (2026-10-12) | **6 Resolved / 19 Unresolved / 1 infra** — $0.76 total |
@@ -150,6 +190,13 @@ dphn-apppath        12  /app parity fixed; solved cell needs ~half the steps
 The point of publishing this table is that four of the five arms are negative. A harness that
 only shows you its wins cannot tell you which of its mechanisms actually work.
 
+What survives the fidelity fixes: the *mechanism* halves (`dphn-trust` drove denials to zero,
+`dphn-apppath` eliminated the `/app` refusal class, `dphn-cap` moved step counts without moving
+tests) and every grading-path result that does not depend on the seeded workspace. What does not
+survive: the capability halves measured on cells whose tests could not move — in practice
+`dphn-goalchk`'s 5/6 → 6/6 (re-measured on the faithful pipeline as the first item of the
+remaining work, since it is the only lever that was ever capability-positive).
+
 </details>
 
 ## Quickstart
@@ -196,7 +243,8 @@ writes the complete event log for replay.
 
 `rof eval` adds `--tasks-dir DIR` (required), `--ids`, `--out-dir`, `--report`, `--winnability-only`,
 `--lenient-apply`, `--agent`, `--in-container`. Without `--agent` it is a scaffold, not a grader.
-Agent budgets default to 300k tokens / 60 steps / 120 actions.
+Agent budgets default to 300k tokens / 60 steps / 120 actions; the agent phase also stops at the
+task's own `[agent] timeout_sec`, which harbor enforces and which is now parsed per task.
 
 <details>
 <summary><b>Flags that exist but are off, and why</b></summary>
@@ -250,5 +298,6 @@ above is what `cargo test --workspace` reports today. Apache-2.0 — see [LICENS
 - [`docs/decisions.md`](docs/decisions.md) — decision log, with the measurement behind each entry
 - [`docs/roadmap.md`](docs/roadmap.md) — what's next, spend-gated
 - [`docs/threat-model.md`](docs/threat-model.md) — what the tools do and do not enforce
+- `NOTES_FOR_PI.md` — current handoff: where the project stands, what is void, what is next
 
 </details>
