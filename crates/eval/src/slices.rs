@@ -9,7 +9,49 @@ pub struct Instance {
     pub image: String,
     pub oracle: String,
     pub tests: Vec<String>,
+    /// Verifier budget: `[verifier] timeout_sec` (default 1800s).
     pub timeout_secs: u64,
+    /// Agent-phase budget: `[agent] timeout_sec` (default 1800s). Harbor ends a
+    /// trial at this wall clock, so a row measured without it runs on a more
+    /// generous envelope than the benchmark allows.
+    #[serde(default = "default_timeout")]
+    pub agent_timeout_secs: u64,
+}
+
+fn default_timeout() -> u64 {
+    DEFAULT_TIMEOUT_SECS
+}
+
+/// One integer read inside a specific `[section]` of a minimal task.toml.
+/// A bare `toml_int` scan cannot do this: `timeout_sec` appears in both
+/// `[verifier]` and `[agent]` and they differ per task (query-optimize 1800 vs
+/// 900, video-processing 3600 vs 3600).
+fn section_int(content: &str, section: &str, key: &str) -> Option<u64> {
+    let mut in_section = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_section = t.trim_start_matches('[').trim_end_matches(']').trim() == section;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((k, v)) = t.split_once('=') {
+            if k.trim() == key {
+                let token = v.trim().trim_matches(['"', '\'']);
+                if let Ok(n) = token.parse::<u64>() {
+                    return Some(n);
+                }
+                if let Ok(f) = token.parse::<f64>() {
+                    if f.is_finite() && f >= 0.0 {
+                        return Some(f as u64);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Default per-instance timeout (Commit0's 1800s floor, bench-landscape §5).
@@ -88,7 +130,10 @@ pub fn load_tb_slice(dir: &Path, ids: &[String]) -> std::io::Result<Vec<Instance
                         files
                     })
                     .unwrap_or_default(),
-                timeout_secs: toml_int(&toml, &["timeout", "timeout_secs", "time_limit"])
+                timeout_secs: section_int(&toml, "verifier", "timeout_sec")
+                    .or_else(|| toml_int(&toml, &["timeout", "timeout_secs", "time_limit"]))
+                    .unwrap_or(DEFAULT_TIMEOUT_SECS),
+                agent_timeout_secs: section_int(&toml, "agent", "timeout_sec")
                     .unwrap_or(DEFAULT_TIMEOUT_SECS),
             })
         })

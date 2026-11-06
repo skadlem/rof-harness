@@ -68,6 +68,7 @@ mod tests {
             oracle: oracle.into(),
             tests,
             timeout_secs: 60,
+            agent_timeout_secs: 60,
         }
     }
 
@@ -87,6 +88,28 @@ mod tests {
         let one = load_tb_slice(&root, &["bbb".to_string()]).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].image, "img-b");
+    }
+
+    #[test]
+    fn tb_adapter_reads_agent_and_verifier_timeouts_separately() {
+        // Real task.toml files carry `timeout_sec` in both sections and they
+        // differ per task (query-optimize 900 agent / 1800 verifier,
+        // video-processing 3600/3600). The old `timeout_secs` key never matched
+        // `timeout_sec`, so every cell silently got the 1800s default.
+        let root = tmp();
+        let task = root.join("z");
+        std::fs::create_dir_all(task.join("tests")).unwrap();
+        std::fs::write(
+            task.join("task.toml"),
+            "schema_version = \"1.1\"\n\n[verifier]\ntimeout_sec = 1800.0\n\n[agent]\ntimeout_sec = 900.0\n\n[environment]\ndocker_image = \"img\"\n",
+        )
+        .unwrap();
+        std::fs::write(task.join("instruction.md"), "do it").unwrap();
+        std::fs::write(task.join("tests").join("test.sh"), "true\n").unwrap();
+        let all = load_tb_slice(&root, &[]).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].timeout_secs, 1800, "verifier budget");
+        assert_eq!(all[0].agent_timeout_secs, 900, "agent budget");
     }
 
     #[test]

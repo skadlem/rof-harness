@@ -602,3 +602,30 @@ says so explicitly.
   fix with walls under their cell's limit are unaffected (heap 240-501s,
   log-summary 56-195s against 900s); the one mcmc row that ran unbounded is kept
   as void.
+- **Timeouts were never read from `task.toml`: every cell silently used the
+  1800s default (2026-11-06, measured).** `slices::load_tb_slice` looked for
+  `timeout`/`timeout_secs`/`time_limit`, but task.toml says `timeout_sec`, and it
+  appears in BOTH `[verifier]` and `[agent]` with different values per task:
+  video-processing 3600/3600, query-optimize 1800 verifier vs 900 agent,
+  log-summary 900/900, mcmc and heap 1800/1800. So the verifier budget and the new
+  agent wall clock were both the 1800s default — too tight for video (would cut a
+  legitimate 3600s agent phase) and too loose for query-optimize (900). Fix: a
+  section-aware `section_int` reads `[verifier] timeout_sec` into
+  `Instance.timeout_secs` and `[agent] timeout_sec` into the new
+  `Instance.agent_timeout_secs` (serde default keeps old JSON readable), and the
+  agent deadline and its halt reason use the agent value. Test pins a task.toml
+  whose two sections disagree. CONSEQUENCE: rows banked before this fix ran under
+  1800s for both phases; every banked row's wall is far under 900s except the
+  mcmc row this exposed, so no reading changes.
+- **`mcmc-sampling-stan` is a blocked cell, not a headroom cell (2026-11-06,
+  measured).** Floor scan: pristine image scores 2/6 reward 0
+  (`test_posterior_alpha_estimation`, `test_posterior_beta_estimation` pass on the
+  shipped sources) and its reference `solution/solve.sh` FAILS in-image —
+  `Error in library(rstan): there is no package called 'rstan'`, because the
+  install step needs sudo/apt plus a source build of rstan 2.32.7 and silently
+  produces nothing. A map row then burned 291,445/13,467 tokens over 1,743s (49
+  steps, halt=tokens) and its verifier exec HUNG for the full 2,100s timeout with
+  no ctrf. Harbour's own agent envelope for the task is 1800s, so the install plus
+  sampling cannot fit. Decision: drop mcmc from cell selection; the old
+  "rstan-env class — uninformative" readings are now explained rather than
+  mysterious.

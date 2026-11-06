@@ -59,6 +59,16 @@ The owner authorized $5 additional spend for the steering pilot, raising the cum
   near-miss, and cmhc arms must be read as pass^1 plus "did it break the
   floor". The old 0/6 was *below* floor — the build-context seed failed tests
   the untouched sources pass.
+- **Fourth and fifth gaps, same family, both fixed: `task.toml` timeouts were
+  never read (the loader looked for `timeout_secs`, the file says `timeout_sec`,
+  and it appears in both `[verifier]` and `[agent]` with different values per
+  task), so every cell ran on the 1800s default — too tight for
+  video-processing (3600) and too loose for query-optimize (900). Section-aware
+  parsing now feeds separate agent and verifier budgets, and the agent budget is
+  the wall clock. Also measured: `mcmc-sampling-stan` is a **blocked cell** — its
+  reference solution fails in-image (`no package called 'rstan'`), pristine is
+  2/6, and a paid row burned 291k tokens in 1,743s before its verifier hung for
+  the full 2,100s timeout. It is dropped from cell selection.
 - **Third fidelity gap found and fixed: the agent phase had no wall clock.**
   `inst.timeout_secs` bounded only the verifier, so an agent row ran until the
   token/step caps; the first map row on mcmc was still working at ~2,100s where

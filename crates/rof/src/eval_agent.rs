@@ -933,13 +933,13 @@ pub(crate) async fn run_agent_leg(
         // `[agent] timeout_sec`. Without it a slow cell (R installs, package
         // builds) spends far more wall time than the benchmark allows, and the
         // row stops being comparable with a harbor run.
-        let deadline = Instant::now() + Duration::from_secs(inst.timeout_secs);
+        let deadline = Instant::now() + Duration::from_secs(inst.agent_timeout_secs);
         // ponytail: execute() spawns a fresh ctrl-c listener per call (one
         // per instance here) — bounded by the slice size; upgrade path: a
         // shared CancellationToken threaded through execute().
         let r = crate::execute_with_deadline(&provider, &run_args, Some(deadline)).await;
         let agent_timed_out = matches!(r.outcome, agent_loop::Outcome::Cancelled)
-            && start.elapsed().as_secs() >= inst.timeout_secs;
+            && start.elapsed().as_secs() >= inst.agent_timeout_secs;
         if let Some(path) = run_args.dump_events.as_deref() {
             if let Err(e) = finalize_dump(path, &r.events) {
                 eprintln!("infra {}: cannot write {path}: {e}", inst.id);
@@ -991,7 +991,7 @@ pub(crate) async fn run_agent_leg(
                 if agent_timed_out {
                     row.halt_reason = Some(format!(
                         "agent wall timeout (task.toml agent.timeout_sec={}s)",
-                        inst.timeout_secs
+                        inst.agent_timeout_secs
                     ));
                 }
                 reports.push(row)
