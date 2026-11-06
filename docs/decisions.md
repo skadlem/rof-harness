@@ -629,3 +629,33 @@ says so explicitly.
   sampling cannot fit. Decision: drop mcmc from cell selection; the old
   "rstan-env class — uninformative" readings are now explained rather than
   mysterious.
+
+- **`--exec-policy any` re-tested on the corrected pipeline: still mechanism-only
+  (2026-11-06, `dphn-env1`, 3 heap rows, $0.31).** All three Unresolved 5/6 with
+  `test_release_build_runs_without_crash` failing (40/46/39 steps, 286-298k
+  tokens, 408-561s), identical to their allowlist controls. The mechanism half is
+  proven in the trace: with `any` the model ran `which valgrind` and
+  `gdb -batch -ex run -ex bt ./release` — the tools the census shows the
+  allowlist had been denying — and recorded zero denials. It had the task's own
+  debugging toolchain and still did not fix the crash, so the denials are
+  friction, not a capability ceiling. The October version of this verdict is only
+  now trustworthy: it ran before the workspace-seed fix, when heap's floor was
+  0/6 and no test could move.
+- **Two in-container bugs found by the first paid row on a fresh 0/N cell
+  (2026-11-06, `dphn-solve1`, kv-store-grpc).** (1) *Git refused the workdir*:
+  the seeding fix chowns `/app` to the host uid (so host-side `edit`/`write` can
+  write it) while the container runs as root, and git rejects a repo owned by
+  another user — measured `fatal: detected dubious ownership in repository at
+  '/app'` on a chowned workdir, with the same text already in three banked rows
+  (`pilot-steer2/on-r1-custom-memory-heap-crash`, two `make-mips-interpreter`
+  rows). Fix: after the container starts, a best-effort
+  `git config --system --add safe.directory /app` inside it (pinned argv; images
+  without git are a no-op). (2) *An EMPTY workdir had no baseline*: kv-store-grpc's
+  image ships an empty `/app`, so `ensure()` had nothing to commit, HEAD stayed
+  unborn, and every row carried `halt_reason: snapshot rollback: … ensure() has
+  not recorded a start HEAD` — including rows that RESOLVED 7/7. Fix:
+  `commit_all` creates an empty baseline commit when the tree is empty, and
+  `rollback` skips the pathspec restore when the baseline has no tracked paths
+  (`clean` is the whole rollback there). Tests updated to the new contract: an
+  empty workdir yields an empty patch and a real patch once the agent creates
+  files, and rollback clears it.

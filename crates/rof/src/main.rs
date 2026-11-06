@@ -555,29 +555,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unborn_head_is_a_no_baseline_failure_not_silent_empty_patch() {
-        // Empty workdir: `ensure()` records no start HEAD, so the full-patch
-        // fn errs; the run must warn on stderr (the same "no baseline"
-        // message `main` prints) and exit non-zero via a failure outcome —
-        // never a silent empty patch with exit 0.
+    async fn empty_workdir_still_gets_a_baseline_so_the_patch_is_real() {
+        // A task whose image ships an EMPTY /app (kv-store-grpc) starts with an
+        // empty workdir. `ensure()` now records an empty baseline commit
+        // (`--allow-empty`) instead of leaving HEAD unborn, so the run does not
+        // die with "no baseline" and the deliverable patch contains what the
+        // agent created. Measured before the fix: a row that resolved 7/7 still
+        // carried halt_reason "snapshot rollback: ... not recorded a start HEAD".
         let dir = tmp();
         assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
-        let client = ScriptClient::new(vec![text_resp(), text_resp()]);
+        let client = ScriptClient::new(vec![
+            write_resp("new.txt", "created\n"),
+            text_resp(),
+            text_resp(),
+        ]);
         let r = execute(&client, &args_for(&dir, None)).await;
-        assert!(r.patch.is_err(), "no baseline means no patch");
-        let err = r.patch.unwrap_err();
         assert!(
-            err.contains("start HEAD"),
-            "snapshot names the cause: {err}"
-        );
-        assert!(
-            matches!(&r.outcome, Outcome::Failed { message: m, .. } if m.contains("no baseline")),
-            "failure outcome carries the stderr hint: {:?}",
+            matches!(r.outcome, Outcome::Done),
+            "empty start is not a failure: {:?}",
             r.outcome
         );
-        // Snapshot-kind failure: exit 6 (stream S6 item 5 changed this from
-        // the old blanket 3 so wrappers can tell workdir failures apart).
-        assert_eq!(exit_code(&r.outcome), 6);
+        let patch = r.patch.expect("empty baseline still yields a patch");
+        assert!(
+            patch.contains("new.txt"),
+            "the patch carries what the agent created: {patch}"
+        );
+        assert_eq!(exit_code(&r.outcome), 0);
     }
 
     #[tokio::test]

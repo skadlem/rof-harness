@@ -408,6 +408,21 @@ fn env_container_run_args(image: &str, work: &Path, id: &str) -> Vec<String> {
     ]
 }
 
+/// `docker exec` argv that makes the bind-mounted workdir usable by git INSIDE
+/// the container. The seeded tree is chowned to the host uid (so host-side file
+/// tools can write it) while the container runs as root, and git refuses a repo
+/// owned by another user — measured: `fatal: detected dubious ownership in
+/// repository at '/app'` on a chowned workdir, fixed by the system-wide entry.
+fn git_safe_directory_args(container: &str) -> Vec<String> {
+    vec![
+        "exec".into(),
+        container.into(),
+        "sh".into(),
+        "-c".into(),
+        "command -v git >/dev/null 2>&1 && git config --system --add safe.directory /app".into(),
+    ]
+}
+
 /// docker rm -f, best-effort: the stale pre-clean before a run and the
 /// cleanup afterwards (every path, including failure).
 async fn rm_env_container(id: &str) {
@@ -491,7 +506,13 @@ async fn start_env_container(inst: &eval::Instance, work: &Path) -> Result<Strin
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(env_container_name(&inst.id))
+    let name = env_container_name(&inst.id);
+    // Best effort: git inside the container must accept the chowned /app.
+    let _ = tokio::process::Command::new("docker")
+        .args(git_safe_directory_args(&name))
+        .output()
+        .await;
+    Ok(name)
 }
 
 /// Verdict from the verifier exit: 0 is Resolved, nonzero Unresolved; a
@@ -1480,6 +1501,24 @@ mod tests {
         assert!(
             !got.last().unwrap().contains("environment"),
             "in-container seeding must not read the Docker build context"
+        );
+    }
+
+    #[test]
+    fn git_safe_directory_covers_the_chowned_app() {
+        // The seeded /app belongs to the host uid while the container is root;
+        // git refuses that repo without a system-wide exception (measured:
+        // "fatal: detected dubious ownership in repository at '/app'").
+        let got = git_safe_directory_args("eval-id-env");
+        assert_eq!(got[0], "exec");
+        assert_eq!(got[1], "eval-id-env");
+        assert!(
+            got.last().unwrap().contains("safe.directory /app"),
+            "{got:?}"
+        );
+        assert!(
+            got.last().unwrap().contains("command -v git"),
+            "images without git stay a no-op"
         );
     }
 

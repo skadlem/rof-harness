@@ -132,12 +132,18 @@ impl TreeService {
     /// recorded start HEAD there is no known-good state, so rolling back
     /// could destroy work against an unknown base.
     pub fn rollback(&self) -> Result<()> {
-        if self.start.get().is_none() {
-            return Err(other(
-                "rollback: ensure() has not recorded a start HEAD".into(),
-            ));
+        let start = self
+            .start
+            .get()
+            .ok_or_else(|| other("rollback: ensure() has not recorded a start HEAD".into()))?;
+        // An EMPTY baseline (task image ships an empty /app) has no pathspec to
+        // restore, and `git checkout -- .` fails on it; `clean` is what deletes
+        // everything the run created there.
+        let tracked = self.git_status(["ls-tree", "-r", "--name-only", start.as_str()])?;
+        let empty_baseline = tracked.status.success() && tracked.stdout.is_empty();
+        if !empty_baseline {
+            self.git(["checkout", "--", "."])?;
         }
-        self.git(["checkout", "--", "."])?;
         self.git(["clean", "-fdq"])?;
         Ok(())
     }
@@ -405,6 +411,13 @@ impl TreeService {
             .map(|o| o.status.success())
             .unwrap_or(false)
         {
+            // Nothing staged. A workdir that starts EMPTY (kv-store-grpc's
+            // image ships an empty /app) still needs a baseline revision:
+            // without one `head_unborn` stays true and `patch_since_start`
+            // fails with "ensure() has not recorded a start HEAD".
+            if self.head_unborn()? {
+                self.git(["commit", "--allow-empty", "--quiet", "-m", message])?;
+            }
             return Ok(());
         }
         self.git(["commit", "--quiet", "-m", message])?;

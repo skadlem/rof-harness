@@ -107,13 +107,16 @@ fn rollback_before_ensure_errors() {
 }
 
 #[test]
-fn rollback_without_recorded_start_errors() {
-    // ensure() ran but the tree was empty: HEAD unborn, no start rev.
-    let dir = scratch("rollback-unborn");
+fn rollback_on_an_empty_baseline_removes_what_the_run_created() {
+    // Empty baseline: there is no tracked file to restore, so `clean` is the
+    // whole rollback. Before `--allow-empty`, ensure() left HEAD unborn and this
+    // reported "no start HEAD" instead of undoing the work.
+    let dir = scratch("rollback-empty");
     let tree = TreeService::new(&dir);
     tree.ensure().unwrap();
-    let e = tree.rollback().unwrap_err();
-    assert!(e.to_string().contains("start HEAD"), "{e}");
+    std::fs::write(dir.join("made.txt"), "x\n").unwrap();
+    tree.rollback().unwrap();
+    assert!(!dir.join("made.txt").exists(), "rollback clears the tree");
 }
 
 #[test]
@@ -574,18 +577,23 @@ fn bounded_patch_since_start_still_truncates_same_tree() {
 }
 
 #[test]
-fn patch_since_start_full_unborn_head_errors_like_bounded() {
-    let dir = scratch("full-unborn");
+fn patch_since_start_full_empty_workdir_is_an_empty_patch_not_an_error() {
+    // A task image can ship an EMPTY /app (kv-store-grpc does). ensure() now
+    // commits an empty baseline (`--allow-empty`), so the start HEAD exists and
+    // both patch views answer "nothing yet" instead of erroring — measured
+    // consequence before the fix: a row that resolved 7/7 still carried
+    // halt_reason "snapshot rollback: ... not recorded a start HEAD".
+    let dir = scratch("full-empty");
     let tree = TreeService::new(&dir);
-    tree.ensure().unwrap(); // empty tree: HEAD stays unborn, no start
-    let bounded = tree.patch_since_start().unwrap_err();
-    let full: SnapshotError = tree.patch_since_start_full().unwrap_err();
-    for e in [&bounded, &full] {
-        assert!(
-            e.to_string().contains("has not recorded a start HEAD"),
-            "unborn HEAD stays Err: {e}"
-        );
-    }
+    tree.ensure().unwrap();
+    let (summary, patch) = tree.patch_since_start().unwrap();
+    assert!(summary.changed.is_empty() && summary.untracked.is_empty());
+    assert_eq!(patch.text, "");
+    assert_eq!(tree.patch_since_start_full().unwrap(), "", "nothing yet");
+    // And what the run creates afterwards IS in the patch.
+    std::fs::write(dir.join("created.txt"), "hi\n").unwrap();
+    let after = tree.patch_since_start_full().unwrap();
+    assert!(after.contains("created.txt"), "{after}");
 }
 
 #[test]
