@@ -659,3 +659,35 @@ says so explicitly.
   (`clean` is the whole rollback there). Tests updated to the new contract: an
   empty workdir yields an empty patch and a real patch once the agent creates
   files, and rollback clears it.
+- **Cell portfolio from the zero-cost floor scan: 7 of 9 candidate cells are
+  trustworthy, 2 of 9 have defective reference solutions (2026-11-06).** Every
+  measurement below is pristine-reward 0 with ctrf produced (no verifier
+  failures), so a pass on any of these cells is real signal rather than a
+  partial-credit floor:
+  dna-assembly 0/1 → gold 1/1; kv-store-grpc 0/7 → 7/7; raman-fitting 0/3 →
+  3/3; model-extraction-relu-logits 0/1 → 1/1; hf-model-inference 0/4 → 4/4
+  (verifier 24-28s, the fastest cell measured); break-filter-js-from-html 0/1 →
+  1/1; make-mips-interpreter 0/3 → 3/3. EXCLUDED for broken gold:
+  `protein-assembly` gold 0/1 (its DNAChisel solve is stochastic and produced no
+  gblock.txt) and `sanitize-git-repo` gold 2/3 (its own solution trips
+  `test_no_other_files_changed`), plus `mcmc-sampling-stan` (no rstan in-image).
+  Procedure note that matters for interpreting gold on service tasks:
+  `hf-model-inference`'s deliverable is a running Flask server, so gold only
+  scores 4/4 when solve.sh runs INSIDE the graded container — a throwaway
+  container takes the server down with it and grades 1/4, which is exactly the
+  class in-container mode exists for.
+- **Corrected-pipeline capability map, first complete version (2026-11-06).**
+  Everything below ran on the faithful pipeline (image-seeded `/app`, tests
+  uploaded at grading, per-task agent/verifier budgets, git-safe workdir,
+  in-container package and service persistence), shipped defaults, 300k/60/120:
+  log-summary-date-ranges **3/3 solved** (ceiling), kv-store-grpc **3/3 solved**
+  (0/7 floor, 0.01/row), hf-model-inference **2/3** (r1 wall-timeout at 900s,
+  r2/r3 solved in 309-352s — path variance, not a capability gap),
+  custom-memory-heap-crash **0/3** at its 5/6 floor with the crux test failing
+  even when `--exec-policy any` let the model run `gdb`/`valgrind`,
+  video-processing **0/1** at its 2/5 floor, query-optimize **0/1** (wall-clocked
+  at its 900s agent budget after 12 steps). Excluded cells: mcmc-sampling-stan
+  (no rstan in-image), protein-assembly and sanitize-git-repo (defective gold).
+  So: this harness solves ordinary mid-difficulty tasks at this model tier and
+  does not solve the three legacy "headroom" cells — which is a statement about
+  the cells, not about a missing harness lever.

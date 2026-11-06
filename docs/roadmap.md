@@ -9,6 +9,22 @@ The owner authorized $5 additional spend for the steering pilot, raising the cum
 
 ## Current state (2026-11-06)
 
+- **Corrected-pipeline capability map (all numbers above the fold are measured):**
+  log-summary 3/3 solved, kv-store-grpc 3/3 solved (fresh 0/7 cell, ~$0.01/row),
+  hf-model-inference 2/3 (r1 died on the task's own 900s agent wall at 28 steps;
+  r2/r3 solved in 309-352s), custom-memory-heap-crash 0/3 at its 5/6 floor with
+  the crux test failing *even with* `--exec-policy any` and `gdb`/`valgrind` in
+  hand, video-processing 0/1 at its 2/5 floor, query-optimize 0/1 wall-clocked at
+  900s after 12 steps. Excluded: mcmc (no rstan), protein-assembly and
+  sanitize-git-repo (broken gold). Read: the harness works at this model tier on
+  ordinary tasks; the legacy headroom cells are hard for the model, not broken by
+  a missing lever.
+- **Five fidelity/measurement defects found and fixed today, each with a
+  test:** build-context workspace seeding, `/tests` visible to the agent, no
+  agent wall clock, `task.toml` timeouts never parsed (`timeout_sec` vs
+  `timeout_secs`, and both sections), and the in-container git
+  `safe.directory` + empty-workdir baseline pair. Every pre-fix in-container
+  capability reading is void on cells whose verifier tests could not move.
 - **The initiative nudge layer is measured-dead and ships off (`dphn-steer2`,
   12 rows, $0.89).** Two cells with measured corrected baselines x 3 reps x 2
   arms (`--steer on|off`, differing by that flag only, `--streak-steer off` in
