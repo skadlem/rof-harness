@@ -20,6 +20,7 @@ use agent_loop::{FailureKind, Input, LoopState, NoBets, Outcome, Run};
 use provider_core::LlmClient;
 use provider_openai::OpenAiCompat;
 use snapshot::TreeService;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
@@ -121,6 +122,19 @@ fn preserve_log(path: &Path, workdir: &Path) -> std::io::Result<()> {
 }
 
 async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
+    execute_with_deadline(provider, args, None).await
+}
+
+/// Same run with an optional wall-clock deadline, used by the eval agent leg to
+/// enforce the task's `[agent] timeout_sec` the way harbor does. The deadline
+/// cancels through the same token Ctrl-C uses, so the loop still ends with
+/// `Outcome::Cancelled`, emits `RunEnd` and leaves a gradeable workdir — a
+/// dropped future would look like an infra failure instead.
+async fn execute_with_deadline<P: LlmClient>(
+    provider: &P,
+    args: &Args,
+    deadline: Option<Instant>,
+) -> RunResult {
     let policy = Arc::new(policy_for(args));
     let mut reg = tool_core::Registry::new(Arc::new(GrantGate::new(HashMap::from([(
         "agent".to_string(),
@@ -145,6 +159,13 @@ async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
     let bets_hook: &dyn agent_loop::BetsHook = if args.bets { &gate } else { &NoBets };
     let mut emitter = Emitter::new();
     let cancel = CancellationToken::new();
+    if let Some(d) = deadline {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await;
+            cancel.cancel();
+        });
+    }
     // First Ctrl-C cancels the run; the loop reports Outcome::Cancelled.
     tokio::spawn({
         let cancel = cancel.clone();
@@ -353,6 +374,51 @@ mod tests {
             policy_for(&a).root,
             Path::new("/tmp/w"),
             "policy root still the workdir"
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_cancels_the_run_and_still_emits_run_end() {
+        // Harbor parity for the eval agent leg: an expired deadline must end the
+        // run through the same cancel token Ctrl-C uses, so the loop reports
+        // Outcome::Cancelled and still emits RunEnd (a dropped future would look
+        // like an infra failure instead).
+        let dir = tmp().join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Non-empty tree: an empty workdir has an unborn HEAD and no baseline
+        // to diff from, which fails before the deadline can be observed.
+        std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
+        let args = args_for(&dir, None);
+        // Already expired: the scripted provider is never consulted.
+        let past = Instant::now() - std::time::Duration::from_millis(1);
+        let r =
+            execute_with_deadline(&ScriptClient::new(vec![text_resp()]), &args, Some(past)).await;
+        assert!(
+            matches!(r.outcome, Outcome::Cancelled),
+            "expired deadline cancels, got {:?}",
+            r.outcome
+        );
+        assert!(
+            r.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RunEnd { .. })),
+            "cancelled runs still emit RunEnd so the row is gradeable"
+        );
+        // A future deadline is inert: same scripted run, fresh workdir.
+        let dir2 = tmp().join("work");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("note.txt"), "hello\n").unwrap();
+        let args2 = args_for(&dir2, None);
+        let ok = execute_with_deadline(
+            &ScriptClient::new(vec![text_resp()]),
+            &args2,
+            Some(Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .await;
+        assert!(
+            matches!(ok.outcome, Outcome::Done),
+            "future deadline is inert, got {:?}",
+            ok.outcome
         );
     }
 

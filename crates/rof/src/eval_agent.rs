@@ -15,8 +15,8 @@ use crate::cli::{endpoint_profile, Args};
 use crate::dump::finalize_dump;
 use crate::eval_cmd::{apply_mode_for, EvalArgs};
 use crate::exit::EXIT_NO_CREDENTIALS;
+use crate::missing_credentials_message;
 use crate::workdir::validate_workdir;
-use crate::{execute, missing_credentials_message};
 
 /// Goal rules tail, ported verbatim from the driver's `mk_goal` (plain
 /// variant).
@@ -929,10 +929,17 @@ pub(crate) async fn run_agent_leg(
         } else {
             None
         };
+        // Harbor parity: the agent phase is bounded by the task's
+        // `[agent] timeout_sec`. Without it a slow cell (R installs, package
+        // builds) spends far more wall time than the benchmark allows, and the
+        // row stops being comparable with a harbor run.
+        let deadline = Instant::now() + Duration::from_secs(inst.timeout_secs);
         // ponytail: execute() spawns a fresh ctrl-c listener per call (one
         // per instance here) — bounded by the slice size; upgrade path: a
         // shared CancellationToken threaded through execute().
-        let r = execute(&provider, &run_args).await;
+        let r = crate::execute_with_deadline(&provider, &run_args, Some(deadline)).await;
+        let agent_timed_out = matches!(r.outcome, agent_loop::Outcome::Cancelled)
+            && start.elapsed().as_secs() >= inst.timeout_secs;
         if let Some(path) = run_args.dump_events.as_deref() {
             if let Err(e) = finalize_dump(path, &r.events) {
                 eprintln!("infra {}: cannot write {path}: {e}", inst.id);
@@ -981,6 +988,12 @@ pub(crate) async fn run_agent_leg(
                 row.task_digest =
                     digest.filter(|d| task_digest(&task_dir).ok().as_ref() == Some(d));
                 row.image_id = image_id;
+                if agent_timed_out {
+                    row.halt_reason = Some(format!(
+                        "agent wall timeout (task.toml agent.timeout_sec={}s)",
+                        inst.timeout_secs
+                    ));
+                }
                 reports.push(row)
             }
             Err(e) => {

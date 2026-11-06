@@ -59,6 +59,15 @@ The owner authorized $5 additional spend for the steering pilot, raising the cum
   near-miss, and cmhc arms must be read as pass^1 plus "did it break the
   floor". The old 0/6 was *below* floor — the build-context seed failed tests
   the untouched sources pass.
+- **Third fidelity gap found and fixed: the agent phase had no wall clock.**
+  `inst.timeout_secs` bounded only the verifier, so an agent row ran until the
+  token/step caps; the first map row on mcmc was still working at ~2,100s where
+  harbor's `[agent] timeout_sec=900` would have stopped it. Agent rows now cancel
+  at that limit through the same token Ctrl-C uses (clean `Outcome::Cancelled`,
+  `RunEnd` still emitted, workdir still graded) and record
+  `halt_reason = agent wall timeout (...)` so a timeout is never read as a model
+  failure. Rows banked before the fix all ran under 900s except the voided mcmc
+  row, so their readings stand.
 - **Pipeline validity re-established (3 rows, `dphn-seedfix-base2`, $0.14):**
   `log-summary-date-ranges` — the cell the broken-seed arms "solved" — is
   **3/3 Resolved, 2/2 tests** on the corrected pipeline (124s/112s/69s, 14-32
@@ -295,7 +304,10 @@ self-describe through the provenance block; no arm's rows pool with another's.
    rule as pure functions in `eval`. Instrument only — it cannot make a
    capability claim on its own.
 
-3. **Wire fidelity against the vendor's own encoder.** DeepSeek released
+3. **Wire fidelity against the vendor's own encoder — DONE 2026-11-06
+   (zero-cost diff, `research/wire-fidelity-2026-11-06.md`, outcomes in
+   `docs/decisions.md`; one claim refuted by banked cache data, nothing
+   changed).** DeepSeek released
    `github.com/deepseek-ai/deepseek-recipe` (MIT, Rust) — a protocol-aware
    toolkit that converts Chat Completions/Messages/Responses requests into
    DeepSeek V4/V4.1 prompts and parses output back. `provider-openai`

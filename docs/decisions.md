@@ -559,3 +559,46 @@ says so explicitly.
   deletion check on those two tasks, not a capability estimate, and the declare
   hold firing 6/6 on solved rows shows it is active where it was supposed to
   help and still bought nothing.
+- **Wire-fidelity diff done against vendor `deepseek-recipe` @ `935817c6`; one claim
+  refuted by our own data, three recorded as measured, nothing changed
+  (2026-11-06, zero model calls).** Report: `research/wire-fidelity-2026-11-06.md`
+  (vendor is a serving-side prompt renderer, not an HTTP client, so the layers
+  only partly overlap). Outcomes, each with the evidence that settles it:
+  (1) *effort is a prompt line* — already measured on both channels by us
+  (`dphn-effort` JSON field 1.23x, `dphn-effort2` vendor marker 1.26x against the
+  1.5x mechanism rule); the vendor template `Reasoning Effort: {1-100}` matches
+  the marker we sent, so this is confirmation, not new work. (2) *cache-token
+  field mismatch* (`prompt_cache_hit_tokens` vs our
+  `prompt_tokens_details.cached_tokens`) — **refuted by banked events**: the
+  endpoint we use emits the OpenAI shape and we parse it, with non-zero
+  `cache_read_tokens` in real rows (1,216 / 2,624 / … on a single cmhc row), so
+  the cost guardrail is not silently pricing every input token at the miss rate
+  and `--budget-shape miss-plus-out` is usable. (3) *`finish_reason=length`
+  becomes a `BodyFail` and re-runs with a doubled `max_tokens`* — deliberate,
+  bounded (one thinking-off rung, then a 32,768 ceiling), and the double billing
+  IS accounted (`retry::merge_usage` sums attempts). Measured frequency across
+  every banked event log: 3 rows total (2 of today's, 1 old GLM), and both of
+  today's rows still graded (one Resolved, one at the 5/6 floor), so there is no
+  evidence of capability loss and no change is justified without an arm.
+  (4) Runner-up, latent not live: a plain 400/422 falls through the fail-open
+  `classify_message` table and would be retried although DeepSeek documents both
+  as "modify your request". Zero 400/422 rows exist in the banked set (only 402
+  and 504 halt codes), so this stays recorded with its one-line fix, not
+  implemented.
+- **The agent phase is now bounded by the task's `[agent] timeout_sec`, like
+  harbor (2026-11-06, third in-container fidelity gap).** `inst.timeout_secs`
+  was used only to bound the verifier and the harbor grade run; the agent leg had
+  no wall clock, so it ran until the token/step caps fired. Measured in the first
+  map row: `mcmc-sampling-stan` was still working at ~2,100s where harbor's 900s
+  agent timeout would have ended it, and older banked mcmc rows reached 971s —
+  so those rows were more generous than the benchmark and not comparable with a
+  harbor run. Fix: `execute_with_deadline` (the same cancel token Ctrl-C uses, so
+  the loop still ends `Outcome::Cancelled`, emits `RunEnd` and leaves a gradeable
+  workdir — a dropped future would look like an infra failure), wired from the
+  agent leg with `Instant::now() + inst.timeout_secs`, and the row's
+  `halt_reason` records `agent wall timeout (task.toml agent.timeout_sec=Ns)` so a
+  timeout row is never read as a model failure. Test: an expired deadline cancels
+  and still emits `RunEnd`; a future deadline is inert. Rows measured before this
+  fix with walls under their cell's limit are unaffected (heap 240-501s,
+  log-summary 56-195s against 900s); the one mcmc row that ran unbounded is kept
+  as void.
