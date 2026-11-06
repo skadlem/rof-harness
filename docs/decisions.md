@@ -539,3 +539,23 @@ says so explicitly.
   shows the model did not solve it and did not break the floor; it is not a
   near-miss. Rule for future cmhc arms: report pass^1 and the floor delta, never
   a named-test count as if it were progress.
+- **The initiative nudge layer ships off: measured dead, and a 2.64x tax
+  (2026-11-06, `dphn-steer2`, 12 rows, $0.89).** Ablation on the corrected
+  pipeline (image-seeded `/app`, tests uploaded only at grading), two cells with
+  measured baselines, 3 reps per arm, arms differing by `--steer on|off` only,
+  matched order r1 on→off, r2 off→on, r3 on→off. Capability: identical — cmhc
+  0/3 both arms with every row at the 5/6 floor and `test_release_build_runs_without_crash`
+  never passed; log-summary 3/3 both arms at 2/2; no named test differs in any
+  matched pair. Cost on the solved cell: 175,657 vs 66,620 gross tokens per
+  solved task (2.64x), median 22 vs 11 steps, 155s vs 56s. Mechanism verified
+  from the WALs, not assumed: zero nudge text in all 6 `off` rows; `on` fired in
+  all 6 (declare hold 2x + wrap-up 1x on log-summary; wrap-up 1x on cmhc, plus
+  one half directive in r3 — the half directive still needs 60 actions, which
+  cmhc reaches only at the margin). Decision: `steer` defaults to false on both
+  CLI surfaces (`rof run`, `rof eval`); `--steer on` re-enables the declare
+  hold, the action directives and the wrap-up; the workflow contract and the
+  rollback notice are untouched; the nudge code stays as the substrate for any
+  future state-triggered gate. Limit stated plainly: 2 cells x 3 reps is a
+  deletion check on those two tasks, not a capability estimate, and the declare
+  hold firing 6/6 on solved rows shows it is active where it was supposed to
+  help and still bought nothing.

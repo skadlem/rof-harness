@@ -17,7 +17,7 @@ pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--work
 --no-log: disable the WAL (run without a durable log)
 --keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default keeps the DeepSeek thinking-off knob, sent only on compaction-summary calls and the truncation ladder first rung; ordinary requests carry no thinking fragment)
 --streak-steer on|off: enable the experimental six-read directive (default off)
---steer on|off: initiative steering nudges (unverified-declare hold, half/late action directives, wrap-up nudge). `off` is the ablation arm; the workflow contract and the rollback notice still ship. Default on
+--steer on|off: initiative steering nudges (unverified-declare hold, half/late action directives, wrap-up nudge). The workflow contract and the rollback notice ship either way. Default off: measured dead in dphn-steer2 (no named-test change on either cell, 2.64x tokens per solved task)
 --reasoning-effort LEVEL (none|low|high|xhigh|max): send `reasoning_effort` on every request (default: none sent = endpoint default). Measured on the vLLM gateway 2026-10-19: 0/722/1060/1149/2976 reasoning tokens on one prompt for none/low/high/xhigh/max; api.deepseek.com ignores the field
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget
 --exec-policy allowlist|any: command-allowlist policy for exec/test. `any` skips the list entirely and is for callers whose process boundary is elsewhere (in-container eval wraps exec as `docker exec <container>`, so the allowlist is not a boundary there, only capability loss); the choice is recorded in the report provenance so relaxed rows never pool with strict rows
@@ -65,10 +65,12 @@ pub(crate) struct Args {
     /// `reasoning_effort` level sent on every request (`None` = endpoint
     /// default). Validated at the edge against [`EFFORT_LEVELS`].
     pub reasoning_effort: Option<String>,
-    /// Initiative steering nudges (default `true` = the shipped behavior:
-    /// unverified-declare hold, half/late action directives, wrap-up nudge).
-    /// `--steer off` is the ablation arm; the workflow contract and the
-    /// rollback notice still ship.
+    /// Initiative steering nudges (default `false`: measured dead in
+    /// `dphn-steer2`, docs/decisions.md 2026-11-06 — no named-test change on
+    /// either cell at 2.64x tokens per solved task). `--steer on` re-enables
+    /// the unverified-declare hold, the half/late action directives and the
+    /// wrap-up nudge; the workflow contract and the rollback notice ship
+    /// either way.
     pub steer: bool,
     /// Experimental read-streak intervention, off by default.
     pub streak_steer: bool,
@@ -584,7 +586,7 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         no_log: b.no_log,
         keep_thinking: b.keep_thinking,
         reasoning_effort: b.reasoning_effort,
-        steer: b.steer.unwrap_or(true),
+        steer: b.steer.unwrap_or(false),
         streak_steer: b.streak_steer.unwrap_or(false),
         proof_cmd: b.proof_cmd,
         incentives: b.incentives.unwrap_or(agent_loop::IncentivesLevel::Full),
@@ -804,7 +806,7 @@ mod tests {
                 no_log: false,
                 keep_thinking: false,
                 reasoning_effort: None,
-                steer: true,
+                steer: false,
                 streak_steer: false,
                 bets: false,
                 incentives: agent_loop::IncentivesLevel::Full,
@@ -1292,14 +1294,19 @@ mod tests {
     }
 
     #[test]
-    fn steer_flag_defaults_on_and_records_the_ablation_arm() {
+    fn steer_flag_defaults_off_and_records_both_arms() {
+        // dphn-steer2 (2026-11-06): the nudges changed no named test on either
+        // cell and cost 2.64x tokens per solved task, so the shipped default is
+        // off; `on` stays available as the substrate for a future gate.
         let plain = parse_args(&run_min(&[])).unwrap();
-        assert!(plain.steer, "default ships the shipped steering behavior");
-        assert!(run_config(&plain).steer, "loop config carries it");
+        assert!(!plain.steer, "default ships without the nudges");
+        assert!(!run_config(&plain).steer, "loop config carries it");
+        let on = parse_args(&run_min(&["--steer", "on"])).unwrap();
+        assert!(on.steer);
+        assert!(run_config(&on).steer);
         let off = parse_args(&run_min(&["--steer", "off"])).unwrap();
         assert!(!off.steer);
         assert!(!run_config(&off).steer);
-        assert!(parse_args(&run_min(&["--steer", "on"])).unwrap().steer);
         let err = parse_args(&run_min(&["--steer", "sometimes"])).unwrap_err();
         assert!(err.contains("on|off"), "{err}");
     }

@@ -345,11 +345,14 @@ pub struct RunConfig {
     /// recipe's gross input+output). Arms set the field directly; the loop
     /// never reads the environment.
     pub budget_shape: BudgetShape,
-    /// Steering interventions (default ON = current behavior): the
-    /// unverified-declare hold, the half/late action directives and the
-    /// budget wrap-up nudge. `false` is the ablation arm that keeps the
-    /// workflow contract and the rollback notice but ships no initiative
-    /// nudges, so "does steering earn its place?" becomes measurable.
+    /// Steering interventions: the unverified-declare hold, the half/late
+    /// action directives and the budget wrap-up nudge. The loop default stays
+    /// `true` (the substrate's historical behavior, which the nudge tests
+    /// exercise); BOTH shipped CLI surfaces default to `false` — `dphn-steer2`
+    /// measured the nudges dead (2026-11-06, docs/decisions.md): no named-test
+    /// change on either cell, 2.64x tokens per solved task. `--steer on`
+    /// re-enables them; the workflow contract and the rollback notice ship
+    /// either way.
     pub steer: bool,
 }
 

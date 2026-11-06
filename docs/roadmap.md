@@ -9,6 +9,21 @@ The owner authorized $5 additional spend for the steering pilot, raising the cum
 
 ## Current state (2026-11-06)
 
+- **The initiative nudge layer is measured-dead and ships off (`dphn-steer2`,
+  12 rows, $0.89).** Two cells with measured corrected baselines x 3 reps x 2
+  arms (`--steer on|off`, differing by that flag only, `--streak-steer off` in
+  both): capability identical everywhere — cmhc 0/3 vs 0/3 with every row at the
+  5/6 floor and the crux test never passed by either arm, log-summary 3/3 vs 3/3
+  at 2/2 — while on the solved cell the nudges cost **2.64x gross tokens per
+  solved task** (175,657 vs 66,620), 2x the steps (22 vs 11) and 2.7x the wall
+  (155s vs 56s); cmhc is token-capped in both arms (0.98x). Mechanism was
+  verified, not assumed: every `off` WAL carries zero nudge text, every `on` row
+  fired (log-summary declare hold 2x + wrap-up 1x per rep; cmhc wrap-up 1x, plus
+  one half directive in r3). Default flipped to off (`--steer on` re-enables),
+  nudges flagged measured-dead and kept as the substrate for a future gate.
+  Limit: 2 cells x 3 reps is a deletion check on those tasks, not a capability
+  estimate.
+
 - **In-container workspaces were the Docker build context, not the task
   workspace — fixed, and it invalidates in-container capability rows on four of
   the five cells used so far.** `fresh_workdir` seeded `/app` from
@@ -207,8 +222,22 @@ self-describe through the provenance block; no arm's rows pool with another's.
    above means cmhc/query-optimize rows were reading a Docker build context, so
    the read-starvation streaks that motivate the re-keyed trigger are not
    evidence about the benchmark task. Do not resume this arm or the frozen
-   `pilot-steer/rof-steer` binary; re-register after a corrected-workspace
-   baseline. The forensics before that stay valid as facts about the old code:
+   `pilot-steer/rof-steer` binary.
+   **RE-REGISTERED 2026-11-06 as `dphn-steer2`** (owner approved spend) on the
+   corrected pipeline: binary `a6da984` (md5 `b2f696dc`), arms `--steer on|off`
+   differing by that one flag, `--streak-steer off` in both, 2 cells x 3 reps x
+   2 arms = 12 rows with matched windows (r1 on→off, r2 off→on, r3 on→off).
+   Cells from the corrected baseline, not the old firing tables:
+   custom-memory-heap-crash (0/3 resolved, 5/6 floor, crux test
+   `test_release_build_runs_without_crash`) and log-summary-date-ranges (3/3
+   resolved 2/2). Measured mechanism: log-summary fires declare hold 2/1/2 and
+   the wrap-up once per row; cmhc fires the wrap-up once per row and never the
+   declare hold; the half directive needs 60 actions and cmhc makes 41-44
+   steps, so it stays unreachable and untested. KILL = `off` >= `on` on pass^1
+   in both cells and `on` never wins the cmhc crux test in >=2 of 3 pairs => the
+   default flips off and the nudges are flagged measured-dead. PASS = `on` wins a
+   named test `off` never wins in >=2 of 3 pairs at <=1.3x tokens/test-passed.
+   The forensics below stay valid as facts about the old code:
    The state-triggered gate as originally registered was **unbuildable, and
    the forensics are the finding**: `VerifyHold` (the declare hold) is an
    ancestor of the current branch, so it has shipped in every in-container

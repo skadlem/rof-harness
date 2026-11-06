@@ -13,7 +13,7 @@ pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b]
 --exec-policy allowlist|any: command-allowlist policy forwarded to the agent leg. `any` skips the prefix list entirely (the in-container agent's process boundary is the task container, not this harness); the value is recorded in the report provenance, so relaxed rows never pool with strict rows
 --budget-shape: token-cap accounting, recorded on the report's provenance block. gross = input+output (default, the frozen recipe); miss-plus-out = (input - cache_read) + output, so provider-cached prompt re-reads stop spending the token cap. A miss-plus-out arm is a DIFFERENT ESTIMAND from a gross arm: never mix the two shapes in one table. Reported usage totals and dollars are unchanged by either shape;
 --streak-steer on|off: enable the experimental six-read directive (default off);
---steer on|off: initiative steering nudges for the agent leg (unverified-declare hold, half/late action directives, wrap-up nudge); `off` is the ablation arm and still ships the workflow contract and the rollback notice (default on);
+--steer on|off: initiative steering nudges for the agent leg (unverified-declare hold, half/late action directives, wrap-up nudge); the workflow contract and the rollback notice still ship either way. Default off: measured dead in dphn-steer2 (no named-test change on either cell, 2.64x tokens per solved task, docs/decisions.md 2026-11-06);
 --reasoning-effort LEVEL (none|low|high|xhigh|max): send `reasoning_effort` on every request of the agent leg; recorded in the report provenance (default: none sent = endpoint default). Measured on the vLLM gateway 2026-10-19: 0/722/1060/1149/2976 reasoning tokens on one prompt for none/low/high/xhigh/max; the field is ignored by api.deepseek.com";
 
 #[derive(Debug, PartialEq)]
@@ -56,9 +56,10 @@ pub(crate) struct EvalArgs {
     /// default); recorded in the report provenance so effort arms never pool
     /// with the frozen-recipe rows.
     pub reasoning_effort: Option<String>,
-    /// Initiative steering nudges for the agent leg (default `true`); the
-    /// `off` arm keeps the contract and rollback notice but ships no
-    /// nudges. Recorded in provenance so arms never pool.
+    /// Initiative steering nudges for the agent leg (default `false`:
+    /// measured dead in `dphn-steer2`). `on` re-enables the declare hold, the
+    /// action directives and the wrap-up; the contract and rollback notice
+    /// ship either way. Recorded in provenance so arms never pool.
     pub steer: bool,
     /// Experimental read-streak intervention, off by default.
     pub streak_steer: bool,
@@ -446,7 +447,7 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
         max_tokens: b.max_tokens,
         keep_thinking: b.keep_thinking,
         reasoning_effort: b.reasoning_effort,
-        steer: b.steer.unwrap_or(true),
+        steer: b.steer.unwrap_or(false),
         streak_steer: b.streak_steer.unwrap_or(false),
         in_container: b.in_container,
     })
