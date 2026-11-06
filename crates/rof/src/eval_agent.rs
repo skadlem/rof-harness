@@ -623,8 +623,9 @@ async fn grade_live_container(
 /// `verify()` does — `/tests` exists only from grading onward, so the agent
 /// cannot read the grader. Also settles the exec-bit question: test.sh is
 /// invoked through `bash`.
-async fn copy_tests_into_container(id: &str, container: &str, tasks_dir: &Path) -> bool {
-    let src = format!("{}/.", tasks_dir.join(id).join("tests").display());
+async fn copy_tests_into_container(id: &str, container: &str, frozen_task: &Path) -> bool {
+    // `frozen_task` is already the per-task dir (`<home>/task-inputs/<id>`).
+    let src = format!("{}/.", frozen_task.join("tests").display());
     let _ = tokio::process::Command::new("docker")
         .args([
             "exec",
@@ -635,12 +636,26 @@ async fn copy_tests_into_container(id: &str, container: &str, tasks_dir: &Path) 
         ])
         .output()
         .await;
-    tokio::process::Command::new("docker")
+    let out = tokio::process::Command::new("docker")
         .args(["cp", &src, &format!("{container}:/tests")])
         .output()
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .await;
+    match out {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            eprintln!(
+                "infra {id}: docker cp rc={:?} {}{}",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stdout).trim(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("infra {id}: docker cp spawn failed: {e}");
+            false
+        }
+    }
 }
 
 fn reset_verifier_dir(home: &Path) -> std::io::Result<()> {

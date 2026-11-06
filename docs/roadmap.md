@@ -44,6 +44,14 @@ The owner authorized $5 additional spend for the steering pilot, raising the cum
   near-miss, and cmhc arms must be read as pass^1 plus "did it break the
   floor". The old 0/6 was *below* floor — the build-context seed failed tests
   the untouched sources pass.
+- **Pipeline validity re-established (3 rows, `dphn-seedfix-base2`, $0.14):**
+  `log-summary-date-ranges` — the cell the broken-seed arms "solved" — is
+  **3/3 Resolved, 2/2 tests** on the corrected pipeline (124s/112s/69s, 14-32
+  steps, 72-226k tokens, 1-5 reads / 2-9 writes), with zero `/tests` mentions
+  in the event logs and ctrf present in all three. One task x three reps is a
+  pipeline check, not a capability estimate. Campaign spend to date: $0.5786
+  over 6 banked rows plus 3 upload-failure rows and 1 provider-404 row, all
+  retained under `pilot-seedfix/void/`.
 - Consequence: `dphn-effort`, `dphn-effort2` and the single banked `dphn-steer`
   row measured a *different task* on cmhc, mcmc and query-optimize (and a
   generator-reconstructed variant on log-summary). Their within-arm comparisons
