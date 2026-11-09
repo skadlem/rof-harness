@@ -1,13 +1,18 @@
 # rof
 
-**A coding-agent harness that runs the agent inside the task's own container, unattended,
-at flash-model prices** — and pays for that with the boring guarantees unattended runs need:
-a write-ahead log persisted before tool dispatch, batch rollback with optional proof gating,
-budgets denominated in dollars, and a verdict taken from the task's own verifier.
+**A coding-agent harness for autonomous repository work and terminal tasks.**
+The goal is competitive frontier-system benchmark performance, with same-model
+comparisons establishing the harness's contribution. Current measurements below
+are selected-task results, not a frontier-performance claim. The runtime provides
+a write-ahead log, configurable batch rollback, resource budgets, and evaluation
+inside the task's own container.
+
+[Capability experiments](docs/harness-experiments.md) describe the opt-in loop,
+tool and inference mechanisms available for ablation. Their local tests establish
+behaviour; external benchmark gains remain unmeasured.
 
 [![CI](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml/badge.svg?branch=v2-core)](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
-![shape](https://img.shields.io/badge/14%20crates-26.7k%20lines-lightgrey)
 
 | What it does | How it's judged | What it costs | What it refuses to be |
 |---|---|---|---|

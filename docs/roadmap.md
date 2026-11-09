@@ -3,6 +3,22 @@
 Ordered and spend-gated. Design decisions anchor to `docs/decisions.md`;
 measured numbers carry a date and live with the run artifacts.
 
+## Direction reset (2026-11-10)
+
+The owner reaffirmed the goal: a coding agent with competitive frontier-system
+benchmark results, plus same-model comparisons that establish the harness's
+contribution. The first external comparison should use ROF and a compatible
+established agent on the same pinned benchmark, model snapshot and task slice.
+Develop on that slice, diagnose paired disagreements, and reserve unseen tasks
+for final evaluation. Internal tests establish implementation correctness only.
+
+The owner authorized implementation of the twelve capability proposals with
+GPT-6 Luna workers. The implementation contract and status are in
+`docs/harness-capability-plan.md`. Unmeasured mechanisms remain opt-in, and the
+historical checklist experiment below is superseded as the top priority by the
+external comparison. Implementation tests use scripted providers; this does not
+authorize exceeding the cumulative paid-pilot budget.
+
 ## Budget update (2026-11-05)
 
 The owner authorized $5 additional spend for the steering pilot, raising the cumulative ceiling to $10. The fresh campaign stopped without an eligible result: both heap-control verifiers lacked CTRF output after the `uv` download failed, and the retry also encountered an HTTP 524 with unknown usage. The proxy denied subsequent requests. Its ledger accounts for or reserves $4.83727350, including five unknown-usage reservations; this is not the billed amount. Verify the task verifiers before further paid work and carry all reservations into any newly registered campaign. The proxy assumes regular DeepSeek V4.1 Flash 1017 peak rates, not an independently verified dphn account quota. The full protocol and historical records remain in `docs/steering-experiment.md`.

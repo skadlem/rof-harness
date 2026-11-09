@@ -4,6 +4,17 @@ Headless agent harness. One process wires the sibling crates together;
 a model drives a sequential tool loop against a disposable scratch
 directory.
 
+Experimental capability controls are described in `docs/harness-experiments.md`.
+The default registry still exposes the original six tools. Optional tools add
+archived-output retrieval, shell commands, pipe sessions, literal repository
+lookup and multi-file edits. Loop controls independently vary workflow,
+observation retention, failed-check preservation and repeated-failure notices.
+These mechanisms are unmeasured on external benchmarks and remain opt-in.
+The optional review/repair sequence uses fresh contexts, read-only reviewer
+tools, separate excluded WALs and the same cumulative budget/deadline. Procedure
+files are loaded from frozen, hashed bytes and selected against the original
+task; offline distillation and two-candidate helpers live under `tools/`.
+
 ## Process shape (`crates/rof/src/main.rs`)
 
 1. Parse flags (`cli.rs`), validate `--workdir` (`workdir.rs`), fail fast
@@ -124,9 +135,9 @@ is computed once at the end from the snapshot tree.
   prefix. Exec timeout and cancellation cover pipe draining; in-container
   descendants may still outlive a killed docker-exec client.
 - Verifier artifacts are cleared before grading; verifier infrastructure
-  failures take precedence over a reward. Tests are mounted during the agent
-  leg and `/logs` is writable there, so tests and rewards are not isolated
-  from agent commands.
+  failures take precedence over a reward. Tests are copied into the container
+  immediately before grading. `/logs` is writable during the agent phase;
+  clearing its verifier artifacts before grading prevents stale rewards.
 - Reports record nonsecret model, endpoint, command allowlist, output-token
   limit, and thinking setting. Each row records a SHA-256 task snapshot
   digest and live-container image ID when available. Symlinks and special
