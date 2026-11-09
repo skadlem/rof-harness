@@ -23,6 +23,7 @@ mod common;
 mod condense;
 mod edit;
 mod exec;
+mod experimental;
 mod policy;
 mod runner;
 mod search;
@@ -33,6 +34,7 @@ mod write;
 pub use common::{apply_hunk, prefix_allowed};
 pub use edit::{edit_tool, EditTool};
 pub use exec::{exec_tool, ExecTool};
+pub use experimental::{experimental_tools, ExperimentalToolsConfig};
 pub use policy::{
     default_denied_globs, glob_match, resolve_under, ExecPolicy, Policy, ToolPathError,
 };

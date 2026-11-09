@@ -107,7 +107,12 @@ pub(crate) fn spawn_argv(policy: &Policy, argv: &[String]) -> Vec<String> {
     }
 }
 
-fn spawn_allowed(policy: &Policy, argv: &[String]) -> Result<tokio::process::Child, ToolError> {
+fn spawn_allowed(
+    policy: &Policy,
+    argv: &[String],
+    archive: Option<&std::fs::File>,
+    pipe_stdin: bool,
+) -> Result<tokio::process::Child, ToolError> {
     // The exec wrap (e.g. `docker exec <cid>` for in-container eval) lands
     // here only: the shell-op guard, the allowlist check, and the canonical
     // join in `run_allowed_argv` all saw the UNWRAPPED argv, and the child
@@ -115,17 +120,42 @@ fn spawn_allowed(policy: &Policy, argv: &[String]) -> Result<tokio::process::Chi
     // ponytail: timeout/cancel kill the wrap's client (the docker-exec
     // process); the in-container process may outlive it — upgrade path is
     // docker kill or exec-session tracking.
-    let full = spawn_argv(policy, argv);
+    let mut full = spawn_argv(policy, argv);
+    // `docker exec` closes stdin unless `-i` is explicit. Process sessions
+    // need it; one-shot exec/test and shell keep their existing argv.
+    if pipe_stdin
+        && full
+            .first()
+            .and_then(|s| Path::new(s).file_name())
+            .is_some_and(|s| s == "docker")
+        && full.get(1).is_some_and(|s| s == "exec")
+    {
+        full.insert(2, "-i".into());
+    }
     let (bin, rest) = full
         .split_first()
         .ok_or_else(|| ToolError::Failed("empty cmd".to_string()))?;
     let mut cmd = std::process::Command::new(bin);
     cmd.args(rest)
         .current_dir(&policy.root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdin(if pipe_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .env_clear();
+    if let Some(file) = archive {
+        cmd.stdout(Stdio::from(
+            file.try_clone()
+                .map_err(|e| ToolError::Failed(e.to_string()))?,
+        ))
+        .stderr(Stdio::from(
+            file.try_clone()
+                .map_err(|e| ToolError::Failed(e.to_string()))?,
+        ));
+    } else {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
     for name in PASS_ENV
         .iter()
         .map(|s| s.to_string())
@@ -167,6 +197,30 @@ fn spawn_allowed(policy: &Policy, argv: &[String]) -> Result<tokio::process::Chi
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| ToolError::Failed(e.to_string()))
+}
+
+/// Starts a local process session. With a Docker exec wrapper, `-i` connects
+/// stdin; killing the local exec client still cannot guarantee the in-container
+/// command dies, because this API does not track a container-side PID.
+pub(crate) fn spawn_process(
+    policy: &Policy,
+    argv: &[String],
+) -> Result<tokio::process::Child, ToolError> {
+    if let Some(op) = argv.iter().find(|t| is_shell_op(t)) {
+        return Err(ToolError::Failed(format!(
+            "exec has no shell and stdin is closed: '{op}' is a literal argument here"
+        )));
+    }
+    let canonical = argv.join(" ");
+    if !policy.allow_any_cmd
+        && !policy.allowed_commands.iter().any(|a| a == &canonical)
+        && !prefix_allowed(&policy.allowed_prefixes, &canonical)
+    {
+        return Err(ToolError::Denied(format!(
+            "command not allowlisted: {canonical}"
+        )));
+    }
+    spawn_allowed(policy, argv, None, true)
 }
 
 /// Per-pipe bound: head + tail cap the retained bytes; the dropped middle
@@ -238,7 +292,7 @@ where
 
 /// SIGKILL the whole process group (unix) plus the direct child (all
 /// platforms), then reap. Killing an exited child errors; ignored.
-async fn kill_tree(child: &mut tokio::process::Child) {
+pub(crate) async fn kill_tree(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         // ponytail: one libc syscall instead of a `nix` dependency.
@@ -302,7 +356,7 @@ pub(crate) async fn run_allowed_argv(
         )));
     }
     let mut guard = GroupGuard {
-        child: Some(spawn_allowed(policy, argv)?),
+        child: Some(spawn_allowed(policy, argv, None, false)?),
         pgid: None,
     };
     guard.pgid = guard.child.as_ref().and_then(|c| c.id());
@@ -388,6 +442,126 @@ pub(crate) async fn run_allowed_raw(
     cancel: &CancellationToken,
 ) -> Result<(bool, String, bool), ToolError> {
     run_allowed_argv(policy, &split_cmd(cmd), timeout, cancel, true).await
+}
+
+/// Archive at most 64 MiB per command. Excess bytes are drained and counted,
+/// then the artifact receives an explicit incomplete-output marker.
+pub(crate) async fn run_allowed_archived(
+    policy: &Policy,
+    cmd: &str,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    path: &Path,
+) -> Result<(bool, String, bool), ToolError> {
+    let argv = split_cmd(cmd);
+    if let Some(op) = argv.iter().find(|t| is_shell_op(t)) {
+        return Err(ToolError::Failed(format!(
+            "exec has no shell and stdin is closed: '{op}' is a literal argument here"
+        )));
+    }
+    let canonical = argv.join(" ");
+    if !policy.allow_any_cmd
+        && !policy.allowed_commands.iter().any(|a| a == &canonical)
+        && !prefix_allowed(&policy.allowed_prefixes, &canonical)
+    {
+        return Err(ToolError::Denied(format!(
+            "command not allowlisted: {canonical}"
+        )));
+    }
+    const ARCHIVE_CAP: u64 = 64 * 1024 * 1024;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| ToolError::Failed(format!("cannot create output artifact: {e}")))?;
+    let file = std::sync::Arc::new(std::sync::Mutex::new(file));
+    let used = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut child = spawn_allowed(policy, &argv, None, false)?;
+    let pid = child.id();
+    let mut stdout = tokio::spawn(copy_archive(
+        child.stdout.take(),
+        file.clone(),
+        used.clone(),
+        ARCHIVE_CAP,
+    ));
+    let mut stderr = tokio::spawn(copy_archive(
+        child.stderr.take(),
+        file.clone(),
+        used.clone(),
+        ARCHIVE_CAP,
+    ));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let status = tokio::select! {
+        r = child.wait() => r.map_err(|e| ToolError::Failed(e.to_string()))?,
+        _ = tokio::time::sleep_until(deadline) => { kill_tree(&mut child).await; stdout.abort(); stderr.abort(); return Err(ToolError::Failed(format!("timeout after {timeout:?}"))); },
+        _ = cancel.cancelled() => { kill_tree(&mut child).await; stdout.abort(); stderr.abort(); return Err(ToolError::Failed("cancelled".into())); },
+    };
+    let drained = tokio::select! {
+        r = async { tokio::join!(&mut stdout, &mut stderr) } => r,
+        _ = tokio::time::sleep_until(deadline) => { stdout.abort(); stderr.abort(); return Err(ToolError::Failed("timeout while archiving command output".into())); },
+        _ = cancel.cancelled() => { stdout.abort(); stderr.abort(); return Err(ToolError::Failed("cancelled while archiving command output".into())); },
+    };
+    let dropped = drained
+        .0
+        .map_err(|e| ToolError::Failed(e.to_string()))?
+        .map_err(ToolError::Failed)?
+        + drained
+            .1
+            .map_err(|e| ToolError::Failed(e.to_string()))?
+            .map_err(ToolError::Failed)?;
+    if dropped > 0 {
+        use std::io::Write;
+        let mut f = file
+            .lock()
+            .map_err(|_| ToolError::Failed("artifact lock poisoned".into()))?;
+        writeln!(
+            f,
+            "\n[INCOMPLETE OUTPUT: archive capped at {ARCHIVE_CAP} bytes; {dropped} bytes omitted]"
+        )
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    }
+    use std::io::Read;
+    let mut preview = Vec::with_capacity(OUT_CAP * 4 + 1);
+    std::fs::File::open(path)
+        .map_err(|e| ToolError::Failed(e.to_string()))?
+        .take((OUT_CAP * 4 + 1) as u64)
+        .read_to_end(&mut preview)
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    let (preview, cut) = cap_chars(String::from_utf8_lossy(&preview).into_owned(), OUT_CAP);
+    let _ = pid;
+    Ok((status.success(), preview, dropped > 0 || cut))
+}
+
+async fn copy_archive<R: AsyncReadExt + Unpin>(
+    reader: Option<R>,
+    file: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+    used: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    cap: u64,
+) -> Result<u64, String> {
+    use std::io::Write;
+    let Some(mut reader) = reader else {
+        return Ok(0);
+    };
+    let mut buf = [0u8; 8192];
+    let mut omitted = 0;
+    loop {
+        let n = reader.read(&mut buf).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        let prior = used.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        let keep = cap.saturating_sub(prior).min(n as u64) as usize;
+        if keep < n {
+            omitted += (n - keep) as u64;
+        }
+        if keep > 0 {
+            file.lock()
+                .map_err(|_| "artifact lock poisoned".to_string())?
+                .write_all(&buf[..keep])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(omitted)
 }
 
 static SYNTAX_N: AtomicUsize = AtomicUsize::new(0);
