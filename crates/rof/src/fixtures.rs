@@ -57,11 +57,13 @@ impl LlmClient for ScriptClient {
                 }
             }
         }
-        self.queue
+        let response = self
+            .queue
             .lock()
             .unwrap()
             .pop_front()
-            .ok_or(provider_core::LlmError::Transport("script empty".into()))
+            .ok_or(provider_core::LlmError::Transport("script empty".into()))?;
+        Ok(response)
     }
 }
 
@@ -205,6 +207,17 @@ pub(crate) fn args_for(dir: &std::path::Path, steps: Option<u32>) -> Args {
         collapse_hysteresis: None,
         allow_dirty_workdir: false,
         pass_env: Vec::new(),
+        preserve_failed_checks: false,
+        minimal_workflow: false,
+        observation_keep: None,
+        stall_threshold: None,
+        archive_output: false,
+        shell: false,
+        processes: false,
+        repo_lookup: false,
+        multi_edit: false,
+        review: false,
+        procedure_files: Vec::new(),
         exec_wrap: None,
     }
 }

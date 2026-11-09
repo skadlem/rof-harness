@@ -233,6 +233,20 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
         collapse_hysteresis: None,
         allow_dirty_workdir: false,
         pass_env: Vec::new(),
+        preserve_failed_checks: a.preserve_failed_checks,
+        minimal_workflow: a.minimal_workflow,
+        observation_keep: a.observation_keep,
+        stall_threshold: a.stall_threshold,
+        archive_output: a.archive_output,
+        shell: a.shell,
+        processes: a.processes,
+        repo_lookup: a.repo_lookup,
+        multi_edit: a.multi_edit,
+        review: a.review,
+        // The eval leg selects against the frozen original instruction below
+        // and injects its bounded text into `goal`; don't reload against that
+        // augmented goal in the generic run driver.
+        procedure_files: Vec::new(),
         exec_wrap: None,
     }
 }
@@ -773,6 +787,15 @@ pub(crate) async fn run_agent_leg(
     instances: &[eval::Instance],
     caps: &eval::ToolCaps,
 ) -> i32 {
+    let mut report_args = args.clone();
+    let procedure_catalog = match crate::procedures::load(&args.procedure_files) {
+        Ok(selection) => selection,
+        Err(message) => {
+            eprintln!("invalid procedure file: {message}");
+            return 2;
+        }
+    };
+    report_args.procedure_file_sha256 = procedure_catalog.file_sha256.clone();
     // Credential gate exactly once, before any spend (never per instance).
     let endpoint = match args.endpoint.as_deref() {
         Some(e) => e,
@@ -888,7 +911,23 @@ pub(crate) async fn run_agent_leg(
             continue;
         }
         let start = Instant::now();
-        let goal = agent_goal(&inst.instruction);
+        let selected = match procedure_catalog.select(&inst.instruction) {
+            Ok(selection) => selection,
+            Err(message) => {
+                eprintln!("invalid procedure file: {message}");
+                return 2;
+            }
+        };
+        for id in selected.ids {
+            if !report_args.selected_procedure_ids.contains(&id) {
+                report_args.selected_procedure_ids.push(id);
+            }
+        }
+        let mut goal = agent_goal(&inst.instruction);
+        if !selected.instructions.is_empty() {
+            goal.push_str("\n\nExternally sourced procedure guidance (applicability matched against the original task; no learning claim):\n");
+            goal.push_str(&selected.instructions);
+        }
         let events = home.join("events.jsonl");
         let mut run_args = agent_args(args, &work, &goal, &events);
         // A workdir refusal is per-instance infra failure, never capability.
@@ -1023,7 +1062,7 @@ pub(crate) async fn run_agent_leg(
             }
         }
     }
-    crate::eval_cmd::finish_report(args, reports)
+    crate::eval_cmd::finish_report(&report_args, reports)
 }
 
 /// Zero-facts row for an instance that failed before any agent ran (wall

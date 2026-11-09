@@ -26,6 +26,8 @@ pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--work
 --collapse-hysteresis N: collapse-boundary hysteresis rows (flag wins over COLLAPSE_HYSTERESIS; unset leaves the loop default)
 --allow-dirty-workdir: run inside a dirty git workdir (default: refuse; allowed dirt appears in the reported patch)
 --pass-env NAME: forward env var to exec/test children (repeatable; provider-key-shaped names stay withheld at spawn)
+--review on|off: opt-in bounded fresh-context read-only defect review and one repair continuation; default off
+--procedure-file PATH: add a validated JSON procedure record (repeatable); only case-insensitive literal cue matches are injected, with bounded text and explicit source repositories
 exit codes: 0 done, 2 usage/parse, 3 run failure (halt/cancel/provider), 4 missing credentials, 5 log failure, 6 snapshot failure, 7 empty input";
 
 #[derive(Debug, PartialEq)]
@@ -90,6 +92,17 @@ pub(crate) struct Args {
     /// Extra env names forwarded to `exec`/`test` children on top of the
     /// fixed pass-through set (repeatable).
     pub pass_env: Vec<String>,
+    pub preserve_failed_checks: bool,
+    pub minimal_workflow: bool,
+    pub observation_keep: Option<usize>,
+    pub stall_threshold: Option<usize>,
+    pub archive_output: bool,
+    pub shell: bool,
+    pub processes: bool,
+    pub repo_lookup: bool,
+    pub multi_edit: bool,
+    pub review: bool,
+    pub procedure_files: Vec<PathBuf>,
     /// Exec-wrap argv prepended at spawn by the tool policy (in-container
     /// eval: `docker exec <container>` so exec/test calls land in the task
     /// environment container); `None` keeps host-side exec.
@@ -180,6 +193,100 @@ struct RunBuilder {
     collapse_hysteresis: Option<usize>,
     allow_dirty_workdir: bool,
     pass_env: Vec<String>,
+    preserve_failed_checks: bool,
+    minimal_workflow: Option<bool>,
+    observation_keep: Option<usize>,
+    stall_threshold: Option<usize>,
+    archive_output: Option<bool>,
+    shell: Option<bool>,
+    processes: Option<bool>,
+    repo_lookup: Option<bool>,
+    multi_edit: Option<bool>,
+    review: bool,
+    procedure_files: Vec<PathBuf>,
+}
+
+pub(crate) fn parse_toggle(flag: &str, v: Option<String>) -> Result<bool, String> {
+    match v.as_deref() {
+        Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        other => Err(format!("{flag} expects on|off, got {other:?}")),
+    }
+}
+
+fn set_preserve_failed_checks(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.preserve_failed_checks = parse_toggle("--preserve-failed-checks", v)?;
+    Ok(())
+}
+
+fn set_workflow(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.minimal_workflow = Some(match v.as_deref() {
+        Some("legacy") => false,
+        Some("minimal") => true,
+        other => return Err(format!("--workflow expects legacy|minimal, got {other:?}")),
+    });
+    Ok(())
+}
+
+pub(crate) fn set_positive_usize(flag: &str, v: Option<String>) -> Result<usize, String> {
+    let s = v.unwrap_or_default();
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("{flag} needs a positive integer, got {s:?}"))?;
+    if n == 0 {
+        return Err(format!("{flag} must be > 0"));
+    }
+    Ok(n)
+}
+
+fn set_observation_keep(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.observation_keep = Some(set_positive_usize("--observation-keep", v)?);
+    Ok(())
+}
+
+fn set_stall_threshold(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    b.stall_threshold = Some(
+        s.parse()
+            .map_err(|_| format!("--stall-threshold needs a non-negative integer, got {s:?}"))?,
+    );
+    Ok(())
+}
+
+fn set_archive_output(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.archive_output = Some(parse_toggle("--archive-output", v)?);
+    Ok(())
+}
+
+fn set_shell(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.shell = Some(parse_toggle("--shell", v)?);
+    Ok(())
+}
+
+fn set_processes(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.processes = Some(parse_toggle("--processes", v)?);
+    Ok(())
+}
+
+fn set_repo_lookup(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.repo_lookup = Some(parse_toggle("--repo-lookup", v)?);
+    Ok(())
+}
+
+fn set_multi_edit(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.multi_edit = Some(parse_toggle("--multi-edit", v)?);
+    Ok(())
+}
+
+fn set_review(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.review = parse_toggle("--review", v)?;
+    Ok(())
+}
+
+fn set_procedure_file(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.procedure_files
+        .push(PathBuf::from(v.ok_or("--procedure-file needs a path")?));
+    Ok(())
 }
 
 fn set_goal(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
@@ -411,6 +518,61 @@ fn set_pass_env(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
 
 const RUN_FLAGS: &[Flag<RunBuilder>] = &[
     Flag {
+        name: "--preserve-failed-checks",
+        takes_value: true,
+        set: set_preserve_failed_checks,
+    },
+    Flag {
+        name: "--workflow",
+        takes_value: true,
+        set: set_workflow,
+    },
+    Flag {
+        name: "--observation-keep",
+        takes_value: true,
+        set: set_observation_keep,
+    },
+    Flag {
+        name: "--stall-threshold",
+        takes_value: true,
+        set: set_stall_threshold,
+    },
+    Flag {
+        name: "--archive-output",
+        takes_value: true,
+        set: set_archive_output,
+    },
+    Flag {
+        name: "--shell",
+        takes_value: true,
+        set: set_shell,
+    },
+    Flag {
+        name: "--processes",
+        takes_value: true,
+        set: set_processes,
+    },
+    Flag {
+        name: "--repo-lookup",
+        takes_value: true,
+        set: set_repo_lookup,
+    },
+    Flag {
+        name: "--multi-edit",
+        takes_value: true,
+        set: set_multi_edit,
+    },
+    Flag {
+        name: "--review",
+        takes_value: true,
+        set: set_review,
+    },
+    Flag {
+        name: "--procedure-file",
+        takes_value: true,
+        set: set_procedure_file,
+    },
+    Flag {
         name: "--goal",
         takes_value: true,
         set: set_goal,
@@ -566,6 +728,12 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         RUN_FLAGS,
         RunBuilder::default(),
     )?;
+    let exec_policy = b.exec_policy.unwrap_or(tools_std::ExecPolicy::Allowlist);
+    if (b.shell.unwrap_or(false) || b.processes.unwrap_or(false))
+        && exec_policy != tools_std::ExecPolicy::Any
+    {
+        return Err("--shell and --processes require --exec-policy any".into());
+    }
     Ok(Args {
         goal: b.goal.ok_or("missing --goal")?,
         context_files: b.context_files,
@@ -576,7 +744,7 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         api_key_env: b.api_key_env.unwrap_or_else(|| "OPENAI_API_KEY".into()),
         headers: b.headers,
         allow_cmd: b.allow_cmd,
-        exec_policy: b.exec_policy.unwrap_or(tools_std::ExecPolicy::Allowlist),
+        exec_policy,
         budget_steps: b.budget_steps,
         budget_actions: b.budget_actions,
         budget_tokens: b.budget_tokens,
@@ -596,6 +764,17 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         collapse_hysteresis: b.collapse_hysteresis,
         allow_dirty_workdir: b.allow_dirty_workdir,
         pass_env: b.pass_env,
+        preserve_failed_checks: b.preserve_failed_checks,
+        minimal_workflow: b.minimal_workflow.unwrap_or(false),
+        observation_keep: b.observation_keep,
+        stall_threshold: b.stall_threshold,
+        archive_output: b.archive_output.unwrap_or(false),
+        shell: b.shell.unwrap_or(false),
+        processes: b.processes.unwrap_or(false),
+        repo_lookup: b.repo_lookup.unwrap_or(false),
+        multi_edit: b.multi_edit.unwrap_or(false),
+        review: b.review,
+        procedure_files: b.procedure_files,
         exec_wrap: None,
     })
 }
@@ -715,6 +894,7 @@ pub(crate) fn endpoint_profile(
 /// edge by [`apply_env_defaults`]; unset falls back to the loop default here,
 /// so the loop itself never reads the environment.
 pub(crate) fn run_config(args: &Args) -> RunConfig {
+    let dflt = RunConfig::default();
     let mut cfg = RunConfig {
         goal: args.goal.clone(),
         model: args.model.clone(),
@@ -724,9 +904,12 @@ pub(crate) fn run_config(args: &Args) -> RunConfig {
         proof_cmd: args.proof_cmd.clone(),
         steer: args.steer,
         streak_steer: args.streak_steer,
+        preserve_failed_checks: args.preserve_failed_checks,
+        minimal_workflow: args.minimal_workflow,
+        observation_keep: args.observation_keep.unwrap_or(dflt.observation_keep),
+        stall_threshold: args.stall_threshold.unwrap_or(dflt.stall_threshold),
         ..RunConfig::default()
     };
-    let dflt = RunConfig::default();
     cfg.thinking_keep = args.thinking_keep.unwrap_or(dflt.thinking_keep);
     cfg.collapse_hysteresis = args.collapse_hysteresis.unwrap_or(dflt.collapse_hysteresis);
     cfg.budget_shape = args.budget_shape.unwrap_or(dflt.budget_shape);
@@ -816,6 +999,17 @@ mod tests {
                 collapse_hysteresis: None,
                 allow_dirty_workdir: false,
                 pass_env: Vec::new(),
+                preserve_failed_checks: false,
+                minimal_workflow: false,
+                observation_keep: None,
+                stall_threshold: None,
+                archive_output: false,
+                shell: false,
+                processes: false,
+                repo_lookup: false,
+                multi_edit: false,
+                review: false,
+                procedure_files: Vec::new(),
                 exec_wrap: None,
             }
         );
@@ -1322,6 +1516,72 @@ mod tests {
                 .streak_steer
         );
         assert!(parse_args(&run_min(&["--streak-steer", "invalid"])).is_err());
+    }
+
+    #[test]
+    fn capability_flags_default_off_propagate_and_validate() {
+        let plain = parse_args(&run_min(&[])).unwrap();
+        assert!(!plain.review);
+        assert!(plain.procedure_files.is_empty());
+        assert!(!plain.preserve_failed_checks);
+        assert!(!plain.minimal_workflow);
+        assert_eq!(plain.observation_keep, None);
+        assert_eq!(plain.stall_threshold, None);
+        assert!(!plain.archive_output && !plain.shell && !plain.processes);
+        assert!(!plain.repo_lookup && !plain.multi_edit);
+        let cfg = run_config(&plain);
+        let dflt = RunConfig::default();
+        assert_eq!(cfg.preserve_failed_checks, dflt.preserve_failed_checks);
+        assert_eq!(cfg.minimal_workflow, dflt.minimal_workflow);
+        assert_eq!(cfg.observation_keep, dflt.observation_keep);
+        assert_eq!(cfg.stall_threshold, dflt.stall_threshold);
+
+        let on = parse_args(&run_min(&[
+            "--preserve-failed-checks",
+            "on",
+            "--workflow",
+            "minimal",
+            "--observation-keep",
+            "8",
+            "--stall-threshold",
+            "3",
+            "--archive-output",
+            "on",
+            "--repo-lookup",
+            "on",
+            "--multi-edit",
+            "on",
+        ]))
+        .unwrap();
+        assert!(on.preserve_failed_checks && on.minimal_workflow);
+        assert_eq!(
+            (on.observation_keep, on.stall_threshold),
+            (Some(8), Some(3))
+        );
+        assert!(on.archive_output && on.repo_lookup && on.multi_edit);
+        let cfg = run_config(&on);
+        assert!(cfg.preserve_failed_checks && cfg.minimal_workflow);
+        assert_eq!((cfg.observation_keep, cfg.stall_threshold), (8, 3));
+        assert!(parse_args(&run_min(&["--shell", "on"])).is_err());
+        assert!(parse_args(&run_min(&["--processes", "on"])).is_err());
+        assert!(parse_args(&run_min(&["--observation-keep", "0"])).is_err());
+        let disabled_stall = parse_args(&run_min(&["--stall-threshold", "0"])).unwrap();
+        assert_eq!(disabled_stall.stall_threshold, Some(0));
+        assert_eq!(run_config(&disabled_stall).stall_threshold, 0);
+        let wave2 = parse_args(&run_min(&[
+            "--review",
+            "on",
+            "--procedure-file",
+            "p1.json",
+            "--procedure-file",
+            "p2.json",
+        ]))
+        .unwrap();
+        assert!(wave2.review);
+        assert_eq!(
+            wave2.procedure_files,
+            vec![PathBuf::from("p1.json"), PathBuf::from("p2.json")]
+        );
     }
 
     #[test]

@@ -14,9 +14,11 @@ pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b]
 --budget-shape: token-cap accounting, recorded on the report's provenance block. gross = input+output (default, the frozen recipe); miss-plus-out = (input - cache_read) + output, so provider-cached prompt re-reads stop spending the token cap. A miss-plus-out arm is a DIFFERENT ESTIMAND from a gross arm: never mix the two shapes in one table. Reported usage totals and dollars are unchanged by either shape;
 --streak-steer on|off: enable the experimental six-read directive (default off);
 --steer on|off: initiative steering nudges for the agent leg (unverified-declare hold, half/late action directives, wrap-up nudge); the workflow contract and the rollback notice still ship either way. Default off: measured dead in dphn-steer2 (no named-test change on either cell, 2.64x tokens per solved task, docs/decisions.md 2026-11-06);
---reasoning-effort LEVEL (none|low|high|xhigh|max): send `reasoning_effort` on every request of the agent leg; recorded in the report provenance (default: none sent = endpoint default). Measured on the vLLM gateway 2026-10-19: 0/722/1060/1149/2976 reasoning tokens on one prompt for none/low/high/xhigh/max; the field is ignored by api.deepseek.com";
+--reasoning-effort LEVEL (none|low|high|xhigh|max): send `reasoning_effort` on every request of the agent leg; recorded in the report provenance (default: none sent = endpoint default). Measured on the vLLM gateway 2026-10-19: 0/722/1060/1149/2976 reasoning tokens on one prompt for none/low/high/xhigh/max; the field is ignored by api.deepseek.com
+--review on|off: opt-in bounded fresh-context read-only review and one repair continuation (requires --agent; default off)
+--procedure-file PATH: repeatable JSON procedure record for --agent; selects by literal case-insensitive cue and records selected IDs plus content hashes";
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EvalArgs {
     pub tasks_dir: PathBuf,
     pub ids: Vec<String>,
@@ -73,6 +75,19 @@ pub(crate) struct EvalArgs {
     /// Requires `--agent`; default false keeps the harbor grade-task
     /// path byte-identical.
     pub in_container: bool,
+    pub preserve_failed_checks: bool,
+    pub minimal_workflow: bool,
+    pub observation_keep: Option<usize>,
+    pub stall_threshold: Option<usize>,
+    pub archive_output: bool,
+    pub shell: bool,
+    pub processes: bool,
+    pub repo_lookup: bool,
+    pub multi_edit: bool,
+    pub review: bool,
+    pub procedure_files: Vec<PathBuf>,
+    pub selected_procedure_ids: Vec<String>,
+    pub procedure_file_sha256: Vec<String>,
 }
 
 #[derive(Default)]
@@ -89,6 +104,17 @@ struct EvalBuilder {
     steer: Option<bool>,
     streak_steer: Option<bool>,
     in_container: bool,
+    preserve_failed_checks: bool,
+    minimal_workflow: Option<bool>,
+    observation_keep: Option<usize>,
+    stall_threshold: Option<usize>,
+    archive_output: Option<bool>,
+    shell: Option<bool>,
+    processes: Option<bool>,
+    repo_lookup: Option<bool>,
+    multi_edit: Option<bool>,
+    review: bool,
+    procedure_files: Vec<PathBuf>,
     model: Option<String>,
     endpoint: Option<String>,
     api_key_env: Option<String>,
@@ -276,7 +302,126 @@ fn set_in_container(b: &mut EvalBuilder, _: Option<String>) -> Result<(), String
     Ok(())
 }
 
+fn set_preserve_failed_checks(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.preserve_failed_checks = crate::cli::parse_toggle("--preserve-failed-checks", v)?;
+    Ok(())
+}
+
+fn set_workflow(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.minimal_workflow = Some(match v.as_deref() {
+        Some("legacy") => false,
+        Some("minimal") => true,
+        other => return Err(format!("--workflow expects legacy|minimal, got {other:?}")),
+    });
+    Ok(())
+}
+
+fn set_observation_keep(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.observation_keep = Some(crate::cli::set_positive_usize("--observation-keep", v)?);
+    Ok(())
+}
+
+fn set_stall_threshold(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    let s = v.unwrap_or_default();
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("--stall-threshold needs a non-negative integer, got {s:?}"))?;
+    b.stall_threshold = Some(n);
+    Ok(())
+}
+
+fn set_archive_output(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.archive_output = Some(crate::cli::parse_toggle("--archive-output", v)?);
+    Ok(())
+}
+
+fn set_shell(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.shell = Some(crate::cli::parse_toggle("--shell", v)?);
+    Ok(())
+}
+
+fn set_processes(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.processes = Some(crate::cli::parse_toggle("--processes", v)?);
+    Ok(())
+}
+
+fn set_repo_lookup(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.repo_lookup = Some(crate::cli::parse_toggle("--repo-lookup", v)?);
+    Ok(())
+}
+
+fn set_multi_edit(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.multi_edit = Some(crate::cli::parse_toggle("--multi-edit", v)?);
+    Ok(())
+}
+
+fn set_review(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.review = crate::cli::parse_toggle("--review", v)?;
+    Ok(())
+}
+
+fn set_procedure_file(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.procedure_files
+        .push(PathBuf::from(v.ok_or("--procedure-file needs a path")?));
+    Ok(())
+}
+
 const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
+    Flag {
+        name: "--preserve-failed-checks",
+        takes_value: true,
+        set: set_preserve_failed_checks,
+    },
+    Flag {
+        name: "--workflow",
+        takes_value: true,
+        set: set_workflow,
+    },
+    Flag {
+        name: "--observation-keep",
+        takes_value: true,
+        set: set_observation_keep,
+    },
+    Flag {
+        name: "--stall-threshold",
+        takes_value: true,
+        set: set_stall_threshold,
+    },
+    Flag {
+        name: "--archive-output",
+        takes_value: true,
+        set: set_archive_output,
+    },
+    Flag {
+        name: "--shell",
+        takes_value: true,
+        set: set_shell,
+    },
+    Flag {
+        name: "--processes",
+        takes_value: true,
+        set: set_processes,
+    },
+    Flag {
+        name: "--repo-lookup",
+        takes_value: true,
+        set: set_repo_lookup,
+    },
+    Flag {
+        name: "--multi-edit",
+        takes_value: true,
+        set: set_multi_edit,
+    },
+    Flag {
+        name: "--review",
+        takes_value: true,
+        set: set_review,
+    },
+    Flag {
+        name: "--procedure-file",
+        takes_value: true,
+        set: set_procedure_file,
+    },
     Flag {
         name: "--tasks-dir",
         takes_value: true,
@@ -409,6 +554,14 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
     if b.in_container && !b.agent {
         return Err("--in-container requires --agent".into());
     }
+    if (b.review || !b.procedure_files.is_empty()) && !b.agent {
+        return Err("--review and --procedure-file require --agent".into());
+    }
+    if (b.shell.unwrap_or(false) || b.processes.unwrap_or(false))
+        && b.exec_policy.unwrap_or(tools_std::ExecPolicy::Allowlist) != tools_std::ExecPolicy::Any
+    {
+        return Err("--shell and --processes require --exec-policy any".into());
+    }
     // Agent mode requires --model; the Option stays for the default path.
     let model = if b.agent {
         Some(b.model.ok_or("--agent requires --model ID")?)
@@ -450,6 +603,19 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
         steer: b.steer.unwrap_or(false),
         streak_steer: b.streak_steer.unwrap_or(false),
         in_container: b.in_container,
+        preserve_failed_checks: b.preserve_failed_checks,
+        minimal_workflow: b.minimal_workflow.unwrap_or(false),
+        observation_keep: b.observation_keep,
+        stall_threshold: b.stall_threshold,
+        archive_output: b.archive_output.unwrap_or(false),
+        shell: b.shell.unwrap_or(false),
+        processes: b.processes.unwrap_or(false),
+        repo_lookup: b.repo_lookup.unwrap_or(false),
+        multi_edit: b.multi_edit.unwrap_or(false),
+        review: b.review,
+        procedure_files: b.procedure_files,
+        selected_procedure_ids: Vec::new(),
+        procedure_file_sha256: Vec::new(),
     })
 }
 
@@ -627,6 +793,18 @@ pub(crate) fn finish_report(args: &EvalArgs, reports: Vec<eval::InstanceReport>)
                     "max_tokens": args.max_tokens.unwrap_or(8_000),
                     "keep_thinking": args.keep_thinking,
                     "streak_steer": args.streak_steer,
+                    "preserve_failed_checks": args.preserve_failed_checks,
+                    "minimal_workflow": args.minimal_workflow,
+                    "observation_keep": args.observation_keep.unwrap_or(agent_loop::RunConfig::default().observation_keep),
+                    "stall_threshold": args.stall_threshold.unwrap_or(agent_loop::RunConfig::default().stall_threshold),
+                    "archive_output": args.archive_output,
+                    "shell": args.shell,
+                    "processes": args.processes,
+                    "repo_lookup": args.repo_lookup,
+                    "multi_edit": args.multi_edit,
+                    "review": args.review,
+                    "selected_procedure_ids": args.selected_procedure_ids,
+                    "procedure_file_sha256": args.procedure_file_sha256,
                     "task_identity": "per_instance",
                 })
             }),
@@ -657,6 +835,8 @@ mod tests {
     #[test]
     fn eval_accepts_streak_steer() {
         let plain = parse_eval(&argv(&["rof", "eval", "--tasks-dir", "/tmp/tasks"])).unwrap();
+        assert!(!plain.review);
+        assert!(plain.procedure_files.is_empty());
         assert!(!plain.streak_steer);
         let on = parse_eval(&argv(&[
             "rof",
@@ -684,6 +864,132 @@ mod tests {
             "bad"
         ]))
         .is_err());
+    }
+
+    #[test]
+    fn eval_capability_flags_default_off_propagate_and_record_all_settings() {
+        let plain = parse_eval(&argv(&["rof", "eval", "--tasks-dir", "/tmp/tasks"])).unwrap();
+        assert!(!plain.preserve_failed_checks && !plain.minimal_workflow);
+        assert_eq!(
+            (plain.observation_keep, plain.stall_threshold),
+            (None, None)
+        );
+        assert!(!plain.archive_output && !plain.shell && !plain.processes);
+        assert!(!plain.repo_lookup && !plain.multi_edit);
+
+        let report_path =
+            std::env::temp_dir().join(format!("rof-run-config-{}.json", std::process::id()));
+        let mut a = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/tasks",
+            "--agent",
+            "--model",
+            "m",
+            "--endpoint",
+            "http://x",
+            "--exec-policy",
+            "any",
+            "--preserve-failed-checks",
+            "on",
+            "--workflow",
+            "minimal",
+            "--observation-keep",
+            "7",
+            "--stall-threshold",
+            "4",
+            "--archive-output",
+            "on",
+            "--shell",
+            "on",
+            "--processes",
+            "on",
+            "--repo-lookup",
+            "on",
+            "--multi-edit",
+            "on",
+        ]))
+        .unwrap();
+        let run = crate::eval_agent::agent_args(
+            &a,
+            Path::new("/tmp/work"),
+            "g",
+            Path::new("/tmp/events"),
+        );
+        let cfg = crate::cli::run_config(&run);
+        assert!(cfg.preserve_failed_checks && cfg.minimal_workflow);
+        assert_eq!((cfg.observation_keep, cfg.stall_threshold), (7, 4));
+        a.selected_procedure_ids = vec!["rust-tests".into()];
+        a.procedure_file_sha256 = vec!["abc123".into()];
+        a.report = Some(report_path.clone());
+        let report = finish_report(&a, Vec::new());
+        assert_eq!(report, 0);
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+        let rc = &v["provenance"]["run_config"];
+        assert_eq!(rc["preserve_failed_checks"], true);
+        assert_eq!(rc["minimal_workflow"], true);
+        assert_eq!(rc["observation_keep"], 7);
+        assert_eq!(rc["stall_threshold"], 4);
+        assert_eq!(rc["archive_output"], true);
+        assert_eq!(rc["shell"], true);
+        assert_eq!(rc["processes"], true);
+        assert_eq!(rc["repo_lookup"], true);
+        assert_eq!(rc["multi_edit"], true);
+        assert_eq!(rc["review"], false);
+        assert_eq!(
+            rc["selected_procedure_ids"],
+            serde_json::json!(["rust-tests"])
+        );
+        assert_eq!(rc["procedure_file_sha256"], serde_json::json!(["abc123"]));
+        std::fs::remove_file(report_path).ok();
+
+        let wave2 = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/tasks",
+            "--agent",
+            "--model",
+            "m",
+            "--endpoint",
+            "http://x",
+            "--review",
+            "on",
+            "--procedure-file",
+            "p1.json",
+            "--procedure-file",
+            "p2.json",
+        ]))
+        .unwrap();
+        assert!(wave2.review);
+        assert_eq!(
+            wave2.procedure_files,
+            vec![PathBuf::from("p1.json"), PathBuf::from("p2.json")]
+        );
+        let disabled_stall = parse_eval(&argv(&[
+            "rof",
+            "eval",
+            "--tasks-dir",
+            "/tmp/tasks",
+            "--agent",
+            "--model",
+            "m",
+            "--endpoint",
+            "http://x",
+            "--stall-threshold",
+            "0",
+        ]))
+        .unwrap();
+        assert_eq!(disabled_stall.stall_threshold, Some(0));
+        let run = crate::eval_agent::agent_args(
+            &disabled_stall,
+            Path::new("/tmp/work"),
+            "g",
+            Path::new("/tmp/events"),
+        );
+        assert_eq!(crate::cli::run_config(&run).stall_threshold, 0);
     }
 
     #[test]
@@ -1063,6 +1369,19 @@ mod tests {
             steer: true,
             streak_steer: false,
             in_container: false,
+            preserve_failed_checks: false,
+            minimal_workflow: false,
+            observation_keep: None,
+            stall_threshold: None,
+            archive_output: false,
+            shell: false,
+            processes: false,
+            repo_lookup: false,
+            multi_edit: false,
+            review: false,
+            procedure_files: Vec::new(),
+            selected_procedure_ids: Vec::new(),
+            procedure_file_sha256: Vec::new(),
         };
         let code = run_eval(&args).await;
         assert_eq!(code, 0);
