@@ -5,6 +5,7 @@ use crate::proof::BatchSnapshot;
 use crate::settle_tool_msg;
 use crate::state::THINKING_KEEP;
 use crate::state::{ProviderMsg, ToolMsg};
+use crate::verify::is_verification_call;
 use crate::{
     append_to, batch_hunks, build_request, checkpoint, incremental_hunks, note_tool_execution,
     outcome_log_reason, outcome_to_result, pin_snapshot, refund_batch, settle_tool_tail,
@@ -21,6 +22,9 @@ use agent_event::{ControlAck, ControlKind, ControlStatus};
 use agent_log::{Item, ItemKind, LogWriter, LOG_VERSION};
 use provider_core::{AssistantMessage, LlmClient, LlmError, Request, Response, Usage};
 use serde_json::Value;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -354,6 +358,14 @@ pub struct RunConfig {
     /// re-enables them; the workflow contract and the rollback notice ship
     /// either way.
     pub steer: bool,
+    /// Keep changes made before a completed test/exec check fails.
+    pub preserve_failed_checks: bool,
+    /// Replace the restrictive legacy workflow text with a concise workflow.
+    pub minimal_workflow: bool,
+    /// Number of newest tool observations kept verbatim in the prompt.
+    pub observation_keep: usize,
+    /// Intervene after this many identical failed checks with unchanged files; zero disables it.
+    pub stall_threshold: usize,
 }
 
 impl Default for RunConfig {
@@ -374,6 +386,10 @@ impl Default for RunConfig {
             collapse_hysteresis: context::COLLAPSE_HYSTERESIS,
             budget_shape: BudgetShape::Gross,
             steer: true,
+            preserve_failed_checks: false,
+            minimal_workflow: false,
+            observation_keep: 5,
+            stall_threshold: 0,
         }
     }
 }
@@ -452,6 +468,65 @@ struct RunCtx<'s, 'r, P> {
     run_id: u64,
     root: CancellationToken,
     cancel: &'r CancellationToken,
+    stalled_check: Option<StalledCheck>,
+}
+
+struct StalledCheck {
+    signature: String,
+    output: String,
+    tree: u64,
+    count: usize,
+    reported: bool,
+}
+
+fn workspace_identity(root: &Path, excluded: Option<&Path>) -> Result<u64, String> {
+    fn visit(
+        root: &Path,
+        dir: &Path,
+        excluded: Option<&Path>,
+        hasher: &mut DefaultHasher,
+    ) -> Result<(), String> {
+        for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if Some(path.as_path()) == excluded
+                || rel == Path::new(".git")
+                || rel == Path::new("target")
+                || rel == Path::new(".rof-events.jsonl")
+                || name.starts_with(".rof-dump")
+            {
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+            rel.hash(hasher);
+            if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(&path).map_err(|e| e.to_string())?;
+                b'L'.hash(hasher);
+                target.hash(hasher);
+            } else if meta.is_dir() {
+                b'D'.hash(hasher);
+                visit(root, &path, excluded, hasher)?;
+            } else if meta.is_file() {
+                b'F'.hash(hasher);
+                let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = file.read(&mut chunk).map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        break;
+                    }
+                    chunk[..n].hash(hasher);
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut hasher = DefaultHasher::new();
+    visit(root, root, excluded, &mut hasher)?;
+    Ok(hasher.finish())
 }
 
 /// Step-head decision: a provider call was admitted (`Call`), the run parks
@@ -477,6 +552,7 @@ struct BatchReport {
     claim: bets::Claim,
     hunks: Vec<(String, bool)>,
     batch_failed: bool,
+    check_failed: bool,
     snap: BatchSnapshot,
 }
 
@@ -1001,6 +1077,71 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         }
     }
 
+    async fn monitor_failed_check(
+        &mut self,
+        name: &str,
+        args: &Value,
+        output: &str,
+    ) -> Result<(), Outcome> {
+        let threshold = self.cfg.stall_threshold;
+        if threshold == 0 {
+            return Ok(());
+        }
+        let root = self.workdir.to_path_buf();
+        let excluded = self.cfg.log_path.as_ref().map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                root.join(path)
+            }
+        });
+        let Ok(tree) = blocking(move || workspace_identity(&root, excluded.as_deref())).await
+        else {
+            return Ok(());
+        };
+        let signature = format!("{name}:{args}");
+        let count = match self.stalled_check.as_mut() {
+            Some(last)
+                if last.signature == signature && last.output == output && last.tree == tree =>
+            {
+                last.count = last.count.saturating_add(1);
+                last.count
+            }
+            _ => {
+                self.stalled_check = Some(StalledCheck {
+                    signature: signature.clone(),
+                    output: output.to_owned(),
+                    tree,
+                    count: 1,
+                    reported: false,
+                });
+                1
+            }
+        };
+        let Some(last) = self.stalled_check.as_mut() else {
+            return Ok(());
+        };
+        if count == threshold && !last.reported {
+            last.reported = true;
+            let evidence = format!(
+                "stall: same failed check repeated {count} times with identical output and unchanged observed source evidence; check={signature}; output={output}"
+            );
+            self.record(
+                ItemKind::Attempt {
+                    error: evidence.clone(),
+                    will_retry: true,
+                },
+                None,
+            )
+            .await?;
+            self.state.push_directive(
+                format!("{evidence}. Change the relevant files before rerunning this check."),
+                &self.cfg,
+            );
+        }
+        Ok(())
+    }
+
     /// One tool call through the registry with the parent-side cancel race:
     /// Ctrl-C during a tool returns promptly instead of waiting it out. The
     /// race drops the `execute` future and cancels the per-turn child token
@@ -1009,7 +1150,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         &mut self,
         inv: Invocation,
         turn_token: &CancellationToken,
-    ) -> ToolResult {
+    ) -> (ToolResult, bool) {
         let name = inv.name.clone();
         match self.registry.resolve(&inv.name) {
             Some(tool) => {
@@ -1029,26 +1170,35 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                         turn_token.cancel();
                         self.state.stop_hard = true;
                         self.state.gate.begin_abort();
-                        ToolResult {
-                            content: "cancelled".into(),
-                            is_error: true,
-                        }
+                        (
+                            ToolResult {
+                                content: "cancelled".into(),
+                                is_error: true,
+                            },
+                            false,
+                        )
                     }
                     None => {
                         turn_token.cancel();
-                        ToolResult {
-                            content: "wallclock deadline exceeded during tool execution".into(),
-                            is_error: true,
-                        }
+                        (
+                            ToolResult {
+                                content: "wallclock deadline exceeded during tool execution".into(),
+                                is_error: true,
+                            },
+                            false,
+                        )
                     }
-                    Some(Some(Ok(o))) => outcome_to_result(o),
-                    Some(Some(Err(e))) => ToolResult::from(e),
+                    Some(Some(Ok(o))) => (outcome_to_result(o), true),
+                    Some(Some(Err(e))) => (ToolResult::from(e), false),
                 }
             }
-            None => ToolResult {
-                content: format!("unknown tool: {name}"),
-                is_error: true,
-            },
+            None => (
+                ToolResult {
+                    content: format!("unknown tool: {name}"),
+                    is_error: true,
+                },
+                false,
+            ),
         }
     }
 
@@ -1068,6 +1218,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             });
         }
         let mut batch_failed = false;
+        let mut check_failed = false;
         // Rollback restores edit and verification state; executed actions
         // remain charged against the run budget.
         let batch_snap = snapshot_batch(self.state);
@@ -1117,8 +1268,12 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 if let Some(inv) = inv {
                     let name = inv.name.clone();
                     let args = inv.args.to_string();
-                    let res = self.execute_call(inv, turn_token).await;
-                    batch_failed |= res.is_error;
+                    let (res, completed) = self.execute_call(inv, turn_token).await;
+                    let executed_failed_check =
+                        completed && res.is_error && is_verification_call(&name, &c.args);
+                    let failed_check = self.cfg.preserve_failed_checks && executed_failed_check;
+                    check_failed |= failed_check;
+                    batch_failed |= res.is_error && !failed_check;
                     // Shared with `drive_tick`: the same
                     // `note_tool_execution` + `record` order.
                     let _ = note_tool_execution(self.state, &name, &args, &res);
@@ -1126,6 +1281,12 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                         call_id: c.call_id.clone(),
                         result: res.clone(),
                     });
+                    if executed_failed_check {
+                        self.monitor_failed_check(&name, &c.args, &res.content)
+                            .await?;
+                    } else if is_verification_call(&name, &c.args) {
+                        self.stalled_check = None;
+                    }
                 }
             }
             if let Some(result) = self
@@ -1166,7 +1327,11 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         // passed (test/check rides as any other result);
         // per-hunk incremental proof is the later ablation.
         let claim = bets::Claim {
-            predicted_verdict: "tool batch results all passed".to_owned(),
+            predicted_verdict: if check_failed {
+                "a verification check failed".to_owned()
+            } else {
+                "tool batch results all passed".to_owned()
+            },
             on_mismatch: "roll back the batch; keep only proven hunks".to_owned(),
         };
         let hunks = {
@@ -1191,9 +1356,10 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                     });
                     incremental_hunks(self.tree.clone(), self.workdir, cmd, deadline).await
                 }
-                None => batch_hunks(self.tree.clone(), !batch_failed).await,
+                None => batch_hunks(self.tree.clone(), !batch_failed && !check_failed).await,
             };
             match probe {
+                Ok(h) if check_failed => h.into_iter().map(|(hunk, _)| (hunk, false)).collect(),
                 Ok(h) => h,
                 Err(e) if e == "proof wallclock deadline exceeded" => {
                     return Err(Outcome::Halted("wallclock".into()));
@@ -1245,6 +1411,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             claim,
             hunks,
             batch_failed,
+            check_failed,
             snap: batch_snap,
         })
     }
@@ -1259,9 +1426,10 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             claim,
             hunks,
             batch_failed,
+            check_failed,
             snap,
         } = report;
-        let observation = if batch_failed {
+        let observation = if batch_failed || check_failed {
             "tool batch results not all passed"
         } else {
             "tool batch results all passed"
@@ -1386,6 +1554,7 @@ pub async fn run<P: LlmClient>(
         run_id: 0,
         root: CancellationToken::new(),
         cancel,
+        stalled_check: None,
     };
     if let Some(o) = ctx.open_run(inputs).await {
         return o;

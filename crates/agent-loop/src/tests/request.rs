@@ -48,6 +48,34 @@ fn read_streak_changes_only_treatment_request() {
 }
 
 #[test]
+fn minimal_workflow_keeps_goal_and_finish_without_restrictive_contract() {
+    let root = run_tmp("minimal-workflow");
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    state.apply_input(Input::User("fix the parser".into()));
+    state.admit_steering();
+    let request = build_request(
+        &mut state,
+        &registry,
+        &root,
+        &RunConfig {
+            goal: "fix the parser".into(),
+            minimal_workflow: true,
+            ..RunConfig::default()
+        },
+    );
+    let system = &request.messages[0].content;
+    assert!(system.contains("finish the run"));
+    assert!(!system.contains("WORKFLOW CONTRACT"));
+    assert!(!system.contains("ONLY patch mechanisms"));
+    assert!(request
+        .messages
+        .iter()
+        .any(|m| m.content.contains("fix the parser")));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn build_request_system_is_static_and_budgets_ride_the_tail() {
     let root = run_tmp("contract");
     std::fs::write(root.join("a.rs"), "v1\n").unwrap();

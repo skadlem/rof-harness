@@ -234,19 +234,26 @@ impl LoopState {
                 recovery: None,
             },
         );
-        let probe = self
-            .tool_calls
-            .get(&msg.call_id)
-            .map(|c| (c.name.clone(), c.is_verification));
+        let probe = self.tool_calls.get(&msg.call_id).map(|c| {
+            (
+                c.name.clone(),
+                c.is_verification,
+                serde_json::from_str::<Value>(&c.args).unwrap_or_default(),
+            )
+        });
         let ok = !msg.result.is_error;
         if let Some(c) = self.tool_calls.get_mut(&msg.call_id) {
             c.result = Some(msg.result);
         }
         if ok {
-            if let Some((name, is_verification)) = probe {
-                // A successful write invalidates earlier verification; a
-                // passing verification run covers writes since the last one.
-                if name == TOOL_EDIT || name == TOOL_WRITE {
+            if let Some((name, is_verification, args)) = probe {
+                // A successful write, shell, or process input may mutate files.
+                // A passing verification covers mutations since the last one.
+                if name == TOOL_EDIT
+                    || name == TOOL_WRITE
+                    || name == "multi_edit"
+                    || may_mutate_workspace(&name, &args)
+                {
                     self.verify.verified_since_write = false;
                 } else if is_verification {
                     self.verify.verified_since_write = true;
@@ -287,6 +294,15 @@ pub(crate) fn is_verification_call(name: &str, args: &Value) -> bool {
                 _ => false,
             }
         })
+}
+
+pub(crate) fn may_mutate_workspace(name: &str, args: &Value) -> bool {
+    name == "shell"
+        || (name == "process"
+            && matches!(
+                args.get("action").and_then(Value::as_str),
+                Some("start" | "input")
+            ))
 }
 
 /// Stable stop-reason label for the durable log: explicit match, never

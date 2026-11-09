@@ -260,7 +260,7 @@ pub(crate) fn note_tool_execution(
     result: &ToolResult,
 ) -> Option<BudgetHalt> {
     let halt = state.observe_action(&format!("{name}:{args_str}"), &result.content);
-    if !result.is_error && (name == TOOL_EDIT || name == TOOL_WRITE) {
+    if !result.is_error && (name == TOOL_EDIT || name == TOOL_WRITE || name == "multi_edit") {
         state.edits += 1;
     }
     halt

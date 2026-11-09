@@ -122,8 +122,7 @@ impl LoopState {
         // Collapse boundary: rows before it stub, the tail stays verbatim.
         // H=0 moves it one row per fold (collapse-5); hysteresis H batches the
         // move to once per H rows so the untouched prefix stays cache-hittable.
-        let boundary =
-            context::collapse_boundary(tool_idx.len(), context::COLLAPSE_KEEP, hysteresis);
+        let boundary = context::collapse_boundary(tool_idx.len(), cfg.observation_keep, hysteresis);
         for &i in &tool_idx[..boundary] {
             // Bytes at fold time + a 120-char head: enough to tell the
             // observation apart from a re-read of the file.
@@ -160,6 +159,10 @@ pub(crate) const WORKFLOW_CONTRACT: &str = "WORKFLOW CONTRACT\n\
     tool results older than the last 5 are collapsed to one line; re-open a file immediately before editing it.\n\
     work file-by-file: view -> edit immediately -> next file. `edit` and `write` are the ONLY patch mechanisms — never write files via exec; exec/test are for checks only.\n\
     when your patch is complete, reply with a text message and NO tool calls — that finishes the run.";
+
+const WORKFLOW_MINIMAL: &str = "WORKFLOW\n\
+    understand the goal, explore the relevant files, make the smallest useful edit, then verify it.\n\
+    when complete, reply with a text message and no tool calls to finish the run.";
 
 /// Live counters, request-scoped by design: appended to the final outgoing
 /// message after the transcript is derived, so they are never persisted.
@@ -219,6 +222,13 @@ pub(crate) fn build_request(
 ) -> Request {
     let mut asm = context::ContextAssembler::new(cfg.context_budget_chars);
     if cfg.incentives >= IncentivesLevel::Contract {
+        let workflow = if cfg.minimal_workflow {
+            WORKFLOW_MINIMAL.to_owned()
+        } else if cfg.observation_keep == 5 {
+            WORKFLOW_CONTRACT.to_owned()
+        } else {
+            WORKFLOW_CONTRACT.replace("last 5", &format!("last {}", cfg.observation_keep))
+        };
         asm.add(context::ContextItem {
             key: context::ItemKey {
                 path: "workflow-contract".into(),
@@ -227,7 +237,7 @@ pub(crate) fn build_request(
             },
             fidelity: context::Fidelity::Exact,
             must_include: true,
-            text: WORKFLOW_CONTRACT.into(),
+            text: workflow,
         });
     }
     // Frozen by `run` at start; the lazy fallback keeps direct callers honest.

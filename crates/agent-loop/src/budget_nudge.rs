@@ -13,7 +13,7 @@ pub(crate) const DIRECTIVE_CAP: usize = 3;
 
 impl LoopState {
     pub(crate) fn observe_read_streak(&mut self, name: &str, is_error: bool, treatment: bool) {
-        if !is_error && matches!(name, "write" | "edit") {
+        if !is_error && matches!(name, "write" | "edit" | "multi_edit") {
             self.experiment.streak_write_seen = true;
             self.experiment.streak_pending = false;
         }

@@ -69,6 +69,30 @@ fn verify_nudge_silent_when_test_passed_since_write() {
 }
 
 #[test]
+fn shell_and_process_mutations_invalidate_a_passing_check() {
+    for (name, args) in [
+        ("shell", serde_json::json!({"cmd": "touch generated.rs"})),
+        (
+            "process",
+            serde_json::json!({"action": "start", "cmd": "touch generated.rs"}),
+        ),
+        (
+            "process",
+            serde_json::json!({"action": "input", "id": "p1", "data": "write"}),
+        ),
+    ] {
+        let mut state = LoopState::new();
+        ok_round(&mut state, "t1", "test", Value::Null);
+        assert!(state.verify.verified_since_write);
+        ok_round(&mut state, "m1", name, args);
+        assert!(
+            !state.verify.verified_since_write,
+            "{name} must invalidate verification"
+        );
+    }
+}
+
+#[test]
 fn verify_nudge_exec_pytest_counts_but_plain_exec_does_not() {
     let mut s = LoopState::new();
     ok_round(&mut s, "e1", "edit", Value::Null);
@@ -696,6 +720,240 @@ async fn run_e2e_failing_test_does_not_verify_but_holds_declare() {
         )),
         "hold recorded as a retryable attempt"
     );
+}
+
+#[tokio::test]
+async fn preserve_failed_executed_check_keeps_edit_without_proving_it() {
+    let root = run_tmp("preserve-failed-check");
+    std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+    let client = FakeLlm {
+        order: Arc::new(Mutex::new(Vec::new())),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([
+            script_resp(
+                vec![
+                    (
+                        "w1",
+                        "write",
+                        serde_json::json!({"path":"a.rs", "content":"v2\n"}),
+                    ),
+                    ("t1", "test", serde_json::json!({"cmd":"check"})),
+                ],
+                StopReason::ToolUse,
+            ),
+            text_resp("done"),
+            text_resp("done again"),
+        ])),
+    };
+    let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+        [("agent".to_string(), vec!["write".into(), "test".into()])].into(),
+    )));
+    registry.register(Arc::new(WriteFile { root: root.clone() }));
+    registry.register(Arc::new(ProdCheck));
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let _ = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                preserve_failed_checks: true,
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("fix it".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "v2\n");
+    assert_eq!(state.edits, 1);
+    assert!(!state.verify.verified_since_write);
+    assert!(state.items.iter().any(|i| matches!(
+        &i.kind,
+        ItemKind::ToolResult { content, is_error: true, .. } if content.contains("FAIL: check")
+    )));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn policy_denied_check_still_rolls_back_edits() {
+    let root = run_tmp("policy-denied-check");
+    std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+    let client = FakeLlm {
+        order: Arc::new(Mutex::new(Vec::new())),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([
+            script_resp(
+                vec![
+                    (
+                        "w1",
+                        "write",
+                        serde_json::json!({"path":"a.rs", "content":"v2\n"}),
+                    ),
+                    ("t1", "test", serde_json::json!({"cmd":"check"})),
+                ],
+                StopReason::ToolUse,
+            ),
+            text_resp("done"),
+        ])),
+    };
+    let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+        [("agent".to_string(), vec!["write".into()])].into(),
+    )));
+    registry.register(Arc::new(WriteFile { root: root.clone() }));
+    registry.register(Arc::new(ProdCheck));
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let _ = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                preserve_failed_checks: true,
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("fix it".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "v1\n");
+    assert_eq!(state.edits, 0);
+    assert!(state.items.iter().any(|i| matches!(
+        &i.kind,
+        ItemKind::ToolResult { call_id, is_error: true, .. } if call_id == "t1"
+    )));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn failed_check_control_arm_rolls_back_the_same_batch() {
+    let root = run_tmp("failed-check-control");
+    std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+    let client = FakeLlm {
+        order: Arc::new(Mutex::new(Vec::new())),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([
+            script_resp(
+                vec![
+                    (
+                        "w1",
+                        "write",
+                        serde_json::json!({"path":"a.rs", "content":"v2\n"}),
+                    ),
+                    ("t1", "test", serde_json::json!({"cmd":"check"})),
+                ],
+                StopReason::ToolUse,
+            ),
+            text_resp("done"),
+        ])),
+    };
+    let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+        [("agent".to_string(), vec!["write".into(), "test".into()])].into(),
+    )));
+    registry.register(Arc::new(WriteFile { root: root.clone() }));
+    registry.register(Arc::new(ProdCheck));
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let _ = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("fix it".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "v1\n");
+    assert_eq!(state.edits, 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn stall_uses_completed_failures_ignores_run_log_and_resets_on_source_change() {
+    let root = run_tmp("stall-check");
+    let source = root.join("source.rs");
+    std::fs::write(&source, "one\n").unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let client = FakeLlm {
+        order: Arc::new(Mutex::new(Vec::new())),
+        requests: requests.clone(),
+        queue: Mutex::new(VecDeque::from([
+            script_resp(
+                vec![("t1", "test", serde_json::json!({"cmd":"check"}))],
+                StopReason::ToolUse,
+            ),
+            script_resp(
+                vec![(
+                    "w1",
+                    "write",
+                    serde_json::json!({"path":"source.rs", "content":"two\n"}),
+                )],
+                StopReason::ToolUse,
+            ),
+            script_resp(
+                vec![("t2", "test", serde_json::json!({"cmd":"check"}))],
+                StopReason::ToolUse,
+            ),
+            script_resp(
+                vec![("t3", "test", serde_json::json!({"cmd":"check"}))],
+                StopReason::ToolUse,
+            ),
+            text_resp("done"),
+        ])),
+    };
+    let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+        [("agent".to_string(), vec!["test".into(), "write".into()])].into(),
+    )));
+    registry.register(Arc::new(ProdCheck));
+    registry.register(Arc::new(WriteFile { root: root.clone() }));
+    let log_path = root.join("run.log");
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let _ = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                stall_threshold: 2,
+                log_path: Some(log_path),
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("check source".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(state.items.iter().any(|i| matches!(
+        &i.kind,
+        ItemKind::Attempt { error, .. } if error.contains("stall: same failed check repeated 2")
+    )));
+    let reqs = requests.lock().unwrap();
+    assert!(serde_json::to_string(&reqs[4])
+        .unwrap()
+        .contains("stall: same failed check repeated 2"));
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]

@@ -221,6 +221,18 @@ fn fold_knobs_come_from_run_config_not_the_environment() {
     assert_eq!(stub_boundary(&s.derived_messages(&tight)), 3); // H=0 collapse-5
 }
 
+#[test]
+fn observation_keep_comes_from_run_config() {
+    let state = tool_history(8);
+    let kept = state.raw_messages(&RunConfig {
+        observation_keep: 7,
+        ..RunConfig::default()
+    });
+    assert_eq!(stub_boundary(&kept), 1);
+    let default = state.raw_messages(&RunConfig::default());
+    assert_eq!(stub_boundary(&default), 3);
+}
+
 /// The config fields alone steer the fold: no env touched at all.
 #[test]
 fn fold_uses_config_knobs_not_the_environment() {
