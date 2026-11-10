@@ -1,19 +1,29 @@
 # Architecture
 
 Headless agent harness. One process wires the sibling crates together;
-a model drives a sequential tool loop against a disposable scratch
-directory.
+a model drives a sequential tool loop. `rof run` uses a disposable host-side
+workdir, while the native Harbor adapter runs ROF in the task's live
+`/app` container for the current benchmark path.
 
 Experimental capability controls are described in `docs/harness-experiments.md`.
 The default registry still exposes the original six tools. Optional tools add
 archived-output retrieval, shell commands, pipe sessions, literal repository
 lookup and multi-file edits. Loop controls independently vary workflow,
 observation retention, failed-check preservation and repeated-failure notices.
-These mechanisms are unmeasured on external benchmarks and remain opt-in.
+The WAL retention pilot produced one clean pass on one selected task; a React
+retention artifact also received reward 1 during an interrupted attempt whose
+provider accounting was incomplete. These observations do not establish
+general capability improvement. The other experimental tool mechanisms remain
+unmeasured on benchmark tasks and opt-in.
 The optional review/repair sequence uses fresh contexts, read-only reviewer
 tools, separate excluded WALs and the same cumulative budget/deadline. Procedure
 files are loaded from frozen, hashed bytes and selected against the original
 task; offline distillation and two-candidate helpers live under `tools/`.
+
+The [phased capability plan](superpowers/plans/2026-11-11-capability-phases.md)
+describes proposed additions. Its evidence mode, historical observation reader,
+completion predicate, capacity controls and checkpoint provenance are not current
+runtime interfaces.
 
 ## Process shape (`crates/rof/src/main.rs`)
 
@@ -31,7 +41,9 @@ task; offline distillation and two-candidate helpers live under `tools/`.
 5. Exit code from the outcome (`exit.rs`); a one-line event summary on
    stderr.
 
-`rof eval --tasks-dir DIR` (`eval_cmd.rs`) loads a frozen task slice and
+`rof eval --tasks-dir DIR` (`eval_cmd.rs`) is a legacy evaluation path distinct
+from the native Harbor adapter (`tools/harbor_rof.py`), which invokes `rof run`
+inside the task container. The eval command loads a frozen task slice and
 aggregates gate stats into a JSON report, but without `--agent` it is a
 scaffold: the default engine runs no command and reports no reward, so
 instances grade ErrorNoReport. Default patch-apply provenance is Strict;
@@ -101,7 +113,10 @@ capability, and the container is removed best-effort on every path.
 - `snapshot` — git-overlay tree: baselines, rollbacks, bounded evidence
   patch, unbounded `patch_since_start_full()` deliverable.
 - `provider-core` / `provider-openai` — `LlmClient` trait +
-  OpenAI-compatible client (8-attempt retry ladder, priced models).
+  OpenAI-compatible client. The retry behavior has separate bounds: cold-start
+  503 retries use eight attempts, ordinary retryable errors use five, and the
+  truncation output-token ladder has its own bounded escalation (see
+  `provider-openai/src/retry.rs`).
 - `eval` — slice loading (`load_tb_slice`), winnability, gate stats
   (verdicts come from the `rof eval --agent` agent leg).
 - `agent-event` — the live event vocabulary (11 variants; pinned in
@@ -118,7 +133,12 @@ request's derived context. The budget guard admits provider steps and checks
 the action cap before each tool in a batch. The stdout patch
 is computed once at the end from the snapshot tree.
 
-## Current guarantee limits (reviewed 2026-11-03)
+## Guarantee limits and runner scope
+
+The host/file-copy and `--in-container` limitations below describe the legacy
+evaluation rig, with their original measurement dates. In the native Harbor
+adapter path the whole ROF process, including file tools and snapshots, runs
+inside the task container. Neither path currently provides crash resume.
 
 - The CLI archives the previous WAL before startup and constructs fresh state.
   `read_log` has no production caller; durable recording is implemented,
@@ -162,9 +182,12 @@ is computed once at the end from the snapshot tree.
 ## Not inferable from code
 
 - Why the compaction trigger (`--compaction`) remains off-by-default and
-  unvalidated, and when its experiment is planned.
+  unvalidated: the existing trigger uses a cumulative allowance instead of
+  context capacity. Capacity and source-provenance work is conditional Phase 4
+  of the linked plan; no compaction efficacy run is scheduled before that gate.
 - Why `FailureKind::Provider` keeps the historical exit code 3 instead of
   a dedicated one.
 - The intended scope/timeline of Bet C (candidate racing); the code only
-  records it as flagged and unbuilt.
+  records automatic runtime racing as flagged and unbuilt. The explicit
+  `tools/rof_candidates.py` helper already exists and is a different mechanism.
 - The roadmap for pricing new models in `provider-openai`.

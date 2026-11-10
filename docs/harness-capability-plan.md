@@ -1,5 +1,11 @@
 # Harness capability implementation
 
+**Historical implementation record:** this document covers the twelve proposals
+scheduled on 2026-11-07. Their bounded implementations shipped as described below.
+The current [phased capability plan](superpowers/plans/2026-11-11-capability-phases.md)
+adds the paper-audit work and is still planned. It does not imply that new
+history, completion-predicate or checkpoint contracts already exist.
+
 Chosen implementation plan, 2026-11-07. The owner approved implementing the twelve
 proposals using GPT-6 Luna workers. These are experimental mechanisms, not measured
 capability gains. Existing defaults remain the control. No benchmark model spend
@@ -68,7 +74,11 @@ distillation has three. Scoped clippy and formatting checks pass. Source evidenc
 for the stall detector excludes known harness sidecars and the build directory;
 it is not a semantic model of all external state. Final scripted integration
 covers cumulative phase budgets/usage and excludes phase logs from patches.
-No new feature is benchmark-validated or promoted.
+No feature in this batch was benchmark-validated or promoted by these local
+checks. Subsequent retention development runs produced one clean WAL task pass
+and an interrupted React reward-1 artifact; see the
+[current pilot record](current-benchmark-pilot.md). General gains and default
+promotion remain unsupported.
 
 The delivered scope deliberately distinguishes mechanisms from larger research
 claims: configurable observation retention precedes task-aware memory; literal

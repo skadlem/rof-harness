@@ -1,10 +1,18 @@
 # Research and implementation handoff (2026-11-11)
 
+**Active execution reference:** the
+[phased implementation plan](superpowers/plans/2026-11-11-capability-phases.md)
+assigns subagents, freezes additive contracts, and defines per-phase gates for
+the direct paper audit below. It is planned, not implemented. Use its order for
+new work; the completed output-fidelity changes remain the foundation.
+
 ## Objective and current state
 
 Build competitive coding-agent capability, judged on pinned external tasks and
-same-model comparisons. Keep total tokens per solved task at or below 1.3x the
-matched reference as a guardrail; cost is not the objective. Current external
+same-model comparisons. Default admission requires total tokens per solved task
+at or below 1.3x the matched reference; development candidates can be retained
+above that ratio without being promoted or authorized for additional spend.
+Cost is not the objective. Current external
 reference is Terminal-Bench CPU 4.1.0 (63 tasks, tag `v4.1.0`, commit
 `4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`, verified 2026-11-10). Verify the
 official release again before any future spend.
@@ -24,7 +32,9 @@ Verifier budgets are separate and task-specific (for example, WAL 1,800s and
 React 900s). Do not conflate these clocks. Archive-handle and Harbor adapter
 implementation is verified: root exercised collapse plus `output_read` end to
 end; 166 Rust tests, 4 adapter tests, Clippy and formatting passed (reported
-2026-11-11). Benchmark capability remains unmeasured. Defaults stay unchanged.
+2026-11-11). Those fixes have no established benchmark effect. Retention has the
+selected-task evidence above; broader capability gains remain unestablished.
+Defaults stay unchanged.
 
 ## Prepared, not run: next experiment protocol
 
@@ -98,7 +108,11 @@ performed for this preparation.
 All proposals stay out of the default runtime. Existing opt-in code is marked
 implemented/off; other proposals are not built. Revisit only at the stated gate.
 The direct paper-summary audit below adds candidates and qualifications to these
-gates; it does not implement or promote them.
+gates; it does not implement or promote them. Historical observation restoration
+is conditional Phase 3; capacity and checkpoint provenance are conditional Phase
+4. Cross-run memory, trained predictors, automatic search, and runtime MAS remain
+outside that plan. A targeted public completion predicate in Phase 2 is distinct
+from the deferred general review/reflection policy.
 
 | Idea and status | Why deferred; evidence and transfer limit | Prerequisite and revisit criterion |
 |---|---|---|

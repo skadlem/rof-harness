@@ -3,6 +3,32 @@
 Ordered and spend-gated. Design decisions anchor to `docs/decisions.md`;
 measured numbers carry a date and live with the run artifacts.
 
+## Capability implementation sequence (2026-11-11)
+
+The active [phased plan](superpowers/plans/2026-11-11-capability-phases.md)
+implements the direct paper audit through disjoint GPT-6 Luna workers and root
+integration. It is planned, not started. Existing archive-handle recovery and
+Harbor archive/shell forwarding are the completed foundation.
+
+Order: freeze contracts/reference → offline paired reporting and existing Harbor
+controls → evidence-aware lookup plus a targeted public completion predicate →
+controlled development runs → held-out confirmation. Historical restoration is
+conditional on demonstrated evidence loss; capacity-correct compaction and source
+annotations are a separate conditional phase. These phases do not add runtime
+subagents or a planner. No new benchmark result is claimed by this plan.
+
+Report rescue and harm, retain budget-limited failures, and distinguish artifact
+reward from run completion and accounting. Promising development candidates may
+be retained above the deployment token ratio; production admission still requires
+held-out capability evidence and the 1.3x guardrail. The existing USD ceiling and
+campaign accounting stop remain hard constraints.
+
+The proposed four-task slice remains metadata-only and is not a suite score or
+certified historically unseen holdout. Recheck official release relevance,
+actual disk/image capacity, native oracle readiness and preserved accounting
+before any paid run. Deferred items and revisit criteria remain in the
+[handoff](research-next-steps.md#deferred-work-register).
+
 ## Output fidelity handoff (2026-11-11)
 
 Capability remains the objective; ≤1.3x tokens per solved task is the guardrail.
@@ -17,7 +43,9 @@ reservation, within the $2.82 ceiling. No paid calls or ledger reset. Details:
 
 Archive recovery plus Harbor `archive_output` / `shell` are implemented and
 verified locally through end-to-end `output_read`; scoped tests, Clippy and fmt
-passed. Capability remains unmeasured and defaults are unchanged. The
+passed. No benchmark effect is established for those fixes. The retention pilot
+has one clean WAL task pass; broader capability gains are unestablished and
+defaults are unchanged. The
 next work is prepared only: release and hash pinning, free native oracle gate,
 fresh development tasks plus untouched holdouts, and single-knob comparisons of
 existing Harbor controls with `--archive-output on` and `--shell on`. Do not use

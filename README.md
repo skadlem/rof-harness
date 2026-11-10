@@ -9,7 +9,8 @@ inside the task's own container.
 
 [Capability experiments](docs/harness-experiments.md) describe the opt-in loop,
 tool and inference mechanisms available for ablation. Their local tests establish
-behaviour; external benchmark gains remain unmeasured.
+behaviour. Selected-task retention results are recorded below; general capability
+gains and the other experimental mechanisms remain unestablished.
 
 The [current evaluation protocol](docs/current-benchmark-pilot.md) targets pinned
 TB4.1.0 CPU tasks. The [Harness Leaderboard review](docs/harness-leaderboard-review.md)
@@ -18,6 +19,9 @@ records useful published references and their benchmark, provider and cost limit
 [Next steps and deferred work](docs/research-next-steps.md) records the active
 experiments, accounting stop, and prerequisites for revisiting deferred ideas.
 Read it when continuing this project in a new session.
+The [phased implementation plan](docs/superpowers/plans/2026-11-11-capability-phases.md)
+defines Luna worker ownership, dependencies, interfaces and validation gates.
+It is planned work; the archive-recovery foundation is already implemented.
 
 [![CI](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml/badge.svg?branch=v2-core)](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)

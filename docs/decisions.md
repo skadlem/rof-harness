@@ -1,5 +1,13 @@
 # Decisions
 
+Current continuation: the
+[phased capability plan](superpowers/plans/2026-11-11-capability-phases.md)
+records proposed paper-driven additions, ownership and evidence gates. Its new
+interfaces are planned, not shipped decisions. Historical entries below retain
+their original experiment scope; current benchmark outcomes and defaults are
+recorded in the [pilot](current-benchmark-pilot.md) and
+[handoff](research-next-steps.md).
+
 Distilled from the code comments and tests that state them. Anything
 here marked chosen-to-be-validated lacks a measured anchor; the code
 says so explicitly.

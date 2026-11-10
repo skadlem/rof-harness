@@ -1,13 +1,20 @@
 # Terminal-Bench 4.1 ROF pilot record
 
-**Purpose.** Three paid `session-window-debug` runs each received native reward 0.0. The three completed `wal-recovery-ordering` rows received 0.0, 0.0, and 1.0. These are task-level development results, not a Terminal-Bench suite score or a general performance claim.
+**Purpose.** Eight paid rows cover three selected tasks. The three
+`session-window-debug` runs each received native reward 0.0; the three
+completed `wal-recovery-ordering` rows received 0.0, 0.0, and 1.0. On
+`react-lead-form`, the control received 0.0 and the interrupted retention
+treatment produced a reward-1 artifact, but its provider attempt and usage
+accounting were incomplete. The WAL row is the only clean completed ROF pass.
+These are task-level development results, not a Terminal-Bench suite score or
+a general performance claim.
 
 ## Completed Session Window slice
 
 - Dataset package: `terminal-bench/terminal-bench-cpu@4.1.0`; Terminal-Bench tag `v4.1.0`, commit `4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`.
 - Task: `terminal-bench/session-window-debug`, task version `2.3.0`, fetched artifact manifest SHA-256 `7f0633f3c71fe9824cce50628321760f49b29ed21f95c7264096ce6fde3f3953`.
 - One attempt, one concurrent trial, no retries. Model API alias `deepseek-flash`; local task receives proxy URL and dummy API key. Real key remains in the driver process and is injected upstream by the in-process proxy.
-- ROF profile: gross token budget 1,200,000; 120 steps; 240 actions. Legacy workflow; preserved failed checks off; reasoning-effort override unset; per-request output starts at 8,000 and escalates up to 32,000. Exec policy `any`; steering and streak steering off; keep-thinking/default behavior; allow dirty workdir.
+- ROF profile: gross token budget 1,200,000; 120 steps; 240 actions. Legacy workflow; preserved failed checks off; reasoning-effort override unset; per-request output starts at 8,000 and can escalate to 16,000, 32,000, then the 32,768 ceiling. Exec policy `any`; steering and streak steering off; keep-thinking/default behavior; allow dirty workdir.
 - Harbor honors the task's native 8-hour agent allowance, but ROF's internal run guard is 3,600 seconds. This is a shorter pilot allowance and is not identical to a run using the full task-native timeout.
 - Same carried ledger; cap $2.82. At preregistration the parent reports $0.114431406 peak-accounted and $0.057215703 off-peak estimate, with zero unknown attempts. Never reset or seed lower. Unknown usage, proxy denial, failed/errored trial, or zero valid receipts ends the experiment; no automatic retry.
 
@@ -126,7 +133,7 @@ readiness only, not ROF capability.
   Gross budget 1,200,000 tokens, 120 steps, 240 actions; observation/thinking
   keep 5/2; legacy workflow; preserve-failed-checks off; reasoning-effort
   override unset; per-request output starts at 8,000 and retry escalation can
-  raise it to 32,000. One attempt, one concurrent
+  raise it through 16,000 and 32,000 to the 32,768 ceiling. One attempt, one concurrent
   trial, zero retries, 3,600-second internal ROF deadline. Exec policy is
   `any`, steering and streak steering are off, keep-thinking is on, and dirty
   workdirs are allowed.

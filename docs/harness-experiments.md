@@ -2,9 +2,15 @@
 
 Archive handle recovery and Harbor `archive_output` / `shell` forwarding are
 implemented and verified locally, including end-to-end recovery through
-`output_read`. Benchmark capability remains unmeasured; defaults remain in
+`output_read`. The retention pilot has one clean WAL pass at observation keep
+32 and thinking keep 256; the React retention artifact also received reward 1,
+but its provider attempt and accounting were incomplete. These selected-task
+results do not establish general capability improvement. Other experimental
+tool mechanisms remain unmeasured on benchmark tasks, and defaults remain in
 force. See [`research-next-steps.md`](research-next-steps.md) for the spend
-stop, prepared recipes, and deferred-work revisit gates.
+stop and prepared recipes, and
+[`superpowers/plans/2026-11-11-capability-phases.md`](superpowers/plans/2026-11-11-capability-phases.md)
+for the phased evaluation plan.
 
 The goal is competitive coding-agent performance supported by external benchmark
 results and same-model comparisons. These switches expose hypotheses for testing;
@@ -26,7 +32,15 @@ benchmark gain from the wording change is unmeasured.
 
 ## Independent controls
 
-Both `rof run` and `rof eval --agent` accept:
+The `rof run` command exposes the following experimental controls. The native
+Harbor adapter (`tools/harbor_rof.py`) currently forwards
+`max_tokens`, `observation_keep`, `thinking_keep`, `preserve_failed_checks`,
+`archive_output`, `shell`, `workflow`, and `reasoning_effort`. The legacy
+`rof eval --agent` path is separate and does not currently pass
+`thinking_keep` into its run configuration. The remaining listed features are
+not Harbor adapter options; do not treat their presence in the ROF CLI as
+availability in the current Harbor pilot. The table lists run flags; the
+paragraphs below identify the separate adapter and legacy-eval limitations.
 
 | Flag | Treatment | Default |
 | --- | --- | --- |
@@ -34,14 +48,29 @@ Both `rof run` and `rof eval --agent` accept:
 | `--workflow minimal` | Allow exploration before editing; retain normal finish instructions | legacy |
 | `--observation-keep N` | Retain N recent tool observations verbatim | 5 |
 | `--thinking-keep N` | Retain reasoning text for N assistant messages | 2 |
+| `--collapse-hysteresis N` | Batch advances of the observation-collapse boundary; run-only | 0 |
 | `--stall-threshold N` | Notice repeated identical failed checks with unchanged source evidence | 0 (off) |
 | `--archive-output on` | Archive command output and expose paginated retrieval through `output_read` | off |
 | `--shell on` | Add shell composition through the execution wrapper | off |
 | `--processes on` | Add persistent pipe sessions with start/poll/input/stop | off |
-| `--repo-lookup on` | Add bounded literal symbol occurrences and test-file classification | off |
+| `--repo-lookup on` | Add bounded literal occurrences and heuristic test-file classification | off |
 | `--multi-edit on` | Validate a set of file edits before applying them | off |
 | `--review on` | Run one fresh-context review and, for a concrete finding, one repair continuation | off |
 | `--procedure-file PATH` | Load an applicable procedure with a recorded content digest (repeatable) | none |
+
+`--compaction FRAC` also exists on `rof run`, default off. Its current trigger
+compares prompt size against a fraction of the cumulative token allowance;
+capacity/headroom correction is planned before any compaction efficacy run.
+The legacy eval CLI does not expose thinking retention, collapse hysteresis,
+or compaction. Planned `repo_evidence`, history restoration, completion checks,
+capacity controls and source-backed checkpoints are not shipped options.
+
+Other runtime and eval features such as pipe sessions, repository lookup,
+multi-edit, review, procedure loading, and collapse hysteresis are not
+currently exposed by this Harbor adapter. They remain CLI or local helper
+capabilities, not implemented Harbor pilot options. The phase plan linked
+above specifies the evaluation gates before any of these are considered for
+Harbor wiring.
 
 Shell and process sessions require `--exec-policy any`. They inherit the
 configured execution wrapper in container evaluation; host execution grants
@@ -50,15 +79,18 @@ lookup is a text index rather than a semantic call graph. Output archives are
 outside the deliverable workspace; the output retrieval tool accepts run-owned
 handles. Archive limits and omitted bytes must be explicit in returned results.
 
-`--thinking-keep` controls transcript retention. `--keep-thinking` controls
-the provider's thinking-suppression setting. The current WAL pilot's passing
-profile uses observation keep 32 and thinking keep 256; broader replication
-remains pending in the [pilot record](current-benchmark-pilot.md).
+`--thinking-keep` controls transcript retention; `--keep-thinking` controls
+the provider's thinking-suppression setting. `rof run` and the native Harbor
+adapter support `thinking_keep`; the legacy `rof eval --agent` path currently
+sets it to `None`. The WAL pilot's passing profile used observation keep 32
+and thinking keep 256 on one task. Broader replication remains pending in the
+[pilot record](current-benchmark-pilot.md).
 
-The Harbor adapter exposes the existing response-budget control as
-`kwargs.max_tokens`, default 8,000. It sets the first request's cap; provider
-retry escalation remains unchanged. All completed retention experiments used
-8,000. A larger starting cap is available for a separate allocation experiment.
+The Harbor adapter exposes the response-budget control as `kwargs.max_tokens`,
+default 8,000. It sets the first request's cap. On truncation, the provider
+ladder can raise it through 16,000 and 32,000 to a ceiling of 32,768; the last
+rung is capped, not a doubling. All completed retention experiments used an
+8,000 starting cap. A larger starting cap is a separate allocation experiment.
 
 Prepared, not run: use `--archive-output on` to retrieve output beyond the
 120-character preview through its run-owned handle (archive cap: 64 MiB per
@@ -75,13 +107,15 @@ operating-system transaction and cannot roll back external services or packages.
 
 ## External evaluation
 
-Chosen next protocol: pin a benchmark release, use its maintained runner where
-practical, and compare ROF with a compatible established agent using the same
-model snapshot and endpoint. Freeze a representative development slice before
-spend; choose changes from paired successes/failures and preserve a separate
-held-out evaluation. Publish per-task outcomes, infrastructure failures, retries,
-settings, usage, wall time and confidence intervals. Do not reinterpret named-test
-counts as task solve rates.
+The current implementation path uses the native Harbor adapter and controlled
+ROF ablations on a pinned release. Published external agent results provide
+context; they are not matched controls when model, endpoint or protocol differ.
+A future compatible agent comparison must match those variables and the task
+slice. Freeze development and held-out tasks before spend. The current four-task
+proposal is a convenience pilot, not a representative suite. Publish per-task
+outcomes, infrastructure failures, retries, settings, usage, wall time and
+uncertainty where estimable. Do not reinterpret named-test counts as task solve
+rates or drop budget-limited failures from the denominator.
 
 Run a control and one changed mechanism before combining changes. Review extra
 inference and candidate generation must be counted in the system's total budget.

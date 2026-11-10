@@ -1,10 +1,14 @@
 # Reliability fixes
 
+This completed reliability record is historical. New capability work follows
+the [phased plan](superpowers/plans/2026-11-11-capability-phases.md).
+
 > **Status 2026-11-06: all five items shipped** (`32f6b36` and follow-ups), each with the
 > reproducing test named in the item. This file is kept as the record of what was asked for.
 > The later measurement-fidelity defects (workdir seeding, visible `/tests`, missing agent wall
 > clock, unparsed per-task timeouts, in-container git ownership and empty baselines) are recorded
-> in `docs/decisions.md` under 2026-11-06; see `NOTES_FOR_PI.md` for the current state.
+> in `docs/decisions.md` under 2026-11-06. The current state is maintained in
+> [the continuation handoff](research-next-steps.md).
 
 Goal: enforce the existing grading, tool, proof, and budget contracts using the smallest changes that reproduce and fix the reviewed failures. Preserve existing crate interfaces where possible; do not change rollback policy or introduce crash resume without separate evidence.
 
