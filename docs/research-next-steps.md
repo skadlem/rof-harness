@@ -97,6 +97,8 @@ performed for this preparation.
 
 All proposals stay out of the default runtime. Existing opt-in code is marked
 implemented/off; other proposals are not built. Revisit only at the stated gate.
+The direct paper-summary audit below adds candidates and qualifications to these
+gates; it does not implement or promote them.
 
 | Idea and status | Why deferred; evidence and transfer limit | Prerequisite and revisit criterion |
 |---|---|---|
@@ -114,3 +116,57 @@ transfer to this harness. The reviewed reports are `lit-2026-11-SYNTHESIS.md`,
 `lit-2026-11-context-engineering.md`, `lit-2026-11-tools-inference.md`, and
 `lit-2026-11-eval-verifiers.md`. Benchmark claims require controlled ROF
 results.
+
+## Direct paper-summary audit: additional candidates (2026-11-11)
+
+The integration owner personally read all 72 per-paper summaries, including the
+authors' abstracts where available and the copied lane analysis. Relevant methods, results and
+limitations were additionally checked in eight full-text sources through the
+Papers service: 2610.07863, 2610.34967, 2610.38620, 2610.27524, 2607.15516,
+2611.02079, 2610.34679 and 2610.20927. This is not a review of 72 full papers.
+Recommendation: keep the current implementation as control and test the narrow
+coding mechanisms below before broad harness search. No additional paid model
+calls or runtime changes occurred. Transfer to ROF remains unmeasured.
+
+| Candidate or evaluation change | Evidence and smallest ROF application | Validation and main limitation |
+|---|---|---|
+| Evidence bundles for repository edits | [Rivet, 2610.34967](https://arxiv.org/abs/2610.34967) distinguishes target locations, helper definitions, caller usages and configuration constraints. Its 4K/8K context experiments report higher Pass@1 across 16 settings. Infer a small extension to existing `repo_lookup` and context selection, starting with explicit symbol occurrences, tests and configuration paths; avoid a graph service. | Compare with the same lookup/context budget on fresh coding tasks; measure missing evidence and solves. Literal matches cannot claim semantic caller resolution. The paper's tight context budgets differ from ROF. |
+| Tool behavior as an optimization surface | [AT-AT, 2610.34679](https://arxiv.org/abs/2610.34679), Table 3: OpenCode held-out TB2 pass@1 49.32% to 51.36%, TBLite 75.60% to 77.20%, after optimizing tool descriptions and permitted implementations. Diagnose repeated malformed calls and recovery failures in existing traces, then change one contract or behavior. | Native held-out results must improve; count optimizer calls if an optimizer is introduced. These are older benchmarks and different models. The optimizer uses an LLM and is not free. |
+| Targeted executable completion checks | [JevAct, 2610.38620](https://arxiv.org/abs/2610.38620), single-trial Airline component ablation: ReAct 50%, executable checks alone 68%, full gate 72%. Infer bounded feedback from a task-specified public command or explicit deliverable predicate. Existing `VerifyState` notices passing checks; it does not establish arbitrary task completion. | Use only public requirements/checks, never native hidden tests as feedback. Measure false rejection on baseline successes. One hand-off gate was disabled on Airline after flagging 26% of otherwise solved episodes; this is not evidence for blanket completion blocking. |
+| Restore historical observations, with stable rendering boundaries | [ReFold, 2610.07863](https://arxiv.org/abs/2610.07863) restores a logged step by appending its original output as a new turn, preserving the current prefix. Existing `output_read` covers archived command output; it does not restore every historical observation. Reuse the durable log, mark restored observations as historical, and examine existing `--collapse-hysteresis` before introducing another context mechanism. | First verify bounded retrieval after file mutation and preservation of call/result identity. Then test restoration and rendering cadence separately. Self-hosted vLLM cache/throughput gains cannot be promised on the hosted API. |
+| Source-backed facts in checkpoints | [SJC, 2610.20927](https://arxiv.org/abs/2610.20927) identifies compressor-authored plans being reused as facts. The current `context::SUMMARY_PROMPT` asks for key decisions and next steps. Preserve source IDs for observed facts and distinguish hypotheses and planned actions. | Test continuation against unchanged history before enabling compaction. Provenance is not correctness, and aggressive filtering can remove useful correct entries; do not simply delete every unquoted statement. The source's judge adds inference cost. |
+| Separate discovery from deployment admission | [ParetoSaddler, 2611.02079](https://arxiv.org/abs/2611.02079) keeps useful intermediate candidates even when they temporarily violate deployment cost preferences. In Appendix A, the local cost safeguard is disabled because fixing premature termination can increase useful work. Keep such configurations as research candidates rather than discarding them immediately. | The existing total USD ceiling remains hard. Default promotion still requires held-out capability evidence and the 1.3x tokens-per-solved guardrail. Retaining a candidate is not permission to spend on it or deploy it. |
+| Measure rescue and harm, including baseline successes | [MemDev-Bench, 2610.27524](https://arxiv.org/abs/2610.27524) evaluates both Improvement and Preservation tasks. Raw histories preserve process information that compressed memories omit; useful memories can also regress otherwise solvable tasks. Record both baseline-fail/treatment-pass and baseline-pass/treatment-fail transitions for context or procedure experiments. | Select tasks and splits before observing treatment outcomes. These measures generalize as an evaluation design, not as a predicted memory benefit. Do not reopen retired task tuning merely to add a preservation case. |
+| Separate context capacity from cumulative token allowance | Code inspection: `agent-loop::checkpoint` passes `state.budget.config().max_tokens` into `context::compaction_due`, which compares one prompt estimate with a fraction of that run-wide allowance. Those quantities serve different purposes. Before enabling compaction, define the actual input-window capacity and reserve output headroom independently. | A scripted-provider check should vary the run allowance at fixed context capacity and vice versa. This is an inferred design gap in a default-off feature, not an observed cause of the pilot's failures. |
+
+These are candidates, not a scheduled sweep. The unchanged control costs no new
+implementation effort but cannot establish whether these mechanisms help. Start
+with trace-grounded tool changes and evidence selection; use restoration if traces
+show unrecoverable historical evidence, and defer checkpoint changes until a
+compaction experiment is justified. Keep the largest uncertainty explicit:
+independent ROF benchmark effects have not been measured.
+
+### Report interpretations requiring correction
+
+- The CAPC report's quality-loss interpretation is too broad. In
+  [2607.15516](https://arxiv.org/abs/2607.15516), Table 10's 0.703/0.603 values
+  measure tool-selection set overlap with the vanilla output, not task accuracy.
+  Table 14 reports the same task-success count for CAPC and vanilla, 36/50, at
+  average costs $0.1145 and $0.1244 per task. Equal counts on 50 tasks do not
+  establish general quality equivalence. Avoid changing the hosted provider's
+  caching scheme based on this Anthropic-specific study.
+- A run exhausting its configured response/token budget remains evidence about
+  the evaluated system. Record that termination cause separately; do not erase
+  its task result or remove it from the denominator by relabeling it as
+  infrastructure failure. The inference report's blanket recommendation to
+  classify truncation as infrastructure is not an evaluation rule to adopt.
+- The reports' broad rejection of verification misses JevAct's distinction
+  between targeted executable predicates, unconditional re-check prompts, and
+  model-specific effects. Its ablation supports testing a narrow predicate;
+  it does not prove that adding a generic reviewer improves ROF.
+- The two DOI-only summaries contain no retrieved abstract. Their CLEO parity
+  and TurnCost efficiency figures remain unverified here and do not support
+  the recommendations above.
+
+Original summaries and lane reports were left unchanged. This addendum records
+interpretations and proposed experiments; it makes no new benchmark claim.
