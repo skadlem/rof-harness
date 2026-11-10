@@ -66,8 +66,8 @@ Row result, config, and artifact manifest sources are the per-trial files under
 `[197:231]` of
 `/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/receipts.jsonl`.
 Its result records no Harbor exception, ROF exit code 3, and native reward 0.0.
-The carried ledger records $0.868042698 peak upper bound against the $2.82
-cap, with zero unknown attempts; conservative remaining headroom is
+At Session closure, the ledger recorded a $0.868042698 peak upper bound against
+the $2.82 cap, with zero unknown attempts; conservative remaining headroom was
 $1.951957302. These are accounting bounds, not an invoice. Historical TB2.1
 cost remains in the global financial ledger and is excluded from current
 benchmark comparisons.
@@ -175,9 +175,103 @@ readiness only, not ROF capability.
 
 Keep these task-level comparisons separate from published full-suite aggregates.
 
+## React lead-form transfer check (interrupted)
+
+This two-row check transfers the higher-retention profile to
+`react-lead-form`. Both rows use the frozen control runtime and the same
+1,200,000-token gross budget, 120 steps, 240 actions, legacy workflow, no
+preserved failed checks, unset reasoning-effort override, and 8,000-token
+per-request output start. The adapter's `max_tokens` field defaults to 8,000
+(`108d6c3`); both registered rows retain that value, so output allocation is
+unchanged. The
+profiles change observation and thinking retention together, so this is a
+combined profile transfer, not an isolated ablation of either setting.
+
+| Row | Observation / thinking keep | Status |
+|---|---:|---|
+| `tb41-react-control-r1` | 5 / 2 | Complete; native reward 0 |
+| `tb41-react-retention-r1` | 32 / 256 | Interrupted; native artifact reward 1, incomplete provider attempt |
+
+The control launched at approximately 07:32 UTC on 2026-11-10 and closed with
+native reward 0, zero errors and retries, and 69 provider requests (receipt
+slice 396–465). Elapsed time was 796.4754858 seconds; receipts report
+1,181,675 input tokens, 962,048 cached input tokens, and 22,148 output tokens.
+The conservative peak cost bound is $0.098237988. At control closure, the ledger was
+$1.660748286 against the existing $2.82 cap, with zero unknown attempts,
+`denied=false`, and $1.159251714 conservative headroom. Accounting uses peak
+rates, including while the current time is off-peak; bounds are not invoices.
+The control was one attempt, one concurrent trial, and zero retries. ROF's
+internal deadline is 3,600 seconds, shorter than the task's
+28,800-second agent timeout; the task has a separate 900-second verifier,
+2 CPUs, and 4,096 MB memory.
+
+- **Pinned task:** Terminal-Bench CPU 4.1.0, release commit
+  `4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`; task
+  `terminal-bench/react-lead-form`, local path
+  `/home/madiyar/.local/share/rof-tb/datasets/tb41-react-lead-form-20261110-full/tasks/react-lead-form`.
+  Its 42-file, 513,556-byte tree fingerprint is
+  `c75086b2f2647243cc9192bc92fb4afbc33975ca1ed16048fc852fa49adca717`; the
+  fetched manifest SHA-256 is
+  `efdba27645aff4db17fd0a52b8f73c4f560ecbb9de256a38077901e5c9480fb9`.
+- **Runtime and plans:** both rows use
+  `/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/runtime/rof`,
+  SHA-256 `c9a25f9041e54540e03feeb1079a63f9ed0a3dd08c88d841fc7116af52ba3aab`.
+  Preregistered plans are
+  `/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows-react-control-preregistered.json`
+  and
+  `/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows-react-retention-preregistered.json`.
+- **Free oracle gate:** reward 1.0, one completed trial, zero errors, retries,
+  or exceptions. The validation binding is
+  `/home/madiyar/.local/share/rof-tb/work/newTB41/oracle-react-lead-form-validation.json`,
+  SHA-256 `abcf69ec2744e0836780359c9d767a9754f8f18e2913ffa6ae31eaa3861b0c89`;
+  the aggregate result is
+  `/home/madiyar/.local/share/rof-tb/work/newTB41/jobs/oracle-react-lead-form-v410-rootlogfix/result.json`,
+  SHA-256 `5abcbe8bc33751ec5140b25b1c43747534ad350640bd01c3053f7f523cc4ac96`.
+  The validation binds the task manifest, pinned release commit, result, and
+  campaign-local Harbor overlay. As with WAL, this preflight establishes task
+  readiness, not ROF capability.
+
+**Interrupted attempt:** the treatment launched at approximately 11:41 UTC on
+2026-11-10 after the oracle, frozen runtime, configuration, and budget checks
+passed. Its artifact received native reward 1.0, with zero Harbor trial errors
+or retries, in 872.816 seconds. The agent made 14 writes, 2 edits, and 4 test
+calls before an upstream request failed without a receipt. The guard then
+blocked further calls. Keep the raw artifact reward, but treat the system
+comparison and usage totals as incomplete.
+
+The row forwarded 32 requests in total; receipt slice `465:496` covers 31
+requests. Those receipts report 1,006,387 input tokens, 692,992 cached input
+tokens, and 62,544 output tokens, including 46,606 reasoning tokens. Known peak-rate cost is $0.173229252; known
+off-peak cost is $0.086614626. The missing request's full $0.3241728
+reservation remains in the conservative bound, so the row upper bound is
+$0.497402052. The ledger is $2.158150338 against the $2.82 cap, with
+$0.661849662 conservative headroom. `unknown=1` and `denied=true`; paid calls
+have stopped. The reservation is not evidence of the actual charge, and these
+bounds are not invoices.
+
+The row manifests and audited counters are under the campaign's
+`rows/tb41-react-control-r1-rof-react-lead-form/` and
+`rows/tb41-react-retention-r1-rof-react-lead-form/` directories; each has a
+`compactsummary.json`. Both audits use the same 17 public fixture files:
+the baseline retained all 17 unchanged; the treatment changed 6 and added 5.
+
+WAL remains the clean completed passing row. The optional 5/256 plan was not
+launched: the unknown request and spending denial fail its execution conditions.
+No further paid calls are planned in this campaign.
+
+After the incident, the campaign proxy gained sanitized exception type,
+open/read stage, elapsed time, and observed upstream status diagnostics.
+Eight local fake-upstream tests passed, including reservation retention after
+transport failures and settlement before a downstream disconnect. The live
+ledger was unchanged across verification. The exact historical proxy is saved
+as `proxy-before-transport-diagnostics.py`; source hashes and test evidence are
+in the campaign's `verification/transport-diagnostics-provenance.json` and
+`verification/transport-diagnostics-tests.log`. This change adds no paid retry
+and does not recover the missing receipt.
+
 ## Why this version and how to read the result
 
-Terminal-Bench v4.1.0 is the latest stable release checked on 2026-11-10. It changes all 66 tasks and publishes a 63-task CPU-only dataset. This three-row, one-case slice cannot stand in for the 63-task suite or support variance estimates.
+Terminal-Bench v4.1.0 is the latest stable release checked on 2026-11-10. It changes all 66 tasks and publishes a 63-task CPU-only dataset. These selected task-level outcomes cannot stand in for the full suite or support variance estimates.
 
 DeepSeek reports Flash-1017 at 42.3 on Terminal-Bench 4.0 using Claude Code. That is a vendor aggregate on a prior release, not a per-task or v4.1 reference. The public Terminal-Bench 4.1 leaderboard reports aggregate rows and does not expose task-level outcomes or trial IDs, so it cannot supply a matched comparator for Session Window or WAL Recovery. The lookup and limits are recorded in `/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/external-references/tb41-public-outcomes/2026-11-10.md`; do not infer per-task results from aggregate scores.
 

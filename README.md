@@ -25,11 +25,15 @@ records useful published references and their benchmark, provider and cost limit
 The current TB4.1 development slice has three completed `session-window-debug`
 runs with native reward **0**, and three completed `wal-recovery-ordering`
 runs with native rewards **0 / 0 / 1**. These six task-level outcomes are not
-a score for the 63-task CPU suite or a frontier-performance claim. The
-[pilot record](docs/current-benchmark-pilot.md) includes the fixed recipes,
-receipt counts, and conservative cost bounds. The passing WAL profile kept
-32 tool observations and reasoning text for 256 assistant messages. Broader
-replication is next; production defaults remain unchanged.
+a score for the 63-task CPU suite or a frontier-performance claim. The React
+lead-form control completed with native reward **0**. Its 32/256 transfer
+attempt produced a native reward-1 artifact but was interrupted by a provider
+transport failure with one unreceipted request; it is not a clean comparison.
+The [pilot record](docs/current-benchmark-pilot.md) includes the fixed recipes,
+receipt counts, and conservative cost bounds. The passing WAL
+profile kept 32 tool observations and reasoning text for 256 assistant
+messages. The React pair changes both retention settings together; it does not
+isolate either setting. Production defaults remain unchanged.
 
 ![Same cap, more budget: steps climb, passing tests do not](docs/assets/arm-envelope.svg)
 
