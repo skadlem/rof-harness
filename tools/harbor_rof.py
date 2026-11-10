@@ -30,9 +30,11 @@ class RofOptions(InstalledAgentOptions):
     budget_steps: int = Field(default=60, gt=0)
     budget_actions: int = Field(default=120, gt=0)
     budget_shape: Literal["gross", "miss-plus-out"] = "gross"
+    observation_keep: int | None = Field(default=None, gt=0)
     preserve_failed_checks: bool = False
     workflow: Literal["legacy", "minimal"] = "legacy"
     reasoning_effort: Literal["low", "high", "max"] | None = None
+    thinking_keep: int | None = Field(default=None, gt=0)
 
 
 class RofAgent(BaseInstalledAgent):
@@ -124,6 +126,10 @@ class RofAgent(BaseInstalledAgent):
             "--log-path",
             str(logs / ".rof-events.jsonl"),
         ]
+        if self.options.observation_keep is not None:
+            args.extend(("--observation-keep", str(self.options.observation_keep)))
+        if self.options.thinking_keep is not None:
+            args.extend(("--thinking-keep", str(self.options.thinking_keep)))
         if self.options.reasoning_effort is not None:
             args.extend(("--reasoning-effort", self.options.reasoning_effort))
         command = (
@@ -181,6 +187,22 @@ def _check_usage_context() -> None:
     assert RofOptions(runtime_dir=Path("/tmp"), reasoning_effort="max").reasoning_effort == "max"
     default = RofOptions(runtime_dir=Path("/tmp"))
     assert (default.budget_tokens, default.budget_steps, default.budget_actions, default.budget_shape) == (300000, 60, 120, "gross")
+    assert default.observation_keep is None
+    assert default.thinking_keep is None
+    assert RofOptions(runtime_dir=Path("/tmp"), thinking_keep=256).thinking_keep == 256
+    try:
+        RofOptions(runtime_dir=Path("/tmp"), thinking_keep=-1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("thinking_keep must be positive")
+    assert RofOptions(runtime_dir=Path("/tmp"), observation_keep=32).observation_keep == 32
+    try:
+        RofOptions(runtime_dir=Path("/tmp"), observation_keep=-1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("observation_keep must be positive")
     profile = RofOptions(
         runtime_dir=Path("/tmp"),
         budget_tokens=1200000,

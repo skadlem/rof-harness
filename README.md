@@ -20,7 +20,13 @@ records useful published references and their benchmark, provider and cost limit
 
 | What it does | How it's judged | What it costs | What it refuses to be |
 |---|---|---|---|
-| Drives an OpenAI-compatible model through six tools against a scratch workdir, or inside the task's live container, until the work is done or a cap trips | The task's own verifier, run in the same container the agent worked in — not a wrapper's exit code | $0.006–$0.13 per task at flash-model tier; frontier harnesses report $6–$23 | A framework, a planner, an MCP host, or a hosted service. One binary, one loop |
+| Drives an OpenAI-compatible model through six tools against a scratch workdir, or inside the task's live container, until the work is done or a cap trips | The task's native verifier; Harbor supports separate verifier environments | Provider usage receipts; current selected-task costs are recorded in the evaluation protocol | A framework, a planner, an MCP host, or a hosted service. One binary, one loop |
+
+The current TB4.1 development slice contains three attempts on
+`session-window-debug`, each with native reward **0**. The
+[pilot record](docs/current-benchmark-pilot.md) includes the fixed recipes,
+receipt counts, and conservative cost bounds. These results do not establish
+a capability gain from changing observation or reasoning retention.
 
 ![Same cap, more budget: steps climb, passing tests do not](docs/assets/arm-envelope.svg)
 
