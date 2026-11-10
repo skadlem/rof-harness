@@ -385,7 +385,7 @@ self-describe through the provenance block; no arm's rows pool with another's.
    capability claim on its own.
 
 3. **Wire fidelity against the vendor's own encoder — DONE 2026-11-06
-   (zero-cost diff, `research/wire-fidelity-2026-11-06.md`, outcomes in
+   (zero-cost diff; local untracked report `wire-fidelity-2026-11-06.md`; outcomes in
    `docs/decisions.md`; one claim refuted by banked cache data, nothing
    changed).** DeepSeek released
    `github.com/deepseek-ai/deepseek-recipe` (MIT, Rust) — a protocol-aware

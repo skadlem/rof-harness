@@ -143,7 +143,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("rof-procedure-{}.json", std::process::id()));
         let bytes = br#"{"id":"rust-tests","cue":"cargo test","instruction":"Run focused tests first.","source_repositories":["example/rust-guide"]}"#;
         std::fs::write(&path, bytes).unwrap();
-        let catalog = load(&[path.clone()]).unwrap();
+        let catalog = load(std::slice::from_ref(&path)).unwrap();
         let selected = catalog
             .select("Please run CARGO TEST before finalizing.")
             .unwrap();
@@ -163,9 +163,9 @@ mod tests {
             br#"{"id":"x","cue":"y","instruction":"z","source_repositories":[]}"#,
         )
         .unwrap();
-        assert!(load(&[path.clone()]).is_err());
+        assert!(load(std::slice::from_ref(&path)).is_err());
         std::fs::write(&path, vec![b'x'; MAX_FILE_BYTES + 1]).unwrap();
-        assert!(load(&[path.clone()]).is_err());
+        assert!(load(std::slice::from_ref(&path)).is_err());
         std::fs::remove_file(path).unwrap();
     }
 }

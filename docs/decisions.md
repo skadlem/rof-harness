@@ -564,7 +564,7 @@ says so explicitly.
   help and still bought nothing.
 - **Wire-fidelity diff done against vendor `deepseek-recipe` @ `935817c6`; one claim
   refuted by our own data, three recorded as measured, nothing changed
-  (2026-11-06, zero model calls).** Report: `research/wire-fidelity-2026-11-06.md`
+  (2026-11-06, zero model calls).** Report: `wire-fidelity-2026-11-06.md` (local-only; untracked workspace report)
   (vendor is a serving-side prompt renderer, not an HTTP client, so the layers
   only partly overlap). Outcomes, each with the evidence that settles it:
   (1) *effort is a prompt line* — already measured on both channels by us

@@ -5,8 +5,8 @@ this commit). This file is the entry point. Read it, then the two canonical reco
 
 - `docs/roadmap.md` — *Current state (2026-11-06)* at the top, then `Next (ordered, spend-gated)`.
 - `docs/decisions.md` — the decision log; every entry carries the measurement behind it.
-- `research/DECISIONS.md` — append-only evidence log, one row per arm, including pre-registrations
-  written *before* spend. Local only (git-excluded), same as `NEXT.md` and `research/`.
+- The append-only local evidence journal — one row per arm, including pre-registrations
+  written *before* spend. It is git-excluded, like `NEXT.md` and the other local research notes.
 
 Canonical code-level doc: `docs/architecture.md`. User-facing summary: `README.md`.
 
@@ -81,9 +81,9 @@ mechanism-only until re-run.
 
 ## 4. How to run a paid arm (the only sanctioned way)
 
-Spend is real and guarded. Every arm is **pre-registered before the first call** in
-`research/DECISIONS.md`: binary md5, cells, reps, arm flags, decision rule (PASS/KILL), cost
-estimate, stop rules.
+Spend is real and guarded. Every arm is **pre-registered before the first call** in the
+append-only local evidence journal: binary md5, cells, reps, arm flags, decision rule
+(PASS/KILL), cost estimate, stop rules.
 
 - **Binary is frozen per arm**: `cargo build --release -p rof`, copy to
   `~/.local/share/rof-tb/work/<arm>/rof-<arm>`, record `md5sum`. Never mix binaries in one table.
@@ -151,8 +151,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-- `docs/` and `README.md` are tracked and must never drift from code; `research/`, `NEXT.md` and
-  this file are git-excluded local records (`.git/info/exclude`).
+- `docs/`, `README.md`, and this handoff note are tracked and must never drift from code;
+  the local evidence journal and `NEXT.md` remain outside version control.
 - Commits carry no AI attribution.
 - Any numeric claim needs provenance: measured (source + numbers), inferred (from measured), or
   chosen (no anchor — name what validates it).
