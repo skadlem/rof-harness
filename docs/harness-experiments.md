@@ -47,6 +47,11 @@ the provider's thinking-suppression setting. The current WAL pilot's passing
 profile uses observation keep 32 and thinking keep 256; broader replication
 remains pending in the [pilot record](current-benchmark-pilot.md).
 
+The Harbor adapter exposes the existing response-budget control as
+`kwargs.max_tokens`, default 8,000. It sets the first request's cap; provider
+retry escalation remains unchanged. All completed retention experiments used
+8,000. A larger starting cap is available for a separate allocation experiment.
+
 Preserving a failing check does not grant proof to its edits. Mutation or policy
 errors retain the existing rollback behaviour. Multi-file editing is not an
 operating-system transaction and cannot roll back external services or packages.

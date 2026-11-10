@@ -29,6 +29,7 @@ class RofOptions(InstalledAgentOptions):
     budget_tokens: int = Field(default=300000, gt=0)
     budget_steps: int = Field(default=60, gt=0)
     budget_actions: int = Field(default=120, gt=0)
+    max_tokens: int = Field(default=8000, gt=0)
     budget_shape: Literal["gross", "miss-plus-out"] = "gross"
     observation_keep: int | None = Field(default=None, gt=0)
     preserve_failed_checks: bool = False
@@ -108,7 +109,7 @@ class RofAgent(BaseInstalledAgent):
             "--budget-shape",
             self.options.budget_shape,
             "--max-tokens",
-            "8000",
+            str(self.options.max_tokens),
             "--exec-policy",
             "any",
             "--steer",
