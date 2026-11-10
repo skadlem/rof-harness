@@ -11,6 +11,10 @@ inside the task's own container.
 tool and inference mechanisms available for ablation. Their local tests establish
 behaviour; external benchmark gains remain unmeasured.
 
+The [current evaluation protocol](docs/current-benchmark-pilot.md) targets pinned
+TB4.1.0 CPU tasks. The [Harness Leaderboard review](docs/harness-leaderboard-review.md)
+records useful published references and their benchmark, provider and cost limits.
+
 [![CI](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml/badge.svg?branch=v2-core)](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 
@@ -238,7 +242,7 @@ writes the complete event log for replay.
 | `--max-tokens N` | per-request output ceiling |
 | `--steer on\|off` | initiative nudges (unverified-declare hold, half/late action directives, wrap-up). Default **off**: `dphn-steer2` measured them dead — no named-test change on either cell, 2.64x tokens per solved task; the workflow contract + rollback notice ship either way |
 | `--streak-steer on\|off` | experimental one-shot six-read directive; off by default, independent of `--steer` |
-| `--reasoning-effort none\|low\|high\|xhigh\|max` | `reasoning_effort` sent on every request (default: not sent); measured 0→2976 reasoning tokens on one prompt; ignored by api.deepseek.com, honored by the vLLM gateway |
+| `--reasoning-effort none\|low\|high\|xhigh\|max` | Optional per-request effort; endpoint-specific values. [Current DeepSeek docs](https://api-docs.deepseek.com/guides/thinking_mode/) support low/high/max and default to high; the earlier no-effect probe was historical |
 | `--context-file PATH` | pinned file context, repeatable |
 | `--dump-events PATH` | full event log, one run one dump |
 | `--log-path` / `--no-log` | WAL location (defaults to `<workdir>/.rof-events.jsonl`) |

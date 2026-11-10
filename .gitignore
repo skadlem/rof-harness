@@ -1,5 +1,6 @@
 /target/
 .env
+.env.deepseek
 *.log
 .pi/
 __pycache__/

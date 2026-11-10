@@ -16,18 +16,19 @@ use crate::retry::{
 pub struct EndpointProfile {
     pub emission_threshold_chars: usize,
     /// Exact JSON fragment merged into the request body to switch thinking
-    /// off. DeepSeek's measured knob is `{"thinking":{"type":"disabled"}}`;
-    /// `enable_thinking` and `reasoning_effort` are ignored there (live probe,
-    /// api.deepseek.com deepseek-flash). None = no known knob: the ladder
-    /// skips the rung instead of sending a placebo.
+    /// off. DeepSeek documents `{"thinking":{"type":"disabled"}}`;
+    /// a 2026-10-19 api.deepseek.com probe did not detect a change from its
+    /// older `enable_thinking` field. None = no known knob: the ladder skips
+    /// the rung instead of sending a placebo.
     #[serde(default)]
     pub thinking_off: Option<serde_json::Value>,
     /// Reasoning-effort level sent as `reasoning_effort` on every request;
     /// `None` keeps the body byte-identical to before the knob existed.
-    /// Honored by the vLLM gateway (measured 2026-10-19, one prompt:
-    /// none/low/high/xhigh/max = 0/722/1060/1149/2976 reasoning tokens) and
-    /// ignored by api.deepseek.com (live probe) — a per-endpoint property,
-    /// so arms set it per run instead of a global default.
+    /// DeepSeek docs (2026-11-09) list low/high/max and default high; xhigh
+    /// maps to high. A one-prompt api.deepseek.com probe on 2026-10-19 did not
+    /// detect an effect, which is historical evidence, not a universal
+    /// endpoint claim. The vLLM probe measured 0/722/1060/1149/2976 tokens
+    /// for none/low/high/xhigh/max; effort stays per-run, with no global default.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
 }

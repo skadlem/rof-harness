@@ -341,7 +341,10 @@ says so explicitly.
   `reasoning_effort` is honored — `none/low/high/xhigh/max` =
   0/722/1060/1149/2976 reasoning tokens in the raw call, 236 → 568 in
   `rof run` at equal caps — while `thinking:{type:enabled|disabled}` moves
-  nothing and api.deepseek.com ignores the field entirely. It is therefore a
+  nothing and the api.deepseek.com probe showed no effect. That historical
+  observation does not establish current API support: the official documentation
+  checked 2026-11-09 explicitly supports low/high/max effort with high as default.
+  It is therefore a
   per-endpoint property carried on `EndpointProfile` (like the thinking-off
   fragment), set per run with `--reasoning-effort` on `run` and `eval`,
   never a global default, and recorded in the report provenance so an

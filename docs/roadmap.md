@@ -3,6 +3,23 @@
 Ordered and spend-gated. Design decisions anchor to `docs/decisions.md`;
 measured numbers carry a date and live with the run artifacts.
 
+## Official DeepSeek campaign (2026-11-10)
+
+The owner authorized a new **$2.82** ceiling on the official DeepSeek account,
+with credentials in the repository's ignored `.env.deepseek`. Use published web
+results for external agent reference points; the owner excluded Pi comparisons.
+Spend this campaign on ROF controls and focused ablations under Harbor, with
+unchanged task instructions and verifiers. The preregistered development slice,
+accounting rules and historical outcomes are in `docs/deepseek-official-pilot.md`.
+Historical DPHN ledgers below belong to separate campaigns/accounts.
+The TB2.1 slice is now superseded by the owner's recency correction; no further
+paid attempts should use it. The verified latest stable release is TB4.1.0,
+published 2026-11-03, with a 63-task CPU edition. The current protocol is in
+`docs/current-benchmark-pilot.md`; the requested Space's source and cost review
+is in `docs/harness-leaderboard-review.md`. Current DeepSeek docs
+also document low/high/max reasoning effort; the October no-effect probe below
+does not establish current API behavior.
+
 ## Direction reset (2026-11-10)
 
 The owner reaffirmed the goal: a coding agent with competitive frontier-system
