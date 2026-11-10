@@ -18,7 +18,7 @@ impl Tool for TestTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: TOOL_TEST.to_string(),
-            description: "run an allowlisted check, report PASS/FAIL verdict".to_string(),
+            description: "run an allowlisted check, parsed into argv without a shell. Pipes, redirection and command chaining do not work; stdin is closed. Quote arguments containing spaces. Report a PASS/FAIL verdict.".to_string(),
             schema: cmd_schema(),
         }
     }

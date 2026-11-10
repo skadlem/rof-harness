@@ -1,5 +1,11 @@
 # Harness capability experiments
 
+Archive handle recovery and Harbor `archive_output` / `shell` forwarding are
+implemented and verified locally, including end-to-end recovery through
+`output_read`. Benchmark capability remains unmeasured; defaults remain in
+force. See [`research-next-steps.md`](research-next-steps.md) for the spend
+stop, prepared recipes, and deferred-work revisit gates.
+
 The goal is competitive coding-agent performance supported by external benchmark
 results and same-model comparisons. These switches expose hypotheses for testing;
 local regression tests do not establish benchmark improvements. Each switch keeps
@@ -11,7 +17,9 @@ After a trace audit, the built-in tool descriptions were clarified: `exec`
 parses one allowlisted command into argv without a shell, closes stdin, and does
 not support pipes, redirection or command chaining. Quote arguments containing
 spaces. `write` and `edit` operate on paths under the tool root. This is a
-description-only correction; it does not change tool behavior. The frozen pilot
+description-only correction; it does not change tool behavior. `test` documents
+the same argv constraints and its PASS/FAIL verdict; archived variants reuse the
+ordinary descriptions with archive and retrieval guidance. The frozen pilot
 binary remains SHA-256
 `c9a25f9041e54540e03feeb1079a63f9ed0a3dd08c88d841fc7116af52ba3aab`, and any
 benchmark gain from the wording change is unmeasured.
@@ -51,6 +59,15 @@ The Harbor adapter exposes the existing response-budget control as
 `kwargs.max_tokens`, default 8,000. It sets the first request's cap; provider
 retry escalation remains unchanged. All completed retention experiments used
 8,000. A larger starting cap is available for a separate allocation experiment.
+
+Prepared, not run: use `--archive-output on` to retrieve output beyond the
+120-character preview through its run-owned handle (archive cap: 64 MiB per
+command; omitted bytes are reported); use `--shell on` only with
+`--exec-policy any`. Compare either knob alone against the fixed profile. Also
+test failed-check preservation, retention, minimal workflow, and starting
+response cap one at a time. The exact preflight, holdout and spend rules are in
+[`research-next-steps.md`](research-next-steps.md). These recipes do not imply
+any benchmark outcome.
 
 Preserving a failing check does not grant proof to its edits. Mutation or policy
 errors retain the existing rollback behaviour. Multi-file editing is not an

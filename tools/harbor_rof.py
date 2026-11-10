@@ -6,13 +6,12 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Literal, override
 
-from pydantic import Field
-
 from harbor.agents.installed.base import BaseInstalledAgent
 from harbor.agents.model_connection import ModelConnectionSpec
 from harbor.agents.options import InstalledAgentOptions
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
+from pydantic import Field
 
 _RUNTIME_FILES = (
     "rof",
@@ -25,7 +24,9 @@ _REMOTE = PurePosixPath("/opt/rof-runtime")
 
 
 class RofOptions(InstalledAgentOptions):
-    runtime_dir: Path = Field(description="Host directory containing the frozen ROF runtime bundle.")
+    runtime_dir: Path = Field(
+        description="Host directory containing the frozen ROF runtime bundle."
+    )
     budget_tokens: int = Field(default=300000, gt=0)
     budget_steps: int = Field(default=60, gt=0)
     budget_actions: int = Field(default=120, gt=0)
@@ -33,6 +34,8 @@ class RofOptions(InstalledAgentOptions):
     budget_shape: Literal["gross", "miss-plus-out"] = "gross"
     observation_keep: int | None = Field(default=None, gt=0)
     preserve_failed_checks: bool = False
+    archive_output: bool = False
+    shell: bool = False
     workflow: Literal["legacy", "minimal"] = "legacy"
     reasoning_effort: Literal["low", "high", "max"] | None = None
     thinking_keep: int | None = Field(default=None, gt=0)
@@ -58,12 +61,18 @@ class RofAgent(BaseInstalledAgent):
         git = await environment.exec(command="command -v git", user="root")
         if git.return_code:
             raise RuntimeError("ROF requires git in the task environment")
-        missing = [name for name in _RUNTIME_FILES if not (self.options.runtime_dir / name).is_file()]
+        missing = [
+            name
+            for name in _RUNTIME_FILES
+            if not (self.options.runtime_dir / name).is_file()
+        ]
         if missing:
             raise FileNotFoundError(f"ROF runtime bundle missing: {', '.join(missing)}")
         await environment.exec(command=f"mkdir -p {_REMOTE}", user="root")
         for name in _RUNTIME_FILES:
-            await environment.upload_file(self.options.runtime_dir / name, str(_REMOTE / name))
+            await environment.upload_file(
+                self.options.runtime_dir / name, str(_REMOTE / name)
+            )
         await environment.exec(
             command=f"chmod 755 {_REMOTE}/rof {_REMOTE}/ld-linux-x86-64.so.2",
             user="root",
@@ -127,6 +136,10 @@ class RofAgent(BaseInstalledAgent):
             "--log-path",
             str(logs / ".rof-events.jsonl"),
         ]
+        if self.options.archive_output:
+            args.extend(("--archive-output", "on"))
+        if self.options.shell:
+            args.extend(("--shell", "on"))
         if self.options.observation_keep is not None:
             args.extend(("--observation-keep", str(self.options.observation_keep)))
         if self.options.thinking_keep is not None:
@@ -153,7 +166,9 @@ class RofAgent(BaseInstalledAgent):
         )
         marker = "ROF_EXIT_CODE="
         if marker not in result.stdout:
-            raise RuntimeError(f"ROF launcher/bootstrap failed (exit {result.return_code})")
+            raise RuntimeError(
+                f"ROF launcher/bootstrap failed (exit {result.return_code})"
+            )
         try:
             exit_code = int(result.stdout.split(marker)[-1].strip())
         except ValueError as exc:
@@ -185,9 +200,17 @@ class RofAgent(BaseInstalledAgent):
 
 def _check_usage_context() -> None:
     assert RofOptions(runtime_dir=Path("/tmp")).reasoning_effort is None
-    assert RofOptions(runtime_dir=Path("/tmp"), reasoning_effort="max").reasoning_effort == "max"
+    assert (
+        RofOptions(runtime_dir=Path("/tmp"), reasoning_effort="max").reasoning_effort
+        == "max"
+    )
     default = RofOptions(runtime_dir=Path("/tmp"))
-    assert (default.budget_tokens, default.budget_steps, default.budget_actions, default.budget_shape) == (300000, 60, 120, "gross")
+    assert (
+        default.budget_tokens,
+        default.budget_steps,
+        default.budget_actions,
+        default.budget_shape,
+    ) == (300000, 60, 120, "gross")
     assert default.observation_keep is None
     assert default.thinking_keep is None
     assert RofOptions(runtime_dir=Path("/tmp"), thinking_keep=256).thinking_keep == 256
@@ -197,7 +220,9 @@ def _check_usage_context() -> None:
         pass
     else:
         raise AssertionError("thinking_keep must be positive")
-    assert RofOptions(runtime_dir=Path("/tmp"), observation_keep=32).observation_keep == 32
+    assert (
+        RofOptions(runtime_dir=Path("/tmp"), observation_keep=32).observation_keep == 32
+    )
     try:
         RofOptions(runtime_dir=Path("/tmp"), observation_keep=-1)
     except ValueError:
@@ -211,7 +236,12 @@ def _check_usage_context() -> None:
         budget_actions=240,
         budget_shape="miss-plus-out",
     )
-    assert (profile.budget_tokens, profile.budget_steps, profile.budget_actions, profile.budget_shape) == (1200000, 120, 240, "miss-plus-out")
+    assert (
+        profile.budget_tokens,
+        profile.budget_steps,
+        profile.budget_actions,
+        profile.budget_shape,
+    ) == (1200000, 120, 240, "miss-plus-out")
     try:
         RofOptions(runtime_dir=Path("/tmp"), budget_steps=0)
     except ValueError:
@@ -240,7 +270,11 @@ def _check_usage_context() -> None:
         agent = RofAgent(logs_dir=root, model_name="openai/model", runtime_dir=root)
         context = AgentContext()
         agent.populate_context_post_run(context)
-        assert (context.n_input_tokens, context.n_cache_tokens, context.n_output_tokens) == (12, 3, 7)
+        assert (
+            context.n_input_tokens,
+            context.n_cache_tokens,
+            context.n_output_tokens,
+        ) == (12, 3, 7)
         assert context.metadata == {"exit_code": 0}
 
 

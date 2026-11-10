@@ -1,0 +1,101 @@
+{
+  "created": "2026-11-11",
+  "status": "proposed_requires_preflight",
+  "selection_basis": "Chosen from public task metadata and instructions for coding relevance and host resource declarations; a convenience slice, not representative of the suite.",
+  "source": {
+    "repo": "https://github.com/harbor-framework/terminal-bench",
+    "tag": "v4.1.0",
+    "commit": "4070d6cef56a7d20cb5dc98d5e10ada88a6b9440"
+  },
+  "source_manifest_sha256": "9209edb7553cbf2ac67e7d6a737c9222c67cbb4cae8f35c54c7c515a849ee48b",
+  "holdout_status": "Prospectively reserved; historical exposure audit incomplete. Do not use holdout outcomes to choose a profile.",
+  "prerequisites": [
+    "Verify current official release and task compatibility before spend.",
+    "Obtain complete pinned task packages and check exact image availability and measured build footprint.",
+    "Validate native oracles and record image, runtime, runner overlay and full configuration hashes.",
+    "Reconcile stopped campaign accounting before any paid request; preserve all reservations and the existing cap.",
+    "Freeze splits, exclusions, treatment and analysis before viewing new agent outcomes."
+  ],
+  "tasks": [
+    {
+      "id": "terminal-bench/freight-dispatch-shift",
+      "version": "2.2.0",
+      "proposed_split": "development",
+      "selection_reason": "Stateful command-line workflow implementation",
+      "public_metadata_sha256": {
+        "tasks/freight-dispatch-shift/task.toml": "f304fd90f06bb2b21a2e8bf14f38ce4d9408a1d5eeedaa24a4d330b6ef39f553",
+        "tasks/freight-dispatch-shift/instruction.md": "45cd70448d788cd5191f13e890f49f0c63e126309800b817f3bd8f44dd41f19e"
+      },
+      "environment": {
+        "cpus": 2,
+        "memory_mb": 4096,
+        "storage_mb": 10240,
+        "gpus": 0,
+        "build_timeout_sec": 1200
+      },
+      "agent_timeout_sec": 28800.0,
+      "verifier_timeout_sec": 300,
+      "oracle_validated": false
+    },
+    {
+      "id": "terminal-bench/cargo-flight-dispatch",
+      "version": "2.4.0",
+      "proposed_split": "development",
+      "selection_reason": "Repair of a multi-file Python repository",
+      "public_metadata_sha256": {
+        "tasks/cargo-flight-dispatch/task.toml": "16e5f13ae8b9fdadb5f18950850afdcf8f0252fab625126780dc926562304570",
+        "tasks/cargo-flight-dispatch/instruction.md": "a7b0333a36ba08895d4858a6f216de7802b4e584566149acbb2ccb4420be165d"
+      },
+      "environment": {
+        "cpus": 2,
+        "memory_mb": 4096,
+        "storage_mb": 10240,
+        "gpus": 0,
+        "build_timeout_sec": 1200.0
+      },
+      "agent_timeout_sec": 28800.0,
+      "verifier_timeout_sec": 600.0,
+      "oracle_validated": false
+    },
+    {
+      "id": "terminal-bench/coq-block-bound",
+      "version": "2.1.0",
+      "proposed_split": "holdout",
+      "selection_reason": "Formal proof implementation checked by the Coq compiler",
+      "public_metadata_sha256": {
+        "tasks/coq-block-bound/task.toml": "2b8c5b039a18da190e98b3a51091689c74db50524f577dd83726c68ecab4a6e1",
+        "tasks/coq-block-bound/instruction.md": "9e86df1ddf96f1d6ee037b9cfa3aa69bab88b477c83d7c46e8167ff806915a16"
+      },
+      "environment": {
+        "cpus": 2,
+        "memory_mb": 4096,
+        "storage_mb": 10240,
+        "gpus": 0,
+        "build_timeout_sec": 1800.0
+      },
+      "agent_timeout_sec": 28800.0,
+      "verifier_timeout_sec": 1200.0,
+      "oracle_validated": false
+    },
+    {
+      "id": "terminal-bench/vf2-speedup-networkx",
+      "version": "3.2.1",
+      "proposed_split": "holdout",
+      "selection_reason": "Graph algorithm library and API implementation",
+      "public_metadata_sha256": {
+        "tasks/vf2-speedup-networkx/task.toml": "5d91f43a9959cd5ed44bb39f7d37f0b021de12e3829509bf69cd66a3a30a3fc2",
+        "tasks/vf2-speedup-networkx/instruction.md": "18c06496a69be455bf3fc738e3cbfcdc4fd023fea7064a1279182248b1b9a6ae"
+      },
+      "environment": {
+        "cpus": 2,
+        "memory_mb": 8192,
+        "storage_mb": 10240,
+        "gpus": 0,
+        "build_timeout_sec": 600.0
+      },
+      "agent_timeout_sec": 28800.0,
+      "verifier_timeout_sec": 900.0,
+      "oracle_validated": false
+    }
+  ]
+}

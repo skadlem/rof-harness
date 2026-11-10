@@ -86,6 +86,11 @@ async fn output_read_paginates_archived_full_output() {
     )
     .await
     .unwrap();
+    let preview = &result.content[..result.content.len().min(120)];
+    assert!(
+        preview.contains("output handle="),
+        "handle missing from preview: {preview:?}"
+    );
     let handle = result
         .content
         .split("handle=")
@@ -122,6 +127,56 @@ async fn output_read_paginates_archived_full_output() {
     .unwrap();
     assert!(next.content.contains("target-marker"));
     assert!(!result.content.contains("target-marker"));
+}
+
+#[tokio::test]
+async fn failed_archived_test_keeps_verdict_and_handle_in_preview() {
+    let temp = temp_root();
+    let root = temp.join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let tools = experimental_tools(
+        policy(root, true),
+        ExperimentalToolsConfig {
+            output_dir: Some(temp.join("archive")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let check = tools
+        .iter()
+        .find(|t| t.definition().name == "test")
+        .unwrap();
+    let result = invoke(
+        check.as_ref(),
+        serde_json::json!({"cmd":"python3 -c \"import sys; print('X'*9000); print('failed-marker'); sys.exit(1)\""}),
+    )
+    .await
+    .unwrap();
+    let preview = &result.content[..result.content.len().min(120)];
+    assert!(!result.success);
+    assert!(
+        preview.contains("output handle="),
+        "handle missing from preview: {preview:?}"
+    );
+    assert!(preview.contains("\nFAIL:"));
+    let handle = preview
+        .split("handle=")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let read = tools
+        .iter()
+        .find(|t| t.definition().name == "output_read")
+        .unwrap();
+    let page = invoke(
+        read.as_ref(),
+        serde_json::json!({"handle":handle,"offset":9000,"limit":64}),
+    )
+    .await
+    .unwrap();
+    assert!(page.content.contains("failed-marker"));
 }
 
 #[tokio::test]

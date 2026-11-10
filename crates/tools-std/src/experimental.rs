@@ -112,11 +112,15 @@ struct ArchivedExec {
 #[async_trait]
 impl Tool for ArchivedExec {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: if self.test { "test" } else { "exec" }.into(),
-            description: "run an allowlisted command and archive its complete output".into(),
-            schema: cmd_schema(),
-        }
+        let mut definition = if self.test {
+            crate::test_tool(self.policy.clone()).definition()
+        } else {
+            crate::exec_tool(self.policy.clone()).definition()
+        };
+        definition.description.push_str(
+            " Output is archived up to 64 MiB per command; use output_read with the returned handle to retrieve pages or search it.",
+        );
+        definition
     }
     fn prepare(&self, call: &ToolCall) -> CallStatus {
         dispatch(call)
@@ -152,7 +156,7 @@ impl Tool for ArchivedExec {
             String::new()
         };
         Ok(ToolOutcome {
-            content: format!("{prefix}{output}\noutput handle={id}"),
+            content: format!("output handle={id}\n{prefix}{output}"),
             truncated,
             success: ok,
         })

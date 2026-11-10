@@ -15,6 +15,10 @@ The [current evaluation protocol](docs/current-benchmark-pilot.md) targets pinne
 TB4.1.0 CPU tasks. The [Harness Leaderboard review](docs/harness-leaderboard-review.md)
 records useful published references and their benchmark, provider and cost limits.
 
+[Next steps and deferred work](docs/research-next-steps.md) records the active
+experiments, accounting stop, and prerequisites for revisiting deferred ideas.
+Read it when continuing this project in a new session.
+
 [![CI](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml/badge.svg?branch=v2-core)](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 

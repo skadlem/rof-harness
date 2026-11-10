@@ -832,6 +832,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collapsed_archive_observation_remains_retrievable() {
+        struct ArchiveClient(std::sync::atomic::AtomicUsize);
+
+        #[async_trait::async_trait]
+        impl LlmClient for ArchiveClient {
+            async fn complete(&self, _: &str, req: &Request) -> Result<Response, LlmError> {
+                use provider_core::ToolCallRef;
+                use std::sync::atomic::Ordering;
+
+                let mut response = text_resp();
+                response.message.tool_calls = match self.0.fetch_add(1, Ordering::Relaxed) {
+                    0 => vec![ToolCallRef {
+                        id: "archived".into(),
+                        name: "exec".into(),
+                        args: serde_json::json!({"cmd": "python3 -c \"print('x'*9000); print('RECOVERED-END')\""}),
+                    }],
+                    1 => (0..6)
+                        .map(|i| ToolCallRef {
+                            id: format!("view-{i}"),
+                            name: "view".into(),
+                            args: serde_json::json!({"path": format!("note-{i}.txt")}),
+                        })
+                        .collect(),
+                    2 => {
+                        let old = req
+                            .messages
+                            .iter()
+                            .find(|m| m.tool_call_id.as_deref() == Some("archived"))
+                            .expect("archived observation remains in history");
+                        assert!(old.content.starts_with("[collapsed:"));
+                        let handle = old
+                            .content
+                            .split_whitespace()
+                            .find_map(|word| word.strip_prefix("handle="))
+                            .expect("collapsed observation must retain its retrieval handle");
+                        vec![ToolCallRef {
+                            id: "recovered".into(),
+                            name: "output_read".into(),
+                            args: serde_json::json!({"handle": handle, "offset": 9000, "limit": 32}),
+                        }]
+                    }
+                    3 => {
+                        let recovered = req
+                            .messages
+                            .iter()
+                            .find(|m| m.tool_call_id.as_deref() == Some("recovered"))
+                            .expect("output_read result reaches the provider");
+                        assert!(recovered.content.contains("RECOVERED-END"));
+                        Vec::new()
+                    }
+                    _ => panic!("unexpected extra provider request"),
+                };
+                if !response.message.tool_calls.is_empty() {
+                    response.stop = provider_core::StopReason::ToolUse;
+                }
+                Ok(response)
+            }
+        }
+
+        let workdir = tmp().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::write(workdir.join("note.txt"), "hello\n").unwrap();
+        for i in 0..6 {
+            std::fs::write(workdir.join(format!("note-{i}.txt")), "hello\n").unwrap();
+        }
+        let mut args = args_for(&workdir, None);
+        args.archive_output = true;
+        args.exec_policy = tools_std::ExecPolicy::Any;
+        args.incentives = agent_loop::IncentivesLevel::Base;
+        let client = ArchiveClient(std::sync::atomic::AtomicUsize::new(0));
+        let result = execute_with_deadline(&client, &args, None).await;
+        assert!(
+            matches!(result.outcome, Outcome::Done),
+            "{:?}",
+            result.outcome
+        );
+        assert_eq!(client.0.load(std::sync::atomic::Ordering::Relaxed), 4);
+        std::fs::remove_dir_all(workdir).unwrap();
+    }
+
+    #[tokio::test]
     async fn deadline_cancels_the_run_and_still_emits_run_end() {
         // Harbor parity for the eval agent leg: an expired deadline must end the
         // run through the same cancel token Ctrl-C uses, so the loop reports

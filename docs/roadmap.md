@@ -3,6 +3,30 @@
 Ordered and spend-gated. Design decisions anchor to `docs/decisions.md`;
 measured numbers carry a date and live with the run artifacts.
 
+## Output fidelity handoff (2026-11-11)
+
+Capability remains the objective; ≤1.3x tokens per solved task is the guardrail.
+The official CPU reference is TB4.1.0 (63 tasks; release tag `v4.1.0`, commit
+`4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`, verified 2026-11-10). Recheck the
+official release before future spend. The campaign is stopped: eight paid rows
+across three tasks, with one clean WAL pass, three Session Window failures, and
+React treatment interrupted despite native artifact reward 1. The carried
+upper-bound ledger is $2.158150338, including the $0.324172800 unknown-request
+reservation, within the $2.82 ceiling. No paid calls or ledger reset. Details:
+[`current-benchmark-pilot.md`](current-benchmark-pilot.md).
+
+Archive recovery plus Harbor `archive_output` / `shell` are implemented and
+verified locally through end-to-end `output_read`; scoped tests, Clippy and fmt
+passed. Capability remains unmeasured and defaults are unchanged. The
+next work is prepared only: release and hash pinning, free native oracle gate,
+fresh development tasks plus untouched holdouts, and single-knob comparisons of
+existing Harbor controls with `--archive-output on` and `--shell on`. Do not use
+hidden verifier feedback for selection; add independent control resampling only
+when evaluating extra inference. Recipes and the explicit deferred-work register
+are in [`research-next-steps.md`](research-next-steps.md); opt-in controls are
+listed in [`harness-experiments.md`](harness-experiments.md). No new experiment
+result is claimed here.
+
 ## Official DeepSeek campaign (2026-11-10)
 
 The owner authorized a new **$2.82** ceiling on the official DeepSeek account,
