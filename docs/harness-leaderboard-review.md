@@ -31,6 +31,39 @@ trials remain, so historical DeepSWE mixes network conditions.
 
 ## Published reference and limits
 
+### Official Terminal-Bench 4.1 aggregate snapshot
+
+The public Harbor board `terminal-bench/terminal-bench/4-1-0` was fetched at
+2026-11-10 06:10:07 UTC. The raw 35-row response is
+`/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/external-references/tb41-public-outcomes/leaderboard-2026-11-10T061007Z.json`,
+SHA-256 `966e176efb12e88da24ec81bfdbe90affcad628fad331f822d586f24c9e1538e`.
+The displayed `accuracy` values below are already percentages; do not multiply
+them by 100.
+
+| Rank | Published agent | Published model | Effort | Accuracy | Trials |
+|---:|---|---|---|---:|---:|
+| 1 | Claude Code | Opus 5.5 | max | 65.76% | 330 |
+| 2 | Claude Code | Sonnet 5.5 | max | 63.94% | 330 |
+| 3 | Codex | GPT-6.1 Sol | max | 60.91% | 330 |
+
+These are published TB4.1 board aggregates, not task results: the board does not expose
+per-task outcomes or trial IDs, nor a CPU-only score. The local target is the
+63-task CPU slice; do not infer a local task score or a matched ROF comparison
+from these figures. The published names are display aliases, not guaranteed
+checkpoint IDs; no row in this snapshot uses the `DeepSeek Flash` display label.
+The `Release Date` column reads `metadata.date`, not a trial run date, and its
+more specific meaning is undocumented. Do not use those dates to date
+experiments. The three Session Window ROF rows and any single-task WAL result
+cannot be treated as a full-suite score or same-model delta.
+
+Primary source: [official Terminal-Bench 4.1 leaderboard](https://hub.harborframework.com/datasets/terminal-bench/terminal-bench/5?tab=leaderboard&leaderboard=4-1-0).
+The raw response, fetch record, and summary are saved under
+`/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/external-references/tb41-public-outcomes/`
+(`leaderboard-2026-11-10T061007Z.json`,
+`fetch-2026-11-10T061007Z.txt`, and `summary-2026-11-10.md`).
+
+### HF Space payload (TB2.1 and DeepSWE)
+
 The live payload was generated `2026-11-10T00:32:52Z`, version `0.1.2`,
 SHA-256 `9c8a9487146a436054e0be17dec107c2867e82c14cb1119f519de8c5a6b59f5a`;
 cached at `/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/external-references/harness-leaderboard/api-index.json`.
