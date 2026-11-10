@@ -5,6 +5,17 @@ results and same-model comparisons. These switches expose hypotheses for testing
 local regression tests do not establish benchmark improvements. Each switch keeps
 the previous behaviour as its default control.
 
+## Default tool contract
+
+After a trace audit, the built-in tool descriptions were clarified: `exec`
+parses one allowlisted command into argv without a shell, closes stdin, and does
+not support pipes, redirection or command chaining. Quote arguments containing
+spaces. `write` and `edit` operate on paths under the tool root. This is a
+description-only correction; it does not change tool behavior. The frozen pilot
+binary remains SHA-256
+`c9a25f9041e54540e03feeb1079a63f9ed0a3dd08c88d841fc7116af52ba3aab`, and any
+benchmark gain from the wording change is unmeasured.
+
 ## Independent controls
 
 Both `rof run` and `rof eval --agent` accept:

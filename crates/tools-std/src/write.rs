@@ -70,7 +70,7 @@ impl Tool for WriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: TOOL_WRITE.to_string(),
-            description: "create or overwrite a whole file".to_string(),
+            description: "create or overwrite a whole file under the tool root".to_string(),
             schema: write_schema(),
         }
     }

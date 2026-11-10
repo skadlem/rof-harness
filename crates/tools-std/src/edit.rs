@@ -41,7 +41,8 @@ impl Tool for EditTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: TOOL_EDIT.to_string(),
-            description: "replace one hunk in a file; match must be unique".to_string(),
+            description: "replace one hunk in a file under the tool root; match must be unique"
+                .to_string(),
             schema: edit_schema(),
         }
     }

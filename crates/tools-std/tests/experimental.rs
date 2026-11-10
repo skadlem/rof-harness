@@ -602,11 +602,20 @@ async fn process_adds_docker_exec_interactive_flag_and_forwards_input() {
     )
     .await
     .unwrap();
-    let poll = invoke(proc.as_ref(), serde_json::json!({"action":"poll","id":id}))
-        .await
-        .unwrap()
-        .content;
-    assert!(poll.contains("from-container"));
+    let poll = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let poll = invoke(proc.as_ref(), serde_json::json!({"action":"poll","id":id}))
+                .await
+                .unwrap()
+                .content;
+            if poll.contains("from-container") {
+                break poll;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("forwarded process input before deadline");
     assert!(poll.contains("-i fake-container cat"));
     invoke(proc.as_ref(), serde_json::json!({"action":"stop","id":id}))
         .await

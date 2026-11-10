@@ -18,7 +18,7 @@ impl Tool for ExecTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: TOOL_EXEC.to_string(),
-            description: "run an allowlisted command without a shell".to_string(),
+            description: "run one allowlisted command, parsed into argv without a shell. Pipes, redirection and command chaining do not work; stdin is closed. Quote arguments containing spaces. For scripts, write a file under the tool root, then execute it.".to_string(),
             schema: cmd_schema(),
         }
     }
