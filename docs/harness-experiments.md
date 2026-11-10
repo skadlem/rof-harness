@@ -25,6 +25,7 @@ Both `rof run` and `rof eval --agent` accept:
 | `--preserve-failed-checks on` | Keep edits after an executed verification check fails; the check remains failed | off |
 | `--workflow minimal` | Allow exploration before editing; retain normal finish instructions | legacy |
 | `--observation-keep N` | Retain N recent tool observations verbatim | 5 |
+| `--thinking-keep N` | Retain reasoning text for N assistant messages | 2 |
 | `--stall-threshold N` | Notice repeated identical failed checks with unchanged source evidence | 0 (off) |
 | `--archive-output on` | Archive command output and expose paginated retrieval through `output_read` | off |
 | `--shell on` | Add shell composition through the execution wrapper | off |
@@ -40,6 +41,11 @@ host code execution. Pipe sessions do not provide a pseudo-terminal. Repository
 lookup is a text index rather than a semantic call graph. Output archives are
 outside the deliverable workspace; the output retrieval tool accepts run-owned
 handles. Archive limits and omitted bytes must be explicit in returned results.
+
+`--thinking-keep` controls transcript retention. `--keep-thinking` controls
+the provider's thinking-suppression setting. The current WAL pilot's passing
+profile uses observation keep 32 and thinking keep 256; broader replication
+remains pending in the [pilot record](current-benchmark-pilot.md).
 
 Preserving a failing check does not grant proof to its edits. Mutation or policy
 errors retain the existing rollback behaviour. Multi-file editing is not an

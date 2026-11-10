@@ -1,6 +1,6 @@
 # Terminal-Bench 4.1 ROF pilot record
 
-**Purpose.** The completed paid `session-window-debug` slice has three ROF rewards of 0.0. The held-out `wal-recovery-ordering` baseline preregistered as `tb41-wal-control-r1` has launched; its result is pending. The free oracle reward 1.0 validates task and verifier readiness, not ROF capability.
+**Purpose.** Three paid `session-window-debug` runs each received native reward 0.0. The three completed `wal-recovery-ordering` rows received 0.0, 0.0, and 1.0. These are task-level development results, not a Terminal-Bench suite score or a general performance claim.
 
 ## Completed Session Window slice
 
@@ -75,12 +75,41 @@ benchmark comparisons.
 Retire further Session Window tuning. Its three paid rows are complete and all
 scored 0.0; they are the development slice, not a held-out result.
 
-## Preregistered held-out WAL baseline
+## WAL baseline and retention ablations
 
-The preregistered paid row `tb41-wal-control-r1` launched at approximately
-06:14 UTC on 2026-11-10; its result is pending. The successful free oracle
-checks the task/verifier path only; it is not a ROF capability result. The
-pilot gate matched the successful oracle validation record below before launch.
+All three paid WAL rows closed with one completed trial, zero errors, zero
+retries, and native rewards 0.0, 0.0, and 1.0. They used the frozen control
+runtime. The control-to-obs32 comparison changed observation retention from 5
+to 32; the obs32-to-think256 comparison changed thinking retention from 2 to
+256 while observation retention stayed at 32.
+
+| Row | Observation / thinking keep | Native reward | Requests / elapsed | Prompt tokens (cached) | Completion tokens | Peak cost bound |
+|---|---:|---:|---:|---:|---:|---:|
+| `tb41-wal-control-r1` | 5 / 2 | 0.0 | 81 / 531.504 s | 1,193,432 (974,080) | 13,614 | $0.087986880 |
+| `tb41-wal-obs32-r1` | 32 / 2 | 0.0 | 54 / 1,189.307 s | 1,096,555 (348,800) | 109,686 | $0.358042500 |
+| `tb41-wal-obs32-think256-r1` | 32 / 256 | 1.0 | 30 / 997.241 s | 926,061 (328,320) | 55,955 | $0.248438220 |
+
+Prompt, cached and completion counts are sums of receipt usage fields, not
+thinking estimates. Receipt slices are `[231:312]`, `[312:366]`, and `[366:396]`
+for control, obs32, and think256, respectively, in
+`/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/receipts.jsonl`.
+The think256 slice totals 926,061 input tokens (328,320 cached), 55,955 output
+tokens, including 39,012 reasoning tokens.
+Elapsed time, native reward and row status are from
+`/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows/tb41-wal-control-r1-rof-wal-recovery-ordering/manifest.json`
+and
+`/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows/tb41-wal-obs32-r1-rof-wal-recovery-ordering/manifest.json`.
+The think256 row status and native result are recorded in
+`/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows/tb41-wal-obs32-think256-r1-rof-wal-recovery-ordering/manifest.json`.
+The think256 run passed, following two zero-reward controls. Each row has one
+attempt; broader replication is needed before changing defaults. A
+tokens-per-solved-task ratio against the zero-reward controls is undefined.
+
+The thinking-retention follow-up launched at approximately 06:54 UTC on
+2026-11-10 and completed as `AgentCompleted/Passed`. It was the final paid WAL
+arm; further paid WAL tuning is retired. The optional tool-contract runtime
+was not used and remains unmeasured. The free oracle below checks task/verifier
+readiness only, not ROF capability.
 
 - **Pinned source:** Terminal-Bench CPU 4.1.0, tag `v4.1.0`, commit
   `4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`; task
@@ -101,6 +130,14 @@ pilot gate matched the successful oracle validation record below before launch.
   trial, zero retries, 3,600-second internal ROF deadline. Exec policy is
   `any`, steering and streak steering are off, keep-thinking is on, and dirty
   workdirs are allowed.
+- **Observed ablation:** `tb41-wal-obs32-r1` used the same frozen control runtime
+  SHA-256 above and baseline profile, except `observation_keep=32` (baseline
+  5; `thinking_keep=2` remained fixed). The optional tool-contract runtime was
+  not used; its score and any wording effect remain unmeasured.
+- **Thinking-retention follow-up:** `tb41-wal-obs32-think256-r1` uses that same
+  control runtime and obs32 profile, except `thinking_keep=256` (baseline 2).
+  It launched at approximately 06:54 UTC on 2026-11-10 and closed
+  `AgentCompleted/Passed`, with native reward 1.0, no errors, and no retries.
 - **Native task limits:** agent timeout 28,800 seconds; separate verifier
   timeout 1,800 seconds; 2 CPUs, 4,096 MB memory and 10,240 MB storage. These
   limits do not extend ROF's 3,600-second internal deadline.
@@ -126,10 +163,17 @@ pilot gate matched the successful oracle validation record below before launch.
   The matching task manifest and overlay hashes are bound in that validation
   file. This preflight result establishes neither ROF success nor an external
   capability comparison.
-- **Spend guard at preregistration:** carried ledger peak upper bound was
-  $0.868042698 with zero unknown attempts against the existing $2.82 cap.
-  Remaining conservative headroom at that point was $1.951957302. Use peak pricing throughout; do not
-  apply an off-peak discount. These are accounting bounds, not an invoice.
+- **Spend guard:** starting peak upper bound was
+  $0.868042698 with zero unknown attempts against the existing $2.82 cap. The
+  control row moved it to $0.956029578; obs32 closed at $1.314072078. Unknown
+  attempts remain 0 and `denied` is false. Remaining conservative headroom is
+  $1.505927922 at the think256 launch. The final row added $0.248438220 peak
+  bound (counterfactual off-peak estimate $0.124219110), bringing the ledger to
+  $1.562510298 with zero unknown attempts and `denied=false`; remaining
+  conservative headroom is $1.257489702. Use peak pricing, not the
+  counterfactual discount. These are accounting bounds, not an invoice.
+
+Keep these task-level comparisons separate from published full-suite aggregates.
 
 ## Why this version and how to read the result
 

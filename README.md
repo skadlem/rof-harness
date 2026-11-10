@@ -22,11 +22,14 @@ records useful published references and their benchmark, provider and cost limit
 |---|---|---|---|
 | Drives an OpenAI-compatible model through six tools against a scratch workdir, or inside the task's live container, until the work is done or a cap trips | The task's native verifier; Harbor supports separate verifier environments | Provider usage receipts; current selected-task costs are recorded in the evaluation protocol | A framework, a planner, an MCP host, or a hosted service. One binary, one loop |
 
-The current TB4.1 development slice contains three attempts on
-`session-window-debug`, each with native reward **0**. The
+The current TB4.1 development slice has three completed `session-window-debug`
+runs with native reward **0**, and three completed `wal-recovery-ordering`
+runs with native rewards **0 / 0 / 1**. These six task-level outcomes are not
+a score for the 63-task CPU suite or a frontier-performance claim. The
 [pilot record](docs/current-benchmark-pilot.md) includes the fixed recipes,
-receipt counts, and conservative cost bounds. These results do not establish
-a capability gain from changing observation or reasoning retention.
+receipt counts, and conservative cost bounds. The passing WAL profile kept
+32 tool observations and reasoning text for 256 assistant messages. Broader
+replication is next; production defaults remain unchanged.
 
 ![Same cap, more budget: steps climb, passing tests do not](docs/assets/arm-envelope.svg)
 
