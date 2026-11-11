@@ -22,7 +22,7 @@ pub use oracle::{
 };
 pub use report::{
     instance_report, instance_report_with_mode, BudgetShapeLabel, Estimand, ExecPolicyLabel,
-    InstanceReport, RunProvenance, RunReport, APPLY_COMPARABILITY_NOTE,
+    InstanceReport, RunProvenance, RunReport, WorkdirSeedLabel, APPLY_COMPARABILITY_NOTE,
 };
 pub use slices::{
     check_winnability, load_swe_slice, load_tb_slice, slice_path, Instance, SweInstance, ToolCaps,
@@ -527,6 +527,22 @@ mod tests {
     }
 
     #[test]
+    fn a_report_written_before_workdir_seed_reads_as_unknown() {
+        // Every banked report predates the field. It must read as "fidelity
+        // unknown", never as a seed that would pool with a faithful row.
+        let old = r#"{"instances":[],"provenance":{"binary_git_sha":"cd839a9",
+            "estimand":"InContainerReward","budget_tokens":300000,"budget_steps":60,
+            "budget_actions":120,"budget_shape":"Gross","exec_policy":"Any",
+            "apply_mode":"Strict"}}"#;
+        let r: RunReport = serde_json::from_str(old).expect("old report still parses");
+        let p = r.provenance.expect("provenance present");
+        assert_eq!(
+            p.workdir_seed, None,
+            "absent field is unknown, not faithful"
+        );
+    }
+
+    #[test]
     fn run_report_provenance_round_trips() {
         let r = RunReport {
             instances: vec![],
@@ -539,6 +555,7 @@ mod tests {
                 budget_actions: 120,
                 budget_shape: BudgetShapeLabel::MissPlusOut,
                 exec_policy: ExecPolicyLabel::Any,
+                workdir_seed: Some(WorkdirSeedLabel::ImageApp),
                 reasoning_effort: Some("max".into()),
                 steer: Some(true),
                 apply_mode: ApplyMode::Strict,
@@ -550,6 +567,7 @@ mod tests {
         assert_eq!(v["provenance"]["budget_steps"], 60);
         assert_eq!(v["provenance"]["budget_actions"], 120);
         assert_eq!(v["provenance"]["budget_shape"], "MissPlusOut");
+        assert_eq!(v["provenance"]["workdir_seed"], "ImageApp");
         assert_eq!(v["provenance"]["exec_policy"], "Any");
         assert_eq!(v["provenance"]["apply_mode"], "Strict");
         let back: RunReport = serde_json::from_value(v).unwrap();

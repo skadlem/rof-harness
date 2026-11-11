@@ -799,6 +799,15 @@ pub(crate) fn finish_report(args: &EvalArgs, reports: Vec<eval::InstanceReport>)
             budget_actions,
             budget_shape: budget_shape_for(args),
             exec_policy: exec_policy_for(args),
+            // The seed is campaign-level: in-container copies the image's
+            // /app, every other path copies `<task>/environment`, which is the
+            // Docker build context. Recording it is what stops a future
+            // triage from re-deriving fidelity from commit dates.
+            workdir_seed: args.agent.then_some(if args.in_container {
+                eval::WorkdirSeedLabel::ImageApp
+            } else {
+                eval::WorkdirSeedLabel::BuildContext
+            }),
             reasoning_effort: args.reasoning_effort.clone(),
             steer: Some(args.steer),
             apply_mode: apply_mode_for(args),

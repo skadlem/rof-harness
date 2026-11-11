@@ -89,6 +89,16 @@ pub struct RunProvenance {
     /// never pool in one table. Required field: a provenance block without
     /// it fails loudly rather than silently reading as `Allowlist`.
     pub exec_policy: ExecPolicyLabel,
+    /// How the agent's workdir was seeded. This is the field whose ABSENCE
+    /// voided 169 of 183 banked in-container rows: with the build-context seed
+    /// the verifier tests structurally could not move, so those rows cannot
+    /// answer a capability question at all. `ImageApp` copies the task image's
+    /// `/app` (the workspace the verifier grades); `BuildContext` copies
+    /// `<task>/environment`, which is the Docker build context and on several
+    /// tasks is not the graded workspace. The two never pool. `None` = a report
+    /// written before the field existed, i.e. fidelity unknown.
+    #[serde(default)]
+    pub workdir_seed: Option<WorkdirSeedLabel>,
     /// `reasoning_effort` level the agent leg sent on every request, if any.
     /// `None` = endpoint default (the frozen recipe); not a required field,
     /// so report files written before the knob existed read as "none sent",
@@ -112,6 +122,15 @@ pub struct RunProvenance {
 pub enum ExecPolicyLabel {
     Allowlist,
     Any,
+}
+
+/// Report-side spelling of the workdir seed (see `RunProvenance::workdir_seed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkdirSeedLabel {
+    /// `cp -a /app/.` from the task image: the graded workspace.
+    ImageApp,
+    /// `<task>/environment`, the Docker build context: not the graded workspace.
+    BuildContext,
 }
 
 /// Report-side spelling of the token-cap shape (`Gross` = input+output,
