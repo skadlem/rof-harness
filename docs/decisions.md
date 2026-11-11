@@ -719,3 +719,94 @@ says so explicitly.
   So: this harness solves ordinary mid-difficulty tasks at this model tier and
   does not solve the three legacy "headroom" cells — which is a statement about
   the cells, not about a missing harness lever.
+
+- **A `$` cap that cannot fire is a configuration error, not a warning (2026-11-11).**
+  The `UnattendedBatch` preset arms a $4 cap for every `rof run`, but an unpriced model
+  reports `cost_usd: None`, so `record_spend_cents` is skipped and the cap can never trip —
+  the run looks guarded and is not. `cli::budget_for` now returns `Err` for that
+  combination and the run exits 7 before any provider request; the eval leg aborts the
+  campaign (exit 2) rather than emitting a slab of `InfraFailure` rows. 20 driver
+  invocations pass the vLLM gateway id that `pricing.rs` deliberately leaves unpriced
+  ("rate anchor never invented ... no endpoint dimension"), so the escape is an explicit
+  `--allow-inert-spend-cap` (run and eval, default off) recorded in
+  `RunProvenance.run_config` so opted-out rows cannot pool with guarded ones. No rate was
+  invented for that endpoint. [measured: `cargo test -p rof` 89 green + a mutation proof
+  that reverting the eval-leg forwarding fails `flags_parse_and_fill_agent_args`; live
+  probe: unpriced exits 7 with no provider call, priced reaches the provider]
+
+- **The budget/envelope axis is closed on measured evidence (2026-11-11).** Three arms,
+  all null or void: miss-plus-out alone 0/4 solves at 1.42x cost (`budget-shape-ab1`);
+  the joint arm (miss-plus-out + 120/240 steps, same 300k value) 0/4 cell-reps, guardrail
+  1.79x/3.05x, its registered KILL triggered, and its deepest row halted `done` at 113
+  steps with 73,508 of the cap unspent (`dphn-cap-ab1`, since marked VOID for a
+  workspace-fidelity defect); raising steps at a fixed token cap bought 0/10 -> 2/10, then
+  7/10 died on the token cap. A 253-dump replay shows the cap that kills is cumulative
+  across ~27-40 requests of ~11k tokens, i.e. not a context rule, and the 2026 evidence
+  says budget and information SUBSTITUTE rather than complement (BRA Table 5: 21/36
+  interactions negative, none positive). A decision review chose a re-run arm; it was
+  superseded the same day once the checklist result entered the brief. [measured:
+  docs/experiments/2026-11-11-envelope.json, docs/experiments/2026-11-11-lit-semantic-deliverable.md,
+  docs/reviews/decision-2026-11-11-1134.md]
+
+- **The completion-checklist lever is rerun-context specific, not a general lever
+  (2026-11-11).** Arm 1 converted `mcmc-sampling-stan` 5/6 -> 6/6 SOLVED at fewer gross
+  tokens per test passed, with path-robustness code appearing 11-12x in checklist
+  deliverables vs 0-1x in controls — the project's first capability-positive row. Arm 2
+  then applied the byte-identical checklist to three requirement-shaped cells plus the
+  regression cell (16/16 rows): no named test flipped anywhere, flat tokens, registered
+  KILL triggered. The lever converts a deliverable-verification defect (a script that
+  works where it was written but not where an evaluator runs it) and does nothing for
+  accuracy or correctness gaps. Note the delivery-form constraint: the banked arms used a
+  task copy whose `instruction.md` carried the checklist; the phase plan requires original
+  instructions and graders unchanged, so promotion would need harness-side goal text.
+  [measured: research/goal-checklist-ab1.md, both arms; the file is local-only — see the
+  provenance note below]
+
+- **A `--completion-check` predicate has no reachable trigger on this corpus
+  (2026-11-11).** A zero-cost triage of 242 banked rows (183 in-container) found that of
+  the 12 post-fix rows, every one that reaches `done` already passes, and no post-fix row
+  both declares done and fails — the failing rows die on the token cap mid-work (raman 0/3
+  at 30 steps, session-window-debug 4/9 at 107, wal 1/2 at 81). The cells a predicate could
+  target are accuracy-bound: custom-memory-heap-crash (6 named tests never passed by any
+  arm), query-optimize (5), video-processing (3), session-window-debug (3),
+  make-mips-interpreter (3), mcmc (1), each including its deepest-envelope row. The
+  headline "32 false rejections" is a capture artifact, not predicate error: 0 of 14
+  git-snapshotted passing workspaces are rejected against 32 of 33 files-only captures.
+  [measured: docs/experiments/2026-11-11-triage.md; failure class justified from public
+  `instruction.md` only, never from test files or verifier stderr]
+
+- **Spend stays banked; the binding constraint moved from the harness to the evidence base
+  (2026-11-11).** Five levers are closed (envelope x3, checklist, predicate), so the next
+  dollar cannot buy a capability answer on this slice. Rival per-task rows exist on disk
+  for exactly 2 tasks (session-window-debug, layout-config-recreation2) x 2 harnesses x 3
+  reps; only 12 of 183 in-container rows are post-fix. A same-model comparison therefore
+  needs task count, not another internal arm. Balance is $3.12, a fresh top-up — not a
+  remainder and not a reset of the earlier $2.519179098 upper bound. [measured: triage
+  header, rival tree inventory; chosen: triage-first spend order]
+
+- **`RunProvenance` records how the workdir was seeded (2026-11-11).** 169 of 183 banked
+  in-container rows were unusable for any capability question because the agent was seeded
+  from `<task>/environment` — the Docker build context — rather than the image's `/app`
+  that the verifier grades, and nothing in the report said which. `workdir_seed` now
+  records `ImageApp` or `BuildContext`; it is optional with a serde default so every
+  pre-field report reads as unknown, never as faithful, and never pools with one.
+
+- **Container egress to `github.com` was blocked by routing, not by the tasks
+  (2026-11-11).** Two oracle pre-flights on `break-filter-js-from-html` scored 0 with
+  `curl: (35) Recv failure` on the uv tarball and `uvx: command not found`; 18 of 21
+  Slice A graders bootstrap uv from `astral.sh` -> `github.com`. The host downloaded the
+  same 21,370,871-byte file fine. Cause: `ip rule 31269: not from all fwmark 0xcb6b lookup
+  52075`, where table 52075 is a full-tunnel `default dev laptop`; host traffic is marked
+  and goes direct, container traffic is unmarked and enters a tunnel that cannot serve
+  `20.205.243.166`, while other GitHub edges (`140.82.121.4`) work. One root rule restored
+  parity: `ip rule add to 20.205.243.0/24 lookup main pref 31000`; a container then fetched
+  the tarball byte-identically. This also explains the historical "verifier network errors
+  at grading" rows on install-windows and mteb. [measured: two oracle runs, `ip rule`/route
+  inspection, in-container host matrix]
+
+**Provenance note (2026-11-11).** `research/` is excluded via `.git/info/exclude`, so
+`research/DECISIONS.md` and the arm reports it cites never reach this repository. The
+strategy-level decisions above are therefore repeated here, in the tracked log, with the
+artifact paths that *are* tracked. A session that reads only `research/DECISIONS.md` and
+never this file is missing the reviewable record, and vice versa — both exist on purpose,
+but only this one survives a clone.
