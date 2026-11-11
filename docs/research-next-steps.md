@@ -22,7 +22,11 @@ reference is Terminal-Bench CPU 4.1.0 (63 tasks, tag `v4.1.0`, commit
 `4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`, verified 2026-11-10). The latest official release was rechecked as v4.1.0 on 2026-11-11 before the
 bounded continuation; recheck again for later campaigns.
 
-The original official-account ledger remains unchanged. The owner authorized a
+**Ledger update 2026-11-11:** the account balance is **$3.12**, a fresh top-up the
+owner authorises spending when needed (with a standing instruction to be mindful).
+The campaign figures below stand as history and are neither reset nor reused.
+Spend order is triage-first: no paid arm until the zero-cost classification of
+banked in-container rows names a qualifying cell. The original official-account ledger remains unchanged. The owner authorized a
 new subledger capped at $0.661849662, preserving the old $2.158150338 upper bound
 (including its $0.324172800 unknown reservation) under the total $2.82 ceiling.
 The new campaign also stopped: Cargo control artifact 0.0, 26 forwarded calls,
@@ -162,7 +166,7 @@ calls or runtime changes occurred. Transfer to ROF remains unmeasured.
 | Source-backed facts in checkpoints | [SJC, 2610.20927](https://arxiv.org/abs/2610.20927) identifies compressor-authored plans being reused as facts. The current `context::SUMMARY_PROMPT` asks for key decisions and next steps. Preserve source IDs for observed facts and distinguish hypotheses and planned actions. | Test continuation against unchanged history before enabling compaction. Provenance is not correctness, and aggressive filtering can remove useful correct entries; do not simply delete every unquoted statement. The source's judge adds inference cost. |
 | Separate discovery from deployment admission | [ParetoSaddler, 2611.02079](https://arxiv.org/abs/2611.02079) keeps useful intermediate candidates even when they temporarily violate deployment cost preferences. In Appendix A, the local cost safeguard is disabled because fixing premature termination can increase useful work. Keep such configurations as research candidates rather than discarding them immediately. | The existing total USD ceiling remains hard. Default promotion still requires held-out capability evidence and the 1.3x tokens-per-solved guardrail. Retaining a candidate is not permission to spend on it or deploy it. |
 | Measure rescue and harm, including baseline successes | [MemDev-Bench, 2610.27524](https://arxiv.org/abs/2610.27524) evaluates both Improvement and Preservation tasks. Raw histories preserve process information that compressed memories omit; useful memories can also regress otherwise solvable tasks. Record both baseline-fail/treatment-pass and baseline-pass/treatment-fail transitions for context or procedure experiments. | Select tasks and splits before observing treatment outcomes. These measures generalize as an evaluation design, not as a predicted memory benefit. Do not reopen retired task tuning merely to add a preservation case. |
-| Separate context capacity from cumulative token allowance | Code inspection: `agent-loop::checkpoint` passes `state.budget.config().max_tokens` into `context::compaction_due`, which compares one prompt estimate with a fraction of that run-wide allowance. Those quantities serve different purposes. Before enabling compaction, define the actual input-window capacity and reserve output headroom independently. | A scripted-provider check should vary the run allowance at fixed context capacity and vice versa. This is an inferred design gap in a default-off feature, not an observed cause of the pilot's failures. |
+| Separate context capacity from cumulative token allowance | **Fixed** (verified 2026-11-11): `agent-loop/src/request.rs:445-448` passes `context_capacity_tokens - output_reserve_tokens` into `context::compaction_due`, and `--compaction` requires both `--context-capacity` and `--output-reserve`. The earlier inspection (run-wide `max_tokens` reaching `compaction_due`) no longer describes the code. | Remaining check: a scripted-provider test should vary the run allowance at fixed context capacity and vice versa. Still a default-off feature with no benchmark result. |
 
 These are candidates, not a scheduled sweep. The unchanged control costs no new
 implementation effort but cannot establish whether these mechanisms help. Start
