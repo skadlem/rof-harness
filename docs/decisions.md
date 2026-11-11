@@ -2,8 +2,8 @@
 
 Current continuation: the
 [phased capability plan](superpowers/plans/2026-11-11-capability-phases.md)
-records paper-driven additions, ownership and evidence gates. Phases 0–2 are
-implemented and locally verified; phases 3–4 remain conditional. The
+records paper-driven additions, ownership and evidence gates. Phases 0–4 are
+implemented and locally verified; efficacy/default admission remain conditional. The
 [implementation record](phase-0-2-implementation.md) documents contracts, including
 the decision to reject composing completion predicates with the existing review
 stage until their shared repair allowance is specified. Historical entries retain

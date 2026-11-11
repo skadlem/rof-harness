@@ -17,12 +17,13 @@ TB4.1.0 CPU tasks. The [Harness Leaderboard review](docs/harness-leaderboard-rev
 records useful published references and their benchmark, provider and cost limits.
 
 [Next steps and deferred work](docs/research-next-steps.md) records the active
-experiments, accounting stop, and prerequisites for revisiting deferred ideas.
+experiments, accounting policy, and prerequisites for revisiting deferred ideas.
 Read it when continuing this project in a new session.
 The [phased implementation plan](docs/superpowers/plans/2026-11-11-capability-phases.md)
 defines Luna worker ownership, dependencies, interfaces and validation gates.
-Phases 0–2 add paired reporting, Harbor controls, repository evidence and bounded
-public completion checks; see the [implementation record](docs/phase-0-2-implementation.md).
+Phases 0–4 add paired reporting, Harbor controls, repository evidence, bounded
+public completion checks, historical retrieval and capacity/source checkpoints;
+see the [implementation record](docs/phase-3-5-implementation.md).
 These opt-in additions have no new external benchmark results.
 
 [![CI](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml/badge.svg?branch=v2-core)](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml)

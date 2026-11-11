@@ -11,7 +11,7 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
@@ -21,7 +21,9 @@ pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--work
 --reasoning-effort LEVEL (none|low|high|xhigh|max): send `reasoning_effort` on every request (default: none sent = endpoint default). DeepSeek docs (2026-11-09) list low/high/max and default high; xhigh maps to high. The 2026-10-19 one-prompt api.deepseek.com probe did not detect an effect; that result is historical, not universal. The vLLM gateway probe measured 0/722/1060/1149/2976 reasoning tokens for none/low/high/xhigh/max
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget
 --exec-policy allowlist|any: command-allowlist policy for exec/test. `any` skips the list entirely and is for callers whose process boundary is elsewhere (in-container eval wraps exec as `docker exec <container>`, so the allowlist is not a boundary there, only capability loss); the choice is recorded in the report provenance so relaxed rows never pool with strict rows
---compaction FRAC: checkpoint the older context once the estimate crosses FRAC of the token budget (0 < FRAC <= 1). OFF-BY-DEFAULT and UNVALIDATED: the S-1 compaction experiment has not run yet, so leave it unset unless running that experiment.
+--compaction FRAC: opt-in checkpoint above FRAC of usable context capacity (0 < FRAC <= 1); requires explicit --context-capacity and --output-reserve >= max(initial output,32768), below capacity. Cumulative run token allowance is separate. Default off, unvalidated.
+--checkpoint-sources on|off: opt-in fact/hypothesis/plan checkpoint labels with original source IDs; requires --compaction
+--history-read on|off: opt-in read-only retrieval from current primary WAL, with IDs in collapsed observations; incompatible with --no-log or --review on (default off)
 --thinking-keep N: echoed-reasoning rows kept per assistant message (flag wins over THINKING_KEEP; unset leaves the loop default)
 --collapse-hysteresis N: collapse-boundary hysteresis rows (flag wins over COLLAPSE_HYSTERESIS; unset leaves the loop default)
 --allow-dirty-workdir: run inside a dirty git workdir (default: refuse; allowed dirt appears in the reported patch)
@@ -85,6 +87,10 @@ pub(crate) struct Args {
     pub bets: bool,
     /// Compaction trigger fraction; `None` = checkpoint off (default).
     pub compaction: Option<f64>,
+    pub context_capacity: Option<u64>,
+    pub output_reserve: Option<u64>,
+    pub checkpoint_sources: bool,
+    pub history_read: bool,
     /// Fold knobs: `None` = leave the loop default (`RunConfig::default`).
     /// Flags win over `THINKING_KEEP` / `COLLAPSE_HYSTERESIS`, resolved once
     /// at the edge by [`apply_env_defaults`]; the loop never reads the env.
@@ -195,6 +201,10 @@ struct RunBuilder {
     incentives: Option<agent_loop::IncentivesLevel>,
     bets: bool,
     compaction: Option<f64>,
+    context_capacity: Option<u64>,
+    output_reserve: Option<u64>,
+    checkpoint_sources: Option<bool>,
+    history_read: Option<bool>,
     thinking_keep: Option<usize>,
     collapse_hysteresis: Option<usize>,
     allow_dirty_workdir: bool,
@@ -507,6 +517,34 @@ fn set_compaction(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
+fn set_context_capacity(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let n = v
+        .unwrap_or_default()
+        .parse::<u64>()
+        .map_err(|_| "--context-capacity needs a positive integer")?;
+    if n == 0 {
+        return Err("--context-capacity must be > 0".into());
+    }
+    b.context_capacity = Some(n);
+    Ok(())
+}
+fn set_output_reserve(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.output_reserve = Some(
+        v.unwrap_or_default()
+            .parse::<u64>()
+            .map_err(|_| "--output-reserve needs a nonnegative integer")?,
+    );
+    Ok(())
+}
+fn set_checkpoint_sources(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.checkpoint_sources = Some(parse_toggle("--checkpoint-sources", v)?);
+    Ok(())
+}
+fn set_history_read(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.history_read = Some(parse_toggle("--history-read", v)?);
+    Ok(())
+}
+
 fn set_thinking_keep(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
     let s = v.unwrap_or_default();
     b.thinking_keep = Some(
@@ -538,6 +576,26 @@ fn set_pass_env(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
 }
 
 const RUN_FLAGS: &[Flag<RunBuilder>] = &[
+    Flag {
+        name: "--context-capacity",
+        takes_value: true,
+        set: set_context_capacity,
+    },
+    Flag {
+        name: "--output-reserve",
+        takes_value: true,
+        set: set_output_reserve,
+    },
+    Flag {
+        name: "--checkpoint-sources",
+        takes_value: true,
+        set: set_checkpoint_sources,
+    },
+    Flag {
+        name: "--history-read",
+        takes_value: true,
+        set: set_history_read,
+    },
     Flag {
         name: "--preserve-failed-checks",
         takes_value: true,
@@ -771,6 +829,29 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
     if b.completion_check.is_some() && b.review {
         return Err("--completion-check cannot be combined with --review on".into());
     }
+    if b.history_read.unwrap_or(false) && b.no_log {
+        return Err("--history-read on requires the current run WAL; remove --no-log".into());
+    }
+    if b.history_read.unwrap_or(false) && b.review {
+        return Err("--history-read cannot be combined with --review on; history is bound to the primary run".into());
+    }
+    if b.checkpoint_sources.unwrap_or(false) && b.compaction.is_none() {
+        return Err("--checkpoint-sources requires --compaction".into());
+    }
+    if b.compaction.is_some() {
+        let capacity = b
+            .context_capacity
+            .ok_or("--compaction requires --context-capacity")?;
+        let reserve = b
+            .output_reserve
+            .ok_or("--compaction requires --output-reserve")?;
+        let maximum_output = b.max_tokens.unwrap_or(8000).max(32768) as u64;
+        if reserve >= capacity || reserve < maximum_output {
+            return Err(format!(
+                "--output-reserve must be >= {maximum_output} and below --context-capacity"
+            ));
+        }
+    }
     Ok(Args {
         goal: b.goal.ok_or("missing --goal")?,
         context_files: b.context_files,
@@ -798,6 +879,10 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         incentives: b.incentives.unwrap_or(agent_loop::IncentivesLevel::Full),
         bets: b.bets,
         compaction: b.compaction,
+        context_capacity: b.context_capacity,
+        output_reserve: b.output_reserve,
+        checkpoint_sources: b.checkpoint_sources.unwrap_or(false),
+        history_read: b.history_read.unwrap_or(false),
         thinking_keep: b.thinking_keep,
         collapse_hysteresis: b.collapse_hysteresis,
         allow_dirty_workdir: b.allow_dirty_workdir,
@@ -942,6 +1027,7 @@ pub(crate) fn run_config(args: &Args) -> RunConfig {
         incentives: args.incentives,
         proof_cmd: args.proof_cmd.clone(),
         completion_check: args.completion_check.clone(),
+        history_read: args.history_read,
         steer: args.steer,
         streak_steer: args.streak_steer,
         preserve_failed_checks: args.preserve_failed_checks,
@@ -954,6 +1040,9 @@ pub(crate) fn run_config(args: &Args) -> RunConfig {
     cfg.collapse_hysteresis = args.collapse_hysteresis.unwrap_or(dflt.collapse_hysteresis);
     cfg.budget_shape = args.budget_shape.unwrap_or(dflt.budget_shape);
     cfg.log_path = resolve_log_path(args);
+    cfg.compaction.context_capacity_tokens = args.context_capacity;
+    cfg.compaction.output_reserve_tokens = args.output_reserve.unwrap_or(0);
+    cfg.compaction.checkpoint_sources = args.checkpoint_sources;
     if let Some(frac) = args.compaction {
         cfg.compaction.enabled = true;
         cfg.compaction.frac = frac;
@@ -1005,6 +1094,10 @@ mod tests {
             "/tmp/w.log",
             "--compaction",
             "0.6",
+            "--context-capacity",
+            "131072",
+            "--output-reserve",
+            "32768",
         ]))
         .unwrap();
         assert_eq!(
@@ -1036,6 +1129,10 @@ mod tests {
                 proof_cmd: None,
                 completion_check: None,
                 compaction: Some(0.6),
+                context_capacity: Some(131072),
+                output_reserve: Some(32768),
+                checkpoint_sources: false,
+                history_read: false,
                 thinking_keep: None,
                 collapse_hysteresis: None,
                 allow_dirty_workdir: false,
@@ -1558,6 +1655,45 @@ mod tests {
                 .streak_steer
         );
         assert!(parse_args(&run_min(&["--streak-steer", "invalid"])).is_err());
+    }
+
+    #[test]
+    fn history_and_compaction_controls_validate_capacity_and_logging() {
+        assert!(parse_args(&run_min(&["--history-read", "on"])).is_ok());
+        assert!(parse_args(&run_min(&["--history-read", "on", "--no-log"])).is_err());
+        assert!(parse_args(&run_min(&[
+            "--compaction",
+            "0.7",
+            "--context-capacity",
+            "131072",
+            "--output-reserve",
+            "32768",
+            "--checkpoint-sources",
+            "on"
+        ]))
+        .is_ok());
+        assert!(parse_args(&run_min(&["--compaction", "0.7"])).is_err());
+        assert!(parse_args(&run_min(&[
+            "--compaction",
+            "0.7",
+            "--context-capacity",
+            "131072",
+            "--output-reserve",
+            "8000"
+        ]))
+        .is_err());
+        assert!(parse_args(&run_min(&[
+            "--compaction",
+            "0.7",
+            "--context-capacity",
+            "131072",
+            "--output-reserve",
+            "32768",
+            "--max-tokens",
+            "65536"
+        ]))
+        .is_err());
+        assert!(parse_args(&run_min(&["--checkpoint-sources", "on"])).is_err());
     }
 
     #[test]

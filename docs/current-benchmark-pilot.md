@@ -9,6 +9,11 @@ accounting were incomplete. The WAL row is the only clean completed ROF pass.
 These are task-level development results, not a Terminal-Bench suite score or
 a general performance claim.
 
+The original ledger and unknown request below remain unchanged. A later owner
+instruction authorized bounded continuation in a separate subledger under the
+same total $2.82 ceiling; see the [phase 3–5 record](phase-3-5-implementation.md).
+Its new runtime/results must not be pooled with this frozen historical pilot.
+
 ## Completed Session Window slice
 
 - Dataset package: `terminal-bench/terminal-bench-cpu@4.1.0`; Terminal-Bench tag `v4.1.0`, commit `4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`.

@@ -1,9 +1,9 @@
 # ROF capability improvements: phased implementation plan
 
-**Status:** phases 0–2 implemented and locally verified from clean reference `411846d`;
-phases 3–6 remain conditional or spend-gated. The output-fidelity foundation is
-complete. The owner authorized phases 0–2 on 2026-11-11. No paid runs are part of
-this implementation. Reference provenance is recorded in the
+**Status:** phases 0–4 implemented and locally verified from clean reference `411846d`;
+phase 5 bounded development work is authorized, phase 6 remains evidence-gated. The output-fidelity foundation is
+complete. The owner authorized phases 0–2, then phases 3–5 on 2026-11-11. Paid development
+runs require the bounded continuation and preflight below. Reference provenance is recorded in the
 [manifest](../../experiments/2026-11-11-phases-0-2-reference.json).
 
 **Goal:** improve externally verified coding-task completion through better
@@ -33,18 +33,20 @@ Harbor/Pydantic for adapter checks, and the existing Docker task runner.
 - Capability is primary. The 1.3x tokens-per-solved guardrail governs default
   admission, not whether a promising development candidate can be retained.
   The authorized USD cap and all outstanding reservations remain hard limits.
-- The current campaign is stopped: one unknown request; $2.158150338 upper bound
-  **includes** its $0.324172800 reservation, within $2.82. No paid phase starts
-  until accounting is reconciled under the existing stop rule. Never reset it.
+- The original campaign remains stopped and unchanged: its $2.158150338 upper
+  bound includes the $0.324172800 unknown reservation. The owner explicitly
+  authorized bounded continuation in a new subledger capped at $0.661849662;
+  aggregate reservations/spend cannot exceed $2.82. Never reset the old ledger
+  or claim its unknown request reconciled; a new unknown stops the new campaign.
 - Verify current official benchmark release before future spend. TB4.1.0 CPU is
   the last verified pin, not an assertion about the latest release on execution day.
 - Research input remains unchanged. Preserve historical results and frozen pilot
   binaries; build and hash a new runtime for each new code comparison.
 
-Chosen ordering: **0 → 1 → 2 → 5 → 6**. Phase 3 joins only when traces show a
-historical-evidence recovery problem. Phase 4 joins only when a compaction
-experiment is justified. Neither conditional phase blocks earlier benchmark
-comparisons. Implementation checks are free of model calls; phase 5 is spend-gated.
+Original experiment ordering: **0 → 1 → 2 → 5 → 6**. By subsequent explicit owner
+request, phases 3–4 are implemented/off before phase 5. Demonstrated historical
+evidence loss and prompt pressure still gate efficacy experiments with those
+mechanisms. They do not enter the initial lookup comparison. Implementation checks are free of model calls; phase 5 is spend-gated.
 
 ## Team and parallel-work contracts
 
@@ -277,6 +279,26 @@ remaining source review/fixes and reran the finish gates. No paid benchmark or
 capability improvement is claimed. See the
 [implementation record](../../phase-0-2-implementation.md) for provenance/limits.
 
+## Execution update after the phase 0–2 recheck (2026-11-11)
+
+The owner explicitly requested phases 3–5 after re-verification and a push.
+Re-verification passed (323 Rust tests, 21 Python tests, scoped lint/format gates),
+and both the independent Luna review and dedicated `codex review --commit`
+found no actionable defects. The dedicated review's Python invocation had an
+environment/import error; the prescribed Python environments passed separately.
+The requested push was rejected by automatic approval review because this
+session requires approval for the operation while its approval policy is `never`.
+No remote CI result is attributed to the local commit.
+
+The owner request authorizes building phases 3–4 as complete, default-off
+experimental features now. Their original observed-need gates below remain
+requirements for efficacy experiments/default admission, not claims established
+by implementation fixtures. The sampled historical actors did not demonstrate
+irrecoverable historical evidence or context-limit pressure. Chosen synthetic
+mutation/pressure fixtures validate mechanics only. The owner then explicitly
+revised the stop to allow bounded continuation with the full old reservation
+preserved. The [phase 3–5 record](../../phase-3-5-implementation.md) is current.
+
 ## Phase 3 — conditional historical restoration
 
 **Gate:** actor traces show necessary historical observations cannot be recovered
@@ -296,26 +318,26 @@ host-supplied and fixed to the current run; `RunConfig.history_read: bool = fals
 controls rendering metadata. CLI/Harbor `history_read` defaults off. The tool is
 `history_read({item_id: string, offset?: integer, limit?: integer})`.
 
-- [ ] Bind the resolved current WAL path at registry construction and read it
+- [x] Bind the resolved current WAL path at registry construction and read it
   only during the primary run, after existing WAL rotation has completed;
   refuse `--history-read on` with `--no-log`. Bind it to the primary run only;
   do not accidentally expose previous archived WALs or the review phase log.
-- [ ] Treat `Item.id` as WAL-local: fresh runs reuse IDs such as `item-5`.
+- [x] Treat `Item.id` as WAL-local: fresh runs reuse IDs such as `item-5`.
   The fixed WAL prevents reading an older run, but an unqualified ID cannot
   distinguish colliding names across runs. Advertise current `Item.id` values
   in collapsed tool-result stubs only
   when enabled, preserving their existing output archive handles. Never rewrite
   old durable rows or assistant/tool-call associations.
-- [ ] Resolve only `ItemKind::ToolResult` in the fixed current WAL. The model
+- [x] Resolve only `ItemKind::ToolResult` in the fixed current WAL. The model
   supplies no path. Return a historical marker, original item/call IDs, sequence,
   observation time, original error status, and a bounded page of stored text.
   A successful lookup of an originally failed command is a successful lookup,
   not a newly failed command to replay or roll back.
-- [ ] Use 8,000 characters by default, at most 32,768 per page. Bound source log
+- [x] Use 8,000 characters by default, at most 32,768 per page. Bound source log
   size before whole-log loading (chosen 64 MiB initial ceiling); return a clear
   limit result rather than unbounded memory use. Respect cancellation. These
   chosen limits are validated by focused boundary tests, not paper constants.
-- [ ] Test mutated-file history versus current reads, unknown IDs, non-tool IDs,
+- [x] Test mutated-file history versus current reads, unknown IDs, non-tool IDs,
   prior-WAL isolation despite colliding local IDs, paging, malformed/torn logs,
   disabled defaults, and append-only
   retrieval through the actual loop. No original command is executed again.
@@ -346,18 +368,18 @@ its caller supplies usable input capacity, never the cumulative run allowance.
 CLI names: `--context-capacity N`, `--output-reserve N`; adapter equivalents use
 the same names with underscores.
 
-- [ ] Require known positive capacity and a reserve below capacity when
+- [x] Require known positive capacity and a reserve below capacity when
   compaction is requested. Unknown model capacity must not be guessed from its
   name. Explicit old compaction calls need these new values; document this
   intentional validation change to the experimental path.
-- [ ] Trigger at `estimate > frac * (capacity - reserve)`. Validate the reserve
+- [x] Trigger at `estimate > frac * (capacity - reserve)`. Validate the reserve
   against the largest output allocation permitted by the active provider retry
   profile, including a starting cap above its escalation ceiling. Keep spend
   and token accounting in the unchanged run-wide BudgetGuard.
   For the current OpenAI-compatible client that maximum is
   `max(initial_max_tokens, 32768)`. Root supplies this knowledge at CLI/provider
   wiring; the generic loop cannot inspect a nonexistent provider-profile API.
-- [ ] Test fixed capacity/varying total allowance, fixed allowance/varying
+- [x] Test fixed capacity/varying total allowance, fixed allowance/varying
   capacity, insufficient generation headroom, invalid values, disabled-path
   equivalence, and metered summary usage. Expose the compaction fraction through
   Harbor only with the validated capacity/reserve controls.
@@ -388,18 +410,18 @@ messages use `None`. The context owner freezes that field before loop consumers
 start. The loop must construct IDs alongside its ordered source items before
 `compact_view` loses them; an injected earlier checkpoint has no invented item ID.
 
-- [ ] Add `checkpoint_sources: bool = false` to `CompactionConfig`, CLI
+- [x] Add `checkpoint_sources: bool = false` to `CompactionConfig`, CLI
   `--checkpoint-sources on|off`, and the Harbor boolean. Keep the original
   summary format as the control after 4A so provenance is an isolated treatment.
-- [ ] Include that explicit ID/content mapping in the summarizer view; request
+- [x] Include that explicit ID/content mapping in the summarizer view; request
   these entries in plain
   generated JSON. Resolve fact references to eligible original user/tool records.
   Unknown/unattributed claims remain labelled hypotheses rather than established
   facts. Preserve useful plans under their own label; do not delete every claim
   that lacks a quotation or accept an ID as proof its interpretation is correct.
-- [ ] A malformed response leaves history intact and records a refused
+- [x] A malformed response leaves history intact and records a refused
   checkpoint. Never let parse failure erase the only recoverable history.
-- [ ] Test exact IDs, unknown IDs, conflicting hypotheses, user requirements,
+- [x] Test exact IDs, unknown IDs, conflicting hypotheses, user requirements,
   malformed output, protected recent tool groups, and unchanged default format.
   Charge the existing summary call; add no source-judging model call.
 
@@ -412,8 +434,8 @@ judge efficacy and automatic memory learning remain deferred.
 runtime/config hashes and results independently, without reading hidden feedback
 into the solving agent or sharing the live credential.
 
-- [ ] Reconcile the stopped accounting state before any paid request; verify
-  remaining headroom under the preserved cap/reservations. Recheck official
+- [x] Preserve the stopped accounting state and obtain explicit owner revision
+  allowing a new subledger within verified remaining cap/reservations. Recheck official
   release/task relevance and freeze all exclusions before outcomes are viewed.
 - [ ] Obtain complete pinned tasks, check actual disk/build footprint, run native
   oracle readiness checks and an appropriate known-bad artifact control, and bind

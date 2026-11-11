@@ -7,8 +7,8 @@ implemented and verified locally, including end-to-end recovery through
 but its provider attempt and accounting were incomplete. These selected-task
 results do not establish general capability improvement. Other experimental
 tool mechanisms remain unmeasured on benchmark tasks, and defaults remain in
-force. See [`research-next-steps.md`](research-next-steps.md) for the spend
-stop and prepared recipes, and
+force. See [`research-next-steps.md`](research-next-steps.md) for the bounded
+continuation policy and prepared recipes, and
 [`superpowers/plans/2026-11-11-capability-phases.md`](superpowers/plans/2026-11-11-capability-phases.md)
 for the phased evaluation plan.
 
@@ -36,7 +36,9 @@ The `rof run` command exposes the following experimental controls. The native
 Harbor adapter (`tools/harbor_rof.py`) currently forwards
 `max_tokens`, `observation_keep`, `thinking_keep`, `preserve_failed_checks`,
 `archive_output`, `shell`, `workflow`, `reasoning_effort`, `repo_lookup`,
-`repo_evidence`, `collapse_hysteresis`, and `completion_check`. The legacy
+`repo_evidence`, `collapse_hysteresis`, `completion_check`, `history_read`,
+`compaction`, `context_capacity`, `output_reserve`, and `checkpoint_sources`.
+The adapter also accepts the native task `workdir` (default `/app`). The legacy
 `rof eval --agent` path is separate and does not currently pass
 `thinking_keep` into its run configuration. The remaining listed features are
 not Harbor adapter options; do not treat their presence in the ROF CLI as
@@ -57,17 +59,28 @@ paragraphs below identify the separate adapter and legacy-eval limitations.
 | `--repo-lookup on` | Add bounded literal occurrences and heuristic test-file classification | off |
 | `--repo-evidence on` | Group literal, definition, test-path and configuration candidates; requires lookup | off |
 | `--completion-check CMD` | Run the exact public predicate on Done, with at most one repair continuation and two checks | none |
+| `--history-read on` | Restore a historical observation from the current primary WAL; advertises IDs on collapsed results | off |
+| `--checkpoint-sources on` | Label checkpoint facts, hypotheses and plans against the exact supplied source prefix | off |
 | `--multi-edit on` | Validate a set of file edits before applying them | off |
 | `--review on` | Run one fresh-context review and, for a concrete finding, one repair continuation | off |
 | `--procedure-file PATH` | Load an applicable procedure with a recorded content digest (repeatable) | none |
 
-`--compaction FRAC` also exists on `rof run`, default off. Its current trigger
-compares prompt size against a fraction of the cumulative token allowance;
-capacity/headroom correction is planned before any compaction efficacy run.
-The legacy eval CLI does not expose thinking retention, collapse hysteresis,
-or compaction. Evidence mode and completion checks are also run/native-Harbor
-controls only. Historical restoration, capacity controls and source-backed
-checkpoints remain planned, not shipped.
+`--compaction FRAC` stays off by default. Enabling it requires a positive
+`--context-capacity N` and `--output-reserve N` below capacity and at least the
+active provider output ceiling (`max(initial_max_tokens, 32768)`). The trigger
+uses `FRAC * (capacity - reserve)`; cumulative run allowance is separate.
+`--checkpoint-sources on` independently labels sourced facts, hypotheses and
+plans; it requires compaction. Malformed summaries preserve history and still
+charge summary usage. Resolving an eligible source ID does not prove a claim.
+
+`--history-read on` restores historical ToolResults from the current primary WAL;
+collapsed stubs advertise current WAL-local IDs. It preserves archive handles,
+never replays commands, and rejects `--no-log` or `--review on`. Pages are bounded
+in characters (8,000 default, 32,768 maximum) and input logs at 64 MiB. Historical
+error status is metadata, not a failure of a successful lookup. These controls
+also have underscore-named Harbor equivalents. The legacy eval CLI does not
+expose them or thinking retention/collapse hysteresis. See the
+[phase 3–5 record](phase-3-5-implementation.md) for limits and source mapping.
 
 Pipe sessions, multi-edit, review and procedure loading remain outside this
 Harbor adapter. New controls remain off by default and unmeasured on external

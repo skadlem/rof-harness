@@ -7,26 +7,27 @@ measured numbers carry a date and live with the run artifacts.
 
 The active [phased plan](superpowers/plans/2026-11-11-capability-phases.md)
 implements the direct paper audit through disjoint GPT-6 Luna workers and root
-integration. Phases 0–2 are implemented and locally verified: pinned reference, offline paired
+integration. Phases 0–4 are implemented and locally verified: pinned reference, offline paired
 reporting, Harbor lookup/hysteresis, repository evidence and public completion
-checks. The [implementation record](phase-0-2-implementation.md) gives contracts
+checks, historical restoration and capacity/source checkpoints. The
+[implementation record](phase-3-5-implementation.md) gives contracts
 and limitations. Existing archive recovery and Harbor archive/shell forwarding
 remain the foundation; no benchmark effect is established for these additions.
 
 Order: freeze contracts/reference → offline paired reporting and existing Harbor
 controls → evidence-aware lookup plus a targeted public completion predicate →
 controlled development runs → held-out confirmation. Historical restoration is
-conditional on demonstrated evidence loss; capacity-correct compaction and source
-annotations are a separate conditional phase. These phases do not add runtime
+implemented/off; demonstrated evidence loss and prompt pressure still gate
+experiments with restoration or compaction/provenance. These phases do not add runtime
 subagents or a planner. No new benchmark result is claimed by this plan.
 
 Report rescue and harm, retain budget-limited failures, and distinguish artifact
 reward from run completion and accounting. Promising development candidates may
 be retained above the deployment token ratio; production admission still requires
 held-out capability evidence and the 1.3x guardrail. The existing USD ceiling and
-campaign accounting stop remain hard constraints.
+the revised bounded-continuation accounting policy remain hard constraints.
 
-The proposed four-task slice remains metadata-only and is not a suite score or
+The proposed four-task slice is a convenience pilot and is not a suite score or
 certified historically unseen holdout. Recheck official release relevance,
 actual disk/image capacity, native oracle readiness and preserved accounting
 before any paid run. Deferred items and revisit criteria remain in the
@@ -37,12 +38,14 @@ before any paid run. Deferred items and revisit criteria remain in the
 Capability remains the objective; ≤1.3x tokens per solved task is the guardrail.
 The official CPU reference is TB4.1.0 (63 tasks; release tag `v4.1.0`, commit
 `4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`, verified 2026-11-10). Recheck the
-official release before future spend. The campaign is stopped: eight paid rows
-across three tasks, with one clean WAL pass, three Session Window failures, and
-React treatment interrupted despite native artifact reward 1. The carried
-upper-bound ledger is $2.158150338, including the $0.324172800 unknown-request
-reservation, within the $2.82 ceiling. No paid calls or ledger reset. Details:
-[`current-benchmark-pilot.md`](current-benchmark-pilot.md).
+official release before future spend. The original campaign stopped with one unknown request. On 2026-11-11 the owner
+explicitly authorized a new bounded continuation subledger capped at $0.661849662,
+preserving the $2.158150338 carried upper bound (including the $0.324172800 unknown
+reservation) under the unchanged $2.82 total ceiling. The old attempt remains
+incomplete and its ledger unchanged. The first new development comparison is
+original lookup versus no lookup; all new history/compaction knobs stay off.
+Details: [current continuation](phase-3-5-implementation.md) and
+[historical pilot](current-benchmark-pilot.md).
 
 Archive recovery plus Harbor `archive_output` / `shell` are implemented and
 verified locally through end-to-end `output_read`; scoped tests, Clippy and fmt

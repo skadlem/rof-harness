@@ -1478,8 +1478,13 @@ async fn cancel_during_provider_complete_aborts_promptly_as_cancelled() {
     let mut emitter = Emitter::new();
     let cancel = CancellationToken::new();
     let fired = cancel.clone();
+    let observed = client.requests.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait for provider admission, not a wall-clock guess that can fire
+        // during the initial snapshot on a busy machine.
+        while observed.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         fired.cancel();
     });
     let started = Instant::now();

@@ -30,6 +30,29 @@ fn policy(root: PathBuf, allow_any_cmd: bool) -> Arc<Policy> {
     })
 }
 
+fn write_history(path: &std::path::Path, content: &str, is_error: bool) {
+    let header = serde_json::json!({
+        "seq": 1, "id": "item-1", "parent_id": null,
+        "recorded_at": {"secs_since_epoch": 1, "nanos_since_epoch": 0},
+        "kind": "Header", "version": 1, "session_id": "current",
+        "cwd": "/repo", "model": "test"
+    });
+    let result = serde_json::json!({
+        "seq": 2, "id": "item-2", "parent_id": "item-1",
+        "recorded_at": {"secs_since_epoch": 2, "nanos_since_epoch": 0},
+        "kind": "ToolResult", "call_id": "call-2", "content": content,
+        "is_error": is_error, "recovery": null
+    });
+    std::fs::write(path, format!("{}\n{}\n", header, result)).unwrap();
+}
+
+fn history_tool(tools: &[Arc<dyn Tool>]) -> &Arc<dyn Tool> {
+    tools
+        .iter()
+        .find(|t| t.definition().name == "history_read")
+        .expect("history_read registered")
+}
+
 async fn invoke(
     tool: &dyn Tool,
     args: serde_json::Value,
@@ -43,6 +66,266 @@ async fn invoke(
         panic!("dispatch")
     };
     tool.execute(inv, CancellationToken::new()).await
+}
+
+#[test]
+fn history_read_is_absent_by_default_and_does_not_change_default_tool_count() {
+    let tools = experimental_tools(
+        policy(temp_root(), false),
+        ExperimentalToolsConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(tools.len(), 6);
+    assert!(!tools.iter().any(|t| t.definition().name == "history_read"));
+}
+
+#[tokio::test]
+async fn history_registry_binds_missing_current_wal_before_writer_creates_it() {
+    let temp = temp_root();
+    let wal = temp.join("created-after-registry.jsonl");
+    let tools = experimental_tools(
+        policy(temp, false),
+        ExperimentalToolsConfig {
+            history_log: Some(wal.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    write_history(&wal, "created by current writer", false);
+    let result = invoke(
+        history_tool(&tools).as_ref(),
+        serde_json::json!({"item_id":"item-2"}),
+    )
+    .await
+    .unwrap();
+    assert!(result.content.contains("created by current writer"));
+}
+
+#[tokio::test]
+async fn history_read_returns_fixed_wal_observation_after_current_file_changes() {
+    let temp = temp_root();
+    let root = temp.join("repo");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("state.txt"), "current observation").unwrap();
+    let wal = temp.join("current.jsonl");
+    write_history(&wal, "old observation: λambda", true);
+    let tools = experimental_tools(
+        policy(root.clone(), false),
+        ExperimentalToolsConfig {
+            history_log: Some(wal.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    std::fs::write(root.join("state.txt"), "new observation").unwrap();
+
+    let historical = invoke(
+        history_tool(&tools).as_ref(),
+        serde_json::json!({"item_id":"item-2"}),
+    )
+    .await
+    .unwrap();
+    assert!(historical.success);
+    assert!(historical.content.contains("historical"));
+    assert!(historical.content.contains("item_id=item-2"));
+    assert!(historical.content.contains("call_id=call-2"));
+    assert!(historical.content.contains("seq=2"));
+    assert!(historical.content.contains("is_error=true"));
+    assert!(historical.content.contains("old observation: λambda"));
+
+    let view = tools
+        .iter()
+        .find(|t| t.definition().name == "view")
+        .unwrap();
+    let current = invoke(view.as_ref(), serde_json::json!({"path":"state.txt"}))
+        .await
+        .unwrap();
+    assert!(current.content.contains("new observation"));
+    assert!(!current.content.contains("old observation"));
+}
+
+#[tokio::test]
+async fn history_read_pages_by_unicode_characters_and_rejects_oversize_page() {
+    let temp = temp_root();
+    let wal = temp.join("current.jsonl");
+    write_history(&wal, &format!("{}END", "🧪".repeat(40_000)), false);
+    let tools = experimental_tools(
+        policy(temp.clone(), false),
+        ExperimentalToolsConfig {
+            history_log: Some(wal),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let default_page = invoke(
+        history_tool(&tools).as_ref(),
+        serde_json::json!({"item_id":"item-2"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(default_page.content.matches("🧪").count(), 8_000);
+    assert!(default_page.truncated);
+    assert!(invoke(
+        history_tool(&tools).as_ref(),
+        serde_json::json!({"item_id":"item-2","limit":32769}),
+    )
+    .await
+    .is_err());
+    let first = invoke(
+        history_tool(&tools).as_ref(),
+        serde_json::json!({"item_id":"item-2","limit":32768}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.content.matches("🧪").count(), 32768);
+    let next = invoke(
+        history_tool(&tools).as_ref(),
+        serde_json::json!({"item_id":"item-2","offset":32768,"limit":8000}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next.content.matches("🧪").count(), 7232);
+    assert!(next.content.contains("END"));
+}
+
+#[tokio::test]
+async fn history_read_rejects_unknown_and_non_tool_item_ids() {
+    let temp = temp_root();
+    let wal = temp.join("current.jsonl");
+    write_history(&wal, "captured", false);
+    let tools = experimental_tools(
+        policy(temp, false),
+        ExperimentalToolsConfig {
+            history_log: Some(wal),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for id in ["missing", "item-1"] {
+        let result = invoke(
+            history_tool(&tools).as_ref(),
+            serde_json::json!({"item_id":id}),
+        )
+        .await;
+        assert!(result.is_err(), "{id} must not resolve to a tool result");
+    }
+}
+
+#[tokio::test]
+async fn history_read_uses_only_configured_wal_when_ids_collide() {
+    let temp = temp_root();
+    let current = temp.join("current.jsonl");
+    let previous = temp.join("previous.jsonl");
+    write_history(&current, "current WAL", false);
+    write_history(&previous, "previous WAL", false);
+    let tools = experimental_tools(
+        policy(temp.clone(), false),
+        ExperimentalToolsConfig {
+            history_log: Some(current),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let result = invoke(
+        history_tool(&tools).as_ref(),
+        serde_json::json!({"item_id":"item-2"}),
+    )
+    .await
+    .unwrap();
+    assert!(result.content.contains("current WAL"));
+    assert!(!result.content.contains("previous WAL"));
+}
+
+#[tokio::test]
+async fn history_read_accepts_torn_final_row_but_rejects_middle_corruption() {
+    let temp = temp_root();
+    let wal = temp.join("current.jsonl");
+    write_history(&wal, "captured", false);
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&wal)
+        .unwrap()
+        .write_all(b"{torn")
+        .unwrap();
+    let tools = experimental_tools(
+        policy(temp.clone(), false),
+        ExperimentalToolsConfig {
+            history_log: Some(wal.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let result = invoke(
+        history_tool(&tools).as_ref(),
+        serde_json::json!({"item_id":"item-2"}),
+    )
+    .await
+    .unwrap();
+    assert!(result.content.contains("captured"));
+
+    let valid = std::fs::read_to_string(&wal).unwrap();
+    let lines: Vec<_> = valid.lines().collect();
+    std::fs::write(&wal, format!("{}\n{{bad}}\n{}\n", lines[0], lines[1])).unwrap();
+    assert!(invoke(
+        history_tool(&tools).as_ref(),
+        serde_json::json!({"item_id":"item-2"}),
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn history_read_rejects_oversized_log_and_honors_cancellation() {
+    let temp = temp_root();
+    let wal = temp.join("large.jsonl");
+    let file = std::fs::File::create(&wal).unwrap();
+    file.set_len(64 * 1024 * 1024 + 1).unwrap();
+    let tools = experimental_tools(
+        policy(temp, false),
+        ExperimentalToolsConfig {
+            history_log: Some(wal),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let tool = history_tool(&tools);
+    let call = ToolCall {
+        call_id: "cancel-history".into(),
+        name: "history_read".into(),
+        args: serde_json::json!({"item_id":"item-2"}),
+    };
+    let CallStatus::Dispatch(inv) = tool.prepare(&call) else {
+        panic!("dispatch")
+    };
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    assert!(tool.execute(inv, cancel).await.is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn history_read_refuses_a_symlink_current_wal() {
+    use std::os::unix::fs::symlink;
+    let temp = temp_root();
+    let target = temp.join("target.jsonl");
+    let link = temp.join("current.jsonl");
+    write_history(&target, "must not follow", false);
+    symlink(&target, &link).unwrap();
+    let tools = experimental_tools(
+        policy(temp, false),
+        ExperimentalToolsConfig {
+            history_log: Some(link),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(invoke(
+        history_tool(&tools).as_ref(),
+        serde_json::json!({"item_id":"item-2"}),
+    )
+    .await
+    .is_err());
 }
 
 #[test]

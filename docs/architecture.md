@@ -23,8 +23,9 @@ task; offline distillation and two-candidate helpers live under `tools/`.
 The [phased capability plan](superpowers/plans/2026-11-11-capability-phases.md)
 records the implementation sequence. Phases 0–2 add offline paired reporting,
 Harbor controls, opt-in repository evidence and an opt-in public completion
-predicate. Historical observation restoration, capacity controls and checkpoint
-provenance remain conditional, unimplemented phases. The completion predicate
+predicate. Historical observation restoration, explicit capacity controls and checkpoint
+provenance are also implemented, default off; their empirical need and benchmark
+benefit remain unestablished. The completion predicate
 uses the existing policy-checked `test` dispatch, not the host proof executor or
 the hidden native verifier. It shares the original budget and permits one repair
 continuation/two checks; it cannot be combined with the separate review stage.
@@ -185,10 +186,10 @@ inside the task container. Neither path currently provides crash resume.
 
 ## Not inferable from code
 
-- Why the compaction trigger (`--compaction`) remains off-by-default and
-  unvalidated: the existing trigger uses a cumulative allowance instead of
-  context capacity. Capacity and source-provenance work is conditional Phase 4
-  of the linked plan; no compaction efficacy run is scheduled before that gate.
+- Whether compaction improves coding capability: its trigger now uses explicit
+  context capacity/output reserve and optional source-labelled summaries, but
+  efficacy remains unmeasured. Observed prompt pressure is still required before
+  scheduling its benchmark experiment; implementation tests do not establish it.
 - Why `FailureKind::Provider` keeps the historical exit code 3 instead of
   a dedicated one.
 - The intended scope/timeline of Bet C (candidate racing); the code only

@@ -158,6 +158,7 @@ fn msg(role: &str, chars: usize) -> CompactMessage {
     CompactMessage {
         role: role.into(),
         content: "x".repeat(chars),
+        source_item_id: None,
     }
 }
 
@@ -187,15 +188,66 @@ fn compaction_due_is_strict_and_disabled_never_fires() {
         enabled: true,
         frac: 0.5,
         keep_tokens: 20_000,
+        context_capacity_tokens: Some(256_000),
+        output_reserve_tokens: 32_768,
+        checkpoint_sources: false,
     };
-    assert!(!compaction_due(100_000, 200_000, &cfg), "at the threshold");
-    assert!(compaction_due(100_001, 200_000, &cfg), "just above");
-    assert!(!compaction_due(99_999, 200_000, &cfg), "just below");
+    assert!(
+        !compaction_due(111_616, 223_232, &cfg),
+        "at the usable-capacity threshold"
+    );
+    assert!(compaction_due(111_617, 223_232, &cfg), "just above");
+    assert!(!compaction_due(111_615, 223_232, &cfg), "just below");
     let off = CompactionConfig {
         enabled: false,
         ..cfg
     };
     assert!(!compaction_due(u64::MAX, 1, &off));
+}
+
+#[test]
+fn compaction_requires_known_valid_capacity_and_uses_supplied_usable_capacity() {
+    let base = CompactionConfig {
+        enabled: true,
+        frac: 0.5,
+        keep_tokens: 20_000,
+        context_capacity_tokens: Some(100_000),
+        output_reserve_tokens: 20_000,
+        checkpoint_sources: false,
+    };
+    assert!(!compaction_due(40_000, 80_000, &base));
+    assert!(compaction_due(40_001, 80_000, &base));
+    // Total run allowance is intentionally irrelevant to this API.
+    assert!(!compaction_due(40_000, 80_000, &base));
+    assert!(!compaction_due(
+        1_000_000,
+        80_000,
+        &CompactionConfig {
+            context_capacity_tokens: None,
+            ..base.clone()
+        }
+    ));
+    assert!(!compaction_due(
+        1_000_000,
+        80_000,
+        &CompactionConfig {
+            context_capacity_tokens: Some(0),
+            ..base.clone()
+        }
+    ));
+    assert!(!compaction_due(
+        1_000_000,
+        80_000,
+        &CompactionConfig {
+            output_reserve_tokens: 100_000,
+            ..base.clone()
+        }
+    ));
+    assert!(!compaction_due(
+        40_001,
+        80_001,
+        &CompactionConfig { ..base }
+    ));
 }
 
 /// The cut walks back until the kept tail reaches the budget and lands on
@@ -230,6 +282,7 @@ fn summary_payload_caps_tool_results_only() {
         CompactMessage {
             role: "assistant".into(),
             content: "short".into(),
+            source_item_id: None,
         },
     ]);
     assert!(payload.starts_with("[user]: xxxx\n\n[tool]: x"));
@@ -239,6 +292,87 @@ fn summary_payload_caps_tool_results_only() {
     assert_eq!(payload.matches('x').count(), 4 + SUMMARY_TOOL_CAP);
     let small = summary_payload(&[msg("tool", 10)]);
     assert_eq!(small, format!("[tool]: {}", "x".repeat(10)));
+}
+
+#[test]
+fn checkpoint_renderer_labels_claims_and_optional_source_ids() {
+    let rendered = render_checkpoint(&[
+        CheckpointEntry {
+            kind: CheckpointKind::Fact,
+            text: "The public API stays stable".into(),
+            source_item_ids: vec!["item-7".into()],
+        },
+        CheckpointEntry {
+            kind: CheckpointKind::Hypothesis,
+            text: "The build failure may be transient".into(),
+            source_item_ids: vec![],
+        },
+        CheckpointEntry {
+            kind: CheckpointKind::Plan,
+            text: "Run the context tests".into(),
+            source_item_ids: vec![],
+        },
+    ]);
+    assert!(rendered.contains("[fact] sources=[\"item-7\"]: The public API stays stable"));
+    assert!(rendered.contains("[hypothesis]: The build failure may be transient"));
+    assert!(rendered.contains("[plan]: Run the context tests"));
+}
+
+#[test]
+fn source_mapping_is_opt_in_and_legacy_payload_stays_identical() {
+    let messages = [
+        CompactMessage {
+            role: "user".into(),
+            content: "Keep the public API stable".into(),
+            source_item_id: Some("item-7".into()),
+        },
+        CompactMessage {
+            role: "assistant".into(),
+            content: "I will preserve it".into(),
+            source_item_id: None,
+        },
+    ];
+    assert_eq!(
+        summary_payload(&messages),
+        "[user]: Keep the public API stable\n\n[assistant]: I will preserve it"
+    );
+    let mapped = summary_payload_with_sources(&messages);
+    assert!(mapped.contains("[user] [source \"item-7\"]: Keep the public API stable"));
+    assert!(mapped.contains("[assistant] [source: unavailable]: I will preserve it"));
+}
+
+#[test]
+fn checkpoint_parser_resolves_fact_ids_and_preserves_untrusted_claims() {
+    let response = r#"{"entries":[
+      {"kind":"fact","text":"The API must remain stable","source_item_ids":["item-7"]},
+      {"kind":"fact","text":"Unknown source claim","source_item_ids":["item-missing"]},
+      {"kind":"fact","text":"Unattributed claim","source_item_ids":[]},
+      {"kind":"hypothesis","text":"The failure may be a missing package","source_item_ids":["item-7"]},
+      {"kind":"hypothesis","text":"The failure may be a bad environment","source_item_ids":["item-7"]},
+      {"kind":"plan","text":"Run the focused tests","source_item_ids":[]}
+    ]}"#;
+    let entries = parse_checkpoint(response, &["item-7".into()]).unwrap();
+    assert_eq!(entries[0].kind, CheckpointKind::Fact);
+    assert_eq!(entries[0].source_item_ids, ["item-7"]);
+    assert_eq!(entries[1].kind, CheckpointKind::Hypothesis);
+    assert!(entries[1].source_item_ids.is_empty());
+    assert_eq!(entries[2].kind, CheckpointKind::Hypothesis);
+    assert_eq!(entries[3].kind, CheckpointKind::Hypothesis);
+    assert_eq!(entries[4].kind, CheckpointKind::Hypothesis);
+    assert_eq!(entries[5].kind, CheckpointKind::Plan);
+    assert_eq!(entries[5].text, "Run the focused tests");
+}
+
+#[test]
+fn malformed_checkpoint_is_refused_and_unresolved_fact_references_are_filtered() {
+    assert!(parse_checkpoint("not json", &["item-7".into()]).is_err());
+    let entries = parse_checkpoint(
+        r#"{"entries":[{"kind":"fact","text":"Partly sourced","source_item_ids":["item-7","missing"]}]}"#,
+        &["item-7".into()],
+    )
+    .unwrap();
+    assert_eq!(entries[0].kind, CheckpointKind::Hypothesis);
+    assert_eq!(entries[0].source_item_ids, ["item-7"]);
 }
 
 fn file_map_tmp(prefix: &str) -> std::path::PathBuf {

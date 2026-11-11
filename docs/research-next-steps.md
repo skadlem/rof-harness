@@ -3,11 +3,12 @@
 **Active execution reference:** the
 [phased implementation plan](superpowers/plans/2026-11-11-capability-phases.md)
 assigns subagents, freezes additive contracts, and defines per-phase gates for
-the direct paper audit below. Phases 0–2 are implemented and locally verified; phases 3–4
-remain conditional and paid phase 5 remains stopped. The
-[implementation record](phase-0-2-implementation.md) documents new contracts and
-reference provenance. Use the plan order for new work; output-fidelity changes
-remain the foundation.
+the direct paper audit below. Phases 0–4 are implemented and locally verified,
+with all new mechanisms opt-in. Phase 5 uses the owner's bounded continuation
+revision below; source/oracle readiness and matched rows remain required.
+The [phase 0–2 record](phase-0-2-implementation.md) and
+[phase 3–5 record](phase-3-5-implementation.md) distinguish implementation,
+chosen fixtures, historical outcomes and current campaign evidence.
 
 ## Objective and current state
 
@@ -17,18 +18,19 @@ at or below 1.3x the matched reference; development candidates can be retained
 above that ratio without being promoted or authorized for additional spend.
 Cost is not the objective. Current external
 reference is Terminal-Bench CPU 4.1.0 (63 tasks, tag `v4.1.0`, commit
-`4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`, verified 2026-11-10). Verify the
-official release again before any future spend.
+`4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`, verified 2026-11-10). The latest official release was rechecked as v4.1.0 on 2026-11-11 before the
+bounded continuation; recheck again for later campaigns.
 
-The current official-account campaign is stopped. Eight paid rows cover three
-tasks: three Session Window failures, three WAL rows (0, 0, 1), and React control
-plus interrupted retention treatment. Only the WAL think-retention row is a
-clean ROF pass; React treatment has native artifact reward 1 but incomplete
-provider usage, so it is not a completed agent result. This is task-level
-evidence, not a suite score. The carried upper bound is **$2.158150338**, which
-includes the **$0.324172800** unknown-request reservation, against the existing
-**$2.82** ceiling. Do not make paid calls or reset the ledger. See
-[`current-benchmark-pilot.md`](current-benchmark-pilot.md).
+The original official-account campaign remains stopped and unchanged. Its eight
+paid rows cover three tasks; WAL is the only clean completed pass, while React's
+reward-1 artifact has unknown provider usage. The owner explicitly authorized
+bounded continuation on 2026-11-11 while retaining the full old reservation.
+A new subledger may spend/reserve at most **$0.661849662**, the difference between
+the **$2.82** total ceiling and the carried **$2.158150338** upper bound (already
+including **$0.324172800** for the unknown request). Never reset the old ledger or
+claim it reconciled. A new unknown stops the new subledger. See the
+[phase 3–5 record](phase-3-5-implementation.md); historical outcomes remain in the
+[pilot record](current-benchmark-pilot.md).
 
 ROF's pilot internal deadline is 3,600s; the task-agent allowance is 28,800s.
 Verifier budgets are separate and task-specific (for example, WAL 1,800s and
@@ -108,12 +110,13 @@ performed for this preparation.
 
 ## Deferred work register
 
-All proposals stay out of the default runtime. Existing opt-in code is marked
+All new proposals stay out of the default runtime. Historical restoration and
+capacity/source checkpoints are now implemented/off; their observed-need gates
+remain unestablished. Existing opt-in code is marked
 implemented/off; other proposals are not built. Revisit only at the stated gate.
 The direct paper-summary audit below adds candidates and qualifications to these
-gates; it does not implement or promote them. Historical observation restoration
-is conditional Phase 3; capacity and checkpoint provenance are conditional Phase
-4. Cross-run memory, trained predictors, automatic search, and runtime MAS remain
+gates; it does not promote them. Their mechanics were implemented by explicit
+owner request; efficacy remains conditional. Cross-run memory, trained predictors, automatic search, and runtime MAS remain
 outside that plan. A targeted public completion predicate in Phase 2 is distinct
 from the deferred general review/reflection policy.
 

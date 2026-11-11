@@ -3,8 +3,10 @@
 **Historical implementation record:** this document covers the twelve proposals
 scheduled on 2026-11-07. Their bounded implementations shipped as described below.
 The current [phased capability plan](superpowers/plans/2026-11-11-capability-phases.md)
-adds the paper-audit work; phases 0–2 are implemented and locally verified. It does not imply that new
-history, completion-predicate or checkpoint contracts already exist.
+adds the paper-audit work; phases 0–4 are implemented and locally verified.
+Current history, completion-predicate and checkpoint contracts are documented
+in the [phase 3–5 record](phase-3-5-implementation.md); the earlier contracts
+below retain their original date and scope.
 
 Chosen implementation plan, 2026-11-07. The owner approved implementing the twelve
 proposals using GPT-6 Luna workers. These are experimental mechanisms, not measured

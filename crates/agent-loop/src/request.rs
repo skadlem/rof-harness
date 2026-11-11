@@ -57,6 +57,7 @@ impl LoopState {
         hysteresis: usize,
     ) -> Vec<ProviderMessage> {
         let mut out = Vec::new();
+        let mut tool_item_ids = Vec::new();
         for item in &self.items {
             match &item.kind {
                 ItemKind::Input { text, .. } => out.push(ProviderMessage {
@@ -91,13 +92,16 @@ impl LoopState {
                 }
                 ItemKind::ToolResult {
                     call_id, content, ..
-                } => out.push(ProviderMessage {
-                    role: "tool".into(),
-                    content: content.clone(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: Some(call_id.clone()),
-                    thinking: None,
-                }),
+                } => {
+                    tool_item_ids.push(item.id.as_str());
+                    out.push(ProviderMessage {
+                        role: "tool".into(),
+                        content: content.clone(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: Some(call_id.clone()),
+                        thinking: None,
+                    });
+                }
                 _ => {}
             }
         }
@@ -123,12 +127,20 @@ impl LoopState {
         // H=0 moves it one row per fold (collapse-5); hysteresis H batches the
         // move to once per H rows so the untouched prefix stays cache-hittable.
         let boundary = context::collapse_boundary(tool_idx.len(), cfg.observation_keep, hysteresis);
-        for &i in &tool_idx[..boundary] {
+        for (n, &i) in tool_idx[..boundary].iter().enumerate() {
             // Bytes at fold time + a 120-char head: enough to tell the
             // observation apart from a re-read of the file.
             let bytes = out[i].content.len();
             let head: String = out[i].content.chars().take(120).collect();
-            out[i].content = format!("[collapsed: {bytes}b — re-open to edit] {head}");
+            let restore = if cfg.history_read {
+                format!(
+                    " item_id={}; use history_read for the historical observation",
+                    tool_item_ids[n]
+                )
+            } else {
+                String::new()
+            };
+            out[i].content = format!("[collapsed: {bytes}b — re-open to edit{restore}] {head}");
         }
         out
     }
@@ -361,14 +373,50 @@ pub(crate) fn compact_view(messages: &[ProviderMessage]) -> Vec<context::Compact
             context::CompactMessage {
                 role: m.role.clone(),
                 content,
+                source_item_id: None,
             }
         })
         .collect()
 }
 
+/// Associate the ordered fold with eligible original records before the
+/// compact view drops log identity. A prior checkpoint has no new source ID.
+pub(crate) fn checkpoint_view(
+    state: &LoopState,
+    folded: &[ProviderMessage],
+) -> Vec<context::CompactMessage> {
+    let original_ids = state
+        .items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            ItemKind::Input { source, .. } => {
+                Some(if *source == agent_log::InputSource::External {
+                    Some(item.id.clone())
+                } else {
+                    None
+                })
+            }
+            ItemKind::ToolResult { .. } => Some(Some(item.id.clone())),
+            ItemKind::Assistant { .. } => Some(None),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let ids = match &state.checkpoint {
+        Some(prior) => std::iter::once(None)
+            .chain(original_ids.into_iter().skip(prior.keep_from))
+            .collect::<Vec<_>>(),
+        None => original_ids,
+    };
+    let mut view = compact_view(folded);
+    for (message, id) in view.iter_mut().zip(ids) {
+        message.source_item_id = id;
+    }
+    view
+}
+
 /// Compaction checkpoint at the step head: estimate the folded context from
 /// the last settled request's usage plus chars/4 for what followed, and when
-/// it crosses `budget_tokens * frac` replace the older prefix with ONE
+/// it crosses `usable_context_capacity * frac` replace the older prefix with ONE
 /// summarizer call's output. Returns true when a checkpoint was applied.
 ///
 /// The summary call is metered like any other request (tokens, spend, run
@@ -387,9 +435,17 @@ pub(crate) async fn checkpoint<P: LlmClient>(
         return false;
     }
     let folded = state.derived_messages(cfg);
-    let view = compact_view(&folded);
+    let view = if cc.checkpoint_sources {
+        checkpoint_view(state, &folded)
+    } else {
+        compact_view(&folded)
+    };
     let estimate = context::estimate_tokens(&view, state.anchor.as_ref());
-    if !context::compaction_due(estimate, state.budget.config().max_tokens, cc) {
+    let capacity = cc
+        .context_capacity_tokens
+        .and_then(|total| total.checked_sub(cc.output_reserve_tokens))
+        .unwrap_or(0);
+    if !context::compaction_due(estimate, capacity, cc) {
         return false;
     }
     let Some(cut) = context::cut_point(&view, cc.keep_tokens) else {
@@ -409,8 +465,16 @@ pub(crate) async fn checkpoint<P: LlmClient>(
                 role: "user".into(),
                 content: format!(
                     "<conversation>\n{}\n</conversation>\n\n{}",
-                    context::summary_payload(&view[..cut]),
-                    context::SUMMARY_PROMPT
+                    if cc.checkpoint_sources {
+                        context::summary_payload_with_sources(&view[..cut])
+                    } else {
+                        context::summary_payload(&view[..cut])
+                    },
+                    if cc.checkpoint_sources {
+                        context::CHECKPOINT_PROMPT
+                    } else {
+                        context::SUMMARY_PROMPT
+                    }
                 ),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
@@ -430,7 +494,16 @@ pub(crate) async fn checkpoint<P: LlmClient>(
             state.record_usage(&resp.billed_usage());
             match resp.stop {
                 StopReason::Stop if !resp.message.content.trim().is_empty() => {
-                    Ok(resp.message.content.trim().to_owned())
+                    if cc.checkpoint_sources {
+                        let eligible_ids = view[..cut]
+                            .iter()
+                            .filter_map(|message| message.source_item_id.clone())
+                            .collect::<Vec<_>>();
+                        context::parse_checkpoint(resp.message.content.trim(), &eligible_ids)
+                            .map(|entries| context::render_checkpoint(&entries))
+                    } else {
+                        Ok(resp.message.content.trim().to_owned())
+                    }
                 }
                 stop => Err(format!("summary stop {stop:?}")),
             }

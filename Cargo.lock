@@ -1158,6 +1158,7 @@ dependencies = [
 name = "tools-std"
 version = "0.1.0"
 dependencies = [
+ "agent-log",
  "async-trait",
  "libc",
  "serde",

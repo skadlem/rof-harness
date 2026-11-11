@@ -110,6 +110,55 @@ class HarborRofOptionsTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             RofOptions(runtime_dir=Path("/tmp"), completion_check="  ")
 
+    async def test_history_and_compaction_options_reach_the_run(self):
+        argv = await self.run_agent(
+            history_read=True,
+            compaction=0.7,
+            context_capacity=131072,
+            output_reserve=32768,
+            checkpoint_sources=True,
+        )
+        for flag, value in (
+            ("--history-read", "on"),
+            ("--compaction", "0.7"),
+            ("--context-capacity", "131072"),
+            ("--output-reserve", "32768"),
+            ("--checkpoint-sources", "on"),
+        ):
+            self.assertIn(flag, argv)
+            self.assertEqual(argv[argv.index(flag) + 1], value)
+        default = await self.run_agent()
+        for flag in (
+            "--history-read",
+            "--compaction",
+            "--context-capacity",
+            "--output-reserve",
+            "--checkpoint-sources",
+        ):
+            self.assertNotIn(flag, default)
+
+    def test_compaction_requires_known_capacity_and_output_headroom(self):
+        for options in (
+            {"compaction": 0.7},
+            {"checkpoint_sources": True},
+            {"compaction": 0.7, "context_capacity": 32768, "output_reserve": 32768},
+            {"compaction": 0.7, "context_capacity": 131072, "output_reserve": 8000},
+            {
+                "compaction": 0.7,
+                "context_capacity": 131072,
+                "output_reserve": 32768,
+                "max_tokens": 65536,
+            },
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                RofOptions(runtime_dir=Path("/tmp"), **options)
+
+    async def test_native_task_workdir_is_forwarded(self):
+        argv = await self.run_agent(workdir="/workspace")
+        self.assertEqual(argv[argv.index("--workdir") + 1], "/workspace")
+        with self.assertRaises(ValueError):
+            RofOptions(runtime_dir=Path("/tmp"), workdir="relative")
+
     def test_zero_numeric_values_are_rejected_by_pydantic(self):
         for name in (
             "max_tokens",

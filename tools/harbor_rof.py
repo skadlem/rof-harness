@@ -27,6 +27,7 @@ class RofOptions(InstalledAgentOptions):
     runtime_dir: Path = Field(
         description="Host directory containing the frozen ROF runtime bundle."
     )
+    workdir: str = Field(default="/app", pattern=r"^/.+")
     budget_tokens: int = Field(default=300000, gt=0)
     budget_steps: int = Field(default=60, gt=0)
     budget_actions: int = Field(default=120, gt=0)
@@ -40,6 +41,11 @@ class RofOptions(InstalledAgentOptions):
     repo_evidence: bool = False
     collapse_hysteresis: int | None = Field(default=None, gt=0)
     completion_check: str | None = Field(default=None, pattern=r"\S")
+    history_read: bool = False
+    compaction: float | None = Field(default=None, gt=0, le=1)
+    context_capacity: int | None = Field(default=None, gt=0)
+    output_reserve: int | None = Field(default=None, ge=0)
+    checkpoint_sources: bool = False
     workflow: Literal["legacy", "minimal"] = "legacy"
     reasoning_effort: Literal["low", "high", "max"] | None = None
     thinking_keep: int | None = Field(default=None, gt=0)
@@ -48,6 +54,18 @@ class RofOptions(InstalledAgentOptions):
     def validate_evidence(self):
         if self.repo_evidence and not self.repo_lookup:
             raise ValueError("repo_evidence requires repo_lookup")
+        if self.checkpoint_sources and self.compaction is None:
+            raise ValueError("checkpoint_sources requires compaction")
+        if self.compaction is not None:
+            maximum_output = max(self.max_tokens, 32768)
+            if (
+                self.context_capacity is None
+                or self.output_reserve is None
+                or not maximum_output <= self.output_reserve < self.context_capacity
+            ):
+                raise ValueError(
+                    "compaction requires context_capacity and output_reserve covering the provider output ceiling below capacity"
+                )
         return self
 
 
@@ -103,6 +121,8 @@ class RofAgent(BaseInstalledAgent):
 
         model = self.model_name.split("/", 1)[1]
         logs = self.environment_logs_dir / "rof"
+        workdir = self.options.workdir
+        quoted_workdir = shlex.quote(workdir)
         args = [
             str(_REMOTE / "ld-linux-x86-64.so.2"),
             "--library-path",
@@ -112,7 +132,7 @@ class RofAgent(BaseInstalledAgent):
             "--goal",
             instruction,
             "--workdir",
-            "/app",
+            workdir,
             "--model",
             model,
             "--endpoint",
@@ -160,6 +180,16 @@ class RofAgent(BaseInstalledAgent):
             )
         if self.options.completion_check is not None:
             args.extend(("--completion-check", self.options.completion_check))
+        if self.options.history_read:
+            args.extend(("--history-read", "on"))
+        if self.options.compaction is not None:
+            args.extend(("--compaction", str(self.options.compaction)))
+        if self.options.context_capacity is not None:
+            args.extend(("--context-capacity", str(self.options.context_capacity)))
+        if self.options.output_reserve is not None:
+            args.extend(("--output-reserve", str(self.options.output_reserve)))
+        if self.options.checkpoint_sources:
+            args.extend(("--checkpoint-sources", "on"))
         if self.options.observation_keep is not None:
             args.extend(("--observation-keep", str(self.options.observation_keep)))
         if self.options.thinking_keep is not None:
@@ -169,9 +199,9 @@ class RofAgent(BaseInstalledAgent):
         command = (
             "set -e; "
             f"mkdir -p {shlex.quote(str(logs))}; "
-            "if ! git -C /app rev-parse --is-inside-work-tree >/dev/null 2>&1; then "
-            "git -C /app init -q && git -C /app add -A && "
-            "git -C /app -c user.name=Harbor -c user.email=harbor@localhost "
+            f"if ! git -C {quoted_workdir} rev-parse --is-inside-work-tree >/dev/null 2>&1; then "
+            f"git -C {quoted_workdir} init -q && git -C {quoted_workdir} add -A && "
+            f"git -C {quoted_workdir} -c user.name=Harbor -c user.email=harbor@localhost "
             "commit --allow-empty -qm baseline; fi; "
             "set +e; "
             f"{shlex.join(args)} > {shlex.quote(str(logs / 'rof.log'))} 2>&1; "
@@ -181,7 +211,7 @@ class RofAgent(BaseInstalledAgent):
         )
         result = await environment.exec(
             command=command,
-            cwd="/app",
+            cwd=workdir,
             env={"OPENAI_API_KEY": access.api_key},
         )
         marker = "ROF_EXIT_CODE="

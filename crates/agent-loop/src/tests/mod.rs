@@ -27,6 +27,7 @@ use tool_core::{
 use tool_core::{ToolCall, ToolResult};
 
 mod budget;
+mod checkpoint_sources;
 mod completion;
 mod fold;
 mod gate;
@@ -424,6 +425,8 @@ fn compaction(frac: f64, keep_tokens: usize) -> context::CompactionConfig {
         enabled: true,
         frac,
         keep_tokens,
+        context_capacity_tokens: Some(2000),
+        ..context::CompactionConfig::default()
     }
 }
 

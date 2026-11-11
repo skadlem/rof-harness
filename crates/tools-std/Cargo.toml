@@ -11,5 +11,6 @@ async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tool-core = { path = "../tool-core" }
+agent-log = { path = "../agent-log" }
 # Group-kill needs the killpg syscall; one libc import instead of a nix dep.
 libc = "0.2"

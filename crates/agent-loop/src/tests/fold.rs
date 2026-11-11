@@ -527,3 +527,23 @@ async fn run_compaction_off_is_byte_identical_to_collapse_5() {
         .contains(CHECKPOINT_PREFIX));
     assert!(check_pairing(emitter.history()));
 }
+
+#[test]
+fn historical_restore_ids_are_opt_in_and_do_not_mutate_the_log() {
+    let mut state = tool_history(7);
+    if let ItemKind::ToolResult { content, .. } = &mut state.items[0].kind {
+        *content = "output handle=archive-123\nold observation".into();
+    }
+    let before = serde_json::to_string(&state.items).unwrap();
+    let baseline = state.derived_messages(&RunConfig::default());
+    assert!(!baseline[0].content.contains("item_id="));
+    let cfg = RunConfig {
+        history_read: true,
+        ..RunConfig::default()
+    };
+    let restored = state.derived_messages(&cfg);
+    assert!(restored[0].content.contains("item_id=t0"));
+    assert!(restored[0].content.contains("output handle=archive-123"));
+    assert!(!restored[2].content.contains("item_id="));
+    assert_eq!(serde_json::to_string(&state.items).unwrap(), before);
+}

@@ -1,5 +1,8 @@
 // ===== compaction checkpoint (refs-gap-matrix rank 2) =====
 
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
 /// Tool results in the summarizer payload are cut to this many chars: a
 /// checkpoint buys a summary, not a second copy of the transcript.
 pub const SUMMARY_TOOL_CAP: usize = 2_000;
@@ -9,10 +12,16 @@ pub const SUMMARY_TOOL_CAP: usize = 2_000;
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionConfig {
     pub enabled: bool,
-    /// Trigger fraction of the token budget (0.7 = checkpoint at 70%).
+    /// Trigger fraction of usable context capacity (0.7 = 70%).
     pub frac: f64,
     /// Recent tokens kept verbatim (pi `keepRecentTokens`).
     pub keep_tokens: usize,
+    /// Known model input window. `None` means compaction cannot run.
+    pub context_capacity_tokens: Option<u64>,
+    /// Output headroom carved out of the context window.
+    pub output_reserve_tokens: u64,
+    /// Use source-attributed JSON checkpoint summaries as an opt-in treatment.
+    pub checkpoint_sources: bool,
 }
 
 impl Default for CompactionConfig {
@@ -21,6 +30,9 @@ impl Default for CompactionConfig {
             enabled: false,
             frac: 0.7,
             keep_tokens: 20_000,
+            context_capacity_tokens: None,
+            output_reserve_tokens: 0,
+            checkpoint_sources: false,
         }
     }
 }
@@ -41,6 +53,30 @@ pub struct UsageAnchor {
 pub struct CompactMessage {
     pub role: String,
     pub content: String,
+    /// Original durable item ID, captured before transcript folding.
+    pub source_item_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointKind {
+    Fact,
+    Hypothesis,
+    Plan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointEntry {
+    pub kind: CheckpointKind,
+    pub text: String,
+    pub source_item_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointDocument {
+    entries: Vec<CheckpointEntry>,
 }
 
 fn chars_to_tokens(chars: usize) -> u64 {
@@ -63,9 +99,23 @@ pub fn estimate_tokens(messages: &[CompactMessage], anchor: Option<&UsageAnchor>
     anchor.map(|a| a.input_tokens).unwrap_or(0) + chars_to_tokens(chars)
 }
 
-/// Trigger: enabled and the estimate is strictly above `budget_tokens * frac`.
-pub fn compaction_due(estimate: u64, budget_tokens: u64, cfg: &CompactionConfig) -> bool {
-    cfg.enabled && (estimate as f64) > budget_tokens as f64 * cfg.frac
+/// Trigger above the configured context window's usable input capacity.
+/// `capacity` must equal `context_capacity_tokens - output_reserve_tokens`;
+/// run-wide token allowance is not a context window and must not be passed.
+pub fn compaction_due(estimate: u64, capacity: u64, cfg: &CompactionConfig) -> bool {
+    let Some(total) = cfg.context_capacity_tokens else {
+        return false;
+    };
+    if !cfg.enabled
+        || total == 0
+        || cfg.output_reserve_tokens >= total
+        || capacity != total - cfg.output_reserve_tokens
+        || !cfg.frac.is_finite()
+        || !(0.0..=1.0).contains(&cfg.frac)
+    {
+        return false;
+    }
+    (estimate as f64) > capacity as f64 * cfg.frac
 }
 
 /// Cut point: index of the first history message kept verbatim. Walks back
@@ -98,6 +148,15 @@ pub fn cut_point(messages: &[CompactMessage], keep_tokens: usize) -> Option<usiz
 /// Summarizer payload: one `[role]: text` block per message, tool results cut
 /// to [`SUMMARY_TOOL_CAP`] chars with an explicit truncation marker.
 pub fn summary_payload(messages: &[CompactMessage]) -> String {
+    summary_payload_inner(messages, false)
+}
+
+/// Source-attributed variant for the checkpoint-sources treatment.
+pub fn summary_payload_with_sources(messages: &[CompactMessage]) -> String {
+    summary_payload_inner(messages, true)
+}
+
+fn summary_payload_inner(messages: &[CompactMessage], include_sources: bool) -> String {
     let parts: Vec<String> = messages
         .iter()
         .map(|m| {
@@ -106,10 +165,74 @@ pub fn summary_payload(messages: &[CompactMessage]) -> String {
             } else {
                 m.content.clone()
             };
-            format!("[{}]: {text}", m.role)
+            let source = if include_sources {
+                m.source_item_id
+                    .as_deref()
+                    .map(|id| format!(" [source {id:?}]"))
+                    .unwrap_or_else(|| " [source: unavailable]".into())
+            } else {
+                String::new()
+            };
+            format!("[{}]{source}: {text}", m.role)
         })
         .collect();
     parts.join("\n\n")
+}
+
+/// Validate model-produced checkpoint JSON against the source records eligible
+/// for attribution. IDs establish provenance only; they do not prove a claim.
+pub fn parse_checkpoint(
+    response: &str,
+    eligible_source_ids: &[String],
+) -> Result<Vec<CheckpointEntry>, String> {
+    let mut document: CheckpointDocument = serde_json::from_str(response)
+        .map_err(|error| format!("invalid checkpoint JSON: {error}"))?;
+    if document.entries.is_empty() {
+        return Err("checkpoint has no entries".into());
+    }
+    let eligible: HashSet<&str> = eligible_source_ids.iter().map(String::as_str).collect();
+    for entry in &mut document.entries {
+        if entry.text.trim().is_empty() {
+            return Err("checkpoint entry text is empty".into());
+        }
+        let all_sources_resolve = !entry.source_item_ids.is_empty()
+            && entry
+                .source_item_ids
+                .iter()
+                .all(|id| eligible.contains(id.as_str()));
+        let mut seen = HashSet::new();
+        entry
+            .source_item_ids
+            .retain(|id| eligible.contains(id.as_str()) && seen.insert(id.clone()));
+        if entry.kind == CheckpointKind::Fact && !all_sources_resolve {
+            entry.kind = CheckpointKind::Hypothesis;
+        }
+    }
+    Ok(document.entries)
+}
+
+/// Render a validated checkpoint while retaining its epistemic label and any
+/// eligible source references.
+pub fn render_checkpoint(entries: &[CheckpointEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| {
+            let kind = match entry.kind {
+                CheckpointKind::Fact => "fact",
+                CheckpointKind::Hypothesis => "hypothesis",
+                CheckpointKind::Plan => "plan",
+            };
+            if entry.source_item_ids.is_empty() {
+                format!("[{kind}]: {}", entry.text)
+            } else {
+                format!(
+                    "[{kind}] sources={:?}: {}",
+                    entry.source_item_ids, entry.text
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn truncate_for_summary(text: &str) -> String {
@@ -132,6 +255,9 @@ continue the work. Do not continue the conversation or answer anything in it. Us
 ## Progress\n[done / in progress / blocked, with exact file paths and commands]\n\
 ## Key decisions\n[what was decided and why, including errors hit and how they were resolved]\n\
 ## Next steps\n[the immediate next action]";
+
+/// Independent opt-in prompt for source-attributed checkpoint JSON.
+pub const CHECKPOINT_PROMPT: &str = "Summarize the supplied conversation as a compact checkpoint for an agent that must continue the work. Output only a JSON object shaped like {\"entries\":[{\"kind\":\"fact\",\"text\":\"...\",\"source_item_ids\":[\"...\"]}]}. The kind value must be exactly one of fact, hypothesis, or plan. Use facts only for claims tied to the provided eligible user/tool source IDs; copy those IDs exactly. Unsupported or conflicting claims remain hypotheses. Keep useful next actions as plans even when they have no source ID. IDs identify source records but do not prove an interpretation true. Preserve user requirements and unresolved conflicts; do not invent IDs or omit important requirements. Output at least one non-empty entry.";
 
 /// System row of the summarizer request: the summary call must not act.
 pub const SUMMARY_SYSTEM: &str =

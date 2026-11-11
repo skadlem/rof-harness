@@ -339,6 +339,8 @@ pub struct RunConfig {
     pub proof_cmd: Option<String>,
     /// Exact operator-supplied command checked when the model declares Done.
     pub completion_check: Option<String>,
+    /// Advertise current WAL-local IDs on collapsed observations.
+    pub history_read: bool,
     /// Compaction checkpoint knobs (default OFF: no summary call, no fold).
     pub compaction: context::CompactionConfig,
     /// Transcript-fold knobs, the single source of truth: echoed-reasoning
@@ -384,6 +386,7 @@ impl Default for RunConfig {
             incentives: IncentivesLevel::Full,
             proof_cmd: None,
             completion_check: None,
+            history_read: false,
             compaction: context::CompactionConfig::default(),
             thinking_keep: THINKING_KEEP,
             collapse_hysteresis: context::COLLAPSE_HYSTERESIS,

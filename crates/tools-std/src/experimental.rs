@@ -1,3 +1,4 @@
+use agent_log::{read_log, Item, ItemKind};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
@@ -22,6 +23,8 @@ use crate::{edit_tool, exec_tool, test_tool, view_tool, write_tool};
 #[derive(Default, Clone, Debug)]
 pub struct ExperimentalToolsConfig {
     pub output_dir: Option<PathBuf>,
+    /// Fixed host-selected current WAL. When present, enables history_read.
+    pub history_log: Option<PathBuf>,
     pub shell: bool,
     pub processes: bool,
     pub repo_lookup: bool,
@@ -87,6 +90,14 @@ pub fn experimental_tools(
     } else {
         tools.push(Arc::new(exec_tool(policy.clone())));
         tools.push(Arc::new(test_tool(policy.clone())));
+    }
+    if let Some(path) = config.history_log.as_deref() {
+        if !path.is_absolute() {
+            return Err("history log path must be absolute".into());
+        }
+        tools.push(Arc::new(HistoryRead {
+            path: path.to_path_buf(),
+        }));
     }
     if config.shell {
         tools.push(Arc::new(Shell {
@@ -298,6 +309,189 @@ impl Tool for OutputRead {
                 String::from_utf8_lossy(&page)
             ),
             truncated: offset + (page.len() as u64) < size,
+            success: true,
+        })
+    }
+}
+
+const HISTORY_PAGE_DEFAULT: usize = 8_000;
+const HISTORY_PAGE_MAX: usize = 32_768;
+
+struct HistoryRead {
+    path: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryReadArgs {
+    item_id: String,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "history_page_default")]
+    limit: usize,
+}
+
+fn history_page_default() -> usize {
+    HISTORY_PAGE_DEFAULT
+}
+
+struct TempHistoryLog(PathBuf);
+
+impl Drop for TempHistoryLog {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn create_history_snapshot() -> Result<(TempHistoryLog, std::fs::File), ToolError> {
+    for _ in 0..32 {
+        let path = std::env::temp_dir().join(format!("rof-history-{}.jsonl", next_id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((TempHistoryLog(path), file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(ToolError::Failed(e.to_string())),
+        }
+    }
+    Err(ToolError::Failed(
+        "could not create bounded history snapshot".into(),
+    ))
+}
+
+fn read_history(path: &Path, cancel: &CancellationToken) -> Result<Vec<Item>, ToolError> {
+    if cancel.is_cancelled() {
+        return Err(ToolError::Failed("history read cancelled".into()));
+    }
+    let mut source_options = std::fs::OpenOptions::new();
+    source_options.read(true);
+    let path_metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| ToolError::Failed(format!("cannot inspect current history log: {e}")))?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(ToolError::Failed(
+            "history log must be a regular non-symlink file".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        source_options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let source = source_options
+        .open(path)
+        .map_err(|e| ToolError::Failed(format!("cannot open current history log: {e}")))?;
+    let metadata = source
+        .metadata()
+        .map_err(|e| ToolError::Failed(e.to_string()))?;
+    if !metadata.is_file() {
+        return Err(ToolError::Failed(
+            "history log is not a regular file".into(),
+        ));
+    }
+    if metadata.len() > crate::common::READ_FILE_CAP {
+        return Err(ToolError::Failed(format!(
+            "history log exceeds {}-byte limit",
+            crate::common::READ_FILE_CAP
+        )));
+    }
+
+    // Snapshot at most 64 MiB before using the shared validator, so a growing
+    // source cannot bypass the bound that agent_log::read_log itself lacks.
+    let (snapshot_path, mut snapshot) = create_history_snapshot()?;
+    let mut source = std::io::Read::take(source, crate::common::READ_FILE_CAP + 1);
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(ToolError::Failed("history read cancelled".into()));
+        }
+        let n = std::io::Read::read(&mut source, &mut buffer)
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        bytes += n as u64;
+        if bytes > crate::common::READ_FILE_CAP {
+            return Err(ToolError::Failed(format!(
+                "history log exceeds {}-byte limit",
+                crate::common::READ_FILE_CAP
+            )));
+        }
+        std::io::Write::write_all(&mut snapshot, &buffer[..n])
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
+    }
+    drop(snapshot);
+    if cancel.is_cancelled() {
+        return Err(ToolError::Failed("history read cancelled".into()));
+    }
+    let items = read_log(&snapshot_path.0)
+        .map_err(|e| ToolError::Failed(format!("cannot read current history log: {e}")))?;
+    if cancel.is_cancelled() {
+        return Err(ToolError::Failed("history read cancelled".into()));
+    }
+    Ok(items)
+}
+
+#[async_trait]
+impl Tool for HistoryRead {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "history_read".into(),
+            description: "read a paged historical tool observation from this run's fixed WAL; retrieves the recorded result and never replays the command".into(),
+            schema: json!({"type":"object","required":["item_id"],"additionalProperties":false,"properties":{"item_id":{"type":"string","minLength":1,"maxLength":128},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32768}}}),
+        }
+    }
+
+    fn prepare(&self, call: &ToolCall) -> CallStatus {
+        dispatch(call)
+    }
+
+    async fn execute(
+        &self,
+        invocation: Invocation,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutcome, ToolError> {
+        let args: HistoryReadArgs = parse_args(&invocation.args)?;
+        if args.item_id.is_empty() || args.item_id.len() > 128 {
+            return Err(ToolError::Failed(
+                "item_id must contain 1..128 bytes".into(),
+            ));
+        }
+        if args.limit == 0 || args.limit > HISTORY_PAGE_MAX {
+            return Err(ToolError::Failed(format!(
+                "limit must be 1..{HISTORY_PAGE_MAX}"
+            )));
+        }
+        let items = read_history(&self.path, &cancel)?;
+        let item = items
+            .into_iter()
+            .find(|item| item.id == args.item_id)
+            .ok_or_else(|| ToolError::Failed("unknown history item_id".into()))?;
+        let ItemKind::ToolResult {
+            call_id,
+            content,
+            is_error,
+            ..
+        } = item.kind
+        else {
+            return Err(ToolError::Failed(
+                "history item_id does not identify a tool result".into(),
+            ));
+        };
+        let total = content.chars().count();
+        let page: String = content.chars().skip(args.offset).take(args.limit).collect();
+        let page_chars = page.chars().count();
+        Ok(ToolOutcome {
+            content: format!(
+                "[historical observation item_id={} call_id={} seq={} recorded_at={:?} is_error={} offset={} total_chars={}]\n{}",
+                item.id, call_id, item.seq, item.recorded_at, is_error, args.offset, total, page
+            ),
+            truncated: args.offset.saturating_add(page_chars) < total,
             success: true,
         })
     }

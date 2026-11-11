@@ -121,6 +121,18 @@ fn registry_for(
     } else {
         None
     };
+    let history_log = if args.history_read {
+        let path = resolve_log_path(args).ok_or("history_read requires the current run WAL")?;
+        Some(if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()
+                .map_err(|e| e.to_string())?
+                .join(path)
+        })
+    } else {
+        None
+    };
     let tools = tools_std::experimental_tools(
         policy,
         tools_std::ExperimentalToolsConfig {
@@ -129,6 +141,7 @@ fn registry_for(
             processes: args.processes,
             repo_lookup: args.repo_lookup,
             repo_evidence: args.repo_evidence,
+            history_log,
             multi_edit: args.multi_edit,
         },
     )?;
@@ -830,6 +843,111 @@ mod tests {
         let archive = output_archive_dir(&args.workdir).unwrap();
         assert!(!archive.starts_with(&args.workdir));
         std::fs::remove_dir_all(workdir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn collapsed_historical_observation_is_recovered_from_the_current_wal() {
+        struct HistoryClient(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl LlmClient for HistoryClient {
+            async fn complete(&self, _: &str, req: &Request) -> Result<Response, LlmError> {
+                use provider_core::ToolCallRef;
+                use std::sync::atomic::Ordering;
+                let mut response = text_resp();
+                response.message.tool_calls = match self.0.fetch_add(1, Ordering::Relaxed) {
+                    0 => vec![ToolCallRef {
+                        id: "one-time".into(),
+                        name: "exec".into(),
+                        args: serde_json::json!({"cmd":"python3 -c \"from pathlib import Path; p=Path('transient.txt'); print(p.read_text()); p.write_text('changed')\""}),
+                    }],
+                    1 => (0..6)
+                        .map(|i| ToolCallRef {
+                            id: format!("note-{i}"),
+                            name: "view".into(),
+                            args: serde_json::json!({"path":format!("note-{i}.txt")}),
+                        })
+                        .collect(),
+                    2 => {
+                        let old = req
+                            .messages
+                            .iter()
+                            .find(|m| m.tool_call_id.as_deref() == Some("one-time"))
+                            .unwrap();
+                        assert!(old.content.starts_with("[collapsed:"));
+                        assert!(!old.content.contains("HISTORICAL-SENTINEL"));
+                        let id = old
+                            .content
+                            .split("item_id=")
+                            .nth(1)
+                            .unwrap()
+                            .split(';')
+                            .next()
+                            .unwrap();
+                        vec![ToolCallRef {
+                            id: "recover-old".into(),
+                            name: "history_read".into(),
+                            args: serde_json::json!({"item_id":id,"offset":400,"limit":200}),
+                        }]
+                    }
+                    3 => {
+                        let recovered = req
+                            .messages
+                            .iter()
+                            .find(|m| m.tool_call_id.as_deref() == Some("recover-old"))
+                            .unwrap();
+                        assert!(
+                            recovered.content.contains("HISTORICAL-SENTINEL"),
+                            "{}",
+                            recovered.content
+                        );
+                        assert!(recovered.content.to_lowercase().contains("historical"));
+                        vec![]
+                    }
+                    _ => panic!("unexpected provider request"),
+                };
+                if !response.message.tool_calls.is_empty() {
+                    response.stop = provider_core::StopReason::ToolUse;
+                }
+                Ok(response)
+            }
+        }
+        let work = tmp();
+        std::fs::write(
+            work.join("transient.txt"),
+            format!("{}HISTORICAL-SENTINEL", "x".repeat(500)),
+        )
+        .unwrap();
+        for i in 0..6 {
+            std::fs::write(work.join(format!("note-{i}.txt")), "note").unwrap();
+        }
+        let mut args = args_for(&work, None);
+        args.history_read = true;
+        args.exec_policy = tools_std::ExecPolicy::Any;
+        args.incentives = agent_loop::IncentivesLevel::Base;
+        args.steer = false;
+        let provider = HistoryClient(std::sync::atomic::AtomicUsize::new(0));
+        let result = execute(&provider, &args).await;
+        assert!(
+            matches!(result.outcome, Outcome::Done),
+            "{:?}",
+            result.outcome
+        );
+        assert_eq!(provider.0.load(std::sync::atomic::Ordering::Relaxed), 4);
+        assert_eq!(
+            std::fs::read_to_string(work.join("transient.txt")).unwrap(),
+            "changed"
+        );
+        let wal = std::fs::read_to_string(work.join(".rof-events.jsonl")).unwrap();
+        assert!(wal
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .any(|item| item["kind"] == "ToolResult"
+                && item["call_id"] == "one-time"
+                && item["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("HISTORICAL-SENTINEL")));
+        std::fs::remove_dir_all(work).unwrap();
     }
 
     #[tokio::test]
