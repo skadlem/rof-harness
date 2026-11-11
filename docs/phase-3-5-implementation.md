@@ -94,3 +94,51 @@ comparison. Completion-feedback efficacy additionally requires an equal-budget
 repair/resampling control. All attempts, token usage, cap failures and incomplete
 pairs stay visible through the offline reporting helper. Nothing is promoted by
 these implementation tests or a small development run.
+
+## Phase 5 outcome: incomplete, stopped on a new unknown request
+
+The [frozen protocol](experiments/2026-11-11-lookup-development-protocol.json)
+expected two paired tasks/four native trials. Full pinned packages were fetched
+and verified (152 files, 1,096,791 bytes). Both development native oracles scored
+1.0 and both valid known-bad artifacts scored 0.0. Freight's first plain `nop`
+failed artifact collection before grading; it is an invalid readiness run, not a
+zero score. Its subsequent executable-exit-1 control graded normally as 0.0.
+Holdout packages were fetched/hashed; no holdout outcomes were used.
+
+The fresh runtime was built from clean commit `c522466`, SHA-256
+`0e0e8721b73980c161b672a132a948fc455914894ff914b5808df4e0dca3f2cf`.
+The bundle loader recognized the new controls before inference. Paid task/image
+layer IDs and actual CPU/memory limits were recorded; Cargo's main and verifier
+containers each had 2 CPU / 4 GiB limits. These readiness results are not coding
+agent capability scores.
+
+Only Cargo's control ran. Its native artifact reward was **0.0**, in 311.08s,
+with 26 forwarded requests and 25 valid receipts. The next response returned
+HTTP 200 headers, then `ConnectionResetError` during body read after 2.768356s.
+No usage receipt arrived for it. The proxy retained its full reservation,
+blocked subsequent forwarding, and the runner stopped. The original cause of
+the reset is not established. No treatment or Freight agent attempt launched.
+There are zero completed task pairs and zero new clean completed/accounted
+passes; no lookup efficacy conclusion follows.
+
+Known receipts report 186,706 input tokens (82,560 cached) and 4,264 output
+(1,721 reasoning). These are **partial**, not whole-attempt totals. Their
+peak-rate cost is $0.036855960; the new unknown reservation is $0.324172800,
+already included in the new **$0.361028760** upper bound. Added to the immutable
+old upper bound, aggregate spend/reservations are **$2.519179098**, below $2.82.
+The raw difference is $0.300820902, but usable paid headroom under the new stop
+rule is **zero**. Do not reset either ledger or treat either unknown as zero.
+These are conservative accounting bounds, not an invoice.
+
+The [campaign summary](experiments/2026-11-11-lookup-campaign-summary.json)
+records hashes, accounting, and the incomplete verdict. The
+[normalized input](experiments/2026-11-11-lookup-normalized.json),
+[paired report](experiments/2026-11-11-lookup-report.json) and
+[audit](experiments/2026-11-11-lookup-audit.json) retain the three unrun cells and
+both incomplete expected pairs. The report reproduces byte-for-byte with
+`python3 tools/rof_compare.py --input docs/experiments/2026-11-11-lookup-normalized.json --output REPORT.json`.
+The actor's failed RunEnd is structurally valid; incomplete accounting and the
+transport-induced proxy denial prevent a completed comparison. The old pilot results
+remain separate: different runtime, tasks, and protocols cannot be pooled into a
+suite score. Resume paid evaluation only after authoritative usage resolves the
+new stop or an explicit owner policy change that still preserves all reservations.

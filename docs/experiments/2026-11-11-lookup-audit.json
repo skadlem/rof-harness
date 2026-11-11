@@ -1,0 +1,199 @@
+{
+  "accounting_sources": {
+    "carried_parent_ledger": {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/ledger.json",
+      "role": "immutable parent ledger carrying the prior reservation",
+      "sha256": "a09a2883932665c2cabd6fa58cbdcb21577319e364a4eb2e7fbcbd9c5d36aae0"
+    },
+    "new_subledger": {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261111-phases35/ledger.json",
+      "role": "phase 5 request accounting evidence; no invoice computed",
+      "sha256": "524318c62bf213ea1e7c92d80badbf8fc04c5a70cade9767f127ca06d2ca82d8"
+    },
+    "preregistered_protocol_ledger": {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261111-phases35/authorization.json",
+      "preregistered_file_sha256": "84807254216e1f55e8abc5b7a578c052b439629ac141a28c38b0a1e6c5dad03f",
+      "role": "immutable authorization and carried-reservation descriptor",
+      "sha256": "aa7501a5511436df609d2d41f736cc8f059ff7f5c0184e4ac66520cb052587e7"
+    }
+  },
+  "arm_totals": {
+    "control": {
+      "accounted_rows": 0,
+      "completed_rows": 0,
+      "known_usage_receipts": 25,
+      "partial_known_receipt_totals": {
+        "cached_input_tokens": 82560,
+        "input_tokens": 186706,
+        "output_tokens": 4264,
+        "reasoning_tokens": 1721
+      },
+      "receipt_count": 25,
+      "rows": 1,
+      "unknown_usage_receipts": 0
+    },
+    "treatment": {
+      "accounted_rows": 0,
+      "completed_rows": 0,
+      "known_usage_receipts": 0,
+      "partial_known_receipt_totals": {
+        "cached_input_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "receipt_count": 0,
+      "rows": 0,
+      "unknown_usage_receipts": 0
+    }
+  },
+  "counts": {
+    "accounted_rows": 0,
+    "completed_rows": 0,
+    "expected_cells": 4,
+    "missing_expected_cells": 3,
+    "native_rewards_known": 1,
+    "present_rows": 1
+  },
+  "missing_cells": [
+    {
+      "arm": "treatment",
+      "attempt_id": "lookup-cargo-flight-dispatch-treatment-r1",
+      "replicate_id": "r1",
+      "task_id": "cargo-flight-dispatch"
+    },
+    {
+      "arm": "control",
+      "attempt_id": "lookup-freight-dispatch-shift-control-r1",
+      "replicate_id": "r1",
+      "task_id": "freight-dispatch-shift"
+    },
+    {
+      "arm": "treatment",
+      "attempt_id": "lookup-freight-dispatch-shift-treatment-r1",
+      "replicate_id": "r1",
+      "task_id": "freight-dispatch-shift"
+    }
+  ],
+  "notice": "Receipt token counts are provider-reported usage records. Unknown requests and financial reservations remain unreconciled here.",
+  "provenance": {
+    "frozen_path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261111-phases35/frozen.json",
+    "frozen_sha256": "8ec3d318b7be154bef2d41665e24f299e922ecd48fb81db8cb76bfb67e4fa98e",
+    "preregistered_path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261111-phases35/preregistered-experiment.json",
+    "preregistered_sha256": "84807254216e1f55e8abc5b7a578c052b439629ac141a28c38b0a1e6c5dad03f",
+    "receipt_path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261111-phases35/receipts.jsonl",
+    "receipt_sha256": "bc9934fdeb4fedb5c68f060aa117923510720273841ed666e5b6c9d18974426a",
+    "runtime_sha256": "0e0e8721b73980c161b672a132a948fc455914894ff914b5808df4e0dca3f2cf",
+    "source_commit": "c522466b3901ac8538ca1c4e38865b63e7dc4adf"
+  },
+  "purpose": "Evidence normalization audit only; no invoice calculation or candidate selection.",
+  "rows": [
+    {
+      "accounting_complete": false,
+      "actor": {
+        "category": "actor_failure",
+        "error_codes": [
+          "provider-failed"
+        ],
+        "event_path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261111-phases35/jobs/lookup-cargo-flight-dispatch-control-r1/cargo-flight-dispatch__Z27jzjT/agent/rof/events.jsonl",
+        "exit_code": 3,
+        "exit_path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261111-phases35/jobs/lookup-cargo-flight-dispatch-control-r1/cargo-flight-dispatch__Z27jzjT/agent/rof/exit-code",
+        "outcome": "failed",
+        "provider_failures": 1,
+        "quota_error": true,
+        "reason": "actor_failure",
+        "terminal": true,
+        "transport_error": false,
+        "unknown_usage_event": false
+      },
+      "arm": "control",
+      "artifact_reward": 0.0,
+      "attempt_id": "lookup-cargo-flight-dispatch-control-r1",
+      "elapsed_seconds": 311.0787327999715,
+      "image_bindings_sha256": "b12a76cfbdbedd8e4e0584b68853089b8bb257f420e49db8c393886bc1560b61",
+      "images": [
+        {
+          "cpu_period": 0,
+          "cpu_quota": 0,
+          "image_id": "sha256:4ed214cc98f4a1ca79c32a43d755745dcd85082f720a819cad4be27a4f6cba65",
+          "image_name": "cargo-flight-dispatch__z27jzjt__env-main",
+          "memory_bytes": 4294967296,
+          "name": "/cargo-flight-dispatch__z27jzjt__env-main-1",
+          "nano_cpus": 2000000000,
+          "rootfs_layers": [
+            "sha256:34467cc93912af891dfee8a3902adf9b4f355a9bca4eaa46f658d1181a21de0d",
+            "sha256:0229d3e3d668de7c1d42c1e23d30f4bc5c5e93d68c8fe897e94a6fe9b0262491",
+            "sha256:d119e31e71d7a4e8b81f78a0e11901e1a2b3252619eac69266aa157d943b4763",
+            "sha256:1095031acd1c984ad93c83dadab1d79a3b2fd93d5086537b16593c47a3e3ee06",
+            "sha256:22430193f9cef4281adcc32607fe95c97600682fdda3899f89fffdadf279915c",
+            "sha256:a9215107886f3c0361ad79df90af4d42f619493f96798b75180d01b36db208f2",
+            "sha256:9d0e453e7e832aa31a1808277d80cfc9813bea58d1aac17bb2c717d47e6a7d6d",
+            "sha256:6b5cfb348b6fec52f87c31f6f7c10775157ccf63e3e6310981236acf31a22fe1"
+          ]
+        },
+        {
+          "cpu_period": 0,
+          "cpu_quota": 0,
+          "image_id": "sha256:4c69df08bcfd407fa0ff7ee630a612ed4b74e8204024626f6a349f376899f3b7",
+          "image_name": "cargo-flight-dispatch__z27jzjt__verifier__trial-main",
+          "memory_bytes": 4294967296,
+          "name": "/cargo-flight-dispatch__z27jzjt__verifier__trial-main-1",
+          "nano_cpus": 2000000000,
+          "rootfs_layers": [
+            "sha256:34467cc93912af891dfee8a3902adf9b4f355a9bca4eaa46f658d1181a21de0d",
+            "sha256:0229d3e3d668de7c1d42c1e23d30f4bc5c5e93d68c8fe897e94a6fe9b0262491",
+            "sha256:d119e31e71d7a4e8b81f78a0e11901e1a2b3252619eac69266aa157d943b4763",
+            "sha256:1095031acd1c984ad93c83dadab1d79a3b2fd93d5086537b16593c47a3e3ee06",
+            "sha256:6e0fe580f53142dbac7ac841bc2eca2fa7fe7d43011173ec68a6d88d4445d4a5",
+            "sha256:5d21eea286674b2df19679463f64e7fad4dcf6bbdf2854ccdd5df7ba658c2545",
+            "sha256:5fb9343873465d034cb27f6d9d436ecf44da5f9de1ea5a9d9f1faee6c5f061aa",
+            "sha256:f8084cd99307f0be4566f41b89fc112cd425dfe3eea53d6f6d158498c891bad9",
+            "sha256:5ba114e5f77b8b9eb1ad04fd6bdf0d315f555ba8e0d7ef6d4f246372bf648f9c",
+            "sha256:6a3af9f3f6ab8edf8024530089945cc3886bcdec9ea5eafea5d209412d251a0c",
+            "sha256:eb724587555fa851688bfb4d7e9fb84c665f340880a1bcd465970dd3d3b06ded",
+            "sha256:743a5e66ce58275e842558799961dff5ab749e0e9d9ab47c5007e23b90f6b8b3"
+          ]
+        }
+      ],
+      "native_artifact": {
+        "artifact_path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261111-phases35/jobs/lookup-cargo-flight-dispatch-control-r1/cargo-flight-dispatch__Z27jzjT/result.json",
+        "artifact_sha256": "f7f58a82fa6393ab6f3e9b1cd70b916391a61147fb3f09969afc06538da79ad0",
+        "cancelled_trials": 0,
+        "completed": true,
+        "completed_trials": 1,
+        "errored_trials": 0,
+        "reward": 0.0,
+        "summary_path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261111-phases35/jobs/lookup-cargo-flight-dispatch-control-r1/result.json"
+      },
+      "receipt_accounting": {
+        "delta_forwarded": 26,
+        "denied": true,
+        "partial_known_usage": {
+          "cached_input_tokens": 82560,
+          "input_tokens": 186706,
+          "known_usage_receipts": 25,
+          "output_tokens": 4264,
+          "reasoning_tokens": 1721,
+          "receipt_count": 25,
+          "unknown_usage_receipts": 0
+        },
+        "receipt_count": 25,
+        "receipt_end": 25,
+        "receipt_start": 0,
+        "unknown_attempts_end": 1,
+        "unknown_attempts_start": 0,
+        "unknown_attempts_zero": false,
+        "unknown_reason": "transport"
+      },
+      "replicate_id": "r1",
+      "row_manifest": {
+        "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261111-phases35/rows/lookup-cargo-flight-dispatch-control-r1/manifest.json",
+        "sha256": "53ecf8ead2768bd81010dec8ca19eecbb4085b78edbccbdfce724bc85e86dc34"
+      },
+      "run_completed": false,
+      "run_status": "incomplete_accounting_incomplete+financial_or_provider_quota_denial+provider_transport_failure",
+      "runner_returncode": 0,
+      "task_id": "cargo-flight-dispatch"
+    }
+  ]
+}

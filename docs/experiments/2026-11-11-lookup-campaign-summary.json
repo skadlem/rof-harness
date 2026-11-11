@@ -1,0 +1,38 @@
+{
+  "status": "stopped_new_unknown_transport",
+  "verdict": "incomplete",
+  "actual_new_trials": 1,
+  "new_native_artifact_passes": 0,
+  "new_completed_accounted_passes": 0,
+  "planned_trials": 4,
+  "missing_trials": 3,
+  "planned_task_pairs": 2,
+  "completed_pairs": 0,
+  "new_forwarded": 26,
+  "new_valid_receipts": 25,
+  "known_partial_usage": {
+    "prompt_tokens": 186706,
+    "cached_tokens": 82560,
+    "completion_tokens": 4264,
+    "reasoning_tokens": 1721
+  },
+  "known_receipt_peak_cost_nanos": 36855960,
+  "new_upper_bound_nanos": 361028760,
+  "new_unknown_reservation_nanos": 324172800,
+  "carried_old_upper_bound_nanos": 2158150338,
+  "aggregate_upper_bound_nanos": 2519179098,
+  "total_cap_nanos": 2820000000,
+  "raw_gap_nanos": 300820902,
+  "usable_paid_headroom_nanos": 0,
+  "transport": {
+    "elapsed_seconds": 2.768356,
+    "exception": "ConnectionResetError",
+    "stage": "read",
+    "upstream_status": 200
+  },
+  "old_ledger_unchanged": true,
+  "new_ledger_path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261111-phases35/ledger.json",
+  "new_ledger_sha256": "524318c62bf213ea1e7c92d80badbf8fc04c5a70cade9767f127ca06d2ca82d8",
+  "receipts_sha256": "bc9934fdeb4fedb5c68f060aa117923510720273841ed666e5b6c9d18974426a",
+  "note": "Known partial receipt totals are not whole-attempt usage; unknown reservation remains fully included. No paired efficacy or invoice claim."
+}

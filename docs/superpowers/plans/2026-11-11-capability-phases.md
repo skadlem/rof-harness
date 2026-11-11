@@ -1,7 +1,7 @@
 # ROF capability improvements: phased implementation plan
 
 **Status:** phases 0–4 implemented and locally verified from clean reference `411846d`;
-phase 5 bounded development work is authorized, phase 6 remains evidence-gated. The output-fidelity foundation is
+phase 5 ran one interrupted control and stopped; phase 6 remains evidence-gated. The output-fidelity foundation is
 complete. The owner authorized phases 0–2, then phases 3–5 on 2026-11-11. Paid development
 runs require the bounded continuation and preflight below. Reference provenance is recorded in the
 [manifest](../../experiments/2026-11-11-phases-0-2-reference.json).
@@ -437,11 +437,11 @@ into the solving agent or sharing the live credential.
 - [x] Preserve the stopped accounting state and obtain explicit owner revision
   allowing a new subledger within verified remaining cap/reservations. Recheck official
   release/task relevance and freeze all exclusions before outcomes are viewed.
-- [ ] Obtain complete pinned tasks, check actual disk/build footprint, run native
+- [x] Obtain complete pinned tasks, check actual disk/build footprint, run native
   oracle readiness checks and an appropriate known-bad artifact control, and bind
   task/image/runtime/runner hashes. The prior disk snapshot is historical, not
   a current capacity guarantee. Prune no unrelated owner images automatically.
-- [ ] Freeze development/holdout assignments, comparison rule, model endpoint,
+- [x] Freeze development/holdout assignments, comparison rule, model endpoint,
   generation limits and budgets. Treat the proposed four-task slice as a small
   convenience pilot. Increase task coverage before a suite-level conclusion.
 - [ ] Test one change at a time. Start with the existing exposed lookup versus
@@ -460,6 +460,14 @@ into the solving agent or sharing the live credential.
 **Exit:** reviewable paired per-task evidence, fully accounted attempts, and an
 explicit verdict of promising, unsupported, harmful, or incomplete. Do not force
 a significance claim or claim published unmatched external rows are controls.
+
+Outcome (2026-11-11): **incomplete**. Both development oracle/bad controls passed
+readiness, but only Cargo control ran (artifact reward 0.0). One response body
+reset after HTTP 200 without usage: 26 requests, 25 receipts. Its reservation
+remains held; the runner stopped before all other cells. Combined upper bound
+$2.519179098 stays below $2.82, with zero usable headroom while stopped. Do not
+check off the paired experiment merely because it launched. The
+[record](../../phase-3-5-implementation.md) carries evidence and continuation rules.
 
 ## Phase 6 — held-out confirmation, admission, and maintenance
 

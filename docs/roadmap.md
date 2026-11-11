@@ -42,8 +42,11 @@ official release before future spend. The original campaign stopped with one unk
 explicitly authorized a new bounded continuation subledger capped at $0.661849662,
 preserving the $2.158150338 carried upper bound (including the $0.324172800 unknown
 reservation) under the unchanged $2.82 total ceiling. The old attempt remains
-incomplete and its ledger unchanged. The first new development comparison is
-original lookup versus no lookup; all new history/compaction knobs stay off.
+incomplete and its ledger unchanged. The first new development comparison was
+original lookup versus no lookup, with history/compaction off. It stopped after
+one interrupted Cargo control (artifact 0.0): 25 receipts/26 requests, with a new
+unknown reservation. No pair completed. Aggregate upper bound is $2.519179098;
+no further paid calls under the current stop.
 Details: [current continuation](phase-3-5-implementation.md) and
 [historical pilot](current-benchmark-pilot.md).
 

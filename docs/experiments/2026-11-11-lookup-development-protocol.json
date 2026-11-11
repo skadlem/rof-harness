@@ -1,0 +1,145 @@
+{
+  "arms": {
+    "control": {
+      "config": {
+        "archive_output": false,
+        "budget_actions": 240,
+        "budget_shape": "gross",
+        "budget_steps": 120,
+        "budget_tokens": 1200000,
+        "checkpoint_sources": false,
+        "compaction": null,
+        "history_read": false,
+        "max_tokens": 8000,
+        "observation_keep": 5,
+        "preserve_failed_checks": false,
+        "reasoning_effort": null,
+        "repo_evidence": false,
+        "repo_lookup": false,
+        "shell": false,
+        "task_workdirs": {
+          "cargo-flight-dispatch": "/app",
+          "freight-dispatch-shift": "/workspace"
+        },
+        "thinking_keep": 2,
+        "workflow": "legacy"
+      },
+      "runtime_sha256": "0e0e8721b73980c161b672a132a948fc455914894ff914b5808df4e0dca3f2cf"
+    },
+    "treatment": {
+      "config": {
+        "archive_output": false,
+        "budget_actions": 240,
+        "budget_shape": "gross",
+        "budget_steps": 120,
+        "budget_tokens": 1200000,
+        "checkpoint_sources": false,
+        "compaction": null,
+        "history_read": false,
+        "max_tokens": 8000,
+        "observation_keep": 5,
+        "preserve_failed_checks": false,
+        "reasoning_effort": null,
+        "repo_evidence": false,
+        "repo_lookup": true,
+        "shell": false,
+        "task_workdirs": {
+          "cargo-flight-dispatch": "/app",
+          "freight-dispatch-shift": "/workspace"
+        },
+        "thinking_keep": 2,
+        "workflow": "legacy"
+      },
+      "runtime_sha256": "0e0e8721b73980c161b672a132a948fc455914894ff914b5808df4e0dca3f2cf"
+    }
+  },
+  "protocol": {
+    "allowed_difference": {
+      "key": "repo_lookup",
+      "value": true
+    },
+    "budgets": {
+      "actions": 240,
+      "concurrency": 1,
+      "gross_tokens": 1200000,
+      "initial_output": 8000,
+      "internal_wall_seconds": 3600,
+      "native_agent_seconds": 28800,
+      "steps": 120,
+      "trial_retries": 0
+    },
+    "dataset": "Terminal-Bench CPU 4.1.0 convenience development slice",
+    "endpoint": "https://api.deepseek.com",
+    "frozen_path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261111-phases35/frozen.json",
+    "frozen_sha256": "8ec3d318b7be154bef2d41665e24f299e922ecd48fb81db8cb76bfb67e4fa98e",
+    "grade_path": "native unchanged task verifier; oracle1/known-bad0 readiness gates",
+    "ledger": {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261111-phases35/authorization.json",
+      "sha256": "aa7501a5511436df609d2d41f736cc8f059ff7f5c0184e4ac66520cb052587e7"
+    },
+    "limitations": [
+      "Convenience development tasks, one trial per arm/task; not a suite score or frontier-performance claim.",
+      "Do not tune on holdout outcomes.",
+      "Original stopped attempt remains incomplete; its reservation is carried, not reconciled."
+    ],
+    "model": "deepseek-flash",
+    "native_gates": {
+      "cargo-flight-dispatch": [
+        {
+          "expected_reward": 1.0,
+          "path": "/home/madiyar/.local/share/rof-tb/datasets/tb41-next-slice-20261111-full/preflight/jobs/preflight-cargo-flight-dispatch-oracle/result.json",
+          "sha256": "688be4c6a3cf43d13b1d49d8af5fc713aa239296b79d9a5177cb27a99da7d945"
+        },
+        {
+          "expected_reward": 0.0,
+          "path": "/home/madiyar/.local/share/rof-tb/datasets/tb41-next-slice-20261111-full/preflight/jobs/preflight-cargo-flight-dispatch-known-bad/result.json",
+          "sha256": "6822016a31590f6132905b8b56114266420d63f108af853290b2cd27e4a163c9"
+        }
+      ],
+      "freight-dispatch-shift": [
+        {
+          "expected_reward": 1.0,
+          "path": "/home/madiyar/.local/share/rof-tb/datasets/tb41-next-slice-20261111-full/preflight/jobs/preflight-freight-dispatch-shift-oracle/result.json",
+          "sha256": "7f29458aaf13dda4f62554d0f889c5eb72043485074517b22d7bacf7b79c6c99"
+        },
+        {
+          "expected_reward": 0.0,
+          "path": "/home/madiyar/.local/share/rof-tb/datasets/tb41-next-slice-20261111-full/preflight/jobs/preflight-freight-dispatch-shift-known-bad-valid/result.json",
+          "sha256": "f723be2e354fd1f8f9a3a67dde02d387907c9c2c9119ff75d15f523070f43b8c"
+        }
+      ]
+    },
+    "pairs": [
+      {
+        "replicate_id": "r1",
+        "task_id": "cargo-flight-dispatch"
+      },
+      {
+        "replicate_id": "r1",
+        "task_id": "freight-dispatch-shift"
+      }
+    ],
+    "preregistered_utc": "2026-11-11T01:53:50.174754+00:00",
+    "release_commit": "4070d6cef56a7d20cb5dc98d5e10ada88a6b9440",
+    "release_hash": "9209edb7553cbf2ac67e7d6a737c9222c67cbb4cae8f35c54c7c515a849ee48b",
+    "release_hash_kind": "SHA-256 of release-pinning metadata manifest, not a full-suite package digest",
+    "runner": "harbor==0.23.0 with immutable campaign rootlogfix ownership overlay",
+    "splits": {
+      "development": [
+        "cargo-flight-dispatch",
+        "freight-dispatch-shift"
+      ],
+      "holdout": [
+        "coq-block-bound",
+        "vf2-speedup-networkx"
+      ]
+    },
+    "task_hash_kind": "SHA-256 of compact canonical sorted fetch-manifest entries for each full task",
+    "task_hashes": {
+      "cargo-flight-dispatch": "698a599def591ebb68d68f2d78e6252c6d50ebf7acfae6e65d1003b6f83036f4",
+      "freight-dispatch-shift": "0d24476b7935cfc2f99aac853e4d784bb7d0f32fecd5ac8783ccb99cc85c25b8"
+    },
+    "verdict_rule": "Per-task native artifacts and completed/accounted transitions; incomplete if a campaign stop prevents a full pair. No significance or default promotion from this small pilot."
+  },
+  "rows": []
+}

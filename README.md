@@ -24,7 +24,9 @@ defines Luna worker ownership, dependencies, interfaces and validation gates.
 Phases 0–4 add paired reporting, Harbor controls, repository evidence, bounded
 public completion checks, historical retrieval and capacity/source checkpoints;
 see the [implementation record](docs/phase-3-5-implementation.md).
-These opt-in additions have no new external benchmark results.
+The new lookup comparison stopped after one interrupted control; no matched pair
+or new capability gain is established. Accounting and missing rows are recorded
+in the implementation record.
 
 [![CI](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml/badge.svg?branch=v2-core)](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)

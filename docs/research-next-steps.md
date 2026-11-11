@@ -4,8 +4,9 @@
 [phased implementation plan](superpowers/plans/2026-11-11-capability-phases.md)
 assigns subagents, freezes additive contracts, and defines per-phase gates for
 the direct paper audit below. Phases 0–4 are implemented and locally verified,
-with all new mechanisms opt-in. Phase 5 uses the owner's bounded continuation
-revision below; source/oracle readiness and matched rows remain required.
+with all new mechanisms opt-in. Phase 5 ran one interrupted control and stopped
+on a new unknown request; no matched pair completed. Both ledgers/reservations
+remain intact. The observed-need gates and paid stop below govern future work.
 The [phase 0–2 record](phase-0-2-implementation.md) and
 [phase 3–5 record](phase-3-5-implementation.md) distinguish implementation,
 chosen fixtures, historical outcomes and current campaign evidence.
@@ -21,16 +22,19 @@ reference is Terminal-Bench CPU 4.1.0 (63 tasks, tag `v4.1.0`, commit
 `4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`, verified 2026-11-10). The latest official release was rechecked as v4.1.0 on 2026-11-11 before the
 bounded continuation; recheck again for later campaigns.
 
-The original official-account campaign remains stopped and unchanged. Its eight
-paid rows cover three tasks; WAL is the only clean completed pass, while React's
-reward-1 artifact has unknown provider usage. The owner explicitly authorized
-bounded continuation on 2026-11-11 while retaining the full old reservation.
-A new subledger may spend/reserve at most **$0.661849662**, the difference between
-the **$2.82** total ceiling and the carried **$2.158150338** upper bound (already
-including **$0.324172800** for the unknown request). Never reset the old ledger or
-claim it reconciled. A new unknown stops the new subledger. See the
-[phase 3–5 record](phase-3-5-implementation.md); historical outcomes remain in the
-[pilot record](current-benchmark-pilot.md).
+The original official-account ledger remains unchanged. The owner authorized a
+new subledger capped at $0.661849662, preserving the old $2.158150338 upper bound
+(including its $0.324172800 unknown reservation) under the total $2.82 ceiling.
+The new campaign also stopped: Cargo control artifact 0.0, 26 forwarded calls,
+25 receipts, then HTTP-200 body-read `ConnectionResetError` without usage.
+No treatment/Freight row ran and neither expected task pair is complete.
+The new upper bound is $0.361028760, including its separate $0.324172800 unknown
+reservation; aggregate upper bound is **$2.519179098**. The raw $0.300820902 gap is
+not usable while stopped. Do not reset either ledger or infer missing usage.
+The [phase 3–5 record](phase-3-5-implementation.md) and
+[campaign summary](experiments/2026-11-11-lookup-campaign-summary.json) carry paths,
+hashes and the incomplete verdict. Original selected-task outcomes remain in the
+[historical pilot](current-benchmark-pilot.md); no new capability claim is made.
 
 ROF's pilot internal deadline is 3,600s; the task-agent allowance is 28,800s.
 Verifier budgets are separate and task-specific (for example, WAL 1,800s and
@@ -99,14 +103,15 @@ Selection used public metadata and instructions for coding relevance and resourc
 fit. It is a convenience slice; historical exposure auditing is incomplete.
 Do not call these tasks historically unseen or representative of the suite.
 
-All eight public metadata/instruction hashes were checked against the pinned
-source manifest on 2026-11-11. Complete task packages, images, and native oracle
-results remain unvalidated. A read-only host snapshot showed 12 CPUs, about
+All eight public metadata/instruction hashes and the complete selected packages
+were checked on 2026-11-11. Both development oracles and valid bad controls were
+validated; holdout oracles remain unrun. Before building, a read-only host snapshot showed 12 CPUs, about
 15.9 GB total Docker memory, and 3.6 GB free disk. The selected task metadata
 requests 2 CPUs and 4–8 GiB RAM, with a 10 GiB storage ceiling per task. That
 ceiling is not a minimum disk requirement; measure actual image/build footprint
-and working headroom before building. No image pruning or benchmark runs were
-performed for this preparation.
+and working headroom before building. No unrelated images were pruned; rebuildable Rust artifacts were cleaned to
+make room for the native preflight. The current single interrupted control and
+its limits are recorded above.
 
 ## Deferred work register
 
