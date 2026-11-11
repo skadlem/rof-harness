@@ -2,6 +2,8 @@
  "generated_by": "tools/envelope_report.py",
  "corpus": {
   "root": "~/.local/share/rof-tb/work",
+  "supersedes": "research/accounting-recompute.md",
+  "supersedes_note": "That recompute describes an 83-dump corpus and scripts under /tmp/acct that no longer exist on disk, so it is NOT reproducible as written and must not be cited as if it were. Its conclusions survive: this file re-derives the same counter model on the 253 dumps that remain (135/135 gross token deaths reproduce, and the 22 surviving rows it published match their step counts and dollars exactly). Cite this artifact, not that report.",
   "dumps_found": 253,
   "dumps_parsed": 253,
   "dumps_excluded": [],
