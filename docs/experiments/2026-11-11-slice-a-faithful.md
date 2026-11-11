@@ -39,22 +39,30 @@ Excluding the one infra row: **5/17 = 0.294 [0.133, 0.531]**.
 
 ## Halt distribution — the finding that matters
 
-- **5** `done` (all solved)
-- **12** `tokens` — the cap ended the run mid-work
-- **1** `snapshot` — `pypi-server`: rollback could not remove root-owned
-  `build/` files created inside the container ("Permission denied"). The documented
+- **5** `done` (all solved): break-filter, hf-model-inference, kv-store-grpc,
+  log-summary-date-ranges — and `headless-terminal`, which halted `tokens` but was
+  still **Resolved**: the work passed before the cap ended the run.
+- **11 of the 13 failures** halted `tokens` — the cap ended them mid-work:
+  build-pov-ray, custom-memory-heap-crash, dna-assembly, dna-insert,
+  install-windows-3.11, make-mips-interpreter, query-optimize, raman-fitting,
+  sam-cell-seg, sanitize-git-repo, video-processing.
+- **1** `snapshot` — `pypi-server`: rollback could not remove root-owned `build/`
+  files created inside the container ("Permission denied"). The documented
   root-ownership hazard, **not** a capability observation; excluded above.
+- **1** with **no halt** — `model-extraction-relu-logits` stopped on its own after
+  10 steps and failed. That is a capability failure with the envelope not binding,
+  and it is the one row that already tells us a bigger cap cannot help.
 
-So **12 of the 12 capability failures are token-terminated**, not
-converged-and-failed. That is the first faithful-pipeline evidence that the cap binds,
-and it is the evidence the three earlier arms could not supply: two were pre-fix, and the
-joint arm's own deepest row halted `done` with 73,508 tokens of cap unspent.
+So **11 of 13** failures are token-terminated rather than converged-and-failed. That is
+the first faithful-pipeline evidence that the cap binds, and it is the evidence the three
+earlier arms could not supply: two were pre-fix, and the joint arm's own deepest row
+halted `done` with 73,508 tokens of cap unspent.
 
-It does NOT by itself show that more budget converts. The earlier `dphn-cap` joint arm
-(0/4 cell-reps, guardrail 1.79x/3.05x) says it did not on its cells, and the triage shows
-these tasks have named tests no arm ever passed at any envelope. Those two results now
-sit in direct tension for these 18 rows, and the tension is cheap to resolve: this whole
-18-task run cost $0.97.
+It does NOT by itself show that more budget converts — the void joint arm (0/4 cell-reps,
+guardrail 1.79x/3.05x) says it did not on its cells, and the triage shows these tasks have
+named tests no arm ever passed at any envelope. Those results now sit in direct tension
+for these rows, and the tension is cheap to resolve: this whole 18-task run cost under a
+dollar, and the 11-row envelope arm costs about two.
 
 ## Caveats
 
