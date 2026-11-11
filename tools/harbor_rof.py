@@ -11,7 +11,7 @@ from harbor.agents.model_connection import ModelConnectionSpec
 from harbor.agents.options import InstalledAgentOptions
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
-from pydantic import Field
+from pydantic import Field, model_validator
 
 _RUNTIME_FILES = (
     "rof",
@@ -36,9 +36,19 @@ class RofOptions(InstalledAgentOptions):
     preserve_failed_checks: bool = False
     archive_output: bool = False
     shell: bool = False
+    repo_lookup: bool = False
+    repo_evidence: bool = False
+    collapse_hysteresis: int | None = Field(default=None, gt=0)
+    completion_check: str | None = Field(default=None, pattern=r"\S")
     workflow: Literal["legacy", "minimal"] = "legacy"
     reasoning_effort: Literal["low", "high", "max"] | None = None
     thinking_keep: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_evidence(self):
+        if self.repo_evidence and not self.repo_lookup:
+            raise ValueError("repo_evidence requires repo_lookup")
+        return self
 
 
 class RofAgent(BaseInstalledAgent):
@@ -140,6 +150,16 @@ class RofAgent(BaseInstalledAgent):
             args.extend(("--archive-output", "on"))
         if self.options.shell:
             args.extend(("--shell", "on"))
+        if self.options.repo_lookup:
+            args.extend(("--repo-lookup", "on"))
+        if self.options.repo_evidence:
+            args.extend(("--repo-evidence", "on"))
+        if self.options.collapse_hysteresis is not None:
+            args.extend(
+                ("--collapse-hysteresis", str(self.options.collapse_hysteresis))
+            )
+        if self.options.completion_check is not None:
+            args.extend(("--completion-check", self.options.completion_check))
         if self.options.observation_keep is not None:
             args.extend(("--observation-keep", str(self.options.observation_keep)))
         if self.options.thinking_keep is not None:

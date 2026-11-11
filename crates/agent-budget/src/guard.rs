@@ -49,6 +49,12 @@ impl BudgetGuard {
         if c.steps >= cfg.max_steps.get() {
             return Some(BudgetHalt::Steps);
         }
+        self.peek_non_step()
+    }
+
+    fn peek_non_step(&self) -> Option<BudgetHalt> {
+        let c = &self.counters;
+        let cfg = &self.config;
         if cfg.max_tokens > 0 && c.tokens >= cfg.max_tokens {
             return Some(BudgetHalt::Tokens);
         }
@@ -89,6 +95,15 @@ impl BudgetGuard {
     /// Current halt with spent/limit, without consuming grace.
     pub fn exceeded(&self) -> Option<BudgetExceeded> {
         self.peek().map(|halt| {
+            let (spent, limit) = self.spent_limit(&halt);
+            BudgetExceeded { halt, spent, limit }
+        })
+    }
+
+    /// Check every cap except steps for work settling an already-admitted
+    /// final response. Step grace must never hide another exhausted cap.
+    pub fn exceeded_except_steps(&self) -> Option<BudgetExceeded> {
+        self.peek_non_step().map(|halt| {
             let (spent, limit) = self.spent_limit(&halt);
             BudgetExceeded { halt, spent, limit }
         })

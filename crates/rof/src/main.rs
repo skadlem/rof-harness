@@ -128,6 +128,7 @@ fn registry_for(
             shell: args.shell,
             processes: args.processes,
             repo_lookup: args.repo_lookup,
+            repo_evidence: args.repo_evidence,
             multi_edit: args.multi_edit,
         },
     )?;
@@ -829,6 +830,77 @@ mod tests {
         let archive = output_archive_dir(&args.workdir).unwrap();
         assert!(!archive.starts_with(&args.workdir));
         std::fs::remove_dir_all(workdir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_completion_predicate_uses_real_policy_and_records_results() {
+        for (command, expected_code, checks) in [("true", 0, 1), ("false", 8, 2)] {
+            let work = tmp();
+            std::fs::write(work.join("note.txt"), "unchanged").unwrap();
+            let mut args = args_for(&work, None);
+            args.completion_check = Some(command.into());
+            args.allow_cmd = vec![command.into()];
+            let provider = ScriptClient::new(vec![text_resp(), text_resp()]);
+            let result = execute(&provider, &args).await;
+            assert_eq!(
+                exit_code(&result.outcome),
+                expected_code,
+                "{:?}",
+                result.outcome
+            );
+            assert_eq!(
+                result
+                    .events
+                    .iter()
+                    .filter(|e| matches!(e, AgentEvent::ToolStart { name, .. } if name == "test"))
+                    .count(),
+                checks
+            );
+            assert_eq!(
+                result
+                    .events
+                    .iter()
+                    .filter(|e| matches!(e, AgentEvent::ToolEnd { .. }))
+                    .count(),
+                checks
+            );
+            assert_eq!(
+                std::fs::read_to_string(work.join("note.txt")).unwrap(),
+                "unchanged"
+            );
+            assert!(result.patch.unwrap().is_empty());
+            let wal = std::fs::read_to_string(work.join(".rof-events.jsonl")).unwrap();
+            assert!(wal.contains("harness-origin completion-check"));
+            std::fs::remove_dir_all(work).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn evidence_flag_reaches_real_registry_without_changing_defaults() {
+        let work = tmp();
+        std::fs::write(work.join("lib.rs"), "pub fn Rocket() {}\n").unwrap();
+        let mut args = args_for(&work, None);
+        args.repo_lookup = true;
+        args.repo_evidence = true;
+        let registry = registry_for(&args, Arc::new(policy_for(&args))).unwrap();
+        let call = tool_core::ToolCall {
+            call_id: "lookup".into(),
+            name: "repo_lookup".into(),
+            args: serde_json::json!({"symbol":"Rocket"}),
+        };
+        let tool_core::CallStatus::Dispatch(inv) = registry.prepare("agent", call) else {
+            panic!("lookup not dispatched")
+        };
+        let result = registry
+            .resolve("repo_lookup")
+            .unwrap()
+            .execute(inv, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.content);
+        assert!(result.content.contains("definition"), "{}", result.content);
+        assert!(result.content.contains("lib.rs:1"), "{}", result.content);
+        std::fs::remove_dir_all(work).unwrap();
     }
 
     #[tokio::test]

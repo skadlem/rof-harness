@@ -12,7 +12,7 @@ use crate::{
     snapshot_batch, turn_end_reason_to_event, turn_id, BetsHook, ClaimOutcome, FailureKind,
     IncentivesLevel, Input, LoopState, Outcome, Phase, PhaseVerdict, ROLLBACK_NOTICE,
 };
-use agent_budget::BudgetHalt;
+use agent_budget::{halt_name, BudgetHalt};
 use agent_event::{
     AgentError, AgentEvent, DeltaKind, Emitter, Message, MessageDelta, Role,
     RunOutcome as EventRunOutcome, TurnEndReason as EventTurnEndReason, UsageReport,
@@ -337,6 +337,8 @@ pub struct RunConfig {
     /// run against each leading-prefix tree in `workdir`. `None` = the uniform
     /// proof flag (the batch's tool results all passed).
     pub proof_cmd: Option<String>,
+    /// Exact operator-supplied command checked when the model declares Done.
+    pub completion_check: Option<String>,
     /// Compaction checkpoint knobs (default OFF: no summary call, no fold).
     pub compaction: context::CompactionConfig,
     /// Transcript-fold knobs, the single source of truth: echoed-reasoning
@@ -381,6 +383,7 @@ impl Default for RunConfig {
             log_path: None,
             incentives: IncentivesLevel::Full,
             proof_cmd: None,
+            completion_check: None,
             compaction: context::CompactionConfig::default(),
             thinking_keep: THINKING_KEEP,
             collapse_hysteresis: context::COLLAPSE_HYSTERESIS,
@@ -469,6 +472,7 @@ struct RunCtx<'s, 'r, P> {
     root: CancellationToken,
     cancel: &'r CancellationToken,
     stalled_check: Option<StalledCheck>,
+    completion_checks: u8,
 }
 
 struct StalledCheck {
@@ -1032,6 +1036,9 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 Ok(())
             }
             ClaimOutcome::Done => {
+                if let Some(command) = self.cfg.completion_check.clone() {
+                    return self.settle_completion_check(&command, turn_token).await;
+                }
                 // Already-started final step: `record_step` at the head
                 // may have hit max, so `terminate`'s `exceeded` would
                 // preempt this Done with Halted(steps). The admitted
@@ -1075,6 +1082,191 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 self.proof_gate(report).await
             }
         }
+    }
+
+    async fn settle_completion_check(
+        &mut self,
+        command: &str,
+        turn_token: &CancellationToken,
+    ) -> Result<(), Outcome> {
+        if self.completion_checks >= 2 {
+            return Err(Outcome::Failed {
+                kind: FailureKind::Completion,
+                message: "completion predicate was not satisfied".into(),
+            });
+        }
+        if self.cancel.is_cancelled() || self.state.stop_hard {
+            return Err(Outcome::Cancelled);
+        }
+        if let Some(exceeded) = self.state.budget.exceeded_except_steps() {
+            return Err(Outcome::Halted(halt_name(&exceeded.halt).into()));
+        }
+        let n = self.completion_checks + 1;
+        self.completion_checks = n;
+        let mut call_id = format!("harness-completion-{n}");
+        while self.state.items.iter().any(
+            |item| matches!(&item.kind, ItemKind::ToolCall { call_id: id, .. } if id == &call_id),
+        ) {
+            call_id.push_str("-h");
+        }
+        let args = serde_json::json!({"cmd": command});
+        self.state.budget.counters_mut().actions_this_trial += 1;
+        self.record(
+            ItemKind::Attempt {
+                error: format!("harness-origin completion-check call_id={call_id}"),
+                will_retry: false,
+            },
+            None,
+        )
+        .await?;
+        // Strict providers require an assistant tool-call declaration before
+        // its result. This row is explicitly harness-origin and has no usage.
+        let declaration = AssistantMessage {
+            content: "[harness-origin public completion check]".into(),
+            tool_calls: vec![provider_core::ToolCallRef {
+                id: call_id.clone(),
+                name: tool_core::TOOL_TEST.into(),
+                args: args.clone(),
+            }],
+            thinking: None,
+        };
+        self.state
+            .push_assistant(&declaration, "harness-completion");
+        append_to(
+            &mut self.state.items,
+            ItemKind::ToolCall {
+                call_id: call_id.clone(),
+                tool: tool_core::TOOL_TEST.into(),
+                args: args.clone(),
+            },
+        );
+        self.state.tool_calls.insert(
+            call_id.clone(),
+            crate::ToolCallState {
+                name: tool_core::TOOL_TEST.into(),
+                args: args.to_string(),
+                is_verification: true,
+                result: None,
+            },
+        );
+        self.sync().await?;
+        emit_message_frames(self.state, &declaration, None, self.emitter);
+        self.emitter.emit(AgentEvent::ToolStart {
+            id: call_id.clone(),
+            name: tool_core::TOOL_TEST.into(),
+            args: args.clone(),
+        });
+
+        let tool_call = ToolCall {
+            call_id: call_id.clone(),
+            name: tool_core::TOOL_TEST.into(),
+            args: args.clone(),
+        };
+        let prepared = self.registry.prepare(self.agent, tool_call);
+        let (result, completed, dispatched) = match prepared {
+            tool_core::CallStatus::Dispatch(inv) => {
+                let tree = self.tree.clone();
+                if let Err(e) = blocking(move || tree.baseline()).await {
+                    return Err(Outcome::Failed {
+                        kind: FailureKind::Snapshot,
+                        message: format!("snapshot baseline: {e}"),
+                    });
+                }
+                let (result, completed) = self.execute_call(inv, turn_token).await;
+                (result, completed, true)
+            }
+            tool_core::CallStatus::Result(result) => {
+                self.state.budget.counters_mut().actions_this_trial -= 1;
+                (result, true, false)
+            }
+        };
+        if dispatched {
+            // The action was reserved before execution. The shared settlement
+            // records it once and updates the same-action tripwire normally.
+            self.state.budget.counters_mut().actions_this_trial -= 1;
+            let _ =
+                note_tool_execution(self.state, tool_core::TOOL_TEST, &args.to_string(), &result);
+            self.state.observe_read_streak(
+                tool_core::TOOL_TEST,
+                result.is_error,
+                self.cfg.streak_steer,
+            );
+        }
+        self.state.record_tool_result(ToolMsg {
+            call_id: call_id.clone(),
+            result: result.clone(),
+        });
+        settle_tool_tail(self.state, &self.cfg);
+        self.sync().await?;
+        self.emitter.emit(AgentEvent::ToolEnd {
+            id: call_id,
+            result: Value::String(result.content.clone()),
+            is_error: result.is_error,
+        });
+
+        if !result.is_error {
+            if self.cancel.is_cancelled() || self.state.stop_hard {
+                return Err(Outcome::Cancelled);
+            }
+            if let Some(exceeded) = self.state.budget.exceeded_except_steps() {
+                return Err(Outcome::Halted(halt_name(&exceeded.halt).into()));
+            }
+            self.state.call_model = false;
+            if self
+                .state
+                .budget
+                .exceeded()
+                .is_some_and(|e| e.halt == BudgetHalt::Steps)
+            {
+                return Err(Outcome::Done);
+            }
+            return self.settle_terminal(self.state.turn).await;
+        }
+        let denied = result.content.starts_with("denied:")
+            || result.content.starts_with("ask denied")
+            || result.content.starts_with("unknown tool:")
+            || result.content.starts_with("invalid args:");
+        if denied {
+            return Err(Outcome::Failed {
+                kind: FailureKind::Completion,
+                message: format!("completion predicate could not run: {}", result.content),
+            });
+        }
+        if dispatched && result.is_error && (!self.cfg.preserve_failed_checks || !completed) {
+            self.record(
+                ItemKind::Attempt {
+                    error: ROLLBACK_NOTICE.into(),
+                    will_retry: true,
+                },
+                None,
+            )
+            .await?;
+            self.state.push_directive(ROLLBACK_NOTICE.into(), &self.cfg);
+            let tree = self.tree.clone();
+            if let Err(e) = blocking(move || tree.rollback()).await {
+                return Err(Outcome::Failed {
+                    kind: FailureKind::Snapshot,
+                    message: format!("snapshot rollback: {e}"),
+                });
+            }
+        }
+        if self.cancel.is_cancelled() || self.state.stop_hard {
+            return Err(Outcome::Cancelled);
+        }
+        if !completed && result.content.contains("wallclock") {
+            return Err(Outcome::Halted("wallclock".into()));
+        }
+        if let Some(exceeded) = self.state.budget.exceeded() {
+            return Err(Outcome::Halted(halt_name(&exceeded.halt).into()));
+        }
+        if self.completion_checks >= 2 {
+            return Err(Outcome::Failed {
+                kind: FailureKind::Completion,
+                message: format!("completion predicate failed: {}", result.content),
+            });
+        }
+        self.state.call_model = true;
+        Ok(())
     }
 
     async fn monitor_failed_check(
@@ -1555,6 +1747,7 @@ pub async fn run<P: LlmClient>(
         root: CancellationToken::new(),
         cancel,
         stalled_check: None,
+        completion_checks: 0,
     };
     if let Some(o) = ctx.open_run(inputs).await {
         return o;

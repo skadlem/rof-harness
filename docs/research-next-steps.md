@@ -3,8 +3,11 @@
 **Active execution reference:** the
 [phased implementation plan](superpowers/plans/2026-11-11-capability-phases.md)
 assigns subagents, freezes additive contracts, and defines per-phase gates for
-the direct paper audit below. It is planned, not implemented. Use its order for
-new work; the completed output-fidelity changes remain the foundation.
+the direct paper audit below. Phases 0–2 are implemented and locally verified; phases 3–4
+remain conditional and paid phase 5 remains stopped. The
+[implementation record](phase-0-2-implementation.md) documents new contracts and
+reference provenance. Use the plan order for new work; output-fidelity changes
+remain the foundation.
 
 ## Objective and current state
 

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 use tool_core::{CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome};
 
 use crate::common::{
-    apply_hunk, dispatch, parse_args, path_err, EDIT_FILE_CAP, EDIT_REPLACE_CAP, EXEC_TIMEOUT,
+    apply_hunk, cap_chars, dispatch, parse_args, path_err, EDIT_FILE_CAP, EDIT_REPLACE_CAP,
+    EXEC_TIMEOUT, OUT_CAP,
 };
 use crate::policy::{resolve_under, Policy};
 use crate::runner::{cmd_schema, run_allowed_raw, split_cmd};
@@ -24,6 +25,7 @@ pub struct ExperimentalToolsConfig {
     pub shell: bool,
     pub processes: bool,
     pub repo_lookup: bool,
+    pub repo_evidence: bool,
     pub multi_edit: bool,
 }
 
@@ -56,6 +58,9 @@ pub fn experimental_tools(
 ) -> Result<Vec<Arc<dyn Tool>>, String> {
     if (config.shell || config.processes) && !policy.allow_any_cmd {
         return Err("shell and process tools require allow_any_cmd".into());
+    }
+    if config.repo_evidence && !config.repo_lookup {
+        return Err("repo_evidence requires repo_lookup".into());
     }
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(view_tool(policy.clone())),
@@ -94,6 +99,7 @@ pub fn experimental_tools(
     if config.repo_lookup {
         tools.push(Arc::new(RepoLookup {
             policy: policy.clone(),
+            evidence: config.repo_evidence,
         }));
     }
     if config.multi_edit {
@@ -348,13 +354,39 @@ fn lookup_limit() -> usize {
 const LOOKUP_ENTRY_CAP: usize = 100_000;
 const LOOKUP_FILE_CAP: usize = 10_000;
 const LOOKUP_BYTE_CAP: u64 = 64 * 1024 * 1024;
+
+#[cfg(test)]
+mod lookup_scan_tests {
+    #[test]
+    fn bounded_collection_reads_only_one_entry_past_the_limit() {
+        let mut consumed = 0;
+        let entries = (0..).map(|i| {
+            consumed += 1;
+            Ok::<_, ()>(i)
+        });
+        assert_eq!(super::collect_bounded(entries, 2).unwrap(), None);
+        assert_eq!(consumed, 3);
+    }
+}
+
+fn collect_bounded<T, E>(
+    entries: impl Iterator<Item = Result<T, E>>,
+    limit: usize,
+) -> Result<Option<Vec<T>>, E> {
+    let entries = entries
+        .take(limit.saturating_add(1))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((entries.len() <= limit).then_some(entries))
+}
+
 struct RepoLookup {
     policy: Arc<Policy>,
+    evidence: bool,
 }
 #[async_trait]
 impl Tool for RepoLookup {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition{name:"repo_lookup".into(),description:"find literal symbol occurrences; skips symlinks and files over 1 MiB, scans at most 100,000 entries, 10,000 files, or 64 MiB; no semantic call graph".into(),schema:json!({"type":"object","required":["symbol"],"additionalProperties":false,"properties":{"symbol":{"type":"string","minLength":1,"maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":500}}})}
+        ToolDefinition{name:"repo_lookup".into(),description:if self.evidence { "find literal occurrences and heuristic definition, test-path, and configuration-path candidates; skips symlinks and files over 1 MiB, scans at most 100,000 entries, 10,000 files, or 64 MiB; no semantic call graph" } else { "find literal symbol occurrences; skips symlinks and files over 1 MiB, scans at most 100,000 entries, 10,000 files, or 64 MiB; no semantic call graph" }.into(),schema:json!({"type":"object","required":["symbol"],"additionalProperties":false,"properties":{"symbol":{"type":"string","minLength":1,"maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":500}}})}
     }
     fn prepare(&self, c: &ToolCall) -> CallStatus {
         dispatch(c)
@@ -375,6 +407,9 @@ impl Tool for RepoLookup {
         }
         let mut stack = vec![self.policy.root.clone()];
         let mut hits = Vec::new();
+        let mut groups: [Vec<String>; 4] = std::array::from_fn(|_| Vec::new());
+        let mut hit_locations = HashSet::new();
+        let mut snippet_cut = false;
         let mut seen = 0usize;
         let mut entries_seen = 0usize;
         let mut files_seen = 0usize;
@@ -382,6 +417,20 @@ impl Tool for RepoLookup {
         let mut scan_capped = false;
         while let Some(dir) = stack.pop() {
             let entries = std::fs::read_dir(&dir).map_err(|e| ToolError::Failed(e.to_string()))?;
+            let entries: Box<dyn Iterator<Item = std::io::Result<std::fs::DirEntry>>> =
+                if self.evidence {
+                    let remaining = LOOKUP_ENTRY_CAP.saturating_sub(entries_seen);
+                    let Some(mut bounded) = collect_bounded(entries, remaining)
+                        .map_err(|e| ToolError::Failed(e.to_string()))?
+                    else {
+                        scan_capped = true;
+                        break;
+                    };
+                    bounded.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+                    Box::new(bounded.into_iter().map(Ok))
+                } else {
+                    Box::new(entries)
+                };
             for e in entries {
                 if cancel.is_cancelled() {
                     return Err(ToolError::Failed("repository lookup cancelled".into()));
@@ -438,7 +487,16 @@ impl Tool for RepoLookup {
                 for (i, line) in s.lines().enumerate() {
                     if line.contains(&a.symbol) {
                         seen += 1;
-                        if hits.len() < a.limit {
+                        if self.evidence {
+                            let location = (rel.clone(), i + 1);
+                            if hit_locations.len() < a.limit && hit_locations.insert(location) {
+                                let category = lookup_category(&rel, line, &a.symbol);
+                                let text = line.trim();
+                                let snippet = text.chars().take(400).collect::<String>();
+                                snippet_cut |= text.chars().count() > 400;
+                                groups[category].push(format!("{rel}:{}: {snippet}", i + 1));
+                            }
+                        } else if hits.len() < a.limit {
                             hits.push(format!(
                                 "{}:{} [{}] {}",
                                 rel,
@@ -458,17 +516,126 @@ impl Tool for RepoLookup {
                 break;
             }
         }
-        Ok(ToolOutcome {
-            content: format!(
+        let legacy = format!(
                 "literal occurrences for {:?} (showing {}, total matches {}; scanned {files_seen} files/{bytes_seen} bytes)\n{}",
                 a.symbol,
                 hits.len(),
                 seen,
                 hits.join("\n")
-            ),
-            truncated: scan_capped || seen > hits.len(),
+            );
+        if !self.evidence {
+            return Ok(ToolOutcome {
+                content: legacy,
+                truncated: scan_capped || seen > hits.len(),
+                success: true,
+            });
+        }
+        let names = [
+            "literal locations",
+            "definition candidates",
+            "test path candidates",
+            "configuration path candidates",
+        ];
+        let mut body = format!("repository evidence for {:?} ({} literal matches; scanned {files_seen} files/{bytes_seen} bytes)\n", a.symbol, seen);
+        for (name, group) in names.iter().zip(groups.iter()) {
+            body.push_str(&format!("\n{name}:\n{}\n", group.join("\n")));
+        }
+        let mut reasons = Vec::new();
+        if scan_capped {
+            reasons.push("scan limit reached; results may be incomplete");
+        }
+        if seen > hit_locations.len() {
+            reasons.push("results omitted at shared hit limit");
+        }
+        if snippet_cut {
+            reasons.push("line snippets shortened to 400 characters");
+        }
+        let make_note = |reasons: &[&str]| {
+            if reasons.is_empty() {
+                String::new()
+            } else {
+                format!("\n[{}]", reasons.join("; "))
+            }
+        };
+        let mut note = make_note(&reasons);
+        if body.chars().count() + note.chars().count() > OUT_CAP {
+            reasons.push("output omitted at 8000-character limit");
+            note = make_note(&reasons);
+        }
+        let room = OUT_CAP.saturating_sub(note.chars().count());
+        let (mut content, char_cut) = cap_chars(body, room);
+        content.push_str(&note);
+        Ok(ToolOutcome {
+            content,
+            truncated: !reasons.is_empty() || char_cut,
             success: true,
         })
+    }
+}
+
+fn lookup_category(path: &str, line: &str, symbol: &str) -> usize {
+    let lower_path = path.to_ascii_lowercase();
+    let base = lower_path.rsplit('/').next().unwrap_or(&lower_path);
+    if lower_path
+        .split('/')
+        .any(|part| matches!(part, "test" | "tests" | "spec" | "specs" | "__tests__"))
+        || [".test.", ".spec."]
+            .iter()
+            .any(|suffix| base.contains(suffix))
+    {
+        return 2;
+    }
+    if lower_path
+        .split('/')
+        .any(|part| matches!(part, "config" | "configs"))
+        || [
+            "cargo.toml",
+            "package.json",
+            "tsconfig.json",
+            "pyproject.toml",
+            "setup.cfg",
+            ".env",
+        ]
+        .contains(&base)
+        || [".toml", ".yaml", ".yml", ".ini", ".cfg"]
+            .iter()
+            .any(|ext| base.ends_with(ext))
+    {
+        return 3;
+    }
+    let declaration = line.trim_start();
+    let declaration = declaration.trim_start_matches(['#', '/', '*', '@']);
+    let declaration = declaration.trim_start();
+    let declares = [
+        "fn ",
+        "pub fn ",
+        "pub async fn ",
+        "async fn ",
+        "function ",
+        "export function ",
+        "def ",
+        "class ",
+        "interface ",
+        "struct ",
+        "enum ",
+        "type ",
+        "func ",
+        "const ",
+        "var ",
+        "let ",
+    ]
+    .iter()
+    .any(|prefix| declaration.starts_with(prefix));
+    let boundaries = line.match_indices(symbol).any(|(start, matched)| {
+        let before = line[..start].chars().next_back();
+        let after = line[start + matched.len()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+    });
+    if declares && boundaries {
+        1
+    } else {
+        0
     }
 }
 

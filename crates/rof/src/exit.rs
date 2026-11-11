@@ -13,7 +13,7 @@ pub(crate) const EXIT_NO_CREDENTIALS: i32 = 4;
 /// [`FailureKind`] gets its own code so wrappers can react without parsing
 /// stderr — except [`FailureKind::Provider`], which keeps the historical 3
 /// as the most common run failure. 5/6/7 follow declaration order after the
-/// taken codes.
+/// taken codes. 8 is a task-level failure of the configured completion predicate.
 pub(crate) fn exit_code(outcome: &Outcome) -> i32 {
     match outcome {
         Outcome::Done => 0,
@@ -24,6 +24,7 @@ pub(crate) fn exit_code(outcome: &Outcome) -> i32 {
             FailureKind::Snapshot => 6,
             FailureKind::Provider => 3,
             FailureKind::Input => 7,
+            FailureKind::Completion => 8,
         },
     }
 }
@@ -90,6 +91,7 @@ mod tests {
             (FailureKind::Log, 5),
             (FailureKind::Snapshot, 6),
             (FailureKind::Input, 7),
+            (FailureKind::Completion, 8),
         ] {
             assert_eq!(
                 exit_code(&Outcome::Failed {

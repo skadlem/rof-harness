@@ -27,6 +27,7 @@ use tool_core::{
 use tool_core::{ToolCall, ToolResult};
 
 mod budget;
+mod completion;
 mod fold;
 mod gate;
 mod proof;

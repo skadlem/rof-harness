@@ -3,7 +3,7 @@
 **Historical implementation record:** this document covers the twelve proposals
 scheduled on 2026-11-07. Their bounded implementations shipped as described below.
 The current [phased capability plan](superpowers/plans/2026-11-11-capability-phases.md)
-adds the paper-audit work and is still planned. It does not imply that new
+adds the paper-audit work; phases 0–2 are implemented and locally verified. It does not imply that new
 history, completion-predicate or checkpoint contracts already exist.
 
 Chosen implementation plan, 2026-11-07. The owner approved implementing the twelve

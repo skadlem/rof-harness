@@ -11,7 +11,7 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--context-file PATH]... [--proof-cmd CMD] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
@@ -26,9 +26,12 @@ pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--work
 --collapse-hysteresis N: collapse-boundary hysteresis rows (flag wins over COLLAPSE_HYSTERESIS; unset leaves the loop default)
 --allow-dirty-workdir: run inside a dirty git workdir (default: refuse; allowed dirt appears in the reported patch)
 --pass-env NAME: forward env var to exec/test children (repeatable; provider-key-shaped names stay withheld at spawn)
+--repo-lookup on|off: opt-in literal repository lookup (default off)
+--repo-evidence on|off: enriched bounded definition/test/config candidates; requires --repo-lookup on (default off)
+--completion-check CMD: exact public test command checked on Done, at most one repair and two checks within the original caps; argv, no shell; cannot combine with --review on (default unset)
 --review on|off: opt-in bounded fresh-context read-only defect review and one repair continuation; default off
 --procedure-file PATH: add a validated JSON procedure record (repeatable); only case-insensitive literal cue matches are injected, with bounded text and explicit source repositories
-exit codes: 0 done, 2 usage/parse, 3 run failure (halt/cancel/provider), 4 missing credentials, 5 log failure, 6 snapshot failure, 7 empty input";
+exit codes: 0 done, 2 usage/parse, 3 run failure (halt/cancel/provider), 4 missing credentials, 5 log failure, 6 snapshot failure, 7 empty input, 8 unmet completion predicate";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Args {
@@ -77,6 +80,7 @@ pub(crate) struct Args {
     /// Experimental read-streak intervention, off by default.
     pub streak_steer: bool,
     pub proof_cmd: Option<String>,
+    pub completion_check: Option<String>,
     pub incentives: agent_loop::IncentivesLevel,
     pub bets: bool,
     /// Compaction trigger fraction; `None` = checkpoint off (default).
@@ -100,6 +104,7 @@ pub(crate) struct Args {
     pub shell: bool,
     pub processes: bool,
     pub repo_lookup: bool,
+    pub repo_evidence: bool,
     pub multi_edit: bool,
     pub review: bool,
     pub procedure_files: Vec<PathBuf>,
@@ -186,6 +191,7 @@ struct RunBuilder {
     steer: Option<bool>,
     streak_steer: Option<bool>,
     proof_cmd: Option<String>,
+    completion_check: Option<String>,
     incentives: Option<agent_loop::IncentivesLevel>,
     bets: bool,
     compaction: Option<f64>,
@@ -201,6 +207,7 @@ struct RunBuilder {
     shell: Option<bool>,
     processes: Option<bool>,
     repo_lookup: Option<bool>,
+    repo_evidence: Option<bool>,
     multi_edit: Option<bool>,
     review: bool,
     procedure_files: Vec<PathBuf>,
@@ -270,6 +277,20 @@ fn set_processes(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
 
 fn set_repo_lookup(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
     b.repo_lookup = Some(parse_toggle("--repo-lookup", v)?);
+    Ok(())
+}
+
+fn set_repo_evidence(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.repo_evidence = Some(parse_toggle("--repo-evidence", v)?);
+    Ok(())
+}
+
+fn set_completion_check(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let command = v.ok_or("--completion-check needs a command")?;
+    if command.trim().is_empty() {
+        return Err("--completion-check needs a nonempty command".into());
+    }
+    b.completion_check = Some(command);
     Ok(())
 }
 
@@ -558,6 +579,16 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_repo_lookup,
     },
     Flag {
+        name: "--repo-evidence",
+        takes_value: true,
+        set: set_repo_evidence,
+    },
+    Flag {
+        name: "--completion-check",
+        takes_value: true,
+        set: set_completion_check,
+    },
+    Flag {
         name: "--multi-edit",
         takes_value: true,
         set: set_multi_edit,
@@ -734,6 +765,12 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
     {
         return Err("--shell and --processes require --exec-policy any".into());
     }
+    if b.repo_evidence.unwrap_or(false) && !b.repo_lookup.unwrap_or(false) {
+        return Err("--repo-evidence requires --repo-lookup on".into());
+    }
+    if b.completion_check.is_some() && b.review {
+        return Err("--completion-check cannot be combined with --review on".into());
+    }
     Ok(Args {
         goal: b.goal.ok_or("missing --goal")?,
         context_files: b.context_files,
@@ -757,6 +794,7 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         steer: b.steer.unwrap_or(false),
         streak_steer: b.streak_steer.unwrap_or(false),
         proof_cmd: b.proof_cmd,
+        completion_check: b.completion_check,
         incentives: b.incentives.unwrap_or(agent_loop::IncentivesLevel::Full),
         bets: b.bets,
         compaction: b.compaction,
@@ -772,6 +810,7 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         shell: b.shell.unwrap_or(false),
         processes: b.processes.unwrap_or(false),
         repo_lookup: b.repo_lookup.unwrap_or(false),
+        repo_evidence: b.repo_evidence.unwrap_or(false),
         multi_edit: b.multi_edit.unwrap_or(false),
         review: b.review,
         procedure_files: b.procedure_files,
@@ -902,6 +941,7 @@ pub(crate) fn run_config(args: &Args) -> RunConfig {
         max_tokens: args.max_tokens.unwrap_or(8_000),
         incentives: args.incentives,
         proof_cmd: args.proof_cmd.clone(),
+        completion_check: args.completion_check.clone(),
         steer: args.steer,
         streak_steer: args.streak_steer,
         preserve_failed_checks: args.preserve_failed_checks,
@@ -994,6 +1034,7 @@ mod tests {
                 bets: false,
                 incentives: agent_loop::IncentivesLevel::Full,
                 proof_cmd: None,
+                completion_check: None,
                 compaction: Some(0.6),
                 thinking_keep: None,
                 collapse_hysteresis: None,
@@ -1007,6 +1048,7 @@ mod tests {
                 shell: false,
                 processes: false,
                 repo_lookup: false,
+                repo_evidence: false,
                 multi_edit: false,
                 review: false,
                 procedure_files: Vec::new(),
@@ -1516,6 +1558,30 @@ mod tests {
                 .streak_steer
         );
         assert!(parse_args(&run_min(&["--streak-steer", "invalid"])).is_err());
+    }
+
+    #[test]
+    fn evidence_and_completion_flags_parse_and_validate() {
+        let a = parse_args(&run_min(&[
+            "--repo-lookup",
+            "on",
+            "--repo-evidence",
+            "on",
+            "--completion-check",
+            "cargo test",
+        ]))
+        .unwrap();
+        assert!(a.repo_lookup && a.repo_evidence);
+        assert_eq!(
+            run_config(&a).completion_check.as_deref(),
+            Some("cargo test")
+        );
+        assert!(run_config(&parse_args(&run_min(&[])).unwrap())
+            .completion_check
+            .is_none());
+        assert!(parse_args(&run_min(&["--completion-check", "true", "--review", "on"])).is_err());
+        assert!(parse_args(&run_min(&["--repo-evidence", "on"])).is_err());
+        assert!(parse_args(&run_min(&["--completion-check", "  "])).is_err());
     }
 
     #[test]

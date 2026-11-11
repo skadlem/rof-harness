@@ -2,8 +2,11 @@
 
 Current continuation: the
 [phased capability plan](superpowers/plans/2026-11-11-capability-phases.md)
-records proposed paper-driven additions, ownership and evidence gates. Its new
-interfaces are planned, not shipped decisions. Historical entries below retain
+records paper-driven additions, ownership and evidence gates. Phases 0–2 are
+implemented and locally verified; phases 3–4 remain conditional. The
+[implementation record](phase-0-2-implementation.md) documents contracts, including
+the decision to reject composing completion predicates with the existing review
+stage until their shared repair allowance is specified. Historical entries retain
 their original experiment scope; current benchmark outcomes and defaults are
 recorded in the [pilot](current-benchmark-pilot.md) and
 [handoff](research-next-steps.md).

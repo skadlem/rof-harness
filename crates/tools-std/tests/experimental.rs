@@ -308,22 +308,28 @@ async fn repo_lookup_reports_literal_occurrences_with_test_classification() {
     assert!(result.content.contains("literal"));
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn repo_lookup_skips_symlink_loops_and_external_targets() {
-    use std::os::unix::fs::symlink;
+async fn repo_evidence_groups_definitions_tests_and_configuration_with_shared_limit() {
     let temp = temp_root();
-    let root = temp.join("repo");
-    std::fs::create_dir(&root).unwrap();
-    let outside = temp.join("outside");
-    std::fs::create_dir(&outside).unwrap();
-    std::fs::write(outside.join("secret.rs"), "needle\n").unwrap();
-    symlink(&root, root.join("loop")).unwrap();
-    symlink(&outside, root.join("external")).unwrap();
+    std::fs::create_dir_all(temp.join("tests")).unwrap();
+    std::fs::create_dir_all(temp.join("config")).unwrap();
+    std::fs::write(
+        temp.join("src.rs"),
+        "pub fn plantedCaller() { plantedCaller(); }\n",
+    )
+    .unwrap();
+    std::fs::write(temp.join("src.py"), "def plantedCaller(): pass\n").unwrap();
+    std::fs::write(temp.join("tests/check.py"), "def plantedCaller(): pass\n").unwrap();
+    std::fs::write(
+        temp.join("config/settings.toml"),
+        "entry = 'plantedCaller'\n",
+    )
+    .unwrap();
     let tools = experimental_tools(
-        policy(root, false),
+        policy(temp, false),
         ExperimentalToolsConfig {
             repo_lookup: true,
+            repo_evidence: true,
             ..Default::default()
         },
     )
@@ -332,42 +338,188 @@ async fn repo_lookup_skips_symlink_loops_and_external_targets() {
         .iter()
         .find(|t| t.definition().name == "repo_lookup")
         .unwrap();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        invoke(lookup.as_ref(), serde_json::json!({"symbol":"needle"})),
+    let definition = lookup.definition();
+    assert_eq!(definition.schema["required"], serde_json::json!(["symbol"]));
+    assert!(definition.schema["properties"]["limit"].is_object());
+    let result = invoke(
+        lookup.as_ref(),
+        serde_json::json!({"symbol":"plantedCaller","limit":4}),
     )
     .await
-    .unwrap()
     .unwrap();
-    assert!(!result.content.contains("secret.rs"));
+    let definitions = result
+        .content
+        .split("definition candidates:\n")
+        .nth(1)
+        .unwrap()
+        .split("\ntest path candidates:")
+        .next()
+        .unwrap();
+    assert!(definitions.contains("src.rs:1"));
+    assert!(definitions.contains("src.py:1"));
+    assert!(result.content.contains("test path candidates"));
+    assert!(result.content.contains("configuration path candidates"));
+    assert_eq!(result.content.matches("src.rs:1").count(), 1);
+    assert!(!result.content.contains("literal occurrences"));
+    assert!(result.content.contains("tests/check.py:1"));
+    assert!(result.content.contains("config/settings.toml:1"));
+    let limited = invoke(
+        lookup.as_ref(),
+        serde_json::json!({"symbol":"plantedCaller","limit":2}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        limited
+            .content
+            .lines()
+            .filter(|line| line.contains(":1:"))
+            .count(),
+        2
+    );
+    assert!(limited.truncated && limited.content.contains("shared hit limit"));
+}
+
+#[tokio::test]
+async fn repo_evidence_order_is_independent_of_file_creation_order() {
+    let roots = [temp_root(), temp_root()];
+    for (root, names) in roots.iter().zip([["z.rs", "a.rs"], ["a.rs", "z.rs"]]) {
+        for name in names {
+            std::fs::write(root.join(name), "needle\n").unwrap();
+        }
+    }
+    let mut results = Vec::new();
+    for root in roots {
+        let tools = experimental_tools(
+            policy(root, false),
+            ExperimentalToolsConfig {
+                repo_lookup: true,
+                repo_evidence: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let lookup = tools
+            .iter()
+            .find(|t| t.definition().name == "repo_lookup")
+            .unwrap();
+        results.push(
+            invoke(lookup.as_ref(), serde_json::json!({"symbol":"needle"}))
+                .await
+                .unwrap()
+                .content,
+        );
+    }
+    assert_eq!(results[0], results[1]);
+}
+
+#[tokio::test]
+async fn repo_evidence_output_is_bounded_and_reports_omissions() {
+    let temp = temp_root();
+    let lines = (0..300).map(|i| format!("needle_{i} {}\n", "x".repeat(600)));
+    std::fs::write(temp.join("source.txt"), lines.collect::<String>()).unwrap();
+    let tools = experimental_tools(
+        policy(temp, false),
+        ExperimentalToolsConfig {
+            repo_lookup: true,
+            repo_evidence: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let lookup = tools
+        .iter()
+        .find(|t| t.definition().name == "repo_lookup")
+        .unwrap();
+    let result = invoke(lookup.as_ref(), serde_json::json!({"symbol":"needle"}))
+        .await
+        .unwrap();
+    assert!(result.content.chars().count() <= 8_000);
+    assert!(result.content.contains("omitted"));
+    assert!(result.content.contains("shortened to 400 characters"));
+    assert!(result.content.contains("8000-character limit"));
+    assert!(result.truncated);
+}
+
+#[test]
+fn repo_evidence_requires_repo_lookup() {
+    let temp = temp_root();
+    let result = experimental_tools(
+        policy(temp, false),
+        ExperimentalToolsConfig {
+            repo_evidence: true,
+            ..Default::default()
+        },
+    );
+    assert!(result.is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn repo_lookup_skips_symlink_loops_and_external_targets() {
+    for repo_evidence in [false, true] {
+        use std::os::unix::fs::symlink;
+        let temp = temp_root();
+        let root = temp.join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let outside = temp.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.rs"), "needle\n").unwrap();
+        symlink(&root, root.join("loop")).unwrap();
+        symlink(&outside, root.join("external")).unwrap();
+        let tools = experimental_tools(
+            policy(root, false),
+            ExperimentalToolsConfig {
+                repo_lookup: true,
+                repo_evidence,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let lookup = tools
+            .iter()
+            .find(|t| t.definition().name == "repo_lookup")
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            invoke(lookup.as_ref(), serde_json::json!({"symbol":"needle"})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!result.content.contains("secret.rs"));
+    }
 }
 
 #[tokio::test]
 async fn repo_lookup_observes_cancellation() {
-    let root = temp_root();
-    let tools = experimental_tools(
-        policy(root, false),
-        ExperimentalToolsConfig {
-            repo_lookup: true,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let lookup = tools
-        .iter()
-        .find(|t| t.definition().name == "repo_lookup")
+    for repo_evidence in [false, true] {
+        let root = temp_root();
+        let tools = experimental_tools(
+            policy(root, false),
+            ExperimentalToolsConfig {
+                repo_lookup: true,
+                repo_evidence,
+                ..Default::default()
+            },
+        )
         .unwrap();
-    let call = ToolCall {
-        call_id: "cancel-lookup".into(),
-        name: "repo_lookup".into(),
-        args: serde_json::json!({"symbol":"needle"}),
-    };
-    let CallStatus::Dispatch(inv) = lookup.prepare(&call) else {
-        panic!("dispatch")
-    };
-    let cancel = CancellationToken::new();
-    cancel.cancel();
-    assert!(lookup.execute(inv, cancel).await.is_err());
+        let lookup = tools
+            .iter()
+            .find(|t| t.definition().name == "repo_lookup")
+            .unwrap();
+        let call = ToolCall {
+            call_id: "cancel-lookup".into(),
+            name: "repo_lookup".into(),
+            args: serde_json::json!({"symbol":"needle"}),
+        };
+        let CallStatus::Dispatch(inv) = lookup.prepare(&call) else {
+            panic!("dispatch")
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(lookup.execute(inv, cancel).await.is_err());
+    }
 }
 
 #[tokio::test]

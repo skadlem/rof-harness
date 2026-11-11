@@ -21,9 +21,13 @@ files are loaded from frozen, hashed bytes and selected against the original
 task; offline distillation and two-candidate helpers live under `tools/`.
 
 The [phased capability plan](superpowers/plans/2026-11-11-capability-phases.md)
-describes proposed additions. Its evidence mode, historical observation reader,
-completion predicate, capacity controls and checkpoint provenance are not current
-runtime interfaces.
+records the implementation sequence. Phases 0–2 add offline paired reporting,
+Harbor controls, opt-in repository evidence and an opt-in public completion
+predicate. Historical observation restoration, capacity controls and checkpoint
+provenance remain conditional, unimplemented phases. The completion predicate
+uses the existing policy-checked `test` dispatch, not the host proof executor or
+the hidden native verifier. It shares the original budget and permits one repair
+continuation/two checks; it cannot be combined with the separate review stage.
 
 ## Process shape (`crates/rof/src/main.rs`)
 

@@ -59,6 +59,8 @@ pub enum FailureKind {
     Provider,
     /// The run was asked to do nothing: no input seeds a turn.
     Input,
+    /// The operator-supplied completion predicate did not pass or could not run.
+    Completion,
 }
 
 #[derive(Debug, Clone)]

@@ -35,7 +35,8 @@ benchmark gain from the wording change is unmeasured.
 The `rof run` command exposes the following experimental controls. The native
 Harbor adapter (`tools/harbor_rof.py`) currently forwards
 `max_tokens`, `observation_keep`, `thinking_keep`, `preserve_failed_checks`,
-`archive_output`, `shell`, `workflow`, and `reasoning_effort`. The legacy
+`archive_output`, `shell`, `workflow`, `reasoning_effort`, `repo_lookup`,
+`repo_evidence`, `collapse_hysteresis`, and `completion_check`. The legacy
 `rof eval --agent` path is separate and does not currently pass
 `thinking_keep` into its run configuration. The remaining listed features are
 not Harbor adapter options; do not treat their presence in the ROF CLI as
@@ -48,12 +49,14 @@ paragraphs below identify the separate adapter and legacy-eval limitations.
 | `--workflow minimal` | Allow exploration before editing; retain normal finish instructions | legacy |
 | `--observation-keep N` | Retain N recent tool observations verbatim | 5 |
 | `--thinking-keep N` | Retain reasoning text for N assistant messages | 2 |
-| `--collapse-hysteresis N` | Batch advances of the observation-collapse boundary; run-only | 0 |
+| `--collapse-hysteresis N` | Batch advances of the observation-collapse boundary | 0 |
 | `--stall-threshold N` | Notice repeated identical failed checks with unchanged source evidence | 0 (off) |
 | `--archive-output on` | Archive command output and expose paginated retrieval through `output_read` | off |
 | `--shell on` | Add shell composition through the execution wrapper | off |
 | `--processes on` | Add persistent pipe sessions with start/poll/input/stop | off |
 | `--repo-lookup on` | Add bounded literal occurrences and heuristic test-file classification | off |
+| `--repo-evidence on` | Group literal, definition, test-path and configuration candidates; requires lookup | off |
+| `--completion-check CMD` | Run the exact public predicate on Done, with at most one repair continuation and two checks | none |
 | `--multi-edit on` | Validate a set of file edits before applying them | off |
 | `--review on` | Run one fresh-context review and, for a concrete finding, one repair continuation | off |
 | `--procedure-file PATH` | Load an applicable procedure with a recorded content digest (repeatable) | none |
@@ -62,15 +65,13 @@ paragraphs below identify the separate adapter and legacy-eval limitations.
 compares prompt size against a fraction of the cumulative token allowance;
 capacity/headroom correction is planned before any compaction efficacy run.
 The legacy eval CLI does not expose thinking retention, collapse hysteresis,
-or compaction. Planned `repo_evidence`, history restoration, completion checks,
-capacity controls and source-backed checkpoints are not shipped options.
+or compaction. Evidence mode and completion checks are also run/native-Harbor
+controls only. Historical restoration, capacity controls and source-backed
+checkpoints remain planned, not shipped.
 
-Other runtime and eval features such as pipe sessions, repository lookup,
-multi-edit, review, procedure loading, and collapse hysteresis are not
-currently exposed by this Harbor adapter. They remain CLI or local helper
-capabilities, not implemented Harbor pilot options. The phase plan linked
-above specifies the evaluation gates before any of these are considered for
-Harbor wiring.
+Pipe sessions, multi-edit, review and procedure loading remain outside this
+Harbor adapter. New controls remain off by default and unmeasured on external
+tasks; exposing an option does not establish a capability gain.
 
 Shell and process sessions require `--exec-policy any`. They inherit the
 configured execution wrapper in container evaluation; host execution grants
@@ -104,6 +105,51 @@ any benchmark outcome.
 Preserving a failing check does not grant proof to its edits. Mutation or policy
 errors retain the existing rollback behaviour. Multi-file editing is not an
 operating-system transaction and cannot roll back external services or packages.
+
+## Repository evidence and public completion checks
+
+`--repo-lookup on --repo-evidence on` keeps the existing tool arguments (`symbol`,
+optional `limit`) and selects enriched output through run configuration. It groups
+literal locations, heuristic definition candidates, test paths and configuration
+paths under one shared hit limit and an 8,000-character output ceiling. Omitted
+results and scan limits are explicit. These candidates are literal matches, not
+semantic dependency resolution. Without evidence mode, legacy lookup is unchanged.
+Harbor uses `repo_lookup: true` and `repo_evidence: true`; evidence without lookup
+is rejected. `collapse_hysteresis` accepts a positive integer; absence retains
+ROF's existing default of zero.
+
+`--completion-check "python3 -m unittest"` uses the normal `test` tool, command
+policy, execution wrapper, action allowance, deadline and cancellation. It parses
+argv without a shell. Supply only a task/operator-owned public check; hidden
+native graders must never be used. A passing unrelated earlier test cannot
+satisfy this exact predicate. Passing can complete a valid read-only task.
+After the first failed predicate the model gets one repair continuation within
+the original budgets; its next Done is checked once more. Unmet/unknown checks
+are task failures (`FailureKind::Completion`, exit 8), while actual budget or
+cancellation outcomes retain their usual meaning. Tool calls/results and the
+harness origin are logged without fabricated provider usage. Failed checks obey
+`preserve_failed_checks`. Generic verification nudges are disabled for this path.
+
+Harbor's `completion_check` is the exact nonempty command string. `rof run`
+rejects combining completion checks with `--review on`: composing their repair
+opportunities has not been specified or measured. No universal completion rule
+or benchmark improvement is claimed; false rejection must be measured before
+promotion. Per-hunk `--proof-cmd` admission remains a separate mechanism.
+
+## Offline paired reporting
+
+`python3 tools/rof_compare.py --input EXPERIMENT.json --output REPORT.json`
+compares explicit normalized evidence without contacting a provider. The input
+pins a shared protocol, control/treatment runtime hashes and configs, and every
+agent-trial row. Expected task/replicate pairs expose missing attempts in either
+arm. The report separates native artifact rewards from completed/accounted
+comparisons, shows rescue/harm/unchanged outcomes and incomplete pairs, and
+retains failures and interrupted attempts. Gross tokens include cached input
+once, plus output; provider retry usage belongs in its agent-trial row.
+
+See the [input/output contract](phase-0-2-implementation.md) for the schema,
+weighting and zero/unknown semantics. This is an evidence report, not an invoice,
+a budget override or an automatic promotion decision.
 
 ## External evaluation
 

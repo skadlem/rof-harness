@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "status": "implementation_reference_only_no_benchmark_run",
+  "created": "2026-11-11",
+  "provenance_class": "measured hashes; chosen recipe; no capability claim",
+  "source_commit": "411846d497e2a33f5401cae9c075cee5cef078dc",
+  "source_objects": {
+    "Cargo.toml": "0766b131c380a04305d7ed36de5b93c4ca0a6414",
+    "Cargo.lock": "f1db9caa447711c77a0524db0fdd04bb7d97801e",
+    "crates": "f7296a723c1f8f494be883727063bcc8b3b3a1fa",
+    "tools/harbor_rof.py": "82f46fb72c7972f6fc3241c08b388df18932c6cf",
+    "docs/next-benchmark-slice.json": "89f47c05b8f96957cbe0a07880104e3a1bd7c84d"
+  },
+  "build": {
+    "command": "cargo build --release --locked -p rof --manifest-path target/phase0-reference-source/Cargo.toml --target-dir target",
+    "source_export": "git archive 411846d extracted into target/phase0-reference-source; initialized local Git metadata and attached the full reference commit via local fetch/reset so embedded revision is the clean source commit",
+    "profile": "release",
+    "runtime_dir": "/home/madiyar/prod/rof-harness/target/phase0-reference-runtime",
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "embedded_revision": "411846d"
+  },
+  "runtime_sha256": {
+    "rof": "dc170bc3a99f28699206163533b18ab5a5d574f64fa737e3227a793a09a749f2",
+    "ld-linux-x86-64.so.2": "bda779ea9e9ad234f60315477d7cfd0bdde861cd8ddd9df8cdaf62f18c4cec14",
+    "libc.so.6": "85e64f97e348786a8fb4d9f3d52fec289e2fb86bba20f0731dfe61990525e0f7",
+    "libm.so.6": "1c488db6f4fe8cecb72456bc018de000b7a9b539c2994864b0416b5e8371b3d8",
+    "libgcc_s.so.1": "9d339ecb409578d6a5d587e6c537a8f9589b8a13fefba30d167433a4b5758bee"
+  },
+  "adapter": {
+    "source_commit": "411846d",
+    "path": "tools/harbor_rof.py",
+    "sha256": "e3bf6f841b65aee711deb616068c2878f46fd21f6290b6b4375a2bd48fff4056"
+  },
+  "runner": {
+    "base_distribution": "harbor==0.23.0",
+    "files": [
+      {
+        "path": "/home/madiyar/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/verifier/verifier.py",
+        "sha256": "6d3d9ed8882c5e07bae4aa6449732b096166fb9bbabc685b39c0e25f57b20aa9"
+      },
+      {
+        "path": "/home/madiyar/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/trial/trial.py",
+        "sha256": "757f34424e35ea6e924484bff9ae75464e94acd5dec3d769bc65a9518ada79a8"
+      },
+      {
+        "path": "/home/madiyar/.local/share/rof-tb/work/campaign/harbor-rootlogfix/harbor/verifier/verifier.py",
+        "sha256": "a27254a226d56a9885e28ce59374a1696aed961f97009571570e3bcd753260c9"
+      },
+      {
+        "path": "/home/madiyar/.local/share/rof-tb/work/campaign/harbor-rootlogfix/harbor/trial/trial.py",
+        "sha256": "93ad8c3b32f51352ae6257543db9c63a3815f7a93b94f9be27de0e870119e72c"
+      }
+    ]
+  },
+  "recipe": {
+    "model": "openai/deepseek-flash",
+    "endpoint": "https://api.deepseek.com",
+    "credential_variable": "OPENAI_API_KEY",
+    "credential_value": null,
+    "budget_tokens": 1200000,
+    "budget_steps": 120,
+    "budget_actions": 240,
+    "budget_shape": "gross",
+    "max_tokens": 8000,
+    "exec_policy": "any",
+    "steer": false,
+    "streak_steer": false,
+    "keep_thinking": true,
+    "allow_dirty_workdir": true,
+    "workflow": "legacy",
+    "preserve_failed_checks": false,
+    "observation_keep": 5,
+    "thinking_keep": 2,
+    "collapse_hysteresis": 0,
+    "archive_output": false,
+    "shell": false,
+    "repo_lookup": false,
+    "repo_evidence": false,
+    "completion_check": null,
+    "compaction": false,
+    "review": false,
+    "proof_cmd": null,
+    "procedures": [],
+    "internal_deadline_seconds": 3600,
+    "harbor_concurrency": 1,
+    "harbor_retries": 0,
+    "task_resources": "Use pinned task declarations; do not silently reduce resources.",
+    "agent_timeout_seconds": 28800,
+    "native_verifier_timeout": "task-specific",
+    "workdir": "/app",
+    "incentives": "full",
+    "bets": false,
+    "reasoning_effort": null,
+    "processes": false,
+    "multi_edit": false,
+    "context_files": [],
+    "headers": [],
+    "pass_env": [],
+    "stall_threshold": 0,
+    "no_log": false,
+    "log_path": "trial /logs/agent/rof/.rof-events.jsonl",
+    "dump_events": "trial /logs/agent/rof/events.jsonl",
+    "exec_wrap": null,
+    "same_action_cycles": 3,
+    "max_refunds": 30,
+    "warn_steps": 12,
+    "spend_cap_cents": 400,
+    "spend_cap_limit": "Provider price book dependent; financial authorization remains the stopped reservation ledger."
+  },
+  "task_proposal": {
+    "path": "docs/next-benchmark-slice.json",
+    "sha256": "ae31e3f551f5757270f31b12c159fc2d256b68eb22226f258e514ab66b39bddc",
+    "status": "metadata-only convenience slice; no packages/images/oracles/historical exposure validation"
+  },
+  "mechanisms_confirmed": {
+    "original_repo_lookup": "tools-std experimental registry; run CLI; Harbor exposure phase1",
+    "minimal_workflow": "run CLI and Harbor",
+    "preserve_failed_checks": "run CLI and Harbor",
+    "shell_and_output_archive": "run CLI and Harbor",
+    "thinking_retention": "run CLI and Harbor; not legacy eval",
+    "collapse_hysteresis": "run CLI; Harbor exposure phase1",
+    "review": "run CLI default off",
+    "proof_cmd": "run CLI per-hunk admission, not goal completion"
+  },
+  "owners": {
+    "root": [
+      "crates/rof",
+      "tools/harbor_rof.py",
+      "tools/test_harbor_rof.py",
+      "documentation"
+    ],
+    "luna_analysis": [
+      "tools/rof_compare.py",
+      "tools/test_rof_compare.py"
+    ],
+    "luna_tools": [
+      "crates/tools-std"
+    ],
+    "luna_loop": [
+      "crates/agent-loop"
+    ]
+  },
+  "contracts": "../superpowers/plans/2026-11-11-capability-phases.md",
+  "campaign": {
+    "status": "stopped_unknown_usage",
+    "new_paid_requests": 0,
+    "existing_upper_bound_usd": "2.158150338",
+    "includes_unknown_reservation_usd": "0.324172800",
+    "cap_usd": "2.82",
+    "rule": "No paid calls until existing accounting stop is reconciled; preserve reservations."
+  },
+  "limits": [
+    "Reference runtime is built from clean committed export, not the changing implementation tree.",
+    "This local reference has no external outcomes; old pilot rows remain attributed to their original frozen binary.",
+    "After implementation freeze a distinct candidate source/runtime; before benchmark spend reverify current release, task resources, image hashes, oracles, runner and recipes.",
+    "All changes in phases1-2 stay opt-in; completion_check is operator-supplied public command only."
+  ]
+}

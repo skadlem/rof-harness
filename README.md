@@ -21,7 +21,9 @@ experiments, accounting stop, and prerequisites for revisiting deferred ideas.
 Read it when continuing this project in a new session.
 The [phased implementation plan](docs/superpowers/plans/2026-11-11-capability-phases.md)
 defines Luna worker ownership, dependencies, interfaces and validation gates.
-It is planned work; the archive-recovery foundation is already implemented.
+Phases 0–2 add paired reporting, Harbor controls, repository evidence and bounded
+public completion checks; see the [implementation record](docs/phase-0-2-implementation.md).
+These opt-in additions have no new external benchmark results.
 
 [![CI](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml/badge.svg?branch=v2-core)](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
@@ -247,7 +249,7 @@ export OPENAI_API_KEY=...
 ```
 
 Exit codes say what happened: `0` done, `2` usage, `3` run failure (halt, cancel, provider),
-`4` missing credentials, `5` log failure, `6` snapshot failure, `7` empty input. `--dump-events`
+`4` missing credentials, `5` log failure, `6` snapshot failure, `7` empty input, `8` unmet public completion predicate. `--dump-events`
 writes the complete event log for replay.
 
 ## CLI

@@ -1,9 +1,10 @@
 # ROF capability improvements: phased implementation plan
 
-**Status:** planned, not implemented. The output-fidelity foundation is complete;
-the tasks below start from `3e205ea`. The owner requested this implementation plan
-and documentation refresh on 2026-11-11. No new runtime changes or paid runs are
-part of writing it.
+**Status:** phases 0–2 implemented and locally verified from clean reference `411846d`;
+phases 3–6 remain conditional or spend-gated. The output-fidelity foundation is
+complete. The owner authorized phases 0–2 on 2026-11-11. No paid runs are part of
+this implementation. Reference provenance is recorded in the
+[manifest](../../experiments/2026-11-11-phases-0-2-reference.json).
 
 **Goal:** improve externally verified coding-task completion through better
 repository evidence, trace-grounded tools, and targeted execution feedback.
@@ -71,16 +72,16 @@ checks before committing. No worker edits another owner's files or pushes.
 
 **Owner:** root, with read-only Luna source inspection. **Dependencies:** none.
 
-- [ ] Record a clean reference source commit, runtime SHA-256, runner/overlay
+- [x] Record a clean reference source commit, runtime SHA-256, runner/overlay
   hashes, and the complete nonsecret recipe in the new experiment manifest.
   Do not reuse old pilot outcomes as a new-binary control.
-- [ ] Confirm existing mechanisms before adding code: `repo_lookup`, minimal
+- [x] Confirm existing mechanisms before adding code: `repo_lookup`, minimal
   workflow, failed-check preservation, shell, output archive, thinking retention,
   collapse hysteresis, review, and proof commands already exist in some paths.
-- [ ] Freeze the per-phase interfaces below. Record any necessary signature
+- [x] Freeze the per-phase interfaces below. Record any necessary signature
   revision before dispatching consumers; do not invent stubs for conditional work
   before its gate is met.
-- [ ] Preserve the current task/split proposal in `docs/next-benchmark-slice.json`.
+- [x] Preserve the current task/split proposal in `docs/next-benchmark-slice.json`.
   Its packages/oracles and historical exposure remain unvalidated; it is not a
   representative suite or a certified historically unseen holdout.
 
@@ -126,18 +127,18 @@ that the model declared success. Configured token/step/wall-limit terminations
 remain system attempts with their native artifact rewards; they are not removed
 from the task denominator as infrastructure failures.
 
-- [ ] Write failing cases for 00/01/10/11 outcomes, duplicate attempts, mismatched
+- [x] Write failing cases for 00/01/10/11 outcomes, duplicate attempts, mismatched
   tasks/protocols, unknown usage, budget-limited failure, interrupted reward-1
   artifacts, unequal repeat counts, and zero-solve ratios.
-- [ ] Implement deterministic JSON output with per-task paired rows, rescue,
+- [x] Implement deterministic JSON output with per-task paired rows, rescue,
   harm, unchanged outcomes and explicit incomplete pairs. Report raw artifact
   results separately from completed/accounted comparisons; list every attempt.
-- [ ] Compute input/output totals across all attempts, including failures and
+- [x] Compute input/output totals across all attempts, including failures and
   retries. Never add cached-input twice. Return null for tokens-per-solved or
   the treatment/control ratio when denominators or usage are unavailable.
-- [ ] Average repetitions within task before equal weighting across tasks.
+- [x] Average repetitions within task before equal weighting across tasks.
   Keep incomplete tasks visible; do not improve a score through exclusions.
-- [ ] Record `retained_for_research` separately from `eligible_for_promotion`.
+- [x] Record `retained_for_research` separately from `eligible_for_promotion`.
   Do not implement automatic default promotion, significance claims on the
   four-task proposal, or an automatic search scheduler.
 
@@ -157,13 +158,13 @@ repo_lookup: bool = False
 collapse_hysteresis: int | None = Field(default=None, gt=0)
 ```
 
-- [ ] Observe failing forwarding checks, then pass `--repo-lookup on` only when
+- [x] Observe failing forwarding checks, then pass `--repo-lookup on` only when
   enabled and `--collapse-hysteresis N` only when supplied.
-- [ ] Keep existing goal, budgets, exec policy, retention, workflow, shell and
+- [x] Keep existing goal, budgets, exec policy, retention, workflow, shell and
   archive behavior unchanged. Both controls must remain independently testable.
-- [ ] Capture actual adapter argv and validate it with the built ROF parser,
+- [x] Capture actual adapter argv and validate it with the built ROF parser,
   using a deliberately missing credential variable to stop before inference.
-- [ ] Do not claim parity with the legacy `rof eval --agent` CLI. Current native
+- [x] Do not claim parity with the legacy `rof eval --agent` CLI. Current native
   experiments use the installed Harbor adapter, which invokes `rof run`.
 
 Run: `/home/madiyar/.local/share/uv/tools/harbor/bin/python -m unittest discover -s tools -p 'test_harbor_rof.py' -v`.
@@ -180,13 +181,13 @@ real CLI. This lane can run alongside 1A and the trace audit below.
 and `crates/tools-std/tests/experimental.rs`. Root registers integration tests
 under `crates/rof/` after the contract is stable.
 
-- [ ] Audit recorded development actor traces, excluding hidden grader content.
+- [x] Audit recorded development actor traces, excluding hidden grader content.
   Count repeated malformed calls, unrecoverable outputs, and missing repository
   evidence. Preserve trace IDs and exact tool schemas/binary identities.
-- [ ] Reproduce one remaining tool-contract failure locally. If none remains,
+- [x] Reproduce one remaining tool-contract failure locally. If none remains,
   record that result and skip speculative execution API changes. In particular,
   do not add a second shell tool or automatic LLM tool optimizer.
-- [ ] Add `repo_evidence: bool = false` to `ExperimentalToolsConfig`, CLI
+- [x] Add `repo_evidence: bool = false` to `ExperimentalToolsConfig`, CLI
   `--repo-evidence on|off`, and the Harbor option; require `repo_lookup` when it
   is enabled. Preserve the tool's required `symbol`, optional `limit`, and
   default output. The control cannot select enriched mode through an argument:
@@ -194,7 +195,7 @@ under `crates/rof/` after the contract is stable.
   Evidence mode groups bounded literal locations, definition candidates, test
   path candidates and configuration path candidates. These are explicit
   heuristics, not a semantic caller graph or guaranteed complete dependencies.
-- [ ] Reuse current traversal, containment, cancellation and scan caps. Keep
+- [x] Reuse current traversal, containment, cancellation and scan caps. Keep
   one shared result limit across categories. Bound evidence-mode output to
   `common::OUT_CAP` (8,000 characters), with an explicit omission/scan-limit
   notice and `ToolOutcome.truncated`; preserve legacy-mode output. The normal
@@ -202,7 +203,7 @@ under `crates/rof/` after the contract is stable.
   has no tool-local character cap, so this is an evidence-mode contract rather
   than a claim about its old behavior. Deduplicate repeated path/line hits and
   define test/config path heuristics explicitly in fixture tests.
-- [ ] Test old calls, mixed-language definition candidates, duplicate hits,
+- [x] Test old calls, mixed-language definition candidates, duplicate hits,
   test/config paths, deterministic ordering, output limits, and existing escape
   and cancellation behavior. A planted caller/config dependency must be findable
   in evidence mode without asserting that arbitrary semantic dependencies resolve.
@@ -226,16 +227,16 @@ Add `FailureKind::Completion` at the contract gate and adapt exhaustive consumer
 do not rename existing variants or misclassify an unmet predicate as budget or
 infrastructure failure.
 
-- [ ] Write failing scripted cases: passing predicate, failing predicate then
+- [x] Write failing scripted cases: passing predicate, failing predicate then
   successful repair, two failed predicate checks, policy rejection, timeout,
   cancellation, and exhausted step/token budget. Include a valid no-edit task.
-- [ ] Intercept `ClaimOutcome::Done` in `settle_success` before terminal
+- [x] Intercept `ClaimOutcome::Done` in `settle_success` before terminal
   settlement can close the run. Route the exact command through the existing
   policy-checked, wrapped `test` dispatch and logging/budget path. Do not use the
   host proof executor or a hidden native verifier. Reserve action capacity before
   dispatch and add no allowlist grants. Record the invocation as harness-origin
   with a matching tool-call/result pair; do not fabricate provider usage.
-- [ ] Allow at most one repair continuation and two predicate executions total.
+- [x] Allow at most one repair continuation and two predicate executions total.
   Both share the original usage totals, action caps, deadline and cancellation.
   A first failed check sets continuation state once and supplies its new result
   as feedback; a second proposed completion executes the final check. Unmet or
@@ -243,15 +244,38 @@ infrastructure failure.
   message }`; genuine budget exhaustion keeps its normal outcome. Preserve a
   gradeable artifact. The existing last-step Done grace cannot buy an extra
   provider request for repair after a failed predicate.
-- [ ] Disable repeated generic verification nudges for this completion path so
+- [x] Disable repeated generic verification nudges for this completion path so
   they cannot multiply the repair allowance. A previous unrelated passing check
   cannot satisfy the exact configured predicate. Default `None` is unchanged.
-- [ ] Record command, exit/timeout/denial, output and intervention count using
+- [x] Record command, exit/timeout/denial, output and intervention count using
   existing logs/events. Preserve failed-check rollback semantics as configured.
 
 **Exit:** bounded behavior is verified locally and does not falsely require a
 patch on read-only tasks. Measure false rejection on reference successes before
 promotion; no universal completion rule is inferred from JevAct.
+
+Implementation contract refinement (phase 2): `rof run` rejects combining the
+new completion predicate with `--review on`. These mechanisms each offer a repair
+continuation; composing them needs a separate experiment and a shared intervention
+contract. `FailureKind::Completion` maps to exit 8, a task failure that the native
+Harbor adapter does not classify as startup/infrastructure failure. A repair
+continuation may include multiple model/tool steps under the original caps;
+it is not limited to one model response. Root also owns the small additive
+`agent-budget` integration: `BudgetGuard::exceeded_except_steps()` delegates to
+the existing non-step cap checks. This prevents step grace from masking other
+exhausted caps without duplicating budgets in the loop.
+
+Implementation evidence (2026-11-11): 323 scoped Rust tests passed (budget 7,
+loop 142, CLI 84 plus build-provenance 1, standard tools 66 plus experimental
+23); comparison tests 14 and Harbor adapter tests 7 passed. Scoped all-target
+Clippy, Rust formatting, Python Ruff checks and six captured Harbor argv parser
+recipes passed. No provider inference was used for these checks. Two fresh Luna
+reviews found the null-reward denominator and unbounded-directory collection
+issues; their fixes and further completion integration regressions are tested.
+Luna usage limits interrupted the final follow-up turns; root finished the
+remaining source review/fixes and reran the finish gates. No paid benchmark or
+capability improvement is claimed. See the
+[implementation record](../../phase-0-2-implementation.md) for provenance/limits.
 
 ## Phase 3 — conditional historical restoration
 

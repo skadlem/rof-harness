@@ -226,6 +226,7 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
         steer: a.steer,
         streak_steer: a.streak_steer,
         proof_cmd: None,
+        completion_check: None,
         incentives: agent_loop::IncentivesLevel::Full,
         bets: false,
         compaction: None,
@@ -241,6 +242,7 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
         shell: a.shell,
         processes: a.processes,
         repo_lookup: a.repo_lookup,
+        repo_evidence: false,
         multi_edit: a.multi_edit,
         review: a.review,
         // The eval leg selects against the frozen original instruction below

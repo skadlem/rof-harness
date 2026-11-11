@@ -46,6 +46,13 @@ class HarborRofOptionsTest(unittest.IsolatedAsyncioTestCase):
         argv = await self.run_agent()
         self.assertNotIn("--archive-output", argv)
         self.assertNotIn("--shell", argv)
+        for flag in (
+            "--repo-lookup",
+            "--repo-evidence",
+            "--collapse-hysteresis",
+            "--completion-check",
+        ):
+            self.assertNotIn(flag, argv)
         self.assertIn("--workflow", argv)
         self.assertEqual(argv[argv.index("--workflow") + 1], "legacy")
 
@@ -76,8 +83,40 @@ class HarborRofOptionsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(argv[argv.index("--thinking-keep") + 1], "256")
         self.assertEqual(argv[argv.index("--max-tokens") + 1], "4096")
 
+    async def test_lookup_and_hysteresis_are_independent(self):
+        lookup = await self.run_agent(repo_lookup=True)
+        self.assertIn("--repo-lookup", lookup)
+        self.assertEqual(lookup[lookup.index("--repo-lookup") + 1], "on")
+        self.assertNotIn("--collapse-hysteresis", lookup)
+        fold = await self.run_agent(collapse_hysteresis=3)
+        self.assertIn("--collapse-hysteresis", fold)
+        self.assertEqual(fold[fold.index("--collapse-hysteresis") + 1], "3")
+        self.assertNotIn("--repo-lookup", fold)
+
+    async def test_evidence_and_public_completion_command_reach_argv(self):
+        command = "python3 -m unittest 'a b'"
+        argv = await self.run_agent(
+            repo_lookup=True, repo_evidence=True, completion_check=command
+        )
+        self.assertIn("--repo-evidence", argv)
+        self.assertIn("--completion-check", argv)
+        self.assertEqual(argv[argv.index("--repo-evidence") + 1], "on")
+        self.assertEqual(argv[argv.index("--completion-check") + 1], command)
+        self.assertEqual(argv[argv.index("--goal") + 1], "goal")
+
+    def test_evidence_requires_lookup_and_completion_is_nonempty(self):
+        with self.assertRaises(ValueError):
+            RofOptions(runtime_dir=Path("/tmp"), repo_evidence=True)
+        with self.assertRaises(ValueError):
+            RofOptions(runtime_dir=Path("/tmp"), completion_check="  ")
+
     def test_zero_numeric_values_are_rejected_by_pydantic(self):
-        for name in ("max_tokens", "observation_keep", "thinking_keep"):
+        for name in (
+            "max_tokens",
+            "observation_keep",
+            "thinking_keep",
+            "collapse_hysteresis",
+        ):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 RofOptions(runtime_dir=Path("/tmp"), **{name: 0})
 

@@ -7,8 +7,11 @@ measured numbers carry a date and live with the run artifacts.
 
 The active [phased plan](superpowers/plans/2026-11-11-capability-phases.md)
 implements the direct paper audit through disjoint GPT-6 Luna workers and root
-integration. It is planned, not started. Existing archive-handle recovery and
-Harbor archive/shell forwarding are the completed foundation.
+integration. Phases 0–2 are implemented and locally verified: pinned reference, offline paired
+reporting, Harbor lookup/hysteresis, repository evidence and public completion
+checks. The [implementation record](phase-0-2-implementation.md) gives contracts
+and limitations. Existing archive recovery and Harbor archive/shell forwarding
+remain the foundation; no benchmark effect is established for these additions.
 
 Order: freeze contracts/reference → offline paired reporting and existing Harbor
 controls → evidence-aware lookup plus a targeted public completion predicate →

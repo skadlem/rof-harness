@@ -1,0 +1,194 @@
+{
+  "status": "historical_development_actor_trace_audit_not_benchmark_comparison",
+  "scope": "Actor WAL only; includes two earlier Raman development runs and eight TB4.1 runs; hidden graders not inspected.",
+  "totals": {
+    "tool_calls": 847,
+    "tool_results": 847,
+    "repo_lookup_calls": 0,
+    "tool_errors": 39,
+    "truncation_markers": 71,
+    "argv_shape_errors": 11,
+    "argv_shape_error_traces": 9
+  },
+  "traces": [
+    {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/jobs/control-r1-rof-raman-fitting/raman-fitting__B7X8dwx/agent/rof/.rof-events.jsonl",
+      "sha256": "fd05f095fe40c315a9b0271721659dc0dc40d76c097379998f046d359393957d",
+      "counts": {
+        "tool_calls": 33,
+        "tool_results": 33,
+        "repo_lookup_calls": 0,
+        "tool_errors": 3,
+        "truncation_markers": 1
+      },
+      "row_manifest": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows/control-r1-rof-raman-fitting/manifest.json",
+      "provenance": {
+        "git_sha": "b44d4469dd15673113a8ba385ff9c7680856aa19"
+      }
+    },
+    {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/jobs/r1-rof-raman-fitting/raman-fitting__hHBHmcF/agent/rof/.rof-events.jsonl",
+      "sha256": "b1168644d530e13bacc64ae8033e2450a5c113ceac0a4e9d317bce44ab9bb6c4",
+      "counts": {
+        "tool_calls": 0,
+        "tool_results": 0,
+        "repo_lookup_calls": 0,
+        "tool_errors": 0,
+        "truncation_markers": 0
+      },
+      "row_manifest": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows/r1-rof-raman-fitting/manifest.json",
+      "provenance": {}
+    },
+    {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/jobs/tb41-control-r1-rof-session-window-debug/session-window-debug__qoKULjS/agent/rof/.rof-events.jsonl",
+      "sha256": "d1fac0d6d311e3fd4b00476d1d7a4773b61e544a97c3db35b35355a4733197dd",
+      "counts": {
+        "tool_calls": 144,
+        "tool_results": 144,
+        "repo_lookup_calls": 0,
+        "tool_errors": 5,
+        "truncation_markers": 0
+      },
+      "row_manifest": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows/tb41-control-r1-rof-session-window-debug/manifest.json",
+      "provenance": {
+        "binary_sha256": "c9a25f9041e54540e03feeb1079a63f9ed0a3dd08c88d841fc7116af52ba3aab",
+        "git_sha": "b44d4469dd15673113a8ba385ff9c7680856aa19"
+      }
+    },
+    {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/jobs/tb41-obs32-r1-rof-session-window-debug/session-window-debug__22Pib9H/agent/rof/.rof-events.jsonl",
+      "sha256": "f8d6ccc75e71502f596a838a1568899552c4a98fde08945e5fbc6fc00c9d025d",
+      "counts": {
+        "tool_calls": 69,
+        "tool_results": 69,
+        "repo_lookup_calls": 0,
+        "tool_errors": 7,
+        "truncation_markers": 2
+      },
+      "row_manifest": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows/tb41-obs32-r1-rof-session-window-debug/manifest.json",
+      "provenance": {
+        "binary_sha256": "c9a25f9041e54540e03feeb1079a63f9ed0a3dd08c88d841fc7116af52ba3aab",
+        "git_sha": "2e62fcd26c430993fc8e457fbf7a1699986e7ce6"
+      }
+    },
+    {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/jobs/tb41-obs32-think256-r1-rof-session-window-debug/session-window-debug__BXyRR3T/agent/rof/.rof-events.jsonl",
+      "sha256": "e26333f74579e33c3fc310de1bda3de5a27c41dff6b40c2b2878607cd5b0ba76",
+      "counts": {
+        "tool_calls": 39,
+        "tool_results": 39,
+        "repo_lookup_calls": 0,
+        "tool_errors": 5,
+        "truncation_markers": 0
+      },
+      "row_manifest": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows/tb41-obs32-think256-r1-rof-session-window-debug/manifest.json",
+      "provenance": {
+        "binary_sha256": "c9a25f9041e54540e03feeb1079a63f9ed0a3dd08c88d841fc7116af52ba3aab",
+        "git_sha": "2e62fcd26c430993fc8e457fbf7a1699986e7ce6"
+      }
+    },
+    {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/jobs/tb41-react-control-r1-rof-react-lead-form/react-lead-form__MfQnzBz/agent/rof/.rof-events.jsonl",
+      "sha256": "906602a7ee6697de05e5b0a8adfb56625ae8d4bf186bce97f90e14e6d94bcf73",
+      "counts": {
+        "tool_calls": 186,
+        "tool_results": 186,
+        "repo_lookup_calls": 0,
+        "tool_errors": 7,
+        "truncation_markers": 62
+      },
+      "row_manifest": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows/tb41-react-control-r1-rof-react-lead-form/manifest.json",
+      "provenance": {
+        "binary_sha256": "c9a25f9041e54540e03feeb1079a63f9ed0a3dd08c88d841fc7116af52ba3aab",
+        "git_sha": "108d6c3bb3c984b461fb0ea37bc94ffcf08d9b66",
+        "runtime_variant": "control"
+      }
+    },
+    {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/jobs/tb41-react-retention-r1-rof-react-lead-form/react-lead-form__oUpSiWu/agent/rof/.rof-events.jsonl",
+      "sha256": "37ba24aebd44cebaa682f2ee8b9752474d3f8d3ceb6a28f869029e8e1eb8f540",
+      "counts": {
+        "tool_calls": 41,
+        "tool_results": 41,
+        "repo_lookup_calls": 0,
+        "tool_errors": 2,
+        "truncation_markers": 2
+      },
+      "row_manifest": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows/tb41-react-retention-r1-rof-react-lead-form/manifest.json",
+      "provenance": {
+        "binary_sha256": "c9a25f9041e54540e03feeb1079a63f9ed0a3dd08c88d841fc7116af52ba3aab",
+        "git_sha": "108d6c3bb3c984b461fb0ea37bc94ffcf08d9b66",
+        "runtime_variant": "control"
+      }
+    },
+    {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/jobs/tb41-wal-control-r1-rof-wal-recovery-ordering/wal-recovery-ordering__brzqQq8/agent/rof/.rof-events.jsonl",
+      "sha256": "8249417eb7c9fdb9caf3dc4e5f9a7d2740efca901c9f64c6e8b9370b684f4fa8",
+      "counts": {
+        "tool_calls": 222,
+        "tool_results": 222,
+        "repo_lookup_calls": 0,
+        "tool_errors": 1,
+        "truncation_markers": 0
+      },
+      "row_manifest": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows/tb41-wal-control-r1-rof-wal-recovery-ordering/manifest.json",
+      "provenance": {
+        "binary_sha256": "c9a25f9041e54540e03feeb1079a63f9ed0a3dd08c88d841fc7116af52ba3aab",
+        "git_sha": "143ccac9387d7f94babc2744292b04246fcb74ec"
+      }
+    },
+    {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/jobs/tb41-wal-obs32-r1-rof-wal-recovery-ordering/wal-recovery-ordering__ACTJJma/agent/rof/.rof-events.jsonl",
+      "sha256": "4d8466a2f9655dcf5398aa0be0315e730fc1621bb64958220fd4ebff112f3e1c",
+      "counts": {
+        "tool_calls": 64,
+        "tool_results": 64,
+        "repo_lookup_calls": 0,
+        "tool_errors": 4,
+        "truncation_markers": 3
+      },
+      "row_manifest": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows/tb41-wal-obs32-r1-rof-wal-recovery-ordering/manifest.json",
+      "provenance": {
+        "binary_sha256": "c9a25f9041e54540e03feeb1079a63f9ed0a3dd08c88d841fc7116af52ba3aab",
+        "git_sha": "ca22dbd976daf4a1449066dc8ce7811c31f51414",
+        "runtime_variant": "control"
+      }
+    },
+    {
+      "path": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/jobs/tb41-wal-obs32-think256-r1-rof-wal-recovery-ordering/wal-recovery-ordering__p33duWY/agent/rof/.rof-events.jsonl",
+      "sha256": "1bf1349fe17933dbbc4c32a9333177111676ca65f300b6db854617bacefdb97d",
+      "counts": {
+        "tool_calls": 49,
+        "tool_results": 49,
+        "repo_lookup_calls": 0,
+        "tool_errors": 5,
+        "truncation_markers": 1
+      },
+      "row_manifest": "/home/madiyar/.local/share/rof-tb/work/deepseek-official-20261110/rows/tb41-wal-obs32-think256-r1-rof-wal-recovery-ordering/manifest.json",
+      "provenance": {
+        "binary_sha256": "c9a25f9041e54540e03feeb1079a63f9ed0a3dd08c88d841fc7116af52ba3aab",
+        "git_sha": "ca22dbd976daf4a1449066dc8ce7811c31f51414",
+        "runtime_variant": "control"
+      }
+    }
+  ],
+  "limits": [
+    "No repo_lookup calls observed: no lookup efficacy or missing-dependency rate can be inferred.",
+    "Literal truncation markers do not prove information was irrecoverable.",
+    "Trace WAL does not embed tool schemas; schema pinned separately from source.",
+    "Missing provenance fields remain unknown; row commit is orchestration metadata, not proof of binary source."
+  ],
+  "tool_contract": {
+    "inspected_source_commit": "31f76a69048339211ea3bc2affc3ab6f8bf42953",
+    "schema": "repo_lookup requires string symbol, optional integer limit default100 range1..500; no extra properties",
+    "source_blob": "5889c9b4b8fffda5e61921f1934e4ad48c5becda"
+  },
+  "decision": "No remaining tool execution-contract defect reproduced; no speculative exec API change. Evidence mode remains a chosen, unmeasured experiment.",
+  "trace_count": 10,
+  "nonempty_trace_count": 9,
+  "argv_shape_error_kinds": {
+    "and_operator": 6,
+    "pipe": 3,
+    "redirection": 2
+  }
+}
