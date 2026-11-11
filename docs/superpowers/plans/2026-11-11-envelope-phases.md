@@ -330,3 +330,50 @@ test to write first, the three gate commands, and stop conditions.
 - Spending the remaining ledger on mechanism arms before P2 answers the envelope
   question.
 - Re-running paid cells to fill a hole that P1 can answer offline.
+
+---
+
+## Blocker found 2026-11-11 — container egress to github.com (root cause, diagnosed)
+
+The Slice A oracle pre-flight cannot pass on this host, and the cause is routing, not the
+tasks. Two independent oracle runs on `break-filter-js-from-html` both died the same way:
+`astral.sh/uv/0.9.5/install.sh` redirects to
+`github.com/astral-sh/uv/releases/...` → `curl: (35) Recv failure: Connection reset by peer`
+→ `uvx: command not found` → reward 0. **18 of the 21 Slice A graders bootstrap uv this
+way**, so a campaign today would produce network infras, not capability.
+
+Measured, not inferred:
+- Both the host and a container resolve `github.com` to `20.205.243.166`.
+- The **host reaches it (200) and downloaded the full 21,370,871-byte tarball**.
+- A container reaches `140.82.121.4` and `140.82.113.4` (200) but gets `000` on
+  `20.205.243.166`. Everything else works from a container: PyPI 200, npm 200,
+  crates.io 403 (reachable), `api.deepseek.com` 401 (reachable), deb.debian.org 200.
+- `ip rule` shows `31269: not from all fwmark 0xcb6b lookup 52075`, and table 52075 is a
+  single `default dev laptop` — a full-tunnel default. Host traffic carries fwmark
+  `0xcb6b`, skips the tunnel and goes direct; container traffic is unmarked, enters the
+  tunnel, and that tunnel cannot serve this GitHub edge.
+
+Fix (needs root; this session has no `CAP_NET_ADMIN` and no passwordless sudo) — send one
+destination back to the table the host's own working path uses:
+
+```
+sudo ip rule add to 20.205.243.0/24 lookup main pref 31000
+```
+
+Verify (`200` means unblocked):
+
+```
+docker run --rm debian:bookworm-slim sh -c \
+  'apt-get -qq update && apt-get -qq install -y curl >/dev/null && \
+   curl -sI https://github.com -o /dev/null -w "%{http_code}\n"'
+```
+
+Undo: `sudo ip rule del to 20.205.243.0/24 lookup main pref 31000`. `ip rule` additions do
+not persist across reboot, which makes this safe to try. A no-root workaround does **_not**
+exist here: harbor exposes no `--add-host`, container `/etc/hosts` and the Docker daemon
+config are root-owned, and the task images are not to be rebuilt (that would change their
+digests and void comparability).
+
+Only 3 of 21 tasks are clean today (`headless-terminal`, `hf-model-inference`,
+`kv-store-grpc`), and two of those already solve on the faithful pipeline, so running that
+subset would be saturated and worthless.
