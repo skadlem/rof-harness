@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{parse_table, resolve_endpoint, Flag};
 
-pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--keep-thinking] [--in-container]
+pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--keep-thinking] [--allow-inert-spend-cap] [--in-container]
 --lenient-apply: record Lenient patch-apply provenance in the report (default Strict; Strict grades are not comparable with earlier fuzz-lenient numbers)
 --agent: run the agent leg per instance instead of the oracle-container leg (fresh workdir, in-process rof-run wiring, harbor-CLI grading). Requires --model ID and --endpoint URL (or OPENAI_BASE_URL); mutually exclusive with --winnability-only. Agent budgets default to the frozen pilot recipe: 300000 tokens / 60 steps / 120 actions; explicit flags win.
 --keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default keeps the DeepSeek thinking-off knob, sent only on compaction-summary calls and the truncation ladder first rung; ordinary requests carry no thinking fragment)
+--allow-inert-spend-cap: let the agent leg run when the $ cap cannot fire because the price book does not price --model (default: every instance refuses, which aborts the campaign). The choice is recorded on the report provenance.
 --in-container: with --agent, the agent works inside the task environment container (started before the run; workdir bind-mounted at /app, cpus/memory capped at 2/4096m; agent exec/test calls wrapped with docker exec; the verifier execs the same live container, so installed packages and running services persist to grading). Verdict provenance in this mode is the task-written reward file (/logs/verifier/reward.txt) with the verifier exit code as the no-artifact fallback, never the harbor result.json reward;
 --exec-policy allowlist|any: command-allowlist policy forwarded to the agent leg. `any` skips the prefix list entirely (the in-container agent's process boundary is the task container, not this harness); the value is recorded in the report provenance, so relaxed rows never pool with strict rows
 --budget-shape: token-cap accounting, recorded on the report's provenance block. gross = input+output (default, the frozen recipe); miss-plus-out = (input - cache_read) + output, so provider-cached prompt re-reads stop spending the token cap. A miss-plus-out arm is a DIFFERENT ESTIMAND from a gross arm: never mix the two shapes in one table. Reported usage totals and dollars are unchanged by either shape;
@@ -31,6 +32,10 @@ pub(crate) struct EvalArgs {
     pub lenient_apply: bool,
     /// Agent leg: per-instance in-process run + harbor grading.
     pub agent: bool,
+    /// Let the agent leg run when the `$` cap cannot fire (unpriced model).
+    /// Default false: `budget_for` refuses that combination as a configuration
+    /// error. Needed for the vLLM gateway id the price book does not model.
+    pub allow_inert_spend_cap: bool,
     /// Agent endpoint URL, resolved at parse (`--endpoint` wins over
     /// `OPENAI_BASE_URL`; absent both is a parse error when `--agent`).
     pub endpoint: Option<String>,
@@ -92,6 +97,7 @@ pub(crate) struct EvalArgs {
 
 #[derive(Default)]
 struct EvalBuilder {
+    allow_inert_spend_cap: bool,
     tasks_dir: Option<String>,
     ids: Vec<String>,
     out_dir: Option<String>,
@@ -226,6 +232,11 @@ fn set_budget_shape(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String
         s.parse()
             .map_err(|_| format!("--budget-shape needs gross or miss-plus-out, got {s:?}"))?,
     );
+    Ok(())
+}
+
+fn set_allow_inert_spend_cap(b: &mut EvalBuilder, _: Option<String>) -> Result<(), String> {
+    b.allow_inert_spend_cap = true;
     Ok(())
 }
 
@@ -508,6 +519,11 @@ const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
         set: set_budget_shape,
     },
     Flag {
+        name: "--allow-inert-spend-cap",
+        takes_value: false,
+        set: set_allow_inert_spend_cap,
+    },
+    Flag {
         name: "--max-tokens",
         takes_value: true,
         set: set_max_tokens,
@@ -586,6 +602,7 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
         report: b.report.map(PathBuf::from),
         winnability_only: b.winnability_only,
         lenient_apply: b.lenient_apply,
+        allow_inert_spend_cap: b.allow_inert_spend_cap,
         agent: b.agent,
         model,
         endpoint,
@@ -805,6 +822,7 @@ pub(crate) fn finish_report(args: &EvalArgs, reports: Vec<eval::InstanceReport>)
                     "review": args.review,
                     "selected_procedure_ids": args.selected_procedure_ids,
                     "procedure_file_sha256": args.procedure_file_sha256,
+                    "allow_inert_spend_cap": args.allow_inert_spend_cap,
                     "task_identity": "per_instance",
                 })
             }),
@@ -1271,6 +1289,12 @@ mod tests {
         assert_eq!(p["run_config"]["endpoint"], "http://x");
         assert_eq!(p["run_config"]["max_tokens"], 8000);
         assert_eq!(p["run_config"]["streak_steer"], true);
+        // A relaxation must be identifiable on the row, or guarded and
+        // opted-out rows pool into one unattributable table.
+        assert_eq!(
+            p["run_config"]["allow_inert_spend_cap"], false,
+            "the inert-cap choice is recorded"
+        );
         assert!(
             p["binary_git_sha"].as_str().is_some_and(|s| !s.is_empty()),
             "sha embedded by build.rs (real or 'unknown'), never silently absent: {p}"
@@ -1352,6 +1376,7 @@ mod tests {
             report: Some(root.join("out").join("report.json")),
             winnability_only: true,
             lenient_apply: false,
+            allow_inert_spend_cap: false,
             agent: false,
             endpoint: None,
             model: None,
@@ -1552,5 +1577,37 @@ mod tests {
             Some(v) => std::env::set_var("OPENAI_BASE_URL", v),
             None => std::env::remove_var("OPENAI_BASE_URL"),
         }
+    }
+    #[test]
+    fn allow_inert_spend_cap_parses_for_eval() {
+        // Guards the flag TABLE, not just the field: the earlier bug was a
+        // value recorded in the report while the run hardcoded the opposite.
+        let on = crate::eval_cmd::parse_eval(&[
+            "rof".into(),
+            "eval".into(),
+            "--tasks-dir".into(),
+            "/tmp/t".into(),
+            "--agent".into(),
+            "--model".into(),
+            "deepseek-v4.1-flash".into(),
+            "--endpoint".into(),
+            "https://e/v1".into(),
+            "--allow-inert-spend-cap".into(),
+        ])
+        .unwrap();
+        assert!(on.allow_inert_spend_cap);
+        let off = crate::eval_cmd::parse_eval(&[
+            "rof".into(),
+            "eval".into(),
+            "--tasks-dir".into(),
+            "/tmp/t".into(),
+            "--agent".into(),
+            "--model".into(),
+            "deepseek-v4.1-flash".into(),
+            "--endpoint".into(),
+            "https://e/v1".into(),
+        ])
+        .unwrap();
+        assert!(!off.allow_inert_spend_cap, "default stays fail-closed");
     }
 }

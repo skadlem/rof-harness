@@ -193,6 +193,7 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
         workdir: work.into(),
         // parse_eval refuses `--agent` without `--model`.
         model: a.model.clone().unwrap_or_default(),
+        allow_inert_spend_cap: a.allow_inert_spend_cap,
         endpoint: a.endpoint.clone(),
         api_key_env: a
             .api_key_env
@@ -601,6 +602,14 @@ async fn grade_live_container(
         eprintln!("infra {}: cannot clear verifier artifacts: {e}", inst.id);
         return eval::Verdict::InfraFailure;
     }
+    // Integrity record, NOT a drain: the in-container path exists so that
+    // agent-started services survive to grading (env-mutation family: 0/8
+    // structural under file-copy grading vs 8/8 here), so killing every live
+    // process would destroy the capability the mode is for. What can still go
+    // wrong is a long-lived writer mutating /app during verification, and that
+    // is invisible unless the boundary is recorded. Best effort: a failure to
+    // record never blocks grading, it is only reported.
+    record_agent_phase_boundary(&inst.id, container, home).await;
     // Harbor parity: the tests directory is uploaded inside `verify()`, never
     // mounted for the agent phase — a mounted `/tests` lets the model read the
     // grader (observed: one baseline row opened `/tests/test_outputs.py`).
@@ -658,6 +667,70 @@ async fn grade_live_container(
         );
     }
     verdict
+}
+
+/// Record what the agent phase left running, and the workdir state it left, at
+/// the moment grading takes over. Written to `<home>/agent-boundary.txt` beside
+/// the verifier artifacts. Deliberately does not stop anything: see the call
+/// site for why a drain is the wrong fix here.
+async fn record_agent_phase_boundary(id: &str, container: &str, home: &std::path::Path) {
+    // One exec: the tree digest first (agent-end state is what a diff against
+    // the graded state would use), then every live pid except 1 with its
+    // cmdline, so a process that outlives the agent phase is named rather than
+    // guessed at.
+    // Every line is tagged so a count cannot be confused with the digest. The
+    // tree branch prints exactly one line whether or not `/app` is a git repo:
+    // a missing `git` or safe.directory would otherwise hash empty input, which
+    // is byte-identical to a clean tree and silently voids the record.
+    let script = "if git -C /app rev-parse --git-dir >/dev/null 2>&1; \
+                  then printf 'tree '; git -C /app status --porcelain=v1 2>/dev/null | cksum; \
+                  else echo 'tree unavailable'; fi; \
+                  for p in /proc/[0-9]*; do pid=${p#/proc/}; \
+                  [ \"$pid\" = 1 ] && continue; \
+                  [ \"$pid\" = \"$$\" ] && continue; \
+                  printf 'proc %s ' \"$pid\"; \
+                  tr '\\0\\n' '  ' < \"$p/cmdline\" 2>/dev/null; echo; \
+                  done";
+    // Bounded: an unbounded docker exec here would stall grading behind a
+    // wedged daemon, exactly where the verifier path already has a deadline.
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new("docker")
+            .args(["exec", container, "sh", "-c", script])
+            .output(),
+    )
+    .await;
+    let text = match out {
+        Err(_) => "probe timed out after 30s".to_string(),
+        Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Ok(Ok(o)) => format!(
+            "probe failed rc={:?} {}{}",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout).trim(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Ok(Err(e)) => format!("probe spawn failed: {e}"),
+    };
+    eprintln!(
+        "{id} agent-phase boundary: {} live process(es) recorded",
+        count_boundary_processes(&text)
+    );
+    if let Err(e) = std::fs::write(home.join("agent-boundary.txt"), text) {
+        eprintln!("{id} cannot write agent-boundary.txt: {e}");
+    }
+}
+
+/// Live-process count from an `agent-boundary.txt` probe. Only `proc ` lines
+/// count; the `tree ` digest line and a probe failure line never do.
+fn count_boundary_processes(text: &str) -> usize {
+    text.lines()
+        .filter(|l| l.starts_with("proc "))
+        .filter(|l| {
+            l.split_whitespace()
+                .nth(1)
+                .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .count()
 }
 
 /// Upload the task's tests into a live container (`docker cp`), the way harbor's
@@ -1004,6 +1077,21 @@ pub(crate) async fn run_agent_leg(
         // per instance here) — bounded by the slice size; upgrade path: a
         // shared CancellationToken threaded through execute().
         let r = crate::execute_with_deadline(&provider, &run_args, Some(deadline)).await;
+        // A start-time configuration refusal is identical for every instance
+        // and carries no events, so without this it would become a slice of
+        // InfraFailure rows that read like a docker outage. Abort the campaign
+        // instead: the operator has to change a flag or a model id.
+        if let agent_loop::Outcome::Failed {
+            kind: agent_loop::FailureKind::Input,
+            message,
+        } = &r.outcome
+        {
+            eprintln!("cannot run {}: {message}", inst.id);
+            if container.is_some() {
+                rm_env_container(&inst.id).await;
+            }
+            return 2;
+        }
         let agent_timed_out = matches!(r.outcome, agent_loop::Outcome::Cancelled)
             && start.elapsed().as_secs() >= inst.agent_timeout_secs;
         if let Some(path) = run_args.dump_events.as_deref() {
@@ -1463,6 +1551,30 @@ mod tests {
             ),
             (Some(17), Some(19), Some(12345), Some(432))
         );
+        // The inert-cap opt-out must reach the run, or the flag is recorded as
+        // true while every instance refuses to start (review F1).
+        let mut opted = a.clone();
+        opted.allow_inert_spend_cap = true;
+        assert!(
+            agent_args(
+                &opted,
+                Path::new("/out/id/work"),
+                "goal",
+                Path::new("/out/id/events.jsonl")
+            )
+            .allow_inert_spend_cap,
+            "the eval opt-out is forwarded into the run Args"
+        );
+        assert!(
+            !agent_args(
+                &a,
+                Path::new("/out/id/work"),
+                "goal",
+                Path::new("/out/id/events.jsonl")
+            )
+            .allow_inert_spend_cap,
+            "default stays fail-closed"
+        );
         // Budget flags land in the run Args and win over the defaults.
         let run = agent_args(
             &a,
@@ -1745,5 +1857,21 @@ mod tests {
         );
         assert_eq!(last_passed_failed("no markers at all"), None);
         assert_eq!(last_passed_failed("1 failed"), Some("1 failed".to_string()));
+    }
+
+    #[test]
+    fn boundary_probe_counts_only_live_processes() {
+        // A real probe: a digest line, two live processes, a dead-pid race
+        // (empty cmdline) and an unparseable row.
+        let text = "tree 1234567890 4711\n\
+                    proc 7 python3 -m http.server 8080 \n\
+                    proc 12 node server.js \n\
+                    proc 13 \n\
+                    proc  \n";
+        assert_eq!(count_boundary_processes(text), 3);
+        // A failed probe must not look like a running container.
+        let failed = "probe failed rc=Some(1) no such container";
+        assert_eq!(count_boundary_processes(failed), 0);
+        assert_eq!(count_boundary_processes(""), 0);
     }
 }

@@ -359,7 +359,7 @@ async fn execute_with_deadline<P: LlmClient>(
                     kind: FailureKind::Input,
                     message,
                 },
-                patch: Err("run did not start".into()),
+                patch: Ok(String::new()),
                 events: Vec::new(),
             };
         }
@@ -372,7 +372,7 @@ async fn execute_with_deadline<P: LlmClient>(
                     kind: FailureKind::Input,
                     message,
                 },
-                patch: Err("run did not start".into()),
+                patch: Ok(String::new()),
                 events: Vec::new(),
             }
         }
@@ -386,15 +386,29 @@ async fn execute_with_deadline<P: LlmClient>(
                     kind: FailureKind::Provider,
                     message: format!("cannot configure tools: {message}"),
                 },
-                patch: Err("run did not start".into()),
+                patch: Ok(String::new()),
                 events: Vec::new(),
             };
         }
     };
     let mut state = LoopState::new();
     // Pre-seeded budget: `run` never rebuilds it (precedence is documented
-    // on `agent_loop::run`: cfg-over-state).
-    state.budget = budget_for(args);
+    // on `agent_loop::run`: cfg-over-state). A `$` guard that cannot fire is a
+    // configuration error, so it stops the run before any provider request
+    // instead of warning and proceeding unguarded.
+    state.budget = match budget_for(args) {
+        Ok(budget) => budget,
+        Err(message) => {
+            return RunResult {
+                outcome: Outcome::Failed {
+                    kind: FailureKind::Input,
+                    message,
+                },
+                patch: Ok(String::new()),
+                events: Vec::new(),
+            };
+        }
+    };
     let gate = Gate {
         incremental: args.proof_cmd.is_some(),
     };
@@ -427,7 +441,7 @@ async fn execute_with_deadline<P: LlmClient>(
                     kind: FailureKind::Log,
                     message: format!("cannot preserve WAL: {e}"),
                 },
-                patch: Err("run did not start".into()),
+                patch: Ok(String::new()),
                 events: Vec::new(),
             };
         }
@@ -693,6 +707,14 @@ async fn main() {
         Ok(patch) if !patch.is_empty() => println!("{patch}"),
         Err(e) => eprintln!("warning: no baseline: {e}"),
         _ => {}
+    }
+    // The outcome carries the only human-readable reason a run stopped; without
+    // this a refused start (exit 7) and a dead provider (3) look identical.
+    match &r.outcome {
+        Outcome::Failed { kind, message } => eprintln!("run failed ({kind:?}): {message}"),
+        Outcome::Halted(reason) => eprintln!("run halted: {reason}"),
+        Outcome::Cancelled => eprintln!("run cancelled"),
+        Outcome::Done => {}
     }
     std::process::exit(exit_code(&r.outcome));
 }

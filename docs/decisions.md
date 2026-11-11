@@ -371,6 +371,20 @@ says so explicitly.
   the run looked guarded. A run-start stderr warning now names it once per
   process and says which caps are operative. This closes the deferred gate
   recorded on 2026-10-16; no price is invented to close it the other way.
+- **Unpriced model + armed `$` cap now REFUSES; the 2026-10-19 warning is
+  superseded (2026-11-11).** The earlier entry above (warn once, continue) left
+  every `rof run` with a dead $4 guard, because the `UnattendedBatch` preset arms
+  `max_spend_cents` for all of them. `cli::budget_for` returns `Err` when a cap
+  is armed and `prices_model(&args.model)` is false, and `main` exits **7**
+  (input/config) before any provider request; the eval leg aborts the campaign
+  with exit 2 instead of emitting a slice of `InfraFailure` rows. No price is
+  invented for the vLLM gateway id: 20 driver invocations pass it deliberately
+  unpriced, so the escape is an explicit `--allow-inert-spend-cap` (run and eval),
+  default off, which restores the warn-once behaviour and is recorded in
+  `RunProvenance.run_config` so opted-out rows cannot pool with guarded ones.
+  [measured: `cargo test -p rof` 88 green + mutation proof (reverting the
+  eval-leg forwarding fails `flags_parse_and_fill_agent_args`), live binary
+  probe exit 7 with no provider call]
 - **Reasoning effort: measured, and it is not a capability lever (2026-10-19).**
   18 in-container rows, one binary, one flag apart (control vs
   `--reasoning-effort max`): no named verifier test flipped that the control

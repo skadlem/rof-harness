@@ -180,7 +180,10 @@ pub(crate) fn args_for(dir: &std::path::Path, steps: Option<u32>) -> Args {
     Args {
         goal: "update the note".into(),
         workdir: dir.to_path_buf(),
-        model: "fake".into(),
+        // A priced id: `budget_for` refuses an unpriced model because the
+        // default preset arms the `$` cap and it could never fire.
+        model: "deepseek-flash".into(),
+        allow_inert_spend_cap: false,
         endpoint: None,
         api_key_env: "OPENAI_API_KEY".into(),
         headers: Vec::new(),

@@ -183,6 +183,11 @@ inside the task container. Neither path currently provides crash resume.
   chosen-to-validate; no measured anchor yet).
 - Otherwise the UnattendedBatch preset (50k tokens, 20 steps, 30
   actions/trial).
+- An armed `$` cap whose model has no price-book entry is a *configuration
+  error*: `cli::budget_for` returns `Err` and the run exits 7 before any
+  provider request, because an unpriced model reports no cost and the cap could
+  never trip. `--allow-inert-spend-cap` (run and eval, default off) opts out and
+  names the inert cap once; the choice lands in the eval report's `run_config`.
 
 ## Not inferable from code
 

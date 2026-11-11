@@ -11,7 +11,7 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--pass-env NAME]...
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]...
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
@@ -27,13 +27,14 @@ pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--work
 --thinking-keep N: echoed-reasoning rows kept per assistant message (flag wins over THINKING_KEEP; unset leaves the loop default)
 --collapse-hysteresis N: collapse-boundary hysteresis rows (flag wins over COLLAPSE_HYSTERESIS; unset leaves the loop default)
 --allow-dirty-workdir: run inside a dirty git workdir (default: refuse; allowed dirt appears in the reported patch)
+--allow-inert-spend-cap: run when the $ cap cannot fire because the price book does not price --model (default: refuse; the inert cap is warned once)
 --pass-env NAME: forward env var to exec/test children (repeatable; provider-key-shaped names stay withheld at spawn)
 --repo-lookup on|off: opt-in literal repository lookup (default off)
 --repo-evidence on|off: enriched bounded definition/test/config candidates; requires --repo-lookup on (default off)
 --completion-check CMD: exact public test command checked on Done, at most one repair and two checks within the original caps; argv, no shell; cannot combine with --review on (default unset)
 --review on|off: opt-in bounded fresh-context read-only defect review and one repair continuation; default off
 --procedure-file PATH: add a validated JSON procedure record (repeatable); only case-insensitive literal cue matches are injected, with bounded text and explicit source repositories
-exit codes: 0 done, 2 usage/parse, 3 run failure (halt/cancel/provider), 4 missing credentials, 5 log failure, 6 snapshot failure, 7 empty input, 8 unmet completion predicate";
+exit codes: 0 done, 2 usage/parse, 3 run failure (halt/cancel/provider), 4 missing credentials, 5 log failure, 6 snapshot failure, 7 input/config failure, 8 unmet completion predicate";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Args {
@@ -64,6 +65,13 @@ pub(crate) struct Args {
     pub log_path: Option<String>,
     /// Opt out of the fail-closed WAL.
     pub no_log: bool,
+    /// Run with a `$` cap that cannot fire. The default preset arms the $4 cap
+    /// and an unpriced model reports no cost, so `budget_for` refuses such a
+    /// run as a configuration error. Set this only for an endpoint the price
+    /// book deliberately does not model (the vLLM gateway's
+    /// `deepseek-ai/DeepSeek-V4.1-Flash`): choice is recorded, and the inert
+    /// cap is warned about once. Default false.
+    pub allow_inert_spend_cap: bool,
     /// Send no thinking-off knob in the request body (`EndpointProfile`
     /// with `thinking_off: None`): for providers that reject the
     /// DeepSeek-specific fragment or when reasoning is wanted. Default
@@ -208,6 +216,7 @@ struct RunBuilder {
     thinking_keep: Option<usize>,
     collapse_hysteresis: Option<usize>,
     allow_dirty_workdir: bool,
+    allow_inert_spend_cap: bool,
     pass_env: Vec<String>,
     preserve_failed_checks: bool,
     minimal_workflow: Option<bool>,
@@ -568,6 +577,11 @@ fn set_allow_dirty_workdir(b: &mut RunBuilder, _: Option<String>) -> Result<(), 
     Ok(())
 }
 
+fn set_allow_inert_spend_cap(b: &mut RunBuilder, _: Option<String>) -> Result<(), String> {
+    b.allow_inert_spend_cap = true;
+    Ok(())
+}
+
 fn set_pass_env(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
     if let Some(v) = v {
         b.pass_env.push(v);
@@ -802,6 +816,11 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_allow_dirty_workdir,
     },
     Flag {
+        name: "--allow-inert-spend-cap",
+        takes_value: false,
+        set: set_allow_inert_spend_cap,
+    },
+    Flag {
         name: "--pass-env",
         takes_value: true,
         set: set_pass_env,
@@ -870,6 +889,7 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         dump_events: b.dump_events,
         log_path: b.log_path,
         no_log: b.no_log,
+        allow_inert_spend_cap: b.allow_inert_spend_cap,
         keep_thinking: b.keep_thinking,
         reasoning_effort: b.reasoning_effort,
         steer: b.steer.unwrap_or(false),
@@ -935,7 +955,7 @@ fn read_env_usize(name: &str) -> Result<Option<usize>, String> {
 /// config (50k tokens). The step override is `agent_budget::with_steps`
 /// (warn clamp + refund re-derive live there, never here); precedence
 /// (cfg-over-state) is documented on `agent_loop::run`.
-pub(crate) fn budget_for(args: &Args) -> BudgetGuard {
+pub(crate) fn budget_for(args: &Args) -> Result<BudgetGuard, String> {
     let mut b = config_for(Capability::UnattendedBatch);
     if args.budget_steps.is_some() || args.budget_actions.is_some() || args.budget_tokens.is_some()
     {
@@ -965,24 +985,50 @@ pub(crate) fn budget_for(args: &Args) -> BudgetGuard {
         None => {}
     }
     let guard = BudgetGuard::new(b, Instant::now());
-    if let Some(msg) = inert_spend_cap_warning(args, &guard) {
-        // Once per process: `rof eval` builds one guard per instance and the
-        // same fact holds for every row (roadmap gate 2026-10-16, closed here).
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| eprintln!("{msg}"));
+    if args.allow_inert_spend_cap {
+        if let Some(msg) = inert_cap_accepted_warning(args, &guard) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("{msg}"));
+        }
     }
-    guard
+    match spend_guard_error(args, &guard) {
+        Some(message) => Err(message),
+        None => Ok(guard),
+    }
+}
+
+/// The same fact as [`spend_guard_error`], reported rather than refused: the
+/// operator opted in with `--allow-inert-spend-cap`, so the unenforceable cap
+/// is named once instead of silently shrinking the guard surface to
+/// tokens/steps.
+fn inert_cap_accepted_warning(args: &Args, guard: &BudgetGuard) -> Option<String> {
+    let capped = guard.config().max_spend_cents?;
+    (!provider_openai::prices_model(&args.model)).then(|| {
+        format!(
+            "warning: no price-book entry for model {}: the ${} spend cap is inert \
+             (dollars stay null) and only the token/step caps guard this run",
+            args.model,
+            capped / 100
+        )
+    })
 }
 
 /// The `$` cap only binds when the price book prices the model: an id with no
 /// rate anchor (never invented) reports no cost, so `max_spend_cents` can
-/// never trip. Say so instead of letting an unpriced run look guarded.
-fn inert_spend_cap_warning(args: &Args, guard: &BudgetGuard) -> Option<String> {
+/// never trip. A guard that cannot fire is a configuration error, not a
+/// warning: refusing here is the only place that cannot be bypassed, because
+/// `budget_for` is the one resolver every run and eval instance goes through.
+fn spend_guard_error(args: &Args, guard: &BudgetGuard) -> Option<String> {
     let capped = guard.config().max_spend_cents?;
+    if args.allow_inert_spend_cap {
+        return None;
+    }
     (!provider_openai::prices_model(&args.model)).then(|| {
         format!(
-            "warning: no price book entry for model {}: the ${} spend cap is inert \
-             (dollars stay null) — the token and step caps are the guards",
+            "model {} has no price-book entry, so the ${} spend cap cannot be \
+             enforced (dollars would stay null) — refusing to start. Use a priced \
+             model id, or pass --allow-inert-spend-cap to accept an unenforced \
+             dollar cap for an endpoint the price book does not model",
             args.model,
             capped / 100
         )
@@ -1120,6 +1166,7 @@ mod tests {
                 dump_events: Some("/tmp/ev.json".into()),
                 log_path: Some("/tmp/w.log".into()),
                 no_log: false,
+                allow_inert_spend_cap: false,
                 keep_thinking: false,
                 reasoning_effort: None,
                 steer: false,
@@ -1422,24 +1469,71 @@ mod tests {
     fn context_pins_default_budget_and_flags_override() {
         use crate::fixtures::args_for;
         let dir = Path::new("/tmp/w");
-        assert_eq!(budget_for(&args_for(dir, None)).config().max_tokens, 50_000);
+        assert_eq!(
+            budget_for(&args_for(dir, None))
+                .expect("priced model")
+                .config()
+                .max_tokens,
+            50_000
+        );
         let mut pinned = args_for(dir, None);
         pinned.context_files = vec!["a.py".into()];
-        assert_eq!(budget_for(&pinned).config().max_tokens, 200_000);
+        assert_eq!(
+            budget_for(&pinned)
+                .expect("priced model")
+                .config()
+                .max_tokens,
+            200_000
+        );
         // Explicit flags win over the pilot default.
         pinned.budget_tokens = Some(7);
-        assert_eq!(budget_for(&pinned).config().max_tokens, 7);
+        assert_eq!(
+            budget_for(&pinned)
+                .expect("priced model")
+                .config()
+                .max_tokens,
+            7
+        );
         // A step budget also suppresses the token default.
         pinned.budget_tokens = None;
         pinned.budget_steps = Some(5);
-        assert_eq!(budget_for(&pinned).config().max_tokens, 50_000);
-        assert_eq!(budget_for(&pinned).config().max_steps.get(), 5);
+        assert_eq!(
+            budget_for(&pinned)
+                .expect("priced model")
+                .config()
+                .max_tokens,
+            50_000
+        );
+        assert_eq!(
+            budget_for(&pinned)
+                .expect("priced model")
+                .config()
+                .max_steps
+                .get(),
+            5
+        );
         // The step override is the single `agent_budget::with_steps`
         // implementation: warn clamps to min(warn, max-1), refunds re-derive.
-        assert_eq!(budget_for(&pinned).config().warn_steps.get(), 4);
-        assert_eq!(budget_for(&pinned).config().max_refunds, 1);
         assert_eq!(
-            budget_for(&pinned).config().warn_steps,
+            budget_for(&pinned)
+                .expect("priced model")
+                .config()
+                .warn_steps
+                .get(),
+            4
+        );
+        assert_eq!(
+            budget_for(&pinned)
+                .expect("priced model")
+                .config()
+                .max_refunds,
+            1
+        );
+        assert_eq!(
+            budget_for(&pinned)
+                .expect("priced model")
+                .config()
+                .warn_steps,
             agent_budget::with_steps(
                 agent_budget::config_for(agent_budget::Capability::UnattendedBatch),
                 NonZeroU32::new(5).unwrap()
@@ -1448,9 +1542,18 @@ mod tests {
         );
         // --budget-actions overrides the trial action cap.
         pinned.budget_actions = Some(9);
-        assert_eq!(budget_for(&pinned).config().actions_per_trial, 9);
         assert_eq!(
-            budget_for(&args_for(dir, None)).config().actions_per_trial,
+            budget_for(&pinned)
+                .expect("priced model")
+                .config()
+                .actions_per_trial,
+            9
+        );
+        assert_eq!(
+            budget_for(&args_for(dir, None))
+                .expect("priced model")
+                .config()
+                .actions_per_trial,
             30
         );
     }
@@ -1545,6 +1648,13 @@ mod tests {
     }
 
     #[test]
+    fn allow_inert_spend_cap_parses_opt_in() {
+        let a = parse_args(&run_min(&["--allow-inert-spend-cap"])).unwrap();
+        assert!(a.allow_inert_spend_cap);
+        assert!(!parse_args(&run_min(&[])).unwrap().allow_inert_spend_cap);
+    }
+
+    #[test]
     fn allow_dirty_workdir_parses_opt_in() {
         let a = parse_args(&run_min(&["--allow-dirty-workdir"])).unwrap();
         assert!(a.allow_dirty_workdir);
@@ -1570,6 +1680,7 @@ mod tests {
         // default-batch guard).
         assert_eq!(
             budget_for(&args_for(Path::new("/tmp/w"), None))
+                .expect("priced model")
                 .config()
                 .max_wallclock,
             Duration::from_secs(900)
@@ -1588,7 +1699,7 @@ mod tests {
             a.budget_actions = actions;
             a.budget_tokens = tokens;
             assert_eq!(
-                budget_for(&a).config().max_wallclock,
+                budget_for(&a).expect("priced model").config().max_wallclock,
                 Duration::from_secs(3600),
                 "flags: steps={steps:?} actions={actions:?} tokens={tokens:?}"
             );
@@ -1787,28 +1898,52 @@ mod tests {
     }
 
     #[test]
-    fn unpriced_models_warn_that_the_spend_cap_is_inert() {
+    fn an_unenforceable_spend_cap_refuses_to_start() {
+        // The default preset arms the `$` cap, so a model the price book
+        // cannot price would leave only the token/step caps guarding spend.
+        // That is a configuration error, and it must stop the run before any
+        // provider request rather than warn and continue.
         let mut priced = args_for(Path::new("/tmp/w"), Some(60));
         priced.model = "deepseek-flash".into();
-        let mut g = budget_for(&priced);
+        let g = budget_for(&priced).expect("priced model starts");
         assert!(
             g.config().max_spend_cents.is_some(),
             "preset arms the $ cap"
         );
-        assert_eq!(inert_spend_cap_warning(&priced, &g), None);
+        assert_eq!(spend_guard_error(&priced, &g), None);
 
         let mut unpriced = args_for(Path::new("/tmp/w"), Some(60));
         unpriced.model = "deepseek-ai/DeepSeek-V4.1-Flash".into();
-        g = budget_for(&unpriced);
-        let w = inert_spend_cap_warning(&unpriced, &g).expect("inert cap is named");
+        let err = budget_for(&unpriced).err().expect("unpriced model refuses");
         assert!(
-            w.contains("deepseek-ai/DeepSeek-V4.1-Flash") && w.contains("inert"),
-            "{w}"
+            err.contains("deepseek-ai/DeepSeek-V4.1-Flash") && err.contains("cannot be enforced"),
+            "{err}"
         );
-        // No cap configured: nothing to warn about.
+
+        // An org-prefixed spelling is the realistic mistake: the same model
+        // priced under its bare id must still start.
+        let mut go = args_for(Path::new("/tmp/w"), Some(60));
+        go.model = "deepseek-v4.1-flash".into();
+        assert!(budget_for(&go).is_ok(), "prefixed id is priced");
+
+        // Explicit opt-out: the vLLM gateway id is deliberately unpriced, so
+        // a driver that accepts unmetered dollars must say so. The guard is
+        // then a warning, not a refusal, and the choice is on the row.
+        let mut opted = args_for(Path::new("/tmp/w"), Some(60));
+        opted.model = "deepseek-ai/DeepSeek-V4.1-Flash".into();
+        opted.allow_inert_spend_cap = true;
+        let g = budget_for(&opted).expect("opt-out starts");
+        assert!(g.config().max_spend_cents.is_some(), "cap is still armed");
+        assert!(
+            inert_cap_accepted_warning(&opted, &g).is_some_and(|w| w.contains("inert")),
+            "the accepted risk is named"
+        );
+
+        // No cap configured: an unpriced model is allowed, because there is
+        // no guard to leave inert.
         let mut b = agent_budget::config_for(agent_budget::Capability::Interactive);
         b.max_spend_cents = None;
         let guard = BudgetGuard::new(b, Instant::now());
-        assert_eq!(inert_spend_cap_warning(&unpriced, &guard), None);
+        assert_eq!(spend_guard_error(&unpriced, &guard), None);
     }
 }
