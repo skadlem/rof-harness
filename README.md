@@ -276,7 +276,7 @@ writes the complete event log for replay.
 | `--log-path` / `--no-log` | WAL location (defaults to `<workdir>/.rof-events.jsonl`) |
 | `--resume LOG` | continue from an existing log: user/assistant/tool history is rebuilt and new items append to it; budgets start fresh, counters, verify state, snapshots and directives are not restored; a tool call with no result gets a synthetic "outcome unknown" result. Conflicts with `--log-path`, `--no-log`, `--review on` |
 | `--stream on\|off` | print assistant text as it is generated (SSE, display only; a provider retry may repeat text); `rof chat` prints to stdout, `rof run` to stderr; off by default, not exercised against a live endpoint |
-| `--mcp 'CMD ARGS'` | repeatable; spawn an MCP stdio server (argv split on whitespace, no shell) and expose its tools as `mcp__<name>`; requires `--exec-policy any`; the server inherits this process environment; tested against a scripted server only |
+| `--mcp 'CMD ARGS'` | repeatable; spawn an MCP stdio server (argv split on whitespace, no shell) and expose its tools as `mcp__<name>`; requires `--exec-policy any`; the server inherits this process environment; tested against a scripted server and one live run with `paper-search-mcp` (2026-11-13) |
 | `--incentives base\|contract\|full` | prompt scaffold level |
 | `--keep-thinking`, `--thinking-keep N`, `--collapse-hysteresis N` | transcript-shape knobs |
 | `--pass-env NAME`, `--header NAME:VALUE`, `--api-key-env NAME` | provider plumbing |

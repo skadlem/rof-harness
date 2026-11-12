@@ -1176,10 +1176,19 @@ async fn dropping_session_after_leader_exit_kills_remaining_group() {
         .split(';')
         .next()
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let poll = invoke(proc.as_ref(), serde_json::json!({"action":"poll","id":id}))
+    // interpreter start-up is unbounded under load: wait for the leader, don't guess
+    let mut poll = invoke(proc.as_ref(), serde_json::json!({"action":"poll","id":id}))
         .await
         .unwrap();
+    for _ in 0..100 {
+        if !poll.content.contains("running") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        poll = invoke(proc.as_ref(), serde_json::json!({"action":"poll","id":id}))
+            .await
+            .unwrap();
+    }
     assert!(
         !poll.content.contains("running"),
         "leader still running: {}",
