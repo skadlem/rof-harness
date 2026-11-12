@@ -721,7 +721,13 @@ pub(crate) async fn run_eval(args: &EvalArgs) -> i32 {
             return 2;
         }
     };
-    let _excluded = eval::preflight(&instances);
+    // preflight already prints `pre-flight: excluding <id>` per instance.
+    let excluded = eval::preflight(&instances);
+    let instances = drop_excluded(instances, &excluded);
+    if instances.is_empty() && !excluded.is_empty() {
+        eprintln!("every instance excluded by pre-flight");
+        return 2;
+    }
     let caps = eval_winnability_caps();
     if args.agent {
         return crate::eval_agent::run_agent_leg(args, &instances, &caps).await;
@@ -743,6 +749,13 @@ pub(crate) async fn run_eval(args: &EvalArgs) -> i32 {
         }
         let start = std::time::Instant::now();
         let verdict = match eval::Engine::run_instance(&engine, inst, &work) {
+fn drop_excluded(instances: Vec<eval::Instance>, excluded: &[String]) -> Vec<eval::Instance> {
+    instances
+        .into_iter()
+        .filter(|i| !excluded.contains(&i.id))
+        .collect()
+}
+
             Ok(outcome) => {
                 if let Some(hit) = outcome.reward {
                     if hit {
@@ -888,6 +901,23 @@ mod tests {
             "--tasks-dir",
             "/tmp/tasks",
             "--streak-steer",
+    #[test]
+    fn drop_excluded_removes_preflight_failures() {
+        let mk = |id: &str, oracle: &str| eval::Instance {
+            id: id.into(),
+            instruction: String::new(),
+            image: "img".into(),
+            oracle: oracle.into(),
+            tests: vec!["t".into()],
+            timeout_secs: 1,
+            agent_timeout_secs: 1,
+        };
+        let all = vec![mk("good", "solve"), mk("bad", "")];
+        let ex = eval::preflight(&all);
+        let kept = drop_excluded(all, &ex);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "good");
+    }
             "bad"
         ]))
         .is_err());

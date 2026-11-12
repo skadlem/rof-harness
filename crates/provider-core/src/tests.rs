@@ -172,6 +172,10 @@ fn classifier_status_first_then_string_fallback() {
         class_of(&http(400, "context_length_exceeded: too many tokens")),
         "overflow"
     );
+    // A plain 400/422 is a bad request: retrying the same body cannot help.
+    assert_eq!(class_of(&http(400, "bad request")), "fatal");
+    assert_eq!(class_of(&http(422, "unprocessable entity")), "fatal");
+    assert_eq!(class_of(&http(500, "boom")), "retry");
     // Auth and Cancelled are always fatal.
     assert_eq!(class_of(&LlmError::Auth("missing key".into())), "fatal");
     assert_eq!(class_of(&LlmError::Cancelled), "fatal");

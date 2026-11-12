@@ -68,7 +68,8 @@ pub fn classify_error(e: &LlmError) -> ErrorClass {
 /// Status-first table: overflow text wins (a 400 can carry it), 401/403 are
 /// fatal even when the body cries stale (staleness retries only via a
 /// refreshable source, which never surfaces as `Http`), overload text wins
-/// over a bare 429, then the retryable statuses, then the body table.
+/// over a bare 429, then the retryable statuses, then a plain 400/422 (the
+/// request itself is bad) is fatal, then the body table.
 fn classify_http(status: u16, body: &str) -> ErrorClass {
     let t = body.to_lowercase();
     let has = |p: &[&str]| p.iter().any(|k| t.contains(k));
@@ -98,6 +99,9 @@ fn classify_http(status: u16, body: &str) -> ErrorClass {
     }
     if status == 429 || status == 402 || (500..=599).contains(&status) {
         return ErrorClass::Retryable;
+    }
+    if status == 400 || status == 422 {
+        return ErrorClass::Fatal;
     }
     classify_message(body)
 }

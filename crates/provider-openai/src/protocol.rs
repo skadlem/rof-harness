@@ -97,7 +97,10 @@ pub(crate) fn wire_body(model: &str, req: &Request, k: &WireKnobs) -> serde_json
     }
     if let Some(o) = req.extras.as_object() {
         for (kk, vv) in o {
-            b[kk] = vv.clone();
+            // Extras add keys; they never overwrite model/max_tokens/messages/tools.
+            if b.get(kk).is_none() {
+                b[kk] = vv.clone();
+            }
         }
     }
     b
@@ -307,6 +310,19 @@ mod tests {
     use crate::test_support::req_with_tool;
     use provider_core::{ProviderMessage, Thinking};
     use std::collections::HashMap;
+    #[test]
+    fn extras_add_keys_but_never_clobber_core_fields() {
+        let mut req = req_with_tool();
+        req.extras = serde_json::json!({"model": "evil", "max_tokens": 1, "novel": 7});
+        let b = wire_body(
+            "m",
+            &req,
+            &WireKnobs::from_req(&req, &EndpointProfile::default()),
+        );
+        assert_eq!(b["model"], "m");
+        assert_ne!(b["max_tokens"], 1);
+        assert_eq!(b["novel"], 7);
+    }
     #[test]
     fn wire_body_threads_tool_ids_for_strict_providers() {
         use provider_core::ToolCallRef;
