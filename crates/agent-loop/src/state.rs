@@ -279,6 +279,8 @@ pub struct Experiment {
     /// One-shot latches: the half-cap and near-cap directives fire once each.
     pub half_directive_sent: bool,
     pub late_directive_sent: bool,
+    /// The named-deliverable check ran (it fires once per run).
+    pub deliverable_checked: bool,
 }
 
 impl LoopState {

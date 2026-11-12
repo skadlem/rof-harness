@@ -41,6 +41,8 @@ class RofOptions(InstalledAgentOptions):
     repo_evidence: bool = False
     collapse_hysteresis: int | None = Field(default=None, gt=0)
     completion_check: str | None = Field(default=None, pattern=r"\S")
+    deliverables: list[str] = []
+    deliverable_steer: bool = False
     history_read: bool = False
     compaction: float | None = Field(default=None, gt=0, le=1)
     context_capacity: int | None = Field(default=None, gt=0)
@@ -180,6 +182,10 @@ class RofAgent(BaseInstalledAgent):
             )
         if self.options.completion_check is not None:
             args.extend(("--completion-check", self.options.completion_check))
+        for path in self.options.deliverables:
+            args.extend(("--deliverable", path))
+        if self.options.deliverable_steer:
+            args.extend(("--deliverable-steer", "on"))
         if self.options.history_read:
             args.extend(("--history-read", "on"))
         if self.options.compaction is not None:

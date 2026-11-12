@@ -106,6 +106,8 @@ capability, and the container is removed best-effort on every path.
   WAL path; the loop itself never reads process env.
   `--streak-steer` separately opts in to the unvalidated six-read directive;
   crossings are recorded for both the control and treatment.
+  `--deliverable PATH` logs named output files still missing at step 15
+  (shadow); `--deliverable-steer on` adds one unvalidated directive.
 - `tool-core` — tool vocabulary, registry gate, `ToolOutcome` (`success`
   carries the exit status; serde default false = fail-closed).
 - `tools-std` — policy-gated `view/search/edit/write/exec/test` tools.

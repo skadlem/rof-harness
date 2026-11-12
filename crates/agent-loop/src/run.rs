@@ -317,6 +317,12 @@ impl std::str::FromStr for BudgetShape {
     }
 }
 
+/// Step at whose head the named-deliverable check runs. Provenance: chosen
+/// from docs/experiments/2026-11-11-allowlist-and-named-deliverable.md --
+/// 0/13 banked runs lacking the deliverable at step 15 solved, and 0/2
+/// solves would have been flagged.
+pub const DELIVERABLE_CHECK_STEP: usize = 15;
+
 /// Headless run knobs. `drain_timeout` defaults to 30s (unattended runs must
 /// not wedge on a stuck tool); the context budget reuses v1's 24k evidence
 /// window until the histogram retunes it.
@@ -324,6 +330,11 @@ impl std::str::FromStr for BudgetShape {
 pub struct RunConfig {
     /// Opt-in six-read intervention; counterfactual crossings are logged in both arms.
     pub streak_steer: bool,
+    /// Output files the task names, relative to the workdir. Checked once at
+    /// [`DELIVERABLE_CHECK_STEP`]; a missing one is logged as a crossing.
+    pub deliverables: Vec<PathBuf>,
+    /// Opt-in: also queue one directive naming the missing deliverables.
+    pub deliverable_steer: bool,
     pub goal: String,
     pub model: String,
     pub max_tokens: usize,
@@ -376,6 +387,8 @@ impl Default for RunConfig {
     fn default() -> Self {
         Self {
             streak_steer: false,
+            deliverables: Vec::new(),
+            deliverable_steer: false,
             goal: "run".into(),
             model: "run-model".into(),
             max_tokens: 2000,
@@ -809,6 +822,51 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         }
     }
 
+    /// Once per run, at the head of step [`DELIVERABLE_CHECK_STEP`]: log the
+    /// missing named deliverables; with `deliverable_steer`, queue one directive.
+    /// Never terminates the run.
+    async fn check_deliverables(&mut self) -> Result<(), Outcome> {
+        if self.state.step < DELIVERABLE_CHECK_STEP as u32
+            || self.state.experiment.deliverable_checked
+        {
+            return Ok(());
+        }
+        self.state.experiment.deliverable_checked = true;
+        if self.cfg.deliverables.is_empty() {
+            return Ok(());
+        }
+        let (root, want) = (self.workdir.to_path_buf(), self.cfg.deliverables.clone());
+        let missing = blocking(move || {
+            want.iter()
+                .filter(|p| !root.join(p).exists())
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .await;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        self.record(
+            ItemKind::Attempt {
+                error: format!(
+                    "deliverable-missing step={} paths={missing}",
+                    self.state.step
+                ),
+                will_retry: false,
+            },
+            None,
+        )
+        .await?;
+        if self.cfg.deliverable_steer {
+            self.state.push_directive(
+                format!("The required output {missing} does not exist yet. Create it now, then refine it."),
+                &self.cfg,
+            );
+        }
+        Ok(())
+    }
+
     /// One provider round: checkpoint race, request build, cancel-raced
     /// `complete`, then settle (failure or claim).
     async fn provider_round(&mut self, turn_token: CancellationToken) -> Result<(), Outcome> {
@@ -841,6 +899,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             self.state.gate.begin_abort();
             return self.settle_provider_error(LlmError::Cancelled).await;
         }
+        self.check_deliverables().await?;
         let req = build_request(self.state, self.registry, self.workdir, &self.cfg);
         if self.state.experiment.streak_pending {
             self.record(

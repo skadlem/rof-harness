@@ -51,6 +51,8 @@ class HarborRofOptionsTest(unittest.IsolatedAsyncioTestCase):
             "--repo-evidence",
             "--collapse-hysteresis",
             "--completion-check",
+            "--deliverable",
+            "--deliverable-steer",
         ):
             self.assertNotIn(flag, argv)
         self.assertIn("--workflow", argv)
@@ -103,6 +105,17 @@ class HarborRofOptionsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(argv[argv.index("--repo-evidence") + 1], "on")
         self.assertEqual(argv[argv.index("--completion-check") + 1], command)
         self.assertEqual(argv[argv.index("--goal") + 1], "goal")
+
+    async def test_deliverables_and_steer_reach_argv(self):
+        argv = await self.run_agent(
+            deliverables=["primers.fasta", "vm.js"], deliverable_steer=True
+        )
+        flagged = [argv[i + 1] for i, a in enumerate(argv) if a == "--deliverable"]
+        self.assertEqual(flagged, ["primers.fasta", "vm.js"])
+        self.assertEqual(argv[argv.index("--deliverable-steer") + 1], "on")
+        shadow = await self.run_agent(deliverables=["vm.js"])
+        self.assertIn("--deliverable", shadow)
+        self.assertNotIn("--deliverable-steer", shadow)
 
     def test_evidence_requires_lookup_and_completion_is_nonempty(self):
         with self.assertRaises(ValueError):

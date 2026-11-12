@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{parse_table, resolve_endpoint, Flag};
 
-pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--keep-thinking] [--allow-inert-spend-cap] [--in-container]
+pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--keep-thinking] [--allow-inert-spend-cap] [--in-container]
 --lenient-apply: record Lenient patch-apply provenance in the report (default Strict; Strict grades are not comparable with earlier fuzz-lenient numbers)
 --agent: run the agent leg per instance instead of the oracle-container leg (fresh workdir, in-process rof-run wiring, harbor-CLI grading). Requires --model ID and --endpoint URL (or OPENAI_BASE_URL); mutually exclusive with --winnability-only. Agent budgets default to the frozen pilot recipe: 300000 tokens / 60 steps / 120 actions; explicit flags win.
 --keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default keeps the DeepSeek thinking-off knob, sent only on compaction-summary calls and the truncation ladder first rung; ordinary requests carry no thinking fragment)
@@ -14,6 +14,8 @@ pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b]
 --exec-policy allowlist|any: command-allowlist policy forwarded to the agent leg. `any` skips the prefix list entirely (the in-container agent's process boundary is the task container, not this harness); the value is recorded in the report provenance, so relaxed rows never pool with strict rows
 --budget-shape: token-cap accounting, recorded on the report's provenance block. gross = input+output (default, the frozen recipe); miss-plus-out = (input - cache_read) + output, so provider-cached prompt re-reads stop spending the token cap. A miss-plus-out arm is a DIFFERENT ESTIMAND from a gross arm: never mix the two shapes in one table. Reported usage totals and dollars are unchanged by either shape;
 --streak-steer on|off: enable the experimental six-read directive (default off);
+--deliverable PATH: repeatable output file the task names, relative to the workdir (no absolute path, no `..`); applies to EVERY instance in the invocation, so use it for single-task invocations. Missing at step 15 is logged (shadow); recorded in provenance
+--deliverable-steer on|off: also deliver one 'create it now' directive for missing --deliverable paths (experimental, unvalidated; default off)
 --steer on|off: initiative steering nudges for the agent leg (unverified-declare hold, half/late action directives, wrap-up nudge); the workflow contract and the rollback notice still ship either way. Default off: measured dead in dphn-steer2 (no named-test change on either cell, 2.64x tokens per solved task, docs/decisions.md 2026-11-06);
 --reasoning-effort LEVEL (none|low|high|xhigh|max): send `reasoning_effort` on every request of the agent leg; recorded in the report provenance (default: none sent = endpoint default). DeepSeek docs (2026-11-09) list low/high/max and default high; xhigh maps to high. The 2026-10-19 one-prompt api.deepseek.com probe did not detect an effect; that result is historical, not universal. The vLLM gateway probe measured 0/722/1060/1149/2976 reasoning tokens for none/low/high/xhigh/max
 --review on|off: opt-in bounded fresh-context read-only review and one repair continuation (requires --agent; default off)
@@ -70,6 +72,10 @@ pub(crate) struct EvalArgs {
     pub steer: bool,
     /// Experimental read-streak intervention, off by default.
     pub streak_steer: bool,
+    /// Named output files for every instance of this invocation (shadow log at step 15).
+    pub deliverables: Vec<PathBuf>,
+    /// Opt-in directive for missing deliverables, off by default.
+    pub deliverable_steer: bool,
     /// In-container agent mode: the agent works inside the task
     /// environment container (workdir bind-mounted at /app) and the
     /// verifier execs the same live container, so installed packages and
@@ -109,6 +115,8 @@ struct EvalBuilder {
     reasoning_effort: Option<String>,
     steer: Option<bool>,
     streak_steer: Option<bool>,
+    deliverables: Vec<PathBuf>,
+    deliverable_steer: Option<bool>,
     in_container: bool,
     preserve_failed_checks: bool,
     minimal_workflow: Option<bool>,
@@ -208,6 +216,16 @@ fn set_allow_cmd(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
     if let Some(v) = v {
         b.allow_cmd.push(v);
     }
+    Ok(())
+}
+
+fn set_deliverable(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.deliverables.push(crate::cli::parse_deliverable(v)?);
+    Ok(())
+}
+
+fn set_deliverable_steer(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.deliverable_steer = Some(crate::cli::parse_on_off("--deliverable-steer", v)?);
     Ok(())
 }
 
@@ -549,6 +567,16 @@ const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
         set: set_streak_steer,
     },
     Flag {
+        name: "--deliverable",
+        takes_value: true,
+        set: set_deliverable,
+    },
+    Flag {
+        name: "--deliverable-steer",
+        takes_value: true,
+        set: set_deliverable_steer,
+    },
+    Flag {
         name: "--in-container",
         takes_value: false,
         set: set_in_container,
@@ -619,6 +647,8 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
         reasoning_effort: b.reasoning_effort,
         steer: b.steer.unwrap_or(false),
         streak_steer: b.streak_steer.unwrap_or(false),
+        deliverables: b.deliverables,
+        deliverable_steer: b.deliverable_steer.unwrap_or(false),
         in_container: b.in_container,
         preserve_failed_checks: b.preserve_failed_checks,
         minimal_workflow: b.minimal_workflow.unwrap_or(false),
@@ -713,6 +743,13 @@ fn eval_verdict_from_workdir(workdir: &Path) -> eval::Verdict {
     eval::Verdict::ErrorNoReport
 }
 
+fn drop_excluded(instances: Vec<eval::Instance>, excluded: &[String]) -> Vec<eval::Instance> {
+    instances
+        .into_iter()
+        .filter(|i| !excluded.contains(&i.id))
+        .collect()
+}
+
 pub(crate) async fn run_eval(args: &EvalArgs) -> i32 {
     let instances = match eval::load_tb_slice(&args.tasks_dir, &args.ids) {
         Ok(v) => v,
@@ -749,13 +786,6 @@ pub(crate) async fn run_eval(args: &EvalArgs) -> i32 {
         }
         let start = std::time::Instant::now();
         let verdict = match eval::Engine::run_instance(&engine, inst, &work) {
-fn drop_excluded(instances: Vec<eval::Instance>, excluded: &[String]) -> Vec<eval::Instance> {
-    instances
-        .into_iter()
-        .filter(|i| !excluded.contains(&i.id))
-        .collect()
-}
-
             Ok(outcome) => {
                 if let Some(hit) = outcome.reward {
                     if hit {
@@ -832,6 +862,8 @@ pub(crate) fn finish_report(args: &EvalArgs, reports: Vec<eval::InstanceReport>)
                     "max_tokens": args.max_tokens.unwrap_or(8_000),
                     "keep_thinking": args.keep_thinking,
                     "streak_steer": args.streak_steer,
+                    "deliverables": args.deliverables,
+                    "deliverable_steer": args.deliverable_steer,
                     "preserve_failed_checks": args.preserve_failed_checks,
                     "minimal_workflow": args.minimal_workflow,
                     "observation_keep": args.observation_keep.unwrap_or(agent_loop::RunConfig::default().observation_keep),
@@ -869,8 +901,37 @@ pub(crate) fn finish_report(args: &EvalArgs, reports: Vec<eval::InstanceReport>)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn drop_excluded_removes_preflight_failures() {
+        let mk = |id: &str, oracle: &str| eval::Instance {
+            id: id.into(),
+            instruction: String::new(),
+            image: "img".into(),
+            oracle: oracle.into(),
+            tests: vec!["t".into()],
+            timeout_secs: 1,
+            agent_timeout_secs: 1,
+        };
+        let all = vec![mk("good", "solve"), mk("bad", "")];
+        let ex = eval::preflight(&all);
+        let kept = drop_excluded(all, &ex);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "good");
+    }
     use super::*;
     use crate::fixtures::argv;
+
+    #[test]
+    fn eval_accepts_deliverables_and_rejects_escaping_paths() {
+        let base = ["rof", "eval", "--tasks-dir", "/tmp/tasks"];
+        let with = |extra: &[&str]| parse_eval(&argv(&[&base[..], extra].concat()));
+        let a = with(&["--deliverable", "vm.js", "--deliverable-steer", "on"]).unwrap();
+        assert_eq!(a.deliverables, vec![PathBuf::from("vm.js")]);
+        assert!(a.deliverable_steer);
+        assert!(with(&[]).unwrap().deliverables.is_empty());
+        assert!(with(&["--deliverable", "/abs"]).is_err());
+        assert!(with(&["--deliverable", "../up"]).is_err());
+    }
 
     #[test]
     fn eval_accepts_streak_steer() {
@@ -901,23 +962,6 @@ mod tests {
             "--tasks-dir",
             "/tmp/tasks",
             "--streak-steer",
-    #[test]
-    fn drop_excluded_removes_preflight_failures() {
-        let mk = |id: &str, oracle: &str| eval::Instance {
-            id: id.into(),
-            instruction: String::new(),
-            image: "img".into(),
-            oracle: oracle.into(),
-            tests: vec!["t".into()],
-            timeout_secs: 1,
-            agent_timeout_secs: 1,
-        };
-        let all = vec![mk("good", "solve"), mk("bad", "")];
-        let ex = eval::preflight(&all);
-        let kept = drop_excluded(all, &ex);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].id, "good");
-    }
             "bad"
         ]))
         .is_err());
@@ -1328,6 +1372,7 @@ mod tests {
         assert_eq!(p["run_config"]["endpoint"], "http://x");
         assert_eq!(p["run_config"]["max_tokens"], 8000);
         assert_eq!(p["run_config"]["streak_steer"], true);
+        assert_eq!(p["run_config"]["deliverable_steer"], false);
         // A relaxation must be identifiable on the row, or guarded and
         // opted-out rows pool into one unattributable table.
         assert_eq!(
@@ -1432,6 +1477,8 @@ mod tests {
             reasoning_effort: None,
             steer: true,
             streak_steer: false,
+            deliverables: Vec::new(),
+            deliverable_steer: false,
             in_container: false,
             preserve_failed_checks: false,
             minimal_workflow: false,

@@ -11,12 +11,14 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]...
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]...
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
 --keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default keeps the DeepSeek thinking-off knob, sent only on compaction-summary calls and the truncation ladder first rung; ordinary requests carry no thinking fragment)
 --streak-steer on|off: enable the experimental six-read directive (default off)
+--deliverable PATH: repeatable output file the task names, relative to the workdir (no absolute path, no `..`); if still missing at step 15 the crossing is logged (shadow, no behavior change)
+--deliverable-steer on|off: additionally deliver one 'create it now' directive for missing --deliverable paths (experimental, unvalidated; default off)
 --steer on|off: initiative steering nudges (unverified-declare hold, half/late action directives, wrap-up nudge). The workflow contract and the rollback notice ship either way. Default off: measured dead in dphn-steer2 (no named-test change on either cell, 2.64x tokens per solved task)
 --reasoning-effort LEVEL (none|low|high|xhigh|max): send `reasoning_effort` on every request (default: none sent = endpoint default). DeepSeek docs (2026-11-09) list low/high/max and default high; xhigh maps to high. The 2026-10-19 one-prompt api.deepseek.com probe did not detect an effect; that result is historical, not universal. The vLLM gateway probe measured 0/722/1060/1149/2976 reasoning tokens for none/low/high/xhigh/max
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget
@@ -89,6 +91,10 @@ pub(crate) struct Args {
     pub steer: bool,
     /// Experimental read-streak intervention, off by default.
     pub streak_steer: bool,
+    /// Named output files checked at step 15 (shadow log).
+    pub deliverables: Vec<PathBuf>,
+    /// Opt-in directive for missing deliverables, off by default.
+    pub deliverable_steer: bool,
     pub proof_cmd: Option<String>,
     pub completion_check: Option<String>,
     pub incentives: agent_loop::IncentivesLevel,
@@ -204,6 +210,8 @@ struct RunBuilder {
     reasoning_effort: Option<String>,
     steer: Option<bool>,
     streak_steer: Option<bool>,
+    deliverables: Vec<PathBuf>,
+    deliverable_steer: Option<bool>,
     proof_cmd: Option<String>,
     completion_check: Option<String>,
     incentives: Option<agent_loop::IncentivesLevel>,
@@ -389,6 +397,39 @@ fn set_streak_steer(b: &mut RunBuilder, v: Option<String>) -> Result<(), String>
         Some("off") => false,
         other => return Err(format!("--streak-steer expects on|off, got {other:?}")),
     });
+    Ok(())
+}
+
+/// A deliverable is a path inside the workdir: relative, no `..`.
+pub(crate) fn parse_deliverable(v: Option<String>) -> Result<PathBuf, String> {
+    let p = PathBuf::from(v.ok_or("--deliverable needs a path")?);
+    if p.as_os_str().is_empty()
+        || p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "--deliverable expects a relative path without `..`, got {p:?}"
+        ));
+    }
+    Ok(p)
+}
+
+pub(crate) fn parse_on_off(flag: &str, v: Option<String>) -> Result<bool, String> {
+    match v.as_deref() {
+        Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        other => Err(format!("{flag} expects on|off, got {other:?}")),
+    }
+}
+
+fn set_deliverable(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.deliverables.push(parse_deliverable(v)?);
+    Ok(())
+}
+
+fn set_deliverable_steer(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.deliverable_steer = Some(parse_on_off("--deliverable-steer", v)?);
     Ok(())
 }
 
@@ -731,6 +772,16 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_streak_steer,
     },
     Flag {
+        name: "--deliverable",
+        takes_value: true,
+        set: set_deliverable,
+    },
+    Flag {
+        name: "--deliverable-steer",
+        takes_value: true,
+        set: set_deliverable_steer,
+    },
+    Flag {
         name: "--allow-cmd",
         takes_value: true,
         set: set_allow_cmd,
@@ -894,6 +945,8 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         reasoning_effort: b.reasoning_effort,
         steer: b.steer.unwrap_or(false),
         streak_steer: b.streak_steer.unwrap_or(false),
+        deliverables: b.deliverables,
+        deliverable_steer: b.deliverable_steer.unwrap_or(false),
         proof_cmd: b.proof_cmd,
         completion_check: b.completion_check,
         incentives: b.incentives.unwrap_or(agent_loop::IncentivesLevel::Full),
@@ -1076,6 +1129,8 @@ pub(crate) fn run_config(args: &Args) -> RunConfig {
         history_read: args.history_read,
         steer: args.steer,
         streak_steer: args.streak_steer,
+        deliverables: args.deliverables.clone(),
+        deliverable_steer: args.deliverable_steer,
         preserve_failed_checks: args.preserve_failed_checks,
         minimal_workflow: args.minimal_workflow,
         observation_keep: args.observation_keep.unwrap_or(dflt.observation_keep),
@@ -1171,6 +1226,8 @@ mod tests {
                 reasoning_effort: None,
                 steer: false,
                 streak_steer: false,
+                deliverables: Vec::new(),
+                deliverable_steer: false,
                 bets: false,
                 incentives: agent_loop::IncentivesLevel::Full,
                 proof_cmd: None,
@@ -1766,6 +1823,31 @@ mod tests {
                 .streak_steer
         );
         assert!(parse_args(&run_min(&["--streak-steer", "invalid"])).is_err());
+    }
+
+    #[test]
+    fn deliverable_flags_parse_and_reject_escaping_paths() {
+        let plain = parse_args(&run_min(&[])).unwrap();
+        assert!(plain.deliverables.is_empty() && !plain.deliverable_steer);
+        let on = parse_args(&run_min(&[
+            "--deliverable",
+            "primers.fasta",
+            "--deliverable",
+            "out/vm.js",
+            "--deliverable-steer",
+            "on",
+        ]))
+        .unwrap();
+        assert_eq!(on.deliverables.len(), 2);
+        let cfg = run_config(&on);
+        assert!(cfg.deliverable_steer && cfg.deliverables == on.deliverables);
+        for bad in ["/etc/passwd", "../x", "a/../../x", ""] {
+            assert!(
+                parse_args(&run_min(&["--deliverable", bad])).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse_args(&run_min(&["--deliverable-steer", "maybe"])).is_err());
     }
 
     #[test]

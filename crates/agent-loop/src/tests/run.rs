@@ -2043,3 +2043,110 @@ async fn wallclock_deadline_interrupts_inflight_tool() {
     );
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// 15 one-view steps then "done"; returns (attempt texts, last request's message texts).
+async fn deliverable_run(
+    deliverables: &[&str],
+    steer: bool,
+    create: bool,
+) -> (Vec<String>, Vec<String>) {
+    let root = run_tmp("deliverable");
+    if create {
+        std::fs::write(root.join("out.txt"), "x").unwrap();
+    }
+    let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+        [("agent".to_owned(), vec!["view".to_owned()])].into(),
+    )));
+    registry.register(Arc::new(StreakView));
+    let mut queue: Vec<Scripted> = (0..15)
+        .map(|n| {
+            let id = format!("c{n}");
+            script_resp(
+                vec![(id.as_str(), "view", serde_json::json!({"n": n}))],
+                StopReason::ToolUse,
+            )
+        })
+        .collect();
+    queue.push(text_resp("done"));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let client = FakeLlm {
+        order: Arc::new(Mutex::new(Vec::new())),
+        queue: Mutex::new(VecDeque::from(queue)),
+        requests: requests.clone(),
+    };
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                deliverables: deliverables.iter().map(Into::into).collect(),
+                deliverable_steer: steer,
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Done));
+    let attempts = state
+        .items
+        .iter()
+        .filter_map(|i| match &i.kind {
+            ItemKind::Attempt { error, .. } => Some(error.clone()),
+            _ => None,
+        })
+        .collect();
+    let last = requests
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .map(|m| m.content.clone())
+        .collect();
+    let _ = std::fs::remove_dir_all(root);
+    (attempts, last)
+}
+
+fn count(v: &[String], needle: &str) -> usize {
+    v.iter().filter(|s| s.contains(needle)).count()
+}
+
+#[tokio::test]
+async fn deliverable_missing_shadow_logs_without_directive() {
+    let (a, m) = deliverable_run(&["out.txt"], false, false).await;
+    assert_eq!(count(&a, "deliverable-missing step=15 paths=out.txt"), 1);
+    assert_eq!(count(&m, "The required output"), 0);
+}
+
+#[tokio::test]
+async fn deliverable_missing_steer_delivers_exactly_once() {
+    let (a, m) = deliverable_run(&["out.txt"], true, false).await;
+    assert_eq!(count(&a, "deliverable-missing"), 1);
+    assert_eq!(
+        count(
+            &m,
+            "The required output out.txt does not exist yet. Create it now, then refine it."
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn deliverable_present_or_unlisted_records_nothing() {
+    let (a, m) = deliverable_run(&["out.txt"], true, true).await;
+    assert_eq!(count(&a, "deliverable-missing"), 0);
+    assert_eq!(count(&m, "The required output"), 0);
+    let (a, m) = deliverable_run(&[], true, false).await;
+    assert_eq!(count(&a, "deliverable-missing"), 0);
+    assert_eq!(count(&m, "The required output"), 0);
+}

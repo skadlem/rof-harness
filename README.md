@@ -268,6 +268,8 @@ writes the complete event log for replay.
 | `--max-tokens N` | per-request output ceiling |
 | `--steer on\|off` | initiative nudges (unverified-declare hold, half/late action directives, wrap-up). Default **off**: `dphn-steer2` measured them dead — no named-test change on either cell, 2.64x tokens per solved task; the workflow contract + rollback notice ship either way |
 | `--streak-steer on\|off` | experimental one-shot six-read directive; off by default, independent of `--steer` |
+| `--deliverable PATH` | repeatable output file the task names (relative to the workdir, no `..`); if missing at step 15 the crossing is logged (shadow, no behavior change). `rof eval` applies the list to every instance, so use it for single-task invocations; recorded in provenance. Unvalidated |
+| `--deliverable-steer on\|off` | also deliver one "create it now" directive for missing `--deliverable` paths; off by default, unvalidated |
 | `--reasoning-effort none\|low\|high\|xhigh\|max` | Optional per-request effort; endpoint-specific values. [Current DeepSeek docs](https://api-docs.deepseek.com/guides/thinking_mode/) support low/high/max and default to high; the earlier no-effect probe was historical |
 | `--context-file PATH` | pinned file context, repeatable |
 | `--dump-events PATH` | full event log, one run one dump |
