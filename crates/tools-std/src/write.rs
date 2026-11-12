@@ -121,7 +121,8 @@ impl Tool for WriteTool {
                     .map_err(|e| ToolError::Failed(e.to_string()))?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                std::fs::write(&p, &args.content).map_err(|e| ToolError::Failed(e.to_string()))?;
+                crate::common::overwrite(&p, args.content.as_bytes())
+                    .map_err(|e| ToolError::Failed(e.to_string()))?;
             }
             Err(e) => return Err(ToolError::Failed(e.to_string())),
         }

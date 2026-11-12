@@ -86,7 +86,8 @@ impl Tool for EditTool {
                 check_syntax(&self.policy, &updated, &cancel).await?;
             }
         }
-        std::fs::write(&p, updated).map_err(|e| ToolError::Failed(e.to_string()))?;
+        crate::common::overwrite(&p, updated.as_bytes())
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
         Ok(ToolOutcome {
             content: format!("patched {}", args.path),
             truncated: false,

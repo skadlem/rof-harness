@@ -443,6 +443,35 @@ mod tests {
         );
     }
 
+    /// Stand-in for a root-owned file created inside the task container: the
+    /// host-side tool cannot open it for writing but owns the directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_and_edit_replace_a_file_they_cannot_open_for_writing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tmp_root();
+        let r = reg(policy(&root));
+        for (tool, args, want) in [
+            (
+                "write",
+                json!({"path": "out.txt", "content": "new\n"}),
+                "new\n",
+            ),
+            (
+                "edit",
+                json!({"path": "out.txt", "search": "old", "replace": "fixed"}),
+                "fixed\n",
+            ),
+        ] {
+            let p = root.join("out.txt");
+            let _ = std::fs::remove_file(&p);
+            std::fs::write(&p, "old\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444)).unwrap();
+            run(&r, tool, args).await.unwrap();
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), want, "{tool}");
+        }
+    }
+
     #[tokio::test]
     async fn write_jail_escape_and_glob_denied() {
         let root = tmp_root();

@@ -126,3 +126,17 @@ pub(crate) fn dispatch(call: &ToolCall) -> CallStatus {
         args: call.args.clone(),
     })
 }
+
+/// Overwrite `p`. A file the tool cannot open for writing but whose directory
+/// it owns (root-owned output of an in-container command; observed on
+/// dna-insert and pypi-server) is replaced instead of failing the call.
+/// The replacement gets default ownership and mode.
+pub(crate) fn overwrite(p: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    match std::fs::write(p, bytes) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            std::fs::remove_file(p).map_err(|_| e)?;
+            std::fs::write(p, bytes)
+        }
+        r => r,
+    }
+}
