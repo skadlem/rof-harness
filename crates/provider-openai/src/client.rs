@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use provider_core::{
-    classify_error, parse_retry_after, Credentials, LlmClient, LlmError, Request, Response, Usage,
+    classify_error, parse_retry_after, Credentials, Delta, LlmClient, LlmError, Request, Response,
+    Usage,
 };
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
-use crate::protocol::{parse_body, wire_body, wire_usage, BodyFail, ChatResp};
+use crate::protocol::{parse_body, wire_body, wire_usage, BodyFail, ChatResp, StreamAcc};
 use crate::retry::{
     apply_ladder, chars_after, is_cold_start, merge_usage, schedule_delay, WireKnobs,
 };
@@ -160,6 +161,30 @@ impl OpenAiCompat {
 #[async_trait]
 impl LlmClient for OpenAiCompat {
     async fn complete(&self, model: &str, req: &Request) -> Result<Response, LlmError> {
+        self.run(model, req, None).await
+    }
+
+    /// SSE streaming (`stream: true`). HTTP errors and truncation go through
+    /// the same ladder as `complete`; a stream that ends before `[DONE]` or a
+    /// finish_reason is a retryable error. Deltas are display-only: a retry
+    /// replays text from the start, so the returned `Response` is the truth.
+    async fn complete_streaming(
+        &self,
+        model: &str,
+        req: &Request,
+        sink: &mut (dyn FnMut(Delta) + Send),
+    ) -> Result<Response, LlmError> {
+        self.run(model, req, Some(sink)).await
+    }
+}
+
+impl OpenAiCompat {
+    async fn run(
+        &self,
+        model: &str,
+        req: &Request,
+        mut sink: Option<&mut (dyn FnMut(Delta) + Send)>,
+    ) -> Result<Response, LlmError> {
         let t = Instant::now();
         let mut knobs = WireKnobs::from_req(req, &self.profile);
         // ponytail: retry lives here, not in every caller. Free tiers 429 often.
@@ -186,7 +211,16 @@ impl LlmClient for OpenAiCompat {
                 };
                 tokio::time::sleep(d).await;
             }
-            match self.once(model, req, &knobs).await {
+            match self
+                .once(
+                    model,
+                    req,
+                    &knobs,
+                    sink.as_mut()
+                        .map(|s| &mut **s as &mut (dyn FnMut(Delta) + Send)),
+                )
+                .await
+            {
                 Ok(mut r) => {
                     r.latency_ms = t.elapsed().as_millis() as u64;
                     r.attempts = u64::from(attempt) + 1;
@@ -255,7 +289,13 @@ fn is_stale_msg(s: &str) -> bool {
 }
 
 impl OpenAiCompat {
-    async fn once(&self, model: &str, req: &Request, k: &WireKnobs) -> Result<Response, OnceFail> {
+    async fn once(
+        &self,
+        model: &str,
+        req: &Request,
+        k: &WireKnobs,
+        sink: Option<&mut (dyn FnMut(Delta) + Send)>,
+    ) -> Result<Response, OnceFail> {
         // Env resolve per attempt, never cached past expiry. Empty is fatal
         // before any HTTP round trip.
         let key = self.creds.resolve().map_err(|e| OnceFail {
@@ -279,34 +319,35 @@ impl OpenAiCompat {
             call = call.header(name.as_str(), value.as_str());
         }
         call = call.bearer_auth(key.api_key);
-        let resp = call
-            .json(&wire_body(model, req, k))
-            .send()
-            .await
-            .map_err(|e| {
-                // reqwest's Display stops at "error sending request for url
-                // (...)"; the timeout only lives in the source chain. Walk it
-                // so forensics can tell a hang from connection-refused. The
-                // chain of a send error never contains "503" (statuses take
-                // the status branch), so `is_cold_start` is unaffected.
-                let mut msg = e.to_string();
-                let mut src = std::error::Error::source(&e);
-                while let Some(x) = src {
-                    msg.push_str(": ");
-                    msg.push_str(&x.to_string());
-                    src = x.source();
-                }
-                OnceFail {
-                    msg: msg.clone(),
-                    error: Box::new(LlmError::Transport(msg)),
-                    after: None,
-                    retryable: true,
-                    truncated: false,
-                    content_chars: 0,
-                    reasoning_chars: 0,
-                    usage: None,
-                }
-            })?;
+        let mut body = wire_body(model, req, k);
+        if sink.is_some() {
+            body["stream"] = true.into();
+            body["stream_options"] = serde_json::json!({"include_usage": true});
+        }
+        let resp = call.json(&body).send().await.map_err(|e| {
+            // reqwest's Display stops at "error sending request for url
+            // (...)"; the timeout only lives in the source chain. Walk it
+            // so forensics can tell a hang from connection-refused. The
+            // chain of a send error never contains "503" (statuses take
+            // the status branch), so `is_cold_start` is unaffected.
+            let mut msg = e.to_string();
+            let mut src = std::error::Error::source(&e);
+            while let Some(x) = src {
+                msg.push_str(": ");
+                msg.push_str(&x.to_string());
+                src = x.source();
+            }
+            OnceFail {
+                msg: msg.clone(),
+                error: Box::new(LlmError::Transport(msg)),
+                after: None,
+                retryable: true,
+                truncated: false,
+                content_chars: 0,
+                reasoning_chars: 0,
+                usage: None,
+            }
+        })?;
         if !resp.status().is_success() {
             let code = resp.status();
             let after = resp
@@ -373,16 +414,13 @@ impl OpenAiCompat {
                 usage,
             });
         }
-        let v: serde_json::Value = resp.json().await.map_err(|e| OnceFail {
-            msg: e.to_string(),
-            error: Box::new(LlmError::Transport(e.to_string())),
-            after: None,
-            retryable: true,
-            truncated: false,
-            content_chars: 0,
-            reasoning_chars: 0,
-            usage: None,
-        })?;
+        let v: serde_json::Value = match sink {
+            Some(sink) => read_stream(resp, sink).await?,
+            None => resp
+                .json()
+                .await
+                .map_err(|e| transport_fail(e.to_string()))?,
+        };
         parse_body(&v, model, k.max_tokens).map_err(|BodyFail { msg, usage }| {
             let truncated = msg.contains("finish_reason=length");
             let error = Box::new(LlmError::Transport(msg.clone()));
@@ -410,11 +448,82 @@ impl OpenAiCompat {
     }
 }
 
+fn transport_fail(msg: String) -> OnceFail {
+    OnceFail {
+        error: Box::new(LlmError::Transport(msg.clone())),
+        msg,
+        after: None,
+        retryable: true,
+        truncated: false,
+        content_chars: 0,
+        reasoning_chars: 0,
+        usage: None,
+    }
+}
+
+/// Apply one SSE line; true on `data: [DONE]`.
+fn sse_line(line: &[u8], acc: &mut StreamAcc, sink: &mut (dyn FnMut(Delta) + Send)) -> bool {
+    let line = String::from_utf8_lossy(line);
+    let Some(data) = line.trim().strip_prefix("data:") else {
+        return false;
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return true;
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+        acc.push(&v, sink);
+    }
+    false
+}
+
+/// Read an SSE body into a non-streaming-shaped JSON body. Comments, `event:`
+/// lines and unparseable chunks are skipped. EOF with neither `[DONE]` nor a
+/// finish_reason is a cut stream: retryable, never a truncated success.
+async fn read_stream(
+    mut resp: reqwest::Response,
+    sink: &mut (dyn FnMut(Delta) + Send),
+) -> Result<serde_json::Value, OnceFail> {
+    let mut acc = StreamAcc::default();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut done = false;
+    while !done {
+        let chunk = resp
+            .chunk()
+            .await
+            .map_err(|e| transport_fail(format!("stream broke: {e}")))?;
+        let at_eof = chunk.is_none();
+        if let Some(c) = chunk {
+            buf.extend_from_slice(&c);
+        }
+        // At EOF an unterminated last line still counts.
+        while let Some(i) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=i).collect();
+            done = sse_line(&line, &mut acc, sink);
+            if done {
+                break;
+            }
+        }
+        if at_eof {
+            done = done || (!buf.is_empty() && sse_line(&buf, &mut acc, sink));
+            break;
+        }
+    }
+    if !done && acc.finish.is_none() {
+        return Err(transport_fail(
+            "stream ended before [DONE] or finish_reason".into(),
+        ));
+    }
+    Ok(acc.into_body())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::retry::MAX_TOKENS_CEILING;
-    use crate::test_support::{client_on, ok_body, req_with_tool, serve, trunc_body, Canned};
+    use crate::test_support::{
+        client_on, ok_body, req_with_tool, serve, sse_body, trunc_body, Canned,
+    };
     use provider_core::ProviderMessage;
     #[tokio::test]
     async fn recovered_ladder_carries_failed_attempt_usage() {
@@ -864,5 +973,134 @@ mod tests {
             }
             other => panic!("expected Metered with usage, got {other:?}"),
         }
+    }
+
+    fn delta(d: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"choices": [{"delta": d}]})
+    }
+    fn ok_sse(body: String) -> Canned {
+        Canned {
+            status: 200,
+            headers: vec![("Content-Type".into(), "text/event-stream".into())],
+            body,
+        }
+    }
+    async fn stream(
+        key: &str,
+        canned: Vec<Canned>,
+    ) -> (Result<Response, LlmError>, Vec<Delta>, Vec<String>) {
+        std::env::set_var(key, "k");
+        let (ep, bodies) = serve(canned);
+        let mut req = req_with_tool();
+        req.tools.clear();
+        let mut seen = Vec::new();
+        let r = client_on(&ep, key)
+            .complete_streaming("m", &req, &mut |d| seen.push(d))
+            .await;
+        let b = bodies.lock().unwrap().clone();
+        (r, seen, b)
+    }
+    #[tokio::test]
+    async fn streamed_text_arrives_in_order_with_usage_chunk() {
+        let chunks = [
+            delta(serde_json::json!({"content": "Hel"})),
+            delta(serde_json::json!({"content": "lo "})),
+            delta(serde_json::json!({"content": "you"})),
+            serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            serde_json::json!({"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 4}}),
+        ];
+        let (r, seen, bodies) =
+            stream("TEST_OAI_KEY_S1", vec![ok_sse(sse_body(&chunks, true))]).await;
+        let r = r.unwrap();
+        let t = |s: &str| Delta::Text(s.into());
+        assert_eq!(seen, vec![t("Hel"), t("lo "), t("you")]);
+        assert_eq!(r.message.content, "Hello you");
+        assert_eq!((r.usage.input, r.usage.output), (3, 4));
+        assert_eq!(r.stop, provider_core::StopReason::Stop);
+        let sent: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["stream_options"]["include_usage"], true);
+    }
+    #[tokio::test]
+    async fn streamed_tool_call_fragments_concatenate_per_index() {
+        let tc = |v: serde_json::Value| delta(serde_json::json!({"tool_calls": [v]}));
+        let chunks = [
+            tc(
+                serde_json::json!({"index": 0, "id": "c9", "function": {"name": "read", "arguments": ""}}),
+            ),
+            tc(serde_json::json!({"index": 0, "function": {"arguments": "{\"pa"}})),
+            tc(serde_json::json!({"index": 0, "function": {"arguments": "th\": \"a."}})),
+            tc(serde_json::json!({"index": 0, "function": {"arguments": "rs\"}"}})),
+            serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        ];
+        let (r, seen, _) = stream("TEST_OAI_KEY_S2", vec![ok_sse(sse_body(&chunks, true))]).await;
+        let r = r.unwrap();
+        assert!(seen.is_empty());
+        assert_eq!(r.message.tool_calls.len(), 1);
+        let c = &r.message.tool_calls[0];
+        assert_eq!((c.id.as_str(), c.name.as_str()), ("c9", "read"));
+        assert_eq!(c.args, serde_json::json!({"path": "a.rs"}));
+        assert_eq!(r.stop, provider_core::StopReason::ToolUse);
+    }
+    #[tokio::test]
+    async fn streamed_reasoning_is_carried_without_fabricated_usage() {
+        let chunks = [
+            delta(serde_json::json!({"reasoning_content": "hm"})),
+            delta(serde_json::json!({"reasoning": "m"})),
+            delta(serde_json::json!({"content": "ok"})),
+            serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        ];
+        let (r, seen, _) = stream("TEST_OAI_KEY_S3", vec![ok_sse(sse_body(&chunks, false))]).await;
+        let r = r.unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                Delta::Reasoning("hm".into()),
+                Delta::Reasoning("m".into()),
+                Delta::Text("ok".into())
+            ]
+        );
+        // Same carry as the non-streaming path: reasoning_content wins when set.
+        assert_eq!(r.message.thinking.as_deref(), Some("hm"));
+        assert_eq!(r.message.content, "ok");
+        // No usage chunk: nothing reported, so no cost and no reasoning count.
+        assert!(r.usage.cost_usd.is_none() && r.usage.reasoning.is_none());
+    }
+    // Real time: a paused clock auto-advances during socket IO and fires the
+    // 600 s request timeout. Costs one 2-3 s backoff.
+    #[tokio::test]
+    async fn stream_cut_before_finish_is_retried_not_truncated_success() {
+        let cut = sse_body(&[delta(serde_json::json!({"content": "par"}))], false);
+        let good = sse_body(
+            &[
+                delta(serde_json::json!({"content": "whole"})),
+                serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            ],
+            true,
+        );
+        let (r, seen, bodies) =
+            stream("TEST_OAI_KEY_S5", vec![ok_sse(cut.clone()), ok_sse(good)]).await;
+        let r = r.unwrap();
+        assert_eq!((r.message.content.as_str(), r.attempts), ("whole", 2));
+        assert_eq!(bodies.len(), 2);
+        // Retry replays: display-only deltas saw the cut text too.
+        assert_eq!(seen[0], Delta::Text("par".into()));
+    }
+    #[tokio::test]
+    async fn non_streaming_body_has_no_stream_key() {
+        std::env::set_var("TEST_OAI_KEY_S6", "k");
+        let (ep, bodies) = serve(vec![Canned {
+            status: 200,
+            headers: vec![],
+            body: ok_body("x"),
+        }]);
+        let mut req = req_with_tool();
+        req.tools.clear();
+        client_on(&ep, "TEST_OAI_KEY_S6")
+            .complete("m", &req)
+            .await
+            .unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
+        assert!(sent.get("stream").is_none() && sent.get("stream_options").is_none());
     }
 }

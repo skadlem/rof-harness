@@ -123,6 +123,19 @@ pub fn ok_body(text: &str) -> String {
     .to_string()
 }
 
+/// SSE body: one `data:` event per chunk, optional `[DONE]`; a comment line
+/// and an `event:` line ride along to pin that they are skipped.
+pub fn sse_body(chunks: &[serde_json::Value], done: bool) -> String {
+    let mut s = String::from(": keep-alive\n\nevent: message\n");
+    for c in chunks {
+        s.push_str(&format!("data: {c}\n\n"));
+    }
+    if done {
+        s.push_str("data: [DONE]\n\n");
+    }
+    s
+}
+
 pub fn trunc_body(content: &str, reasoning: &str) -> String {
     serde_json::json!({
         "choices": [{

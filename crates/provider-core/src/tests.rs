@@ -275,3 +275,49 @@ fn retry_after_http_date() {
         Some(Duration::ZERO)
     );
 }
+
+/// Old-style adapter: only `complete`. The new method must reach it and emit
+/// no deltas.
+struct OldClient;
+#[async_trait]
+impl LlmClient for OldClient {
+    async fn complete(&self, _m: &str, _r: &Request) -> Result<Response, LlmError> {
+        Ok(Response {
+            message: AssistantMessage {
+                content: "hi".into(),
+                tool_calls: vec![],
+                thinking: None,
+            },
+            stop: StopReason::Stop,
+            usage: Usage {
+                input: 1,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: None,
+                cost_usd: None,
+            },
+            latency_ms: 0,
+            attempts: 1,
+            raw_stop_reason: None,
+            retry_usage: None,
+        })
+    }
+}
+
+#[test]
+fn default_streaming_delegates_to_complete_without_deltas() {
+    let req = Request {
+        messages: vec![],
+        tools: vec![],
+        max_tokens: 32,
+        thinking: Thinking::Off,
+        extras: json!({}),
+    };
+    let mut seen = Vec::new();
+    let r =
+        futures::executor::block_on(OldClient.complete_streaming("m", &req, &mut |d| seen.push(d)))
+            .unwrap();
+    assert_eq!(r.message.content, "hi");
+    assert!(seen.is_empty());
+}

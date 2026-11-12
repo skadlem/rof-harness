@@ -1,5 +1,5 @@
 use provider_core::{
-    infer_stop, parse_streaming_json, Request, Response, StopReason, ToolCallRef, Usage,
+    infer_stop, parse_streaming_json, Delta, Request, Response, StopReason, ToolCallRef, Usage,
 };
 use serde::Deserialize;
 
@@ -104,6 +104,86 @@ pub(crate) fn wire_body(model: &str, req: &Request, k: &WireKnobs) -> serde_json
         }
     }
     b
+}
+
+/// Fold SSE `data:` payloads into a non-streaming-shaped body so `parse_body`
+/// stays the single conversion path (stop inference, tool args, usage).
+#[derive(Default)]
+pub(crate) struct StreamAcc {
+    content: String,
+    reasoning_content: String,
+    reasoning: String,
+    /// index -> (id, name, concatenated argument fragments)
+    calls: std::collections::BTreeMap<u64, (Option<String>, Option<String>, String)>,
+    pub(crate) finish: Option<String>,
+    usage: Option<serde_json::Value>,
+}
+
+impl StreamAcc {
+    /// Apply one parsed chunk, reporting text/reasoning deltas to `emit`.
+    pub(crate) fn push(&mut self, chunk: &serde_json::Value, emit: &mut dyn FnMut(Delta)) {
+        if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
+            self.usage = Some(u.clone());
+        }
+        let Some(choice) = chunk["choices"].get(0) else {
+            return;
+        };
+        if let Some(f) = choice["finish_reason"].as_str() {
+            self.finish = Some(f.to_string());
+        }
+        let d = &choice["delta"];
+        if let Some(t) = d["content"].as_str().filter(|t| !t.is_empty()) {
+            self.content.push_str(t);
+            emit(Delta::Text(t.to_string()));
+        }
+        if let Some(t) = d["reasoning_content"].as_str().filter(|t| !t.is_empty()) {
+            self.reasoning_content.push_str(t);
+            emit(Delta::Reasoning(t.to_string()));
+        }
+        if let Some(t) = d["reasoning"].as_str().filter(|t| !t.is_empty()) {
+            self.reasoning.push_str(t);
+            emit(Delta::Reasoning(t.to_string()));
+        }
+        for (i, tc) in d["tool_calls"].as_array().into_iter().flatten().enumerate() {
+            let e = self
+                .calls
+                .entry(tc["index"].as_u64().unwrap_or(i as u64))
+                .or_default();
+            if let Some(id) = tc["id"].as_str() {
+                e.0 = Some(id.to_string());
+            }
+            if let Some(n) = tc["function"]["name"].as_str() {
+                e.1 = Some(n.to_string());
+            }
+            if let Some(a) = tc["function"]["arguments"].as_str() {
+                e.2.push_str(a);
+            }
+        }
+    }
+
+    pub(crate) fn into_body(self) -> serde_json::Value {
+        let calls: Vec<_> = self
+            .calls
+            .into_values()
+            .map(|(id, name, args)| {
+                serde_json::json!({"id": id, "function": {"name": name, "arguments": args}})
+            })
+            .collect();
+        let mut b = serde_json::json!({"choices": [{
+            "message": {
+                "content": self.content,
+                "reasoning_content": self.reasoning_content,
+                "reasoning": self.reasoning,
+                "tool_calls": calls,
+            },
+            "finish_reason": self.finish,
+        }]});
+        // No usage chunk -> no key -> None downstream, never zeros.
+        if let Some(u) = self.usage {
+            b["usage"] = u;
+        }
+        b
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]

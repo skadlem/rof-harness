@@ -1,5 +1,5 @@
 use crate::errors::LlmError;
-use crate::types::{Request, Response};
+use crate::types::{Delta, Request, Response};
 use async_trait::async_trait;
 
 #[async_trait]
@@ -15,5 +15,19 @@ pub trait LlmClient: Send + Sync {
         Err(LlmError::Transport(
             "default LlmClient::complete cannot report usage: override it with a metered implementation".into(),
         ))
+    }
+
+    /// Like `complete`, but an implementor that can stream feeds incremental
+    /// text/reasoning to `sink` while the response is generated. The default
+    /// calls `complete` and emits nothing. The returned `Response` is the
+    /// truth: deltas are display-only. A retried attempt may replay text the
+    /// sink already saw, so callers must not build state from the deltas.
+    async fn complete_streaming(
+        &self,
+        model: &str,
+        req: &Request,
+        _sink: &mut (dyn FnMut(Delta) + Send),
+    ) -> Result<Response, LlmError> {
+        self.complete(model, req).await
     }
 }

@@ -33,6 +33,13 @@ pub struct Request {
     pub extras: Value,
 }
 
+/// One incremental piece of a streamed response (display-only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delta {
+    Text(String),
+    Reasoning(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopReason {
     Pending,
