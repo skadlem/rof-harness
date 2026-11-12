@@ -220,6 +220,7 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
         dump_events: Some(events_path.to_string_lossy().into_owned()),
         log_path: None,
         no_log: false,
+        resume: None,
         // The eval leg builds its provider from `EvalArgs.keep_thinking`
         // directly (run_agent_leg); the run-Args copy stays consistent.
         keep_thinking: a.keep_thinking,

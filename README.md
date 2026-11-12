@@ -274,9 +274,13 @@ writes the complete event log for replay.
 | `--context-file PATH` | pinned file context, repeatable |
 | `--dump-events PATH` | full event log, one run one dump |
 | `--log-path` / `--no-log` | WAL location (defaults to `<workdir>/.rof-events.jsonl`) |
+| `--resume LOG` | continue from an existing log: user/assistant/tool history is rebuilt and new items append to it; budgets start fresh, counters, verify state, snapshots and directives are not restored; a tool call with no result gets a synthetic "outcome unknown" result. Conflicts with `--log-path`, `--no-log`, `--review on` |
 | `--incentives base\|contract\|full` | prompt scaffold level |
 | `--keep-thinking`, `--thinking-keep N`, `--collapse-hysteresis N` | transcript-shape knobs |
 | `--pass-env NAME`, `--header NAME:VALUE`, `--api-key-env NAME` | provider plumbing |
+
+`rof chat` takes the same flags with `--goal` optional (it is the first message): one stdin line per
+message, history carries over, the budget applies per message, `/exit` or EOF ends with exit 0.
 
 `rof eval` adds `--tasks-dir DIR` (required), `--ids`, `--out-dir`, `--report`, `--winnability-only`,
 `--lenient-apply`, `--agent`, `--in-container`. Without `--agent` it is a scaffold, not a grader.

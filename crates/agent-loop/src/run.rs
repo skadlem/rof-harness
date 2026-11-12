@@ -1856,6 +1856,7 @@ pub async fn run<P: LlmClient>(
     } = r;
     state.budget_shape = cfg.budget_shape; // the one config copy; see the `run` doc
     let tree = Arc::new(snapshot::TreeService::new(workdir));
+    let synced = state.persisted;
     let mut ctx = RunCtx {
         state,
         provider,
@@ -1867,15 +1868,17 @@ pub async fn run<P: LlmClient>(
         cfg,
         tree,
         writer: None,
-        synced: 0,
+        synced,
         run_id: 0,
         root: CancellationToken::new(),
         cancel,
         stalled_check: None,
         completion_checks: 0,
     };
-    if let Some(o) = ctx.open_run(inputs).await {
-        return o;
-    }
-    ctx.drive().await
+    let outcome = match ctx.open_run(inputs).await {
+        Some(o) => o,
+        None => ctx.drive().await,
+    };
+    ctx.state.persisted = ctx.synced;
+    outcome
 }

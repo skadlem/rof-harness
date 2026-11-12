@@ -19,6 +19,8 @@ pub(crate) struct ScriptClient {
     /// incremental, not a post-run write.
     pub probe_dump: Option<PathBuf>,
     pub probe_hit: std::sync::Mutex<bool>,
+    /// Messages of every request, in order.
+    pub seen: std::sync::Mutex<Vec<Vec<provider_core::ProviderMessage>>>,
 }
 
 impl ScriptClient {
@@ -27,6 +29,7 @@ impl ScriptClient {
             queue: std::sync::Mutex::new(resps.into()),
             probe_dump: None,
             probe_hit: std::sync::Mutex::new(false),
+            seen: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -35,6 +38,7 @@ impl ScriptClient {
             queue: std::sync::Mutex::new(resps.into()),
             probe_dump: Some(dump),
             probe_hit: std::sync::Mutex::new(false),
+            seen: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -44,8 +48,9 @@ impl LlmClient for ScriptClient {
     async fn complete(
         &self,
         _model: &str,
-        _req: &provider_core::Request,
+        req: &provider_core::Request,
     ) -> Result<Response, provider_core::LlmError> {
+        self.seen.lock().unwrap().push(req.messages.clone());
         if let Some(dump) = &self.probe_dump {
             if let Ok(text) = std::fs::read_to_string(dump) {
                 if text.lines().count() >= 1
@@ -198,6 +203,7 @@ pub(crate) fn args_for(dir: &std::path::Path, steps: Option<u32>) -> Args {
         dump_events: None,
         log_path: None,
         no_log: false,
+        resume: None,
         keep_thinking: false,
         reasoning_effort: None,
         steer: true,

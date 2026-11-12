@@ -46,6 +46,13 @@ continuation/two checks; it cannot be combined with the separate review stage.
 5. Exit code from the outcome (`exit.rs`); a one-line event summary on
    stderr.
 
+`rof chat` (`chat.rs`) is an opt-in interactive surface: one `agent_loop::run`
+per stdin line over a single `LoopState` (`reset_for_input` clears the per-run
+latches, `persisted` keeps the log cursor), with an emitter listener printing
+assistant text and one line per tool call. `--resume LOG` (also on `rof run`)
+rebuilds history via `LoopState::restore`, which synthesizes results for
+unanswered tool calls and closes an open turn as interrupted.
+
 `rof eval --tasks-dir DIR` (`eval_cmd.rs`) is a legacy evaluation path distinct
 from the native Harbor adapter (`tools/harbor_rof.py`), which invokes `rof run`
 inside the task container. The eval command loads a frozen task slice and

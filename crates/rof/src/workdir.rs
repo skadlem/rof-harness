@@ -53,7 +53,7 @@ pub(crate) fn resolve_log_path(args: &Args) -> Option<PathBuf> {
     if args.no_log {
         return None;
     }
-    if let Some(p) = args.log_path.as_deref() {
+    if let Some(p) = args.resume.as_deref().or(args.log_path.as_deref()) {
         return Some(PathBuf::from(p));
     }
     Some(default_log_path(&args.workdir))

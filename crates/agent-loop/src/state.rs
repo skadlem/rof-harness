@@ -200,6 +200,10 @@ pub struct LoopState {
     pub step: u32,
     pub phase: Phase,
     pub items: Vec<Item>,
+    /// Leading `items` already durable in the log; `run` starts its sync
+    /// cursor here and writes it back, so repeated runs on one state (chat)
+    /// and a restored history never re-append rows.
+    pub persisted: usize,
     /// File map frozen at run start (prefix-cache head): mid-run edits must
     /// not rotate the system-message bytes, so `build_request` never re-walks.
     pub file_map: Option<String>,
@@ -290,6 +294,7 @@ impl LoopState {
             step: 0,
             phase: Phase::Idle,
             items: Vec::new(),
+            persisted: 0,
             file_map: None,
             pins: None,
             steering: VecDeque::new(),
@@ -320,6 +325,90 @@ impl LoopState {
             anchor: None,
             compacted_turn: None,
         }
+    }
+
+    /// Resume: adopt a durable log (already validated by `read_log`) as the
+    /// history. Calls with no recorded result get a synthetic error result
+    /// and an open last turn is closed `Interrupted`, so the next request is
+    /// well-formed. Not restored: budgets, verify/experiment counters,
+    /// checkpoint, pins/file map (the next `run` re-freezes those).
+    pub fn restore(&mut self, items: Vec<Item>) {
+        self.turn = items
+            .iter()
+            .filter(|i| matches!(i.kind, ItemKind::TurnStart { .. }))
+            .count() as u64;
+        self.persisted = items.len();
+        self.items = items;
+        let answered: std::collections::HashSet<String> = self
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::ToolResult { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let dangling: Vec<String> = self
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Assistant { message, .. } => {
+                    serde_json::from_value::<AssistantMessage>(message.clone()).ok()
+                }
+                _ => None,
+            })
+            .flat_map(|m| m.tool_calls)
+            .map(|c| c.id)
+            .filter(|id| !answered.contains(id))
+            .collect();
+        for call_id in dangling {
+            append_to(
+                &mut self.items,
+                ItemKind::ToolResult {
+                    call_id,
+                    content: agent_log::UNKNOWN_OUTCOME_TEXT.into(),
+                    is_error: true,
+                    recovery: Some(RecoveryCode::ToolOutcomeUnknown),
+                },
+            );
+        }
+        let open = self.items.iter().rev().find_map(|i| match i.kind {
+            ItemKind::TurnStart { .. } => Some(true),
+            ItemKind::TurnEnd { .. } => Some(false),
+            _ => None,
+        });
+        if open == Some(true) {
+            append_to(
+                &mut self.items,
+                ItemKind::TurnEnd {
+                    turn_id: turn_id(self.turn),
+                    reason: TurnEndReason::Interrupted,
+                },
+            );
+        }
+    }
+
+    /// [`Self::restore`] from a log file on disk.
+    pub fn restore_from(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        self.restore(agent_log::read_log(path)?);
+        Ok(())
+    }
+
+    /// Chat: clear the per-run latches a finished or failed `run` leaves
+    /// behind so the same state takes the next user line. History, usage
+    /// totals and counters stay; the caller re-seeds `budget`.
+    pub fn reset_for_input(&mut self) {
+        self.phase = Phase::Idle;
+        self.turn_reason = None;
+        self.fatal_error = None;
+        self.gate = EffectGate::new();
+        self.stop_hard = false;
+        self.stop_when_idle = false;
+        self.call_model = false;
+        self.drain_until = None;
+        self.in_flight = None;
+        self.steering.clear();
+        self.followups.clear();
+        self.step_retries = STEP_RETRY_BUDGET;
     }
 
     pub fn open_tools(&self) -> usize {

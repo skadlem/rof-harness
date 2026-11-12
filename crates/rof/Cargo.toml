@@ -25,3 +25,6 @@ provider-core = { path = "../provider-core" }
 provider-openai = { path = "../provider-openai" }
 snapshot = { path = "../snapshot" }
 trace = { path = "../trace" }
+
+[dev-dependencies]
+agent-log = { path = "../agent-log" }

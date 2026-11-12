@@ -2,6 +2,7 @@
 //! Prompt shape (goal + file map + named files via the context assembler)
 //! lives in `agent_loop::run`; this crate only feeds it `RunConfig` + input.
 
+mod chat;
 mod cli;
 mod dump;
 mod eval_agent;
@@ -26,8 +27,8 @@ use tokio_util::sync::CancellationToken;
 use tool_core::GrantGate;
 
 use cli::{
-    apply_env_defaults, budget_for, endpoint_profile, parse_args, resolve_endpoint, run_config,
-    Args,
+    apply_env_defaults, budget_for, endpoint_profile, parse_args, parse_chat, resolve_endpoint,
+    run_config, Args,
 };
 use dump::{attach_dump, finalize_dump};
 use eval_cmd::{parse_eval, run_eval};
@@ -392,6 +393,18 @@ async fn execute_with_deadline<P: LlmClient>(
         }
     };
     let mut state = LoopState::new();
+    if let Some(p) = args.resume.as_deref() {
+        if let Err(e) = state.restore_from(Path::new(p)) {
+            return RunResult {
+                outcome: Outcome::Failed {
+                    kind: FailureKind::Log,
+                    message: format!("--resume {p}: {e}"),
+                },
+                patch: Ok(String::new()),
+                events: Vec::new(),
+            };
+        }
+    }
     // Pre-seeded budget: `run` never rebuilds it (precedence is documented
     // on `agent_loop::run`: cfg-over-state). A `$` guard that cannot fire is a
     // configuration error, so it stops the run before any provider request
@@ -434,7 +447,7 @@ async fn execute_with_deadline<P: LlmClient>(
     // A fresh run restarts log sequence numbers; preserve the prior WAL
     // outside the workdir before creating a new one.
     let log_path = resolve_log_path(args);
-    if let Some(p) = log_path.as_deref() {
+    if let (Some(p), None) = (log_path.as_deref(), args.resume.as_deref()) {
         if let Err(e) = preserve_log(p, &args.workdir) {
             return RunResult {
                 outcome: Outcome::Failed {
@@ -647,7 +660,12 @@ async fn main() {
         };
         std::process::exit(run_eval(&eargs).await);
     }
-    let mut args = match parse_args(&argv) {
+    let chat = argv.get(1).map(String::as_str) == Some("chat");
+    let mut args = match if chat {
+        parse_chat(&argv)
+    } else {
+        parse_args(&argv)
+    } {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
@@ -695,6 +713,10 @@ async fn main() {
             missing_credentials_message(&args.api_key_env, &e.to_string())
         );
         std::process::exit(EXIT_NO_CREDENTIALS);
+    }
+    if chat {
+        let out = Arc::new(std::sync::Mutex::new(std::io::stdout()));
+        std::process::exit(chat::run_chat(&provider, &args, std::io::stdin().lock(), out).await);
     }
     let r = execute(&provider, &args).await;
     if let Some(path) = args.dump_events.as_deref() {

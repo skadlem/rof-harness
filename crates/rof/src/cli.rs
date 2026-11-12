@@ -11,10 +11,11 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]...
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--resume LOG] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]...
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
+--resume LOG: rebuild the conversation from an existing log and append to it (--goal is the next message). Restores user/assistant/tool history only; budgets start fresh and counters, verify state, snapshots and directives are not restored. A tool call with no recorded result gets a synthetic \"outcome unknown\" error result. Conflicts with --log-path/--no-log/--review on
 --keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default keeps the DeepSeek thinking-off knob, sent only on compaction-summary calls and the truncation ladder first rung; ordinary requests carry no thinking fragment)
 --streak-steer on|off: enable the experimental six-read directive (default off)
 --deliverable PATH: repeatable output file the task names, relative to the workdir (no absolute path, no `..`); if still missing at step 15 the crossing is logged (shadow, no behavior change)
@@ -37,6 +38,10 @@ pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--work
 --review on|off: opt-in bounded fresh-context read-only defect review and one repair continuation; default off
 --procedure-file PATH: add a validated JSON procedure record (repeatable); only case-insensitive literal cue matches are injected, with bounded text and explicit source repositories
 exit codes: 0 done, 2 usage/parse, 3 run failure (halt/cancel/provider), 4 missing credentials, 5 log failure, 6 snapshot failure, 7 input/config failure, 8 unmet completion predicate";
+
+/// `rof chat`: line-based interactive loop over the same flags as `rof run`.
+pub(crate) const CHAT_USAGE: &str = "usage: rof chat [--goal TEXT] --workdir DIR --model ID [any other `rof run` flag, see `rof run`]
+reads one message per stdin line and runs the agent on it until the turn ends; history carries over between lines. --goal, when given, is the first message. `/exit` or EOF ends with exit 0. Budget flags apply per message (each line gets a fresh budget). --resume LOG continues an earlier log (history only: budgets, counters, verify state, snapshots and directives are not restored). --review and procedures are ignored.";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Args {
@@ -67,6 +72,9 @@ pub(crate) struct Args {
     pub log_path: Option<String>,
     /// Opt out of the fail-closed WAL.
     pub no_log: bool,
+    /// Existing log to continue: history is rebuilt from it and new items
+    /// append to the same file (it becomes the WAL path).
+    pub resume: Option<String>,
     /// Run with a `$` cap that cannot fire. The default preset arms the $4 cap
     /// and an unpriced model reports no cost, so `budget_for` refuses such a
     /// run as a configuration error. Set this only for an endpoint the price
@@ -206,6 +214,7 @@ struct RunBuilder {
     dump_events: Option<String>,
     log_path: Option<String>,
     no_log: bool,
+    resume: Option<String>,
     keep_thinking: bool,
     reasoning_effort: Option<String>,
     steer: Option<bool>,
@@ -364,6 +373,11 @@ fn set_dump_events(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> 
 
 fn set_log_path(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
     b.log_path = v;
+    Ok(())
+}
+
+fn set_resume(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.resume = v;
     Ok(())
 }
 
@@ -752,6 +766,11 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_no_log,
     },
     Flag {
+        name: "--resume",
+        takes_value: true,
+        set: set_resume,
+    },
+    Flag {
         name: "--keep-thinking",
         takes_value: false,
         set: set_keep_thinking,
@@ -879,14 +898,28 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
 ];
 
 pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
+    parse_cmd(argv, "run", USAGE)
+}
+
+/// `rof chat`: the `run` flag table, `--goal` optional (empty = none).
+pub(crate) fn parse_chat(argv: &[String]) -> Result<Args, String> {
+    parse_cmd(argv, "chat", CHAT_USAGE)
+}
+
+fn parse_cmd(argv: &[String], cmd: &str, usage: &str) -> Result<Args, String> {
     let b = parse_table(
         argv,
-        "run",
-        USAGE,
-        |k| format!("unknown flag {k:?}\n{USAGE}"),
+        cmd,
+        usage,
+        |k| format!("unknown flag {k:?}\n{usage}"),
         RUN_FLAGS,
         RunBuilder::default(),
     )?;
+    if b.resume.is_some() && (b.no_log || b.log_path.is_some() || b.review) {
+        return Err(
+            "--resume is the log: it conflicts with --log-path/--no-log/--review on".into(),
+        );
+    }
     let exec_policy = b.exec_policy.unwrap_or(tools_std::ExecPolicy::Allowlist);
     if (b.shell.unwrap_or(false) || b.processes.unwrap_or(false))
         && exec_policy != tools_std::ExecPolicy::Any
@@ -923,7 +956,12 @@ pub(crate) fn parse_args(argv: &[String]) -> Result<Args, String> {
         }
     }
     Ok(Args {
-        goal: b.goal.ok_or("missing --goal")?,
+        goal: match b.goal {
+            Some(g) => g,
+            None if cmd == "chat" => String::new(),
+            None => return Err("missing --goal".into()),
+        },
+        resume: b.resume,
         context_files: b.context_files,
         max_tokens: b.max_tokens,
         workdir: PathBuf::from(b.workdir.ok_or("missing --workdir")?),
@@ -1221,6 +1259,7 @@ mod tests {
                 dump_events: Some("/tmp/ev.json".into()),
                 log_path: Some("/tmp/w.log".into()),
                 no_log: false,
+                resume: None,
                 allow_inert_spend_cap: false,
                 keep_thinking: false,
                 reasoning_effort: None,
