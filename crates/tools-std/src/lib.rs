@@ -1339,6 +1339,25 @@ mod tests {
         );
         assert_eq!(split_cmd("echo 'a b' c"), vec!["echo", "a b", "c"]);
         assert!(split_cmd("").is_empty());
+        // POSIX: inside double quotes a backslash is literal unless it
+        // escapes one of $ ` " \ (grep "a\|b" lost its alternation).
+        assert_eq!(
+            split_cmd(r#"grep "a\|b\.c" f"#),
+            vec!["grep", r"a\|b\.c", "f"]
+        );
+        assert_eq!(split_cmd(r#"echo "a\"b\\c""#), vec!["echo", r#"a"b\c"#]);
+    }
+
+    #[tokio::test]
+    async fn exec_reports_nonzero_exit_when_output_is_empty() {
+        // `grep` with no match and `which missing` print nothing: without
+        // the status the model cannot tell "no match" from an empty success.
+        let root = tmp_root();
+        let r = reg(policy(&root));
+        let out = run(&r, "exec", json!({"cmd": "false"})).await.unwrap();
+        assert_eq!(out.content, "[exit 1]");
+        let ok = run(&r, "exec", json!({"cmd": "true"})).await.unwrap();
+        assert_eq!(ok.content, "");
     }
 
     // --- test tool verdict ---

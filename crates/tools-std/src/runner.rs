@@ -14,8 +14,8 @@ use crate::common::{cap_chars, prefix_allowed, EXEC_TIMEOUT, OUT_CAP};
 use crate::condense::condense_output;
 use crate::policy::Policy;
 
-/// Split a command into argv honoring single/double quotes and backslash
-/// escapes (no shell: `;`, `$()`, `&&`, `|` stay literal characters). Naive
+/// Split a command into argv honoring single/double quotes and POSIX
+/// backslash escapes (no shell: `;`, `$()`, `&&`, `|` stay literal characters). Naive
 /// whitespace splitting mangles quoted args (`python3 -c "print(x)"` broke).
 pub(crate) fn split_cmd(cmd: &str) -> Vec<String> {
     let (mut parts, mut cur, mut quote) = (Vec::new(), String::new(), None);
@@ -26,11 +26,12 @@ pub(crate) fn split_cmd(cmd: &str) -> Vec<String> {
             (None, '\'') => quote = Some('\''),
             (None, '"') => quote = Some('"'),
             (Some(q), c) if c == q => quote = None,
-            (Some('"'), '\\') => {
-                if let Some(n) = chars.next() {
-                    cur.push(n);
-                }
-            }
+            // POSIX: in double quotes only \$ \` \" \\ are escapes; any other
+            // backslash is literal (`grep "a\|b"` must keep its `\|`).
+            (Some('"'), '\\') => match chars.peek() {
+                Some('$' | '`' | '"' | '\\') => cur.extend(chars.next()),
+                _ => cur.push('\\'),
+            },
             (None, '\\') => {
                 if let Some(n) = chars.next() {
                     cur.push(n);
@@ -419,6 +420,17 @@ pub(crate) async fn run_allowed_argv(
         s.push_str(&err_text);
     }
     let ok = status.success();
+    // exec only: a silent non-zero exit (grep no-match, `which missing`) is
+    // otherwise indistinguishable from an empty success.
+    if raw && !ok {
+        if !s.is_empty() && !s.ends_with('\n') {
+            s.push('\n');
+        }
+        match status.code() {
+            Some(c) => s.push_str(&format!("[exit {c}]")),
+            None => s.push_str("[killed by signal]"),
+        }
+    }
     let (content, cap_cut) = cap_chars(if raw { s } else { condense_output(&s, None) }, OUT_CAP);
     Ok((ok, content, cap_cut || out.dropped() + err.dropped() > 0))
 }

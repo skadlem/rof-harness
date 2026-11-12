@@ -129,6 +129,9 @@ capability, and the container is removed best-effort on every path.
 - `tool-core` — tool vocabulary, registry gate, `ToolOutcome` (`success`
   carries the exit status; serde default false = fail-closed).
 - `tools-std` — policy-gated `view/search/edit/write/exec/test` tools.
+  `exec` splits its command with POSIX quoting (no shell) and appends
+  `[exit N]` to the output of a non-zero exit, since `success` is not shown
+  to the model.
   The path policy checks containment and requested and resolved paths against
   secrets globs, including recursive search descendants, and resolves a leading
   `/app/` to the tool root.

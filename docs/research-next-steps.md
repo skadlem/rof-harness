@@ -44,6 +44,11 @@ disagree, that file wins.
   **Variance reps (2026-11-13): 0 of 9** on the three published-easy misses; they are
   stable misses, `dna-insert` is 1 in 5. Balance $0.80 after. See
   [easy-miss-variance](experiments/2026-11-13-easy-miss-variance.md).
+- **Fixed (2026-11-13), effect unmeasured:** `exec` stripped backslashes inside double
+  quotes (`grep "a\|b"` matched nothing; 78 of 1,698 banked calls, 13 of 49 traces) and
+  showed a silent non-zero exit as empty output (79 of 475 failed exec calls). Every banked
+  row predates the fix, so the 5/18 baseline was measured with both bugs. See
+  [exec-observation-bugs](experiments/2026-11-13-exec-observation-bugs.md).
 - **Collapse is not the token-death cause:** exact re-reads are 3.6% of tool calls
   ([reread-census](experiments/2026-11-12-reread-census.md)); raising `observation_keep` is
   not supported by the Slice A traces.
