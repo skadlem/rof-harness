@@ -24,6 +24,7 @@ mod condense;
 mod edit;
 mod exec;
 mod experimental;
+mod mcp;
 mod policy;
 mod runner;
 mod search;
@@ -35,6 +36,7 @@ pub use common::{apply_hunk, prefix_allowed};
 pub use edit::{edit_tool, EditTool};
 pub use exec::{exec_tool, ExecTool};
 pub use experimental::{experimental_tools, ExperimentalToolsConfig};
+pub use mcp::{register_mcp_stdio, McpTool};
 pub use policy::{
     default_denied_globs, glob_match, resolve_under, ExecPolicy, Policy, ToolPathError,
 };

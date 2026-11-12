@@ -306,9 +306,9 @@ pub(crate) async fn kill_tree(child: &mut tokio::process::Child) {
 
 /// Drop guard: abandoning the run future (caller-side drop) still kills the
 /// group; `kill_on_drop` alone would only reap the direct child.
-struct GroupGuard {
-    child: Option<tokio::process::Child>,
-    pgid: Option<u32>,
+pub(crate) struct GroupGuard {
+    pub(crate) child: Option<tokio::process::Child>,
+    pub(crate) pgid: Option<u32>,
 }
 
 impl Drop for GroupGuard {
