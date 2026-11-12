@@ -1246,11 +1246,32 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             .await?;
             self.state.push_directive(ROLLBACK_NOTICE.into(), &self.cfg);
             let tree = self.tree.clone();
-            if let Err(e) = blocking(move || tree.rollback()).await {
-                return Err(Outcome::Failed {
-                    kind: FailureKind::Snapshot,
-                    message: format!("snapshot rollback: {e}"),
-                });
+            match blocking(move || tree.rollback()).await {
+                Ok(left) if !left.is_empty() => {
+                    // Root-owned paths the host-side git cannot delete: the batch is
+                    // rolled back for every path it COULD restore, and the survivors
+                    // are named. Failing the stage here loses the row for a
+                    // permission bit (observed on Slice A).
+                    let shown = left.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+                    self.record(
+                        ItemKind::Attempt {
+                            error: format!(
+                                "rollback left {} unremovable path(s): {shown}",
+                                left.len()
+                            ),
+                            will_retry: false,
+                        },
+                        None,
+                    )
+                    .await?;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(Outcome::Failed {
+                        kind: FailureKind::Snapshot,
+                        message: format!("snapshot rollback: {e}"),
+                    });
+                }
             }
         }
         if self.cancel.is_cancelled() || self.state.stop_hard {
@@ -1588,11 +1609,32 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             .await?;
             self.state.push_directive(ROLLBACK_NOTICE.into(), &self.cfg);
             let tree = self.tree.clone();
-            if let Err(e) = blocking(move || tree.rollback()).await {
-                return Err(Outcome::Failed {
-                    kind: FailureKind::Snapshot,
-                    message: format!("snapshot rollback: {e}"),
-                });
+            match blocking(move || tree.rollback()).await {
+                Ok(left) if !left.is_empty() => {
+                    // Root-owned paths the host-side git cannot delete: the batch is
+                    // rolled back for every path it COULD restore, and the survivors
+                    // are named. Failing the stage here loses the row for a
+                    // permission bit (observed on Slice A).
+                    let shown = left.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+                    self.record(
+                        ItemKind::Attempt {
+                            error: format!(
+                                "rollback left {} unremovable path(s): {shown}",
+                                left.len()
+                            ),
+                            will_retry: false,
+                        },
+                        None,
+                    )
+                    .await?;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(Outcome::Failed {
+                        kind: FailureKind::Snapshot,
+                        message: format!("snapshot rollback: {e}"),
+                    });
+                }
             }
             // Rolled-back edits must not linger in the
             // counters: refund to the pre-batch snapshot.
@@ -1656,11 +1698,32 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             }
             bets::CommitVerdict::Aborted { .. } => {
                 let tree = self.tree.clone();
-                if let Err(e) = blocking(move || tree.rollback()).await {
-                    return Err(Outcome::Failed {
-                        kind: FailureKind::Snapshot,
-                        message: format!("snapshot rollback: {e}"),
-                    });
+                match blocking(move || tree.rollback()).await {
+                    Ok(left) if !left.is_empty() => {
+                        // Root-owned paths the host-side git cannot delete: the batch is
+                        // rolled back for every path it COULD restore, and the survivors
+                        // are named. Failing the stage here loses the row for a
+                        // permission bit (observed on Slice A).
+                        let shown = left.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+                        self.record(
+                            ItemKind::Attempt {
+                                error: format!(
+                                    "rollback left {} unremovable path(s): {shown}",
+                                    left.len()
+                                ),
+                                will_retry: false,
+                            },
+                            None,
+                        )
+                        .await?;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(Outcome::Failed {
+                            kind: FailureKind::Snapshot,
+                            message: format!("snapshot rollback: {e}"),
+                        });
+                    }
                 }
                 // Gate-aborted batch is a full rollback: the
                 // counters refund like the tool-error path.

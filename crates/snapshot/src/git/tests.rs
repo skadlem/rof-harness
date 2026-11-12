@@ -94,6 +94,74 @@ fn rollback_restores_byte_identical_tree() {
     assert!(tree.diff().unwrap().is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn rollback_reports_what_it_cannot_remove_instead_of_failing() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("rollback-unremovable");
+    std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+    let tree = TreeService::new(&dir);
+    tree.ensure().unwrap();
+    tree.baseline().unwrap();
+
+    // Simulates a root-owned dir created inside the task container: the
+    // host-side git cannot delete inside it. `git clean` fails, and the run
+    // must survive with the survivors named.
+    let locked = dir.join("rootowned");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("art.bin"), b"x").unwrap();
+    let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+    perms.set_mode(0o500);
+    std::fs::set_permissions(&locked, perms).unwrap();
+
+    let left = tree
+        .rollback()
+        .expect("rollback survives a removal failure");
+    // Restore write access so the scratch dir can be cleaned up.
+    let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&locked, perms).unwrap();
+
+    assert!(
+        left.iter().any(|p| p.contains("rootowned")),
+        "survivors are named: {left:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_untracked_file_becomes_an_honest_stub_not_a_dead_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("unreadable-untracked");
+    std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+    let tree = TreeService::new(&dir);
+    tree.ensure().unwrap();
+    tree.baseline().unwrap();
+
+    let secret = dir.join("root_art.bin");
+    std::fs::write(&secret, b"payload").unwrap();
+    let mut perms = std::fs::metadata(&secret).unwrap().permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(&secret, perms).unwrap();
+
+    let patch = tree
+        .patch_since_start_full()
+        .expect("an unreadable file must not kill the deliverable");
+
+    let mut perms = std::fs::metadata(&secret).unwrap().permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(&secret, perms).unwrap();
+
+    assert!(
+        patch.contains("untracked, new file"),
+        "stub names the unreadable file: {patch}"
+    );
+    assert!(
+        !patch.contains("@@"),
+        "a stub carries no hunk, so restore fails closed: {patch}"
+    );
+}
+
 #[test]
 fn rollback_before_ensure_errors() {
     let dir = scratch("rollback-no-ensure");
@@ -117,6 +185,20 @@ fn rollback_on_an_empty_baseline_removes_what_the_run_created() {
     std::fs::write(dir.join("made.txt"), "x\n").unwrap();
     tree.rollback().unwrap();
     assert!(!dir.join("made.txt").exists(), "rollback clears the tree");
+}
+
+#[test]
+fn a_bare_git_directory_is_not_a_repository() {
+    // Tools leave empty `.git` dirs around; that must read as "not a repo",
+    // never as "dirty", or the workdir guard refuses the directory forever.
+    let dir = scratch("bare-git-dir");
+    std::fs::write(dir.join("a.rs"), "one\n").unwrap();
+    assert_eq!(workdir_state(&dir), WorkdirState::NotARepo);
+    std::fs::create_dir(dir.join(".git")).unwrap();
+    assert_eq!(workdir_state(&dir), WorkdirState::NotARepo);
+    // An unborn-but-real repo still reports through the git path.
+    std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    assert_eq!(workdir_state(&dir), WorkdirState::Dirty);
 }
 
 #[test]

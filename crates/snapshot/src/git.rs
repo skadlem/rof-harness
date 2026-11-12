@@ -12,6 +12,14 @@ pub fn workdir_state(root: &Path) -> WorkdirState {
     if !root.join(".git").exists() {
         return WorkdirState::NotARepo;
     }
+    // A `.git` with no HEAD is not a repository, it is a leftover: multiple
+    // tools create a bare `.git` directory, and treating that as "dirty"
+    // makes the directory permanently unusable as a workdir (cost a false
+    // refusal on /tmp and on $TMPDIR on 2026-11-11). A real repository always
+    // has HEAD, even before the first commit (an unborn branch).
+    if root.join(".git").is_dir() && !root.join(".git").join("HEAD").exists() {
+        return WorkdirState::NotARepo;
+    }
     match hermetic_git(root)
         .args(["status", "--porcelain", "--no-renames"])
         .output()
@@ -131,7 +139,13 @@ impl TreeService {
     /// Requires [`TreeService::ensure`] on this instance first: without a
     /// recorded start HEAD there is no known-good state, so rolling back
     /// could destroy work against an unknown base.
-    pub fn rollback(&self) -> Result<()> {
+    ///
+    /// Returns the paths it could NOT remove (usually empty). Callers must
+    /// record them and continue: a `clean` that fails on a root-owned file
+    /// created inside the task container says nothing about the model, and
+    /// aborting the run there loses the row entirely (observed twice on
+    /// Slice A: pypi-server and build-pov-ray).
+    pub fn rollback(&self) -> Result<Vec<String>> {
         let start = self
             .start
             .get()
@@ -144,8 +158,18 @@ impl TreeService {
         if !empty_baseline {
             self.git(["checkout", "--", "."])?;
         }
-        self.git(["clean", "-fdq"])?;
-        Ok(())
+        if self.git(["clean", "-fdq"]).is_ok() {
+            return Ok(Vec::new());
+        }
+        // Could not delete everything (permissions). Report what survived
+        // instead of failing the stage: the tree is at the baseline for every
+        // path that could be restored, and the leftovers are named.
+        let after = self.git_status(["status", "--porcelain", "--no-renames"])?;
+        let left: Vec<String> = String::from_utf8_lossy(&after.stdout)
+            .lines()
+            .filter_map(|l| porcelain_pair(l).map(|(_, p)| p.to_string()))
+            .collect();
+        Ok(left)
     }
 
     /// Porcelain names (untracked included) + `diff --stat` with one
@@ -240,11 +264,14 @@ impl TreeService {
             return Ok(text);
         }
         if self.root.join(rel).is_file() {
-            return Err(other(format!(
-                "git diff --no-index {rel}: {} | {}",
-                String::from_utf8_lossy(&out.stdout).trim_end(),
-                String::from_utf8_lossy(&out.stderr).trim_end()
-            )));
+            // Present but git produced no fragment: it cannot READ the file
+            // (root-owned inside the task container, mode 000, or gone since
+            // `diff_at`). Degrade to the same honest stub used for vanished
+            // paths — the stub says it is untracked and how many bytes it has,
+            // and it carries no `@@`, so restore fails closed rather than
+            // applying half a patch. Failing the whole run here costs the row
+            // for a permission bit.
+            return Ok(self.untracked_stub(rel));
         }
         // Raced away between `diff_at` and now: stub header, the only
         // non-restorable shape left (no `@@` for `split_patch`).
@@ -345,7 +372,7 @@ impl TreeService {
     /// as `Err` here. A missing final newline is appended (git otherwise
     /// reports "corrupt patch").
     pub fn restore_hunks(&self, kept_hunks: &[String]) -> Result<DiffSummary> {
-        self.rollback()?;
+        let _left = self.rollback()?;
         for hunk in kept_hunks {
             if let Err(e) = self.apply_patch(hunk) {
                 let _ = self.rollback(); // failed restore leaves the tree at baseline
