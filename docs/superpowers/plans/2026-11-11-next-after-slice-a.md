@@ -7,6 +7,26 @@ State at hand-off: **5/18 on the faithful Slice A slice**, **$1.56 left of the $
 gap that is **not attributable** because the frontier column is frontier-class models and
 ours is flash-class.
 
+## Status (2026-11-12): P1–P4 closed
+
+| Item | Outcome | Record |
+|---|---|---|
+| P1 root-owned artefacts | Fixed in `dc7164e` (`crates/snapshot/src/git.rs`, `crates/agent-loop/src/run.rs`). | commit |
+| P2 three published-easy misses | Harness-caused; all three never wrote the named deliverable (`vm.js`, `primers.fasta` ×2) and died on the token cap. Allowlist denials were real (22) but removing them flipped no test. | [three-misses](../../experiments/2026-11-11-three-misses.md), [allowlist-and-named-deliverable](../../experiments/2026-11-11-allowlist-and-named-deliverable.md) |
+| P3 `sam-cell-seg` | Not a solve: 8/9 then 6/9 at 1M. Same partial-credit ceiling. Slice A stays 5/18. | [envelope arm](../../experiments/2026-11-11-slice-a-envelope-arm.md) |
+| Zero-write gate (added) | Killed: on `hf-model-inference` (4/5 solved) every run wrote by step 3, including the failure. | [hf-within-task](../../experiments/2026-11-11-hf-within-task.md) |
+| P4 rival rows | Option 2 taken (2026-11-12): `slice-a-vs-published` stands as unmatched external context; internal n=2 is not called a comparison. No rival runs. | below |
+
+Surviving lead: the **named-deliverable predicate** (no banked run that lacked its named
+deliverable at step 15 solved, 0/13; a step-15 gate would have stopped 0 of 2 solves).
+Unmeasured as a treatment — it needs a two-arm, token-matched forcing test on a fresh
+development task before it is enabled.
+
+Balance: $1.56 was read before the two `--exec-policy any` runs, so the live balance is
+somewhat lower. Re-read it before any spend.
+
+The original plan follows unchanged.
+
 Everything below is ordered by information per dollar, and the first two items cost nothing.
 
 ## P1 (free) — stop losing rows to root-owned artefacts

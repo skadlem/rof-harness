@@ -141,6 +141,7 @@ Never edit these; record conclusions in decisions. Paper notes: [research/papers
 - [diag-snapshot-anomaly](../research/diag-snapshot-anomaly.md) — Snapshot anomaly: sanitize-git-repo-r1 dies on `snapshot baseline`
 - [incontainer-exec-policy](../research/incontainer-exec-policy.md) — In-container exec policy: the allowlist is a host guard, and it is capping the in-container arm
 - [wire-fidelity-2026-11-06](../research/wire-fidelity-2026-11-06.md) — wire-fidelity diff — our `provider-openai` client vs `deepseek-ai/deepseek-recipe`
+- [glm-audit-2026-11-07](../research/glm-audit-2026-11-07/README.md) — from-code audit at `b0e3dd2` ([roadmap](../research/glm-audit-2026-11-07/ROADMAP.md), [loop-context](../research/glm-audit-2026-11-07/loop-context.md), [tools-snapshot](../research/glm-audit-2026-11-07/tools-snapshot.md), [eval-provider](../research/glm-audit-2026-11-07/eval-provider.md), [coverage](../research/glm-audit-2026-11-07/coverage.md)) · **record** (code findings mostly still true; roadmap overtaken by Slice A, see research-next-steps)
 
 ### Ablation arms
 

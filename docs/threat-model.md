@@ -35,10 +35,11 @@ CLI guards (`crates/rof/src/workdir.rs`).
   filesystem sandbox.
 - OS-level isolation (container/namespace, no network, read-only
   mounts) is the operator's job; the tools build no sandbox.
-- In-container evaluation mounts `/tests` during the agent leg and makes
-  `/logs` writable there. Read-only tests prevent direct writes through
-  that mount, but do not hide tests or protect reward files from agent
-  commands. Verifier artifacts are cleared immediately before grading.
+- In-container evaluation starts the agent leg without `/tests`; the frozen
+  tests are copied in at grade time (`crates/rof/src/eval_agent.rs`), so the
+  agent cannot read the grader. `/logs` is mounted writable during the agent
+  leg, so reward files are not protected from agent commands. Verifier
+  artifacts are cleared immediately before grading.
 
 ## Trust boundaries
 

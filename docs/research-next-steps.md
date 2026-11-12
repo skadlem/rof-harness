@@ -11,6 +11,36 @@ The [phase 0–2 record](phase-0-2-implementation.md) and
 [phase 3–5 record](phase-3-5-implementation.md) distinguish implementation,
 chosen fixtures, historical outcomes and current campaign evidence.
 
+## Latest state (2026-11-12) — read this first
+
+The Slice A session postdates everything below. Its plan and status table are in
+[next-after-slice-a](superpowers/plans/2026-11-11-next-after-slice-a.md); where the two
+disagree, that file wins.
+
+- **Baseline:** 5/18 on the faithful Slice A slice (`crates/eval/slices/tb-slice-a.json`, frozen recipe 300k/60/120).
+  Published frontier expectation on the same tasks is 12.08/18; the gap is not
+  attributable (flash-class vs frontier-class models).
+- **Balance:** $1.56 of the $3.12 top-up, read before two further paid runs; re-read the
+  live balance before spending. Report `dollars` are PEAK upper bounds, about 2x the bill.
+- **Closed, each measured:** more envelope (0 of 11 converted at 3.3x tokens), completion
+  checklist, `sam-cell-seg` confirmation (8/9, 6/9, no solve), allowlist removal on the DNA
+  pair (22 denials gone, no test flipped), zero-write gate (no within-task power), learned
+  stuck detection (literature: within-task AUC 0.48–0.52).
+- **Fixed:** snapshot rollback/patch no longer loses rows to root-owned artefacts (`dc7164e`).
+- **Surviving lead, unmeasured:** a named-deliverable predicate. All three published-easy
+  misses never wrote the file the instruction names; 0 of 13 banked runs lacking it at
+  step 15 solved, and 0 of 2 solves would have been stopped. See
+  [allowlist-and-named-deliverable](experiments/2026-11-11-allowlist-and-named-deliverable.md).
+  **Implemented off, unvalidated (2026-11-12):** `--deliverable PATH` logs
+  `deliverable-missing` at step 15 (shadow, no behaviour change);
+  `--deliverable-steer on` adds one directive. No paid arm has run.
+- **Validity fixes (2026-11-12):** eval drops preflight-excluded instances; plain 400/422
+  no longer retried; request extras cannot overwrite existing body keys.
+- **Rival comparison downgraded (2026-11-12):** the published-rate table is unmatched
+  external context; n=2 shared rival tasks is not a comparison. No rival runs planned.
+
+The ledger paragraphs below describe the earlier lookup campaign and stand as history.
+
 ## Objective and current state
 
 Build competitive coding-agent capability, judged on pinned external tasks and
