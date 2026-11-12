@@ -60,6 +60,7 @@ Update this file in the same commit as adding, superseding or voiding a note.
   [allowlist-and-named-deliverable](experiments/2026-11-11-allowlist-and-named-deliverable.md)
 - [reread-census](experiments/2026-11-12-reread-census.md) — re-reads are 3.6% of tool calls; collapse does not explain the token deaths · **record**
 - [deliverable-forcing-arm](experiments/2026-11-12-deliverable-forcing-arm.md) — step-15 directive is read and ignored, 0 of 4; control re-run solved despite the step-15 flag · **record**
+- [easy-miss-variance](experiments/2026-11-13-easy-miss-variance.md) — 0 of 9 reps on the three published-easy misses; they are stable misses, `dna-insert` 1 in 5 · **record**
 
 ## Reviews (independent verdicts)
 

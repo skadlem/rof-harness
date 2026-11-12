@@ -41,6 +41,9 @@ disagree, that file wins.
   **Re-run (2026-11-13):** the same control row solved (1 rep, first `dna-insert` solve)
   although the step-15 shadow line fired, so the predicate is not a safe stop signal
   (1 solve in 18 flagged runs). Slice A stays 5/18. Balance $1.24 before that run.
+  **Variance reps (2026-11-13): 0 of 9** on the three published-easy misses; they are
+  stable misses, `dna-insert` is 1 in 5. Balance $0.80 after. See
+  [easy-miss-variance](experiments/2026-11-13-easy-miss-variance.md).
 - **Collapse is not the token-death cause:** exact re-reads are 3.6% of tool calls
   ([reread-census](experiments/2026-11-12-reread-census.md)); raising `observation_keep` is
   not supported by the Slice A traces.
