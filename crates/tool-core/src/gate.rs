@@ -26,6 +26,12 @@ impl GrantGate {
     }
 }
 
+/// Exact name, or a trailing-`*` prefix grant (`mcp__*`: tool names learned
+/// only after an MCP handshake).
+fn granted(grant: &str, tool: &str) -> bool {
+    grant == tool || grant.strip_suffix('*').is_some_and(|p| tool.starts_with(p))
+}
+
 impl PermissionGate for GrantGate {
     fn check(&self, agent: &str, tool: &str, _args: &Value, _path: Option<&Path>) -> GateDecision {
         match self.grants.get(agent) {
@@ -33,7 +39,7 @@ impl PermissionGate for GrantGate {
                 reason: format!("unknown agent: {agent}"),
                 fatal: false,
             },
-            Some(tools) if tools.iter().any(|t| t.as_str() == tool) => GateDecision::Allow,
+            Some(tools) if tools.iter().any(|t| granted(t, tool)) => GateDecision::Allow,
             Some(_) => GateDecision::Deny {
                 reason: format!("tool not granted to {agent}: {tool}"),
                 fatal: false,

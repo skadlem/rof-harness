@@ -146,10 +146,13 @@ fn registry_for(
             multi_edit: args.multi_edit,
         },
     )?;
-    let grants = tools
+    let mut grants = tools
         .iter()
         .map(|tool| tool.definition().name)
         .collect::<Vec<_>>();
+    if !args.mcp.is_empty() {
+        grants.push("mcp__*".into()); // names are known only after the handshake
+    }
     let mut registry = tool_core::Registry::new(Arc::new(GrantGate::new(HashMap::from([(
         "agent".to_string(),
         grants,
@@ -158,6 +161,49 @@ fn registry_for(
         registry.register(tool);
     }
     Ok(registry)
+}
+
+/// `registry_for` plus one MCP stdio server per `--mcp` (tools `mcp__<name>`).
+pub(crate) async fn registry_with_mcp(
+    args: &Args,
+    policy: Arc<tools_std::Policy>,
+) -> Result<tool_core::Registry, String> {
+    let mut reg = registry_for(args, policy)?;
+    for cmd in &args.mcp {
+        let argv = cmd.split_whitespace().map(str::to_owned).collect();
+        tools_std::register_mcp_stdio(&mut reg, argv, args.exec_policy)
+            .await
+            .map_err(|e| format!("--mcp {cmd}: {e}"))?;
+    }
+    Ok(reg)
+}
+
+/// `--stream on`: route every call through `complete_streaming` and write text
+/// deltas to `out` as they arrive. Display only; the returned Response is truth.
+pub(crate) struct StreamPrint<'a, P> {
+    pub inner: &'a P,
+    pub out: Arc<std::sync::Mutex<dyn std::io::Write + Send>>,
+}
+
+#[async_trait::async_trait]
+impl<P: LlmClient> LlmClient for StreamPrint<'_, P> {
+    async fn complete(&self, model: &str, req: &Request) -> Result<Response, LlmError> {
+        let mut wrote = false;
+        let mut sink = |d: provider_core::Delta| {
+            if let (provider_core::Delta::Text(t), Ok(mut o)) = (d, self.out.lock()) {
+                wrote = true;
+                let _ = o.write_all(t.as_bytes());
+                let _ = o.flush();
+            }
+        };
+        let res = self.inner.complete_streaming(model, req, &mut sink).await;
+        if wrote {
+            if let Ok(mut o) = self.out.lock() {
+                let _ = o.write_all(b"\n");
+            }
+        }
+        res
+    }
 }
 
 fn parse_review_finding(text: &str) -> Option<(bool, String, String)> {
@@ -379,7 +425,7 @@ async fn execute_with_deadline<P: LlmClient>(
         }
     };
     let policy = Arc::new(policy_for(args));
-    let reg = match registry_for(args, policy.clone()) {
+    let reg = match registry_with_mcp(args, policy.clone()).await {
         Ok(reg) => reg,
         Err(message) => {
             return RunResult {
@@ -716,9 +762,26 @@ async fn main() {
     }
     if chat {
         let out = Arc::new(std::sync::Mutex::new(std::io::stdout()));
-        std::process::exit(chat::run_chat(&provider, &args, std::io::stdin().lock(), out).await);
+        let code = if args.stream {
+            let p = StreamPrint {
+                inner: &provider,
+                out: out.clone(),
+            };
+            chat::run_chat(&p, &args, std::io::stdin().lock(), out).await
+        } else {
+            chat::run_chat(&provider, &args, std::io::stdin().lock(), out).await
+        };
+        std::process::exit(code);
     }
-    let r = execute(&provider, &args).await;
+    let r = if args.stream {
+        let p = StreamPrint {
+            inner: &provider,
+            out: Arc::new(std::sync::Mutex::new(std::io::stderr())),
+        };
+        execute(&p, &args).await
+    } else {
+        execute(&provider, &args).await
+    };
     if let Some(path) = args.dump_events.as_deref() {
         if let Err(e) = finalize_dump(path, &r.events) {
             eprintln!("cannot write {path}: {e}");
@@ -813,6 +876,41 @@ mod tests {
             Path::new("/tmp/w"),
             "policy root still the workdir"
         );
+    }
+
+    const MCP_SERVER: &str = r#"while read -r l; do
+  id=$(printf %s "$l" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  case "$l" in
+    *tools/list*) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"d\",\"inputSchema\":{\"type\":\"object\"}}]}}";;
+    *) echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}";;
+  esac
+done"#;
+
+    #[tokio::test]
+    async fn mcp_flag_registers_granted_tools_and_needs_exec_policy_any() {
+        let dir = crate::fixtures::tmp();
+        let script = dir.join("mcp.sh");
+        std::fs::write(&script, MCP_SERVER).unwrap();
+        let mut args = crate::fixtures::args_for(&dir, None);
+        args.mcp = vec![format!("sh {}", script.display())];
+        args.exec_policy = tools_std::ExecPolicy::Allowlist;
+        let denied = registry_with_mcp(&args, Arc::new(policy_for(&args))).await;
+        assert!(denied.is_err_and(|e| e.contains("exec policy any")));
+        args.exec_policy = tools_std::ExecPolicy::Any;
+        let reg = registry_with_mcp(&args, Arc::new(policy_for(&args)))
+            .await
+            .unwrap();
+        assert!(reg.definitions().iter().any(|d| d.name == "mcp__echo"));
+        let call = tool_core::ToolCall {
+            call_id: "1".into(),
+            name: "mcp__echo".into(),
+            args: serde_json::json!({}),
+        };
+        assert!(matches!(
+            reg.prepare("agent", call),
+            tool_core::CallStatus::Dispatch(_)
+        ));
     }
 
     #[test]

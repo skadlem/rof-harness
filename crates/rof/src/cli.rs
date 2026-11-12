@@ -11,7 +11,7 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--resume LOG] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]...
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--stream on|off] [--mcp 'CMD ARGS']... [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--resume LOG] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]...
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
@@ -20,6 +20,8 @@ pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--work
 --streak-steer on|off: enable the experimental six-read directive (default off)
 --deliverable PATH: repeatable output file the task names, relative to the workdir (no absolute path, no `..`); if still missing at step 15 the crossing is logged (shadow, no behavior change)
 --deliverable-steer on|off: additionally deliver one 'create it now' directive for missing --deliverable paths (experimental, unvalidated; default off)
+--stream on|off: print assistant text as it is generated (SSE; display only, a provider retry may repeat text; rof chat prints to stdout, rof run to stderr; default off)
+--mcp 'CMD ARGS': repeatable; spawn an MCP stdio server (argv split on whitespace, no shell) and expose its tools as mcp__<name>; requires --exec-policy any; the server inherits this process environment
 --steer on|off: initiative steering nudges (unverified-declare hold, half/late action directives, wrap-up nudge). The workflow contract and the rollback notice ship either way. Default off: measured dead in dphn-steer2 (no named-test change on either cell, 2.64x tokens per solved task)
 --reasoning-effort LEVEL (none|low|high|xhigh|max): send `reasoning_effort` on every request (default: none sent = endpoint default). DeepSeek docs (2026-11-09) list low/high/max and default high; xhigh maps to high. The 2026-10-19 one-prompt api.deepseek.com probe did not detect an effect; that result is historical, not universal. The vLLM gateway probe measured 0/722/1060/1149/2976 reasoning tokens for none/low/high/xhigh/max
 --context-file PATH: pinned context; with neither --budget-tokens nor --budget-steps the run defaults to a 200000-token budget
@@ -103,6 +105,10 @@ pub(crate) struct Args {
     pub deliverables: Vec<PathBuf>,
     /// Opt-in directive for missing deliverables, off by default.
     pub deliverable_steer: bool,
+    /// `--stream on`: print assistant text deltas as they arrive (display only).
+    pub stream: bool,
+    /// `--mcp 'CMD ARGS'` (repeatable): MCP stdio servers whose tools register as `mcp__<name>`.
+    pub mcp: Vec<String>,
     pub proof_cmd: Option<String>,
     pub completion_check: Option<String>,
     pub incentives: agent_loop::IncentivesLevel,
@@ -221,6 +227,8 @@ struct RunBuilder {
     streak_steer: Option<bool>,
     deliverables: Vec<PathBuf>,
     deliverable_steer: Option<bool>,
+    stream: Option<bool>,
+    mcp: Vec<String>,
     proof_cmd: Option<String>,
     completion_check: Option<String>,
     incentives: Option<agent_loop::IncentivesLevel>,
@@ -439,6 +447,20 @@ pub(crate) fn parse_on_off(flag: &str, v: Option<String>) -> Result<bool, String
 
 fn set_deliverable(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
     b.deliverables.push(parse_deliverable(v)?);
+    Ok(())
+}
+
+fn set_stream(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.stream = Some(parse_on_off("--stream", v)?);
+    Ok(())
+}
+
+fn set_mcp(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    let cmd = v.unwrap_or_default();
+    if cmd.trim().is_empty() {
+        return Err("--mcp needs a server command".into());
+    }
+    b.mcp.push(cmd);
     Ok(())
 }
 
@@ -796,6 +818,16 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_deliverable,
     },
     Flag {
+        name: "--stream",
+        takes_value: true,
+        set: set_stream,
+    },
+    Flag {
+        name: "--mcp",
+        takes_value: true,
+        set: set_mcp,
+    },
+    Flag {
         name: "--deliverable-steer",
         takes_value: true,
         set: set_deliverable_steer,
@@ -985,6 +1017,8 @@ fn parse_cmd(argv: &[String], cmd: &str, usage: &str) -> Result<Args, String> {
         streak_steer: b.streak_steer.unwrap_or(false),
         deliverables: b.deliverables,
         deliverable_steer: b.deliverable_steer.unwrap_or(false),
+        stream: b.stream.unwrap_or(false),
+        mcp: b.mcp,
         proof_cmd: b.proof_cmd,
         completion_check: b.completion_check,
         incentives: b.incentives.unwrap_or(agent_loop::IncentivesLevel::Full),
@@ -1267,6 +1301,8 @@ mod tests {
                 streak_steer: false,
                 deliverables: Vec::new(),
                 deliverable_steer: false,
+                stream: false,
+                mcp: Vec::new(),
                 bets: false,
                 incentives: agent_loop::IncentivesLevel::Full,
                 proof_cmd: None,
@@ -1862,6 +1898,19 @@ mod tests {
                 .streak_steer
         );
         assert!(parse_args(&run_min(&["--streak-steer", "invalid"])).is_err());
+    }
+
+    #[test]
+    fn stream_and_mcp_flags_parse() {
+        let plain = parse_args(&run_min(&[])).unwrap();
+        assert!(!plain.stream && plain.mcp.is_empty());
+        let on = parse_args(&run_min(&[
+            "--stream", "on", "--mcp", "srv a", "--mcp", "other",
+        ]))
+        .unwrap();
+        assert!(on.stream);
+        assert_eq!(on.mcp, vec!["srv a".to_string(), "other".to_string()]);
+        assert!(parse_args(&run_min(&["--mcp", " "])).is_err());
     }
 
     #[test]

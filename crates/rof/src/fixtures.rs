@@ -210,6 +210,8 @@ pub(crate) fn args_for(dir: &std::path::Path, steps: Option<u32>) -> Args {
         streak_steer: false,
         deliverables: Vec::new(),
         deliverable_steer: false,
+        stream: false,
+        mcp: Vec::new(),
         bets: false,
         incentives: agent_loop::IncentivesLevel::Full,
         proof_cmd: None,

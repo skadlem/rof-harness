@@ -239,3 +239,16 @@ fn tool_name_consts_match_definitions() {
     assert_eq!(TOOL_TEST, "test");
     assert_eq!(TOOL_EXEC, "exec");
 }
+
+#[test]
+fn grant_gate_prefix_grant_covers_only_its_prefix() {
+    let g = GrantGate::new([("coder".to_string(), vec!["mcp__*".to_string()])].into());
+    assert!(matches!(
+        g.check("coder", "mcp__echo", &json!({}), None),
+        GateDecision::Allow
+    ));
+    assert!(matches!(
+        g.check("coder", "exec", &json!({}), None),
+        GateDecision::Deny { .. }
+    ));
+}

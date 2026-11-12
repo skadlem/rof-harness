@@ -229,6 +229,8 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
         streak_steer: a.streak_steer,
         deliverables: a.deliverables.clone(),
         deliverable_steer: a.deliverable_steer,
+        stream: false,
+        mcp: Vec::new(),
         proof_cmd: None,
         completion_check: None,
         incentives: agent_loop::IncentivesLevel::Full,

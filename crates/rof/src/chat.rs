@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::{budget_for, run_config, Args};
 use crate::exit::exit_code;
 use crate::workdir::{exclude_sidecar, resolve_log_path};
-use crate::{policy_for, preserve_log, registry_for, Gate};
+use crate::{policy_for, preserve_log, Gate};
 
 type Out = Arc<Mutex<dyn Write + Send>>;
 
@@ -25,10 +25,10 @@ fn say(out: &Out, s: &str) {
 }
 
 /// Assistant text as it settles, plus one `name(args) ok|error` line per call.
-fn tap(out: Out) -> impl Fn(&AgentEvent) + Send + 'static {
+fn tap(out: Out, streamed: bool) -> impl Fn(&AgentEvent) + Send + 'static {
     let calls = Mutex::new(HashMap::new());
     move |e| match e {
-        AgentEvent::MessageEnd { message, .. } if !message.content.is_empty() => {
+        AgentEvent::MessageEnd { message, .. } if !streamed && !message.content.is_empty() => {
             say(&out, &format!("{}\n", message.content));
         }
         AgentEvent::ToolStart { id, name, args } => {
@@ -58,7 +58,7 @@ pub(crate) async fn run_chat<P: LlmClient>(
     mut input: impl BufRead,
     out: Out,
 ) -> i32 {
-    let reg = match registry_for(args, Arc::new(policy_for(args))) {
+    let reg = match crate::registry_with_mcp(args, Arc::new(policy_for(args))).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cannot configure tools: {e}");
@@ -77,7 +77,7 @@ pub(crate) async fn run_chat<P: LlmClient>(
     };
     let bets: &dyn agent_loop::BetsHook = if args.bets { &gate } else { &NoBets };
     let mut emitter = Emitter::new();
-    emitter.on(tap(out.clone()));
+    emitter.on(tap(out.clone(), args.stream));
     let cancel = CancellationToken::new();
     tokio::spawn({
         let cancel = cancel.clone();
@@ -180,6 +180,47 @@ mod tests {
     fn has(msgs: &[provider_core::ProviderMessage], role: &str, needle: &str) -> bool {
         msgs.iter()
             .any(|m| m.role == role && m.content.contains(needle))
+    }
+
+    struct Streamer(ScriptClient);
+
+    #[async_trait::async_trait]
+    impl LlmClient for Streamer {
+        async fn complete(
+            &self,
+            model: &str,
+            req: &provider_core::Request,
+        ) -> Result<provider_core::Response, provider_core::LlmError> {
+            self.0.complete(model, req).await
+        }
+        async fn complete_streaming(
+            &self,
+            model: &str,
+            req: &provider_core::Request,
+            sink: &mut (dyn FnMut(provider_core::Delta) + Send),
+        ) -> Result<provider_core::Response, provider_core::LlmError> {
+            sink(provider_core::Delta::Text("all ".into()));
+            sink(provider_core::Delta::Text("good".into()));
+            self.0.complete(model, req).await
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_prints_deltas_once_not_again_on_message_end() {
+        let dir = tmp();
+        let inner = Streamer(ScriptClient::new(vec![text_resp()]));
+        let mut args = args_for(&dir, None);
+        args.stream = true;
+        args.goal = String::new();
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let p = crate::StreamPrint {
+            inner: &inner,
+            out: buf.clone(),
+        };
+        let code = run_chat(&p, &args, "q\n".as_bytes(), buf.clone()).await;
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(text.matches("all good").count(), 1, "{text}");
     }
 
     #[tokio::test]
