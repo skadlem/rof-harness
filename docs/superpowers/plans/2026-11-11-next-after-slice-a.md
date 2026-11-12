@@ -1,0 +1,68 @@
+# Next after the Slice A session (2026-11-11)
+
+State at hand-off: **5/18 on the faithful Slice A slice**, $2.7968 of the $3.12 balance
+spent, **$0.32 left**. Frontier-expected on the same 18 tasks is 12.08 (67.1%), a 39-point
+gap that is **not attributable** because the frontier column is frontier-class models and
+ours is flash-class.
+
+Everything below is ordered by information per dollar, and the first two items cost nothing.
+
+## P1 (free) — stop losing rows to root-owned artefacts
+
+2 of 29 rows this session died to harness handling of files created as root inside the
+container, not to the model:
+
+- `pypi-server`: `snapshot rollback: git: ... failed to remove build/bdist.linux-x86_64:
+  Permission denied` — the batch rollback aborted the run.
+- `build-pov-ray` at the larger envelope (66 steps): `snapshot patch: git diff --no-index`
+  failed on the same class.
+
+Both are graded failures wearing a capability label. Fix: a rollback or patch that cannot
+remove a root-owned path must degrade to a recorded caveat on the row (or an explicit infra
+flag), never abort the attempt and never be silently counted as Unresolved.
+Acceptance: a test that plants a root-owned file in the workdir mid-run, rolls back, and
+asserts the run still completes with the caveat recorded.
+
+Why first: it is free, it is a correctness bug in the measurement, and it will keep biting
+every future campaign.
+
+## P2 (free) — read the three p>=0.88 traces we lose completely
+
+`make-mips-interpreter` (frontier 0.96), `dna-assembly` (0.96), `dna-insert` (0.88). We
+score **0** on all three, at every envelope tried, and all three burned the whole 1M-token
+cap at 68-75 steps. These are well-specified tasks the frontier solves almost always, so
+the failure is ours to explain.
+
+Read the banked traces and answer, per task: did the agent produce an artefact at all; was
+it the wrong form; was it blocked by the allowlist or a missing toolchain; or did it spend
+1M tokens on the wrong approach. No model calls, no spend. This is the highest-information
+work available in the repo and it directly targets 3 of the 13 misses.
+
+## P3 (small spend, in flight) — `sam-cell-seg` at 8/9
+
+One rep at 1M/120/240 passed **8 of 9** tests, against 0/9 at the frozen recipe. One or two
+confirmation reps (~$0.18 each) decide whether that converts to a solve (6/18) or is the
+same partial-credit ceiling the other three hit. Do not spend beyond that: it is one test
+short and the marginal value is confirmation, not discovery.
+
+## P4 (blocked on an owner decision) — the matched-model rival row
+
+The 39-point gap is mostly model class and cannot be deconfounded with available models:
+`deepseek-v4-pro` is banned by standing owner directive, and the frontier rows are
+frontier-class. So the product question still needs **more shared tasks with rival rows**,
+and there are exactly **2** on disk (`session-window-debug`, `layout-config-recreation2`).
+
+Two options, both the owner's call:
+1. Run the rival harnesses (hermes, pi) on more of the 18 tasks — their compute, our
+   coordination, and it makes the comparison matched for the first time at n > 2.
+2. Downgrade the claim: present `2026-11-11-slice-a-vs-published.md` as unmatched external
+   context and stop calling internal n=2 a comparison.
+
+## Do not do (each already measured)
+
+- **More envelope.** 0 of 11 converted at 3.3x tokens / 2x steps; 5 of 11 were still
+  token-terminated; the 2026 result says budget and information substitute.
+- **The completion checklist.** Arm 2, 16 rows, no named test flipped, registered KILL.
+- **A `--completion-check` predicate.** No post-fix row reaches `done` and fails, so it has
+  no trigger; the failing rows die on the cap mid-work.
+- **Raising caps on the three p>=0.88 tasks.** They already had 1M and still scored 0.
