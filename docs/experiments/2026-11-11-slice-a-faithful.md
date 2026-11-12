@@ -1,5 +1,8 @@
 # Slice A on the faithful pipeline — first number (2026-11-11)
 
+**Cost convention (corrected 2026-11-12).** The `dollars` field in every report is the price-book **PEAK upper bound** (`crates/provider-openai/src/pricing.rs`: DeepSeek bills off-peak at exactly half). Sums below are therefore upper bounds, not the bill: the owner's live balance shows **$1.56 remaining** of $3.12, i.e. roughly half the reported sum, which is what off-peak billing predicts. Quote the balance, not the sum.
+
+
 Agent leg (`rof eval --agent --in-container`), faithful seed (`workdir_seed = ImageApp`
 on every row), frozen recipe **300k gross / 60 steps / 120 actions**, model
 `deepseek-flash` on `api.deepseek.com` (priced, so the per-instance `$` cap is live),
@@ -12,7 +15,7 @@ network error). One rep each.
 
 ## Result
 
-**5/18 solved = 0.278 [0.125, 0.509] (Wilson 95%)**, total spend **$0.9697**,
+**5/18 solved = 0.278 [0.125, 0.509] (Wilson 95%)**, reported cost **$0.9697 at PEAK rates (upper bound; the real bill is about half)**,
 median wall 205s.
 Excluding the one infra row: **5/17 = 0.294 [0.133, 0.531]**.
 

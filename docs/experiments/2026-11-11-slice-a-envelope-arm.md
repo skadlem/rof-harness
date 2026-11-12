@@ -1,5 +1,8 @@
 # Slice A envelope arm — 3.3x tokens, 2x steps, zero new solves (2026-11-11)
 
+**Cost convention (corrected 2026-11-12).** The `dollars` field in every report is the price-book **PEAK upper bound** (`crates/provider-openai/src/pricing.rs`: DeepSeek bills off-peak at exactly half). Sums below are therefore upper bounds, not the bill: the owner's live balance shows **$1.56 remaining** of $3.12, i.e. roughly half the reported sum, which is what off-peak billing predicts. Quote the balance, not the sum.
+
+
 Follow-up to `2026-11-11-slice-a-faithful.md`. Same 18-task slice, same model
 (`deepseek-flash`, priced direct endpoint), same faithful seed, same allowlist. The
 **11 tasks that failed on the token cap** in the baseline were re-run at
@@ -24,8 +27,7 @@ no-halt failure were not re-run.
 | sanitize-git-repo | 0/3 | **2/3** | tokens | tokens (48) |
 | video-processing | 2/5 | 2/5 | tokens | tokens (75) |
 
-Spend: baseline **$0.9697** + envelope **$1.8271** = **$2.7968** of the $3.12 balance
-(remaining $0.3232). No task crossed from Unresolved to Resolved.
+Reported cost: baseline **$0.9697** + envelope **$1.8271** = **$2.7968 at PEAK rates** — an upper bound, see the cost convention note. No task crossed from Unresolved to Resolved.
 
 ## What it actually shows
 
@@ -77,8 +79,9 @@ the cleanest statement of this session's finding: at this model tier the envelop
 buys most of a task and never the last test, and the last test is not a turn-count problem —
 one rep ran 1,002,269 tokens and 51 steps and still stopped short.
 
-Cost of the whole session: **$2.9348 of the $3.12 balance** (baseline $0.9697 +
-envelope arm $1.8271 + this rep $0.1380), leaving **$0.1852**.
+Reported cost of the whole session: **$2.9348 at PEAK rates** (baseline $0.9697 +
+envelope arm $1.8271 + this rep $0.1380). That is an upper bound: the owner's balance
+shows **$1.56 left of $3.12**, i.e. about $1.56 actually billed.
 
 Incidental: the agent-phase boundary probe recorded **1 live process** at the hand-over for
 this run — the first time that field has fired, and exactly the contamination class the

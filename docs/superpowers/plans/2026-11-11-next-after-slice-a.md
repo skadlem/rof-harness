@@ -1,7 +1,9 @@
 # Next after the Slice A session (2026-11-11)
 
-State at hand-off: **5/18 on the faithful Slice A slice**, $2.7968 of the $3.12 balance
-spent, **$0.32 left**. Frontier-expected on the same 18 tasks is 12.08 (67.1%), a 39-point
+**Cost convention (corrected 2026-11-12).** The `dollars` field in every report is the price-book **PEAK upper bound** (`crates/provider-openai/src/pricing.rs`: DeepSeek bills off-peak at exactly half). Sums below are therefore upper bounds, not the bill: the owner's live balance shows **$1.56 remaining** of $3.12, i.e. roughly half the reported sum, which is what off-peak billing predicts. Quote the balance, not the sum.
+
+
+State at hand-off: **5/18 on the faithful Slice A slice**, **$1.56 left of the $3.12 balance** (owner's live balance, 2026-11-12). Report `dollars` sums are PEAK upper bounds and overstate the bill by about 2x — quote the balance, never the sum. Frontier-expected on the same 18 tasks is 12.08 (67.1%), a 39-point
 gap that is **not attributable** because the frontier column is frontier-class models and
 ours is flash-class.
 
