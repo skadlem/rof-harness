@@ -810,3 +810,12 @@ strategy-level decisions above are therefore repeated here, in the tracked log, 
 artifact paths that *are* tracked. A session that reads only `research/DECISIONS.md` and
 never this file is missing the reviewable record, and vice versa — both exist on purpose,
 but only this one survives a clone.
+
+**Scope reversal (2026-11-12, owner request).** MCP and an interactive surface were listed
+as out of scope. The owner asked for a minimal core of the product surface, so four opt-in
+pieces now exist, all default off and none benchmark-validated: `rof chat` (line loop, not a
+TUI), `--resume LOG`, `--stream on` (provider SSE, display only) and `--mcp` (one stdio
+server per flag). They are product surface, not capability bets: no benchmark row uses
+them and none is a candidate for promotion on solve rate. Still out: full-screen TUI, MCP
+HTTP transport/auth/resources, session picker, cross-run memory, planner/MAS. [chosen: owner
+directive; validated only by scripted-provider and scripted-server tests]

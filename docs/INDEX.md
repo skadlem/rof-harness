@@ -58,6 +58,8 @@ Update this file in the same commit as adding, superseding or voiding a note.
   [zero-write-prevalence](experiments/2026-11-11-zero-write-prevalence.md) →
   [hf-within-task](experiments/2026-11-11-hf-within-task.md) (zero-write gate fails) →
   [allowlist-and-named-deliverable](experiments/2026-11-11-allowlist-and-named-deliverable.md)
+- [reread-census](experiments/2026-11-12-reread-census.md) — re-reads are 3.6% of tool calls; collapse does not explain the token deaths · **record**
+- [deliverable-forcing-arm](experiments/2026-11-12-deliverable-forcing-arm.md) — step-15 directive is read and ignored, 0 of 4; one control row lost to a root-owned file · **record**
 
 ## Reviews (independent verdicts)
 

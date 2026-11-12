@@ -33,7 +33,18 @@ disagree, that file wins.
   [allowlist-and-named-deliverable](experiments/2026-11-11-allowlist-and-named-deliverable.md).
   **Implemented off, unvalidated (2026-11-12):** `--deliverable PATH` logs
   `deliverable-missing` at step 15 (shadow, no behaviour change);
-  `--deliverable-steer on` adds one directive. No paid arm has run.
+  `--deliverable-steer on` adds one directive.
+  **Forcing arm run (2026-11-12): 0 of 4 solved**, the directive was read and ignored on
+  both DNA tasks; it stays off. The control `dna-insert` row lost its deliverable write to a
+  root-owned file (now fixed in `write`/`edit`). See
+  [deliverable-forcing-arm](experiments/2026-11-12-deliverable-forcing-arm.md).
+- **Collapse is not the token-death cause:** exact re-reads are 3.6% of tool calls
+  ([reread-census](experiments/2026-11-12-reread-census.md)); raising `observation_keep` is
+  not supported by the Slice A traces.
+- **Product surface (owner request, off, unvalidated):** `rof chat`, `--resume`, `--stream`,
+  `--mcp`; see the scope-reversal entry in `decisions.md`. Not capability bets.
+- **Balance:** $1.45 read before the forcing arm (about $0.43 at PEAK rates, roughly half
+  that billed); re-read before spending.
 - **Validity fixes (2026-11-12):** eval drops preflight-excluded instances; plain 400/422
   no longer retried; request extras cannot overwrite existing body keys.
 - **Rival comparison downgraded (2026-11-12):** the published-rate table is unmatched

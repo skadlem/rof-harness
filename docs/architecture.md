@@ -53,6 +53,17 @@ assistant text and one line per tool call. `--resume LOG` (also on `rof run`)
 rebuilds history via `LoopState::restore`, which synthesizes results for
 unanswered tool calls and closes an open turn as interrupted.
 
+`--stream on` wraps the provider in `StreamPrint` (`main.rs`), which calls
+`LlmClient::complete_streaming` and writes text deltas to stdout (chat) or
+stderr (run); the loop and its events are unchanged and the returned
+`Response` stays the truth. `--mcp` calls `tools_std::register_mcp_stdio` per
+server after `registry_for`; the tools are covered by an `mcp__*` prefix grant
+in `GrantGate` and need `ExecPolicy::Any`.
+
+The host-side `write`/`edit` tools replace a file they cannot open for
+writing when they own its directory (`common::overwrite`): in-container
+commands run as root and leave root-owned outputs in the bind-mounted workdir.
+
 `rof eval --tasks-dir DIR` (`eval_cmd.rs`) is a legacy evaluation path distinct
 from the native Harbor adapter (`tools/harbor_rof.py`), which invokes `rof run`
 inside the task container. The eval command loads a frozen task slice and
