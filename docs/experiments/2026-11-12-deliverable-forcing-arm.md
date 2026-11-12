@@ -51,3 +51,18 @@ now replace a file they cannot open when they own its directory
 - Next free step is not another directive: re-run nothing until the write fix is in the
   binary, then the cheapest informative row is `dna-insert` steer-off again (about $0.05
   off-peak), because that run was two steps from a submitted deliverable.
+
+## Follow-up (2026-11-13): the control row re-run solves, and falsifies the stop predicate
+
+One rep, `dna-insert` steer-off, same flags, binary with the write fix
+(`~/.local/share/rof-tb/work/deliverable-ab1/dna-insert-steer-off-writefix/`). Measured:
+**Resolved**, halt `tokens`, $0.082 peak bound. `primers.fasta` first written at tool call
+35 of 44 and rewritten at call 44.
+
+- First `dna-insert` solve at any envelope. It is one rep outside the frozen Slice A run,
+  so Slice A stays 5/18.
+- Not attributable to the write fix: no tool call before the first write created the
+  file, so the replace path probably never ran. Run-to-run variance is the default reading.
+- The shadow line `deliverable-missing step=15` fired in this run and it solved. The
+  predicate's record is now 1 solve in 18 flagged runs, so a hard stop at step 15 would
+  have killed this solve. It stays a shadow signal only; do not build a stop on it.

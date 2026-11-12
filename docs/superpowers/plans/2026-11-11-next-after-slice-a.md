@@ -21,7 +21,8 @@ Surviving lead: the **named-deliverable predicate** (no banked run that lacked i
 deliverable at step 15 solved, 0/13; a step-15 gate would have stopped 0 of 2 solves).
 Forcing treatment measured 2026-11-12 on the DNA pair: 0 of 4, directive read and ignored
 ([deliverable-forcing-arm](../../experiments/2026-11-12-deliverable-forcing-arm.md)). It
-stays off; the predicate survives only as a shadow/stop signal.
+stays off. A 2026-11-13 re-run of the `dna-insert` control row solved after the shadow
+line fired, so the predicate is shadow-only, not a stop signal (same note).
 
 Balance: $1.56 was read before the two `--exec-policy any` runs, so the live balance is
 somewhat lower. Re-read it before any spend.

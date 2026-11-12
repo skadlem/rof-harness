@@ -38,6 +38,9 @@ disagree, that file wins.
   both DNA tasks; it stays off. The control `dna-insert` row lost its deliverable write to a
   root-owned file (now fixed in `write`/`edit`). See
   [deliverable-forcing-arm](experiments/2026-11-12-deliverable-forcing-arm.md).
+  **Re-run (2026-11-13):** the same control row solved (1 rep, first `dna-insert` solve)
+  although the step-15 shadow line fired, so the predicate is not a safe stop signal
+  (1 solve in 18 flagged runs). Slice A stays 5/18. Balance $1.24 before that run.
 - **Collapse is not the token-death cause:** exact re-reads are 3.6% of tool calls
   ([reread-census](experiments/2026-11-12-reread-census.md)); raising `observation_keep` is
   not supported by the Slice A traces.
