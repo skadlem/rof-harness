@@ -54,6 +54,14 @@ disagree, that file wins.
   Infra-corrected count 6/18, single rep. Balance $0.36 after; paid work is effectively
   stopped until a top-up. See
   [slice-a-misses-rerun](experiments/2026-11-13-slice-a-misses-rerun.md).
+- **Agent tree, stage 1 (2026-11-13), off, unmeasured:** `--agents FILE` (JSON roles and
+  `spawn` edges) gives `spawn`/`wait`; read-only children, budget pool carved from
+  `--budget-tokens` (`crates/rof/src/agents.rs`, scope entry in `docs/decisions.md`).
+  One live root-plus-scout run passed. Not wired into `rof eval`, so no benchmark row can
+  use it yet; that wiring is the next step before any measurement. Stages 2 (worktree
+  writers) and 3 (`message` edges) are not built.
+- **Closed:** the 8,000-token `max_tokens` cap is not the token-death cause (3.4% of
+  spend; see slice-a-misses-rerun).
 - **Collapse is not the token-death cause:** exact re-reads are 3.6% of tool calls
   ([reread-census](experiments/2026-11-12-reread-census.md)); raising `observation_keep` is
   not supported by the Slice A traces.
