@@ -49,6 +49,11 @@ disagree, that file wins.
   showed a silent non-zero exit as empty output (79 of 475 failed exec calls). Every banked
   row predates the fix, so the 5/18 baseline was measured with both bugs. See
   [exec-observation-bugs](experiments/2026-11-13-exec-observation-bugs.md).
+  **Re-run of the 13 misses (2026-11-13): 2 solve**, `pypi-server` (the earlier infra fix)
+  and `model-extraction-relu-logits` (variance); no solve attributable to the exec fixes.
+  Infra-corrected count 6/18, single rep. Balance $0.36 after; paid work is effectively
+  stopped until a top-up. See
+  [slice-a-misses-rerun](experiments/2026-11-13-slice-a-misses-rerun.md).
 - **Collapse is not the token-death cause:** exact re-reads are 3.6% of tool calls
   ([reread-census](experiments/2026-11-12-reread-census.md)); raising `observation_keep` is
   not supported by the Slice A traces.
