@@ -11,7 +11,7 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--stream on|off] [--mcp 'CMD ARGS']... [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--resume LOG] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]...
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--stream on|off] [--mcp 'CMD ARGS']... [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--resume LOG] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]... [--agents FILE]
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
@@ -43,7 +43,7 @@ exit codes: 0 done, 2 usage/parse, 3 run failure (halt/cancel/provider), 4 missi
 
 /// `rof chat`: line-based interactive loop over the same flags as `rof run`.
 pub(crate) const CHAT_USAGE: &str = "usage: rof chat [--goal TEXT] --workdir DIR --model ID [any other `rof run` flag, see `rof run`]
-reads one message per stdin line and runs the agent on it until the turn ends; history carries over between lines. --goal, when given, is the first message. `/exit` or EOF ends with exit 0. Budget flags apply per message (each line gets a fresh budget). --resume LOG continues an earlier log (history only: budgets, counters, verify state, snapshots and directives are not restored). --review and procedures are ignored.";
+reads one message per stdin line and runs the agent on it until the turn ends; history carries over between lines. --goal, when given, is the first message. `/exit` or EOF ends with exit 0. Budget flags apply per message (each line gets a fresh budget). --resume LOG continues an earlier log (history only: budgets, counters, verify state, snapshots and directives are not restored). --review and procedures are ignored. --agents FILE adds spawn/wait for the roles that may spawn; the child token pool is carved from --budget-tokens once per run.";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Args {
@@ -142,6 +142,8 @@ pub(crate) struct Args {
     pub multi_edit: bool,
     pub review: bool,
     pub procedure_files: Vec<PathBuf>,
+    /// `--agents FILE`: validated stage-1 agent tree (spawn/wait tools).
+    pub agents: Option<crate::agents::Config>,
     /// Exec-wrap argv prepended at spawn by the tool policy (in-container
     /// eval: `docker exec <container>` so exec/test calls land in the task
     /// environment container); `None` keeps host-side exec.
@@ -255,6 +257,7 @@ struct RunBuilder {
     multi_edit: Option<bool>,
     review: bool,
     procedure_files: Vec<PathBuf>,
+    agents: Option<crate::agents::Config>,
 }
 
 pub(crate) fn parse_toggle(flag: &str, v: Option<String>) -> Result<bool, String> {
@@ -351,6 +354,11 @@ fn set_review(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
 fn set_procedure_file(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
     b.procedure_files
         .push(PathBuf::from(v.ok_or("--procedure-file needs a path")?));
+    Ok(())
+}
+
+fn set_agents(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.agents = Some(crate::agents::load(&v.ok_or("--agents needs a file")?)?);
     Ok(())
 }
 
@@ -753,6 +761,11 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_procedure_file,
     },
     Flag {
+        name: "--agents",
+        takes_value: true,
+        set: set_agents,
+    },
+    Flag {
         name: "--goal",
         takes_value: true,
         set: set_goal,
@@ -961,6 +974,9 @@ fn parse_cmd(argv: &[String], cmd: &str, usage: &str) -> Result<Args, String> {
     if b.repo_evidence.unwrap_or(false) && !b.repo_lookup.unwrap_or(false) {
         return Err("--repo-evidence requires --repo-lookup on".into());
     }
+    if b.agents.is_some() && b.review {
+        return Err("--agents cannot be combined with --review on".into());
+    }
     if b.completion_check.is_some() && b.review {
         return Err("--completion-check cannot be combined with --review on".into());
     }
@@ -1044,6 +1060,7 @@ fn parse_cmd(argv: &[String], cmd: &str, usage: &str) -> Result<Args, String> {
         multi_edit: b.multi_edit.unwrap_or(false),
         review: b.review,
         procedure_files: b.procedure_files,
+        agents: b.agents,
         exec_wrap: None,
     })
 }
@@ -1100,7 +1117,23 @@ pub(crate) fn budget_for(args: &Args) -> Result<BudgetGuard, String> {
     if let Some(n) = args.budget_actions {
         b.actions_per_trial = n;
     }
-    match args.budget_tokens {
+    // The child pool is carved out of the root's token budget up front.
+    let root_tokens = match &args.agents {
+        None => args.budget_tokens,
+        Some(cfg) => {
+            let pool = cfg.limits.child_budget_tokens;
+            match args.budget_tokens {
+                Some(t) if pool < t => Some(t - pool),
+                Some(t) => {
+                    return Err(format!(
+                        "--agents child_budget_tokens {pool} must be below --budget-tokens {t}"
+                    ))
+                }
+                None => return Err("--agents requires --budget-tokens".into()),
+            }
+        }
+    };
+    match root_tokens {
         Some(t) => b.max_tokens = t,
         // chosen-to-validate: pinned-prefix floor ~4-5k tok/req x 20-30
         // requests + reasoning completions; validated-or-revised at next pilot.
@@ -1328,6 +1361,7 @@ mod tests {
                 multi_edit: false,
                 review: false,
                 procedure_files: Vec::new(),
+                agents: None,
                 exec_wrap: None,
             }
         );

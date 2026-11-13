@@ -259,6 +259,7 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
         // and injects its bounded text into `goal`; don't reload against that
         // augmented goal in the generic run driver.
         procedure_files: Vec::new(),
+        agents: None,
         exec_wrap: None,
     }
 }

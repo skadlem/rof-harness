@@ -114,6 +114,25 @@ carry the suite outcome. Every per-instance failure in this mode (missing
 image, container start, verifier spawn/timeout) is infra, never
 capability, and the container is removed best-effort on every path.
 
+### Agent tree (`crates/rof/src/agents.rs`, `--agents FILE`)
+
+Stage 1 of a configurable topology, off by default and unmeasured. A JSON
+file declares roles (tools, optional prompt, token/step budget), limits
+(`max_depth`, `max_agents`, `child_budget_tokens`) and `spawn` edges. A role
+with an outgoing edge, below `max_depth`, gets `spawn {role, brief}` (returns
+`id=<n>` at once) and `wait {ids}` (blocks, returns each child's final answer
+or failure). A child is one `agent_loop::run` on a fresh `LoopState` with only
+its role's tools (same policy, workdir and exec wrap as the parent), a log at
+`<parent log>.<id>`, and a per-child stderr line. The children are futures
+polled next to the root's run (`with_children`), so they run concurrently with
+each other and the root and borrow the provider; any still running when the
+root ends are dropped. The child pool is carved from `--budget-tokens` before
+the root starts, and unused child tokens are not returned. `workspace:
+"worktree"` and `message` edges parse but are rejected at load; the stage-1
+children share the parent's workdir read-only by tool choice (no `write` or
+`edit`), not by a filesystem boundary. `--agents` conflicts with `--review on`
+and is not wired into `rof eval`.
+
 ## Crate map
 
 - `agent-loop` — the loop. `run()` is the shipped sequential driver;

@@ -58,13 +58,18 @@ pub(crate) async fn run_chat<P: LlmClient>(
     mut input: impl BufRead,
     out: Out,
 ) -> i32 {
-    let reg = match crate::registry_with_mcp(args, Arc::new(policy_for(args))).await {
+    let policy = Arc::new(policy_for(args));
+    let mut reg = match crate::registry_with_mcp(args, policy.clone()).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cannot configure tools: {e}");
             return 3;
         }
     };
+    let mut tree = args.agents.as_ref().map(crate::agents::Tree::new);
+    if let Some(t) = &tree {
+        t.register_root(&mut reg);
+    }
     let mut state = LoopState::new();
     if let Some(p) = args.resume.as_deref() {
         if let Err(e) = state.restore_from(std::path::Path::new(p)) {
@@ -126,19 +131,25 @@ pub(crate) async fn run_chat<P: LlmClient>(
                 return 2;
             }
         };
-        let outcome = agent_loop::run(
-            &mut state,
-            Run {
-                provider,
-                registry: &reg,
-                agent: "agent",
-                workdir: &args.workdir,
-                emitter: &mut emitter,
-                bets,
-                cfg: run_config(args),
-            },
-            vec![Input::User(msg)],
-            &cancel,
+        let outcome = crate::agents::with_children(
+            tree.as_mut(),
+            provider,
+            args,
+            &policy,
+            agent_loop::run(
+                &mut state,
+                Run {
+                    provider,
+                    registry: &reg,
+                    agent: "agent",
+                    workdir: &args.workdir,
+                    emitter: &mut emitter,
+                    bets,
+                    cfg: run_config(args),
+                },
+                vec![Input::User(msg)],
+                &cancel,
+            ),
         )
         .await;
         match &outcome {

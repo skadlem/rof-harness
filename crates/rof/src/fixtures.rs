@@ -237,6 +237,7 @@ pub(crate) fn args_for(dir: &std::path::Path, steps: Option<u32>) -> Args {
         multi_edit: false,
         review: false,
         procedure_files: Vec::new(),
+        agents: None,
         exec_wrap: None,
     }
 }

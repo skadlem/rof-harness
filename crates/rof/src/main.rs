@@ -2,6 +2,7 @@
 //! Prompt shape (goal + file map + named files via the context assembler)
 //! lives in `agent_loop::run`; this crate only feeds it `RunConfig` + input.
 
+mod agents;
 mod chat;
 mod cli;
 mod dump;
@@ -113,10 +114,10 @@ fn output_archive_dir(workdir: &Path) -> std::io::Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-fn registry_for(
+fn tools_for(
     args: &Args,
     policy: Arc<tools_std::Policy>,
-) -> Result<tool_core::Registry, String> {
+) -> Result<Vec<Arc<dyn tool_core::Tool>>, String> {
     let output_dir = if args.archive_output {
         Some(output_archive_dir(&args.workdir).map_err(|e| e.to_string())?)
     } else {
@@ -134,7 +135,7 @@ fn registry_for(
     } else {
         None
     };
-    let tools = tools_std::experimental_tools(
+    tools_std::experimental_tools(
         policy,
         tools_std::ExperimentalToolsConfig {
             output_dir,
@@ -145,14 +146,17 @@ fn registry_for(
             history_log,
             multi_edit: args.multi_edit,
         },
-    )?;
+    )
+}
+
+/// Grant exactly the given tools to `agent`, plus `extra` names (`mcp__*`
+/// before the MCP handshake; `spawn`/`wait` registered after the build).
+fn registry_from(tools: Vec<Arc<dyn tool_core::Tool>>, extra: &[&str]) -> tool_core::Registry {
     let mut grants = tools
         .iter()
         .map(|tool| tool.definition().name)
         .collect::<Vec<_>>();
-    if !args.mcp.is_empty() {
-        grants.push("mcp__*".into()); // names are known only after the handshake
-    }
+    grants.extend(extra.iter().map(|g| g.to_string()));
     let mut registry = tool_core::Registry::new(Arc::new(GrantGate::new(HashMap::from([(
         "agent".to_string(),
         grants,
@@ -160,7 +164,21 @@ fn registry_for(
     for tool in tools {
         registry.register(tool);
     }
-    Ok(registry)
+    registry
+}
+
+fn registry_for(
+    args: &Args,
+    policy: Arc<tools_std::Policy>,
+) -> Result<tool_core::Registry, String> {
+    let mut extra = Vec::new();
+    if !args.mcp.is_empty() {
+        extra.push("mcp__*");
+    }
+    if args.agents.is_some() {
+        extra.extend(["spawn", "wait"]);
+    }
+    Ok(registry_from(tools_for(args, policy)?, &extra))
 }
 
 /// `registry_for` plus one MCP stdio server per `--mcp` (tools `mcp__<name>`).
@@ -438,6 +456,11 @@ async fn execute_with_deadline<P: LlmClient>(
             };
         }
     };
+    let mut reg = reg;
+    let mut agent_tree = args.agents.as_ref().map(agents::Tree::new);
+    if let Some(t) = &agent_tree {
+        t.register_root(&mut reg);
+    }
     let mut state = LoopState::new();
     if let Some(p) = args.resume.as_deref() {
         if let Err(e) = state.restore_from(Path::new(p)) {
@@ -529,19 +552,25 @@ async fn execute_with_deadline<P: LlmClient>(
         primary_input.push_str("\n\nExternally sourced procedure guidance (applicability matched against the original task; no learning claim):\n");
         primary_input.push_str(&procedures.instructions);
     }
-    let mut outcome = agent_loop::run(
-        &mut state,
-        Run {
-            provider,
-            registry: &reg,
-            agent: "agent",
-            workdir: &args.workdir,
-            emitter: &mut emitter,
-            bets: bets_hook,
-            cfg: run_config(args),
-        },
-        vec![Input::User(primary_input)],
-        &cancel,
+    let mut outcome = agents::with_children(
+        agent_tree.as_mut(),
+        provider,
+        args,
+        &policy,
+        agent_loop::run(
+            &mut state,
+            Run {
+                provider,
+                registry: &reg,
+                agent: "agent",
+                workdir: &args.workdir,
+                emitter: &mut emitter,
+                bets: bets_hook,
+                cfg: run_config(args),
+            },
+            vec![Input::User(primary_input)],
+            &cancel,
+        ),
     )
     .await;
     let primary_outcome = outcome.clone();
