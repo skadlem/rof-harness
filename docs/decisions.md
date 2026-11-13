@@ -819,3 +819,14 @@ server per flag). They are product surface, not capability bets: no benchmark ro
 them and none is a candidate for promotion on solve rate. Still out: full-screen TUI, MCP
 HTTP transport/auth/resources, session picker, cross-run memory, planner/MAS. [chosen: owner
 directive; validated only by scripted-provider and scripted-server tests]
+
+**Scope reversal (2026-11-13, owner request).** "No planner/MAS scaffolding" stood in
+`AGENTS.md` and planner/MAS was listed as still out above. The owner confirmed a
+configurable agent topology: roles and `spawn`/`message` edges in a JSON file (`--agents
+FILE`), one runtime with `spawn` and `wait` tools, budget carved from the parent. Built in
+stages: (1) tree at depth 1 with read-only children, (2) deeper tree with one worktree per
+writer, (3) peer `message` edges. Default off; nothing in it is benchmark-validated and no
+baseline row uses it. JSON rather than TOML because `serde_json` is already a dependency.
+The `AGENTS.md` rule still applies to everything else: no planner, and no multi-agent code
+outside this flag. [chosen: owner directive; stage 1 validated only by scripted-provider
+tests]

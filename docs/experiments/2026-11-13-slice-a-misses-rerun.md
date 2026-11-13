@@ -32,5 +32,17 @@ bound; live balance $0.80 → $0.36.
 - Single-rep verdicts on this slice move both ways without a treatment
   (`model-extraction-relu-logits` here, `dna-insert` 1 in 6 now). Any future arm needs
   reps on both sides.
-- 11 of 13 still die on the token cap. Note the recipe's `max_tokens` is 8,000 and the
-  traces show reasoning bursts of exactly 8,000: unexamined.
+- 11 of 13 still die on the token cap.
+
+## The 8,000-token response cap is not the cause (measured, zero model calls)
+
+Census over 58 banked traces, 2,213 requests, 23.6M tokens:
+
+- 91 requests (4.1%) reach the cap, in 29 of 58 runs; 86 of them are reasoning that
+  stops at exactly 8,000. All 91 are still followed by a tool call, so no response is lost.
+- Capped responses are **3.4% of all tokens spent**. All output is 8.9% of spend (83% of
+  it reasoning); input is the other 91%.
+- Reading: the cap bounds reasoning spend rather than wasting it, and raising it would
+  cost more. The token deaths are input accumulation (about 10k per request under the
+  `Gross` shape), as the [reread-census](2026-11-12-reread-census.md) already found.
+  Whether a reasoning burst cut at 8,000 leads to a worse next action is unmeasured.
