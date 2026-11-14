@@ -505,6 +505,13 @@ self-describe through the provenance block; no arm's rows pool with another's.
    it cannot fire at any plausible `frac`. Re-design first (trigger on
    spent-vs-cap, keep-budget scaled to real prompts), then re-register a
    pass rule; do not run the original arm.
+   **Update 2026-11-14:** the trigger was since changed to compare one
+   request against `--context-capacity` minus `--output-reserve`
+   (`context::compaction_due`; see `research-next-steps.md`, "Separate context
+   capacity from cumulative token allowance"). It is still a per-request
+   trigger, so it fires only when the capacity is set near the real request
+   size (about 10k tokens on Slice A; the reserve must be at least 32,768).
+   It remains off and has no benchmark result.
 8. **File-tool `/app` parity — FIXED 2026-10-18 (correctness, no capability
    claim).** Joining denials to their tool arguments showed the largest
    file-tool denial class was the workspace spelled the way task statements
@@ -596,20 +603,28 @@ literature on 2026-10-13 and deliberately stay closed.
   allowlist and policy gate cut attack effects at small utility cost
   (arXiv:2610.07639), and multi-agent orchestration stays out of
   scope by the no-planner/no-MAS rule.
-- **Bet C (candidate racing)**: unbuilt until a workload shows
-  proof-gate interventions (zero in all measured runs to date).
+- **Bet C (candidate racing)**: not wired until a workload shows
+  proof-gate interventions (zero in all measured runs to date). The winner
+  selection exists (`bets::pick_winner`, `RaceConfig` in
+  `crates/bets/src/race.rs`) but nothing calls it.
 - ~~**Unpriced-model spend warning**: gate triggered 2026-10-16, CLOSED
   2026-10-19.~~ A run whose model has no price-book entry prints one stderr
   warning naming the inert `$` cap and the operative token/step caps
   (`cli::budget_for`; `provider_openai::prices_model` is the single
   predicate), so an unpriced run never looks guarded. The other half of the
   gate — a per-endpoint price book — is still unbuilt by choice: no price is
-  invented.
-- **Dynamic / lossy context** (owner idea, 2026-11-06; idea only, nothing
-  built): keep a summary plus the extracted facts in context instead of the
+  invented. **Superseded:** an armed `$` cap on an unpriced model is now a
+  refusal, not a warning (`cli::spend_guard_error`, exit 7); the one-time
+  warning prints only with `--allow-inert-spend-cap`. See `architecture.md`.
+- **Dynamic / lossy context** (owner idea, 2026-11-06; the per-read
+  summarizer is not built. Since then these related pieces landed, all off by
+  default and without a benchmark result: `--compaction` with
+  `--checkpoint-sources`, `--history-read`, and `--archive-output` with
+  `output_read`): keep a summary plus the extracted facts in context instead of the
   long source, and re-acquire the source when it is needed again. There is no
-  web tool (`tools-std` ships `view`/`search`/`edit`/`write`/`exec`/`test`;
-  network is reachable only through `exec`), so the payloads this would shrink
+  web tool (the default registry is `view`/`search`/`edit`/`write`/`exec`/`test`;
+  shell, processes, repo-lookup, multi-edit and `--mcp` servers are opt-in;
+  network is otherwise reachable only through `exec`), so the payloads this would shrink
   are `view` bodies, `search` dumps and `exec` output — the same share the
   token cap already binds on. Reconsider when BOTH (a) an offline replay of
   banked event logs attributes the binding wall on failing cells to those

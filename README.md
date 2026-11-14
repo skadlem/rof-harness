@@ -33,7 +33,7 @@ in the implementation record.
 
 | What it does | How it's judged | What it costs | What it refuses to be |
 |---|---|---|---|
-| Drives an OpenAI-compatible model through six tools against a scratch workdir, or inside the task's live container, until the work is done or a cap trips | The task's native verifier; Harbor supports separate verifier environments | Provider usage receipts; current selected-task costs are recorded in the evaluation protocol | A framework, a planner, an MCP host, or a hosted service. One binary, one loop |
+| Drives an OpenAI-compatible model through six tools against a scratch workdir, or inside the task's live container, until the work is done or a cap trips | The task's native verifier; Harbor supports separate verifier environments | Provider usage receipts; current selected-task costs are recorded in the evaluation protocol | A framework or a hosted service. One binary, one loop by default; MCP servers (`--mcp`) and an agent tree (`--agents`) are opt-in and unmeasured |
 
 The current TB4.1 development slice has three completed `session-window-debug`
 runs with native reward **0**, and three completed `wal-recovery-ordering`

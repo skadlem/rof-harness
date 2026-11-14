@@ -185,11 +185,12 @@ is computed once at the end from the snapshot tree.
 The host/file-copy and `--in-container` limitations below describe the legacy
 evaluation rig, with their original measurement dates. In the native Harbor
 adapter path the whole ROF process, including file tools and snapshots, runs
-inside the task container. Neither path currently provides crash resume.
+inside the task container. Neither path resumes a crashed run on its own.
 
-- The CLI archives the previous WAL before startup and constructs fresh state.
-  `read_log` has no production caller; durable recording is implemented,
-  crash resume is not.
+- By default the CLI archives the previous WAL before startup and constructs
+  fresh state. `--resume LOG` (run and chat) is the manual path: it reads the
+  log with `read_log` and rebuilds history through `LoopState::restore`.
+  `history_read` also reads the log. Automatic crash resume is not built.
 - Spend is accumulated before conversion to cents. Provider calls and tool
   execution and proof commands observe the run wall-clock deadline. In-flight
   provider usage may be unknown on timeout or cancellation; blocking Git

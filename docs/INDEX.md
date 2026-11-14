@@ -123,6 +123,7 @@ Never edit these; record conclusions in decisions. Paper notes: [research/papers
 - [lit-2026-11-harness-architecture](../research/lit-2026-11-harness-architecture.md) — LANE A — harness / scaffold architecture and loop control — papers 2026-09 .. 2026-11 · **read with lit-2026-11-ERRATA**
 - [lit-2026-11-tools-inference](../research/lit-2026-11-tools-inference.md) — LANE C — TOOLS, EXECUTION ENVIRONMENTS, AND INFERENCE-SIDE ECONOMICS — papers 2026-09 .. 2026-11 · **read with lit-2026-11-ERRATA**
 - [lit-sweep-2026-10-19](../research/lit-sweep-2026-10-19.md) — Literature sweep 2026-10-19 — synthesis and decision
+- [lit-sweep-2026-11-14](../research/lit-sweep-2026-11-14.md) — Literature sweep 2026-11-14 — no paper shows subagents lifting a weak model at matched tokens
 - [meta-harness-current-systems](../research/meta-harness-current-systems.md) — Current live "meta-harness-like" systems (as of 2026-10-13)
 - [meta-harness-published](../research/meta-harness-published.md) — Published Work on Meta-Harnesses for LLM Coding Agents
 - [papers-2026h2-eval-methodology](../research/papers-2026h2-eval-methodology.md) — what a 21-task agent slice can actually resolve (eval methodology, 2025-2026)

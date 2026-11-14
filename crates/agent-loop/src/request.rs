@@ -225,7 +225,7 @@ pub(crate) fn pin_snapshot(files: &[String], workdir: &Path) -> Vec<(String, Str
 /// outgoing message only and never to the transcript, so the durable log stays
 /// exactly what was recorded. History is delivered exactly once, raw, as
 /// messages (collapse-5 rides [`LoopState::derived_messages`]) — never fitted
-/// into the system copy. Never summarizes.
+/// into the system copy. Summarizes only when `--compaction` is on (checkpoint).
 pub(crate) fn build_request(
     state: &mut LoopState,
     registry: &tool_core::Registry,
