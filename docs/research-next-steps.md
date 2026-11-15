@@ -60,6 +60,34 @@ disagree, that file wins.
   One live root-plus-scout run passed. Not wired into `rof eval`, so no benchmark row can
   use it yet; that wiring is the next step before any measurement. Stages 2 (worktree
   writers) and 3 (`message` edges) are not built.
+  **Demoted (2026-11-14):** the literature sweep (`research/lit-sweep-2026-11-14.md`) found
+  no paper showing subagents lifting a weak model at matched tokens, and one (Spine, arXiv
+  2610.37224) with recursive subagents at 3.8x the cost for no gain. The eval wiring also
+  needs child token accounting: child usage is only printed to stderr
+  (`agents.rs:512`), while the report reads the root's totals. The scout arm is now last
+  in the order, and only for a subtask with a fixed input/output contract.
+- **Failed-trace audit (2026-11-14), zero model calls:** 47 of 52 failed runs are token
+  deaths and 2 end by claiming verification, so the TB4 false-verification pattern does not
+  explain the misses; no new silent tool-feedback class in the census. 472 of 2,330 requests
+  (20%) are a lone helper-script write, which the eval `GOAL_TAIL` instructs; runs that used
+  `sh -c` still do it (15.6% against 21.5%), so `--shell on` alone would probably not change
+  it. This is an efficiency finding: the envelope arm gave 3.3x tokens for 0 of 11, so no
+  paid arm is proposed. Argument stubbing has about 10% pooled headroom; scope collapse is
+  not estimated; cache savings are bounded at half the bill and cost requests.
+  **Done (2026-11-15):** the three stable misses were read with reasoning text against
+  their oracle solutions. None is a knowledge gap: the model reaches the answer and runs
+  out before writing the file. It paces by the step counter (25 of 27 runs cite steps, 11
+  tokens) and reads the `N/M` token figure both ways. The batch rollback notice fires on
+  21% of tool batches. Of three candidate changes, the first is built: `--budget-line
+  requests` (off by default, unmeasured) prints replies left at the last reply's cost. It is wired into
+  `rof run`, `rof eval` (recorded as `run_config.budget_requests` in the report) and the
+  Harbor adapter (`budget_line`, recorded in the job's `config.json` kwargs). A paid arm
+  needs a binary built from a commit that contains it: older binaries reject the flag,
+  and a build from an uncommitted tree records a `-dirty` revision.
+  Rollback notice scope and write-and-run batching are unbuilt and need the owner's design
+  agreement. Each needs a paid arm on tasks other than these three. See
+  [miss-diagnosis](experiments/2026-11-15-miss-diagnosis.md) and
+  [failed-trace-audit](experiments/2026-11-14-failed-trace-audit.md).
 - **Closed:** the 8,000-token `max_tokens` cap is not the token-death cause (3.4% of
   spend; see slice-a-misses-rerun).
 - **Collapse is not the token-death cause:** exact re-reads are 3.6% of tool calls

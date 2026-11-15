@@ -63,6 +63,8 @@ Update this file in the same commit as adding, superseding or voiding a note.
 - [easy-miss-variance](experiments/2026-11-13-easy-miss-variance.md) — 0 of 9 reps on the three published-easy misses; they are stable misses, `dna-insert` 1 in 5 · **record**
 - [exec-observation-bugs](experiments/2026-11-13-exec-observation-bugs.md) — exec mangled 78 of 1,698 banked commands and hid 79 silent failures; both fixed, effect on solve rate unmeasured · **record**
 - [slice-a-misses-rerun](experiments/2026-11-13-slice-a-misses-rerun.md) — 2 of 13 misses solve on the fixed binary; one is the earlier infra fix, one is variance, none attributable to the exec fixes · **record**
+- [failed-trace-audit](experiments/2026-11-14-failed-trace-audit.md) — 47 of 52 failures are token deaths, 2 claim verification; 20% of requests are a lone helper-script write that the eval prompt instructs · **record**
+- [miss-diagnosis](experiments/2026-11-15-miss-diagnosis.md) — the three stable misses reach the answer and run out before writing it; the model paces by steps and misreads the token budget line · **record**
 
 ## Reviews (independent verdicts)
 
@@ -124,6 +126,9 @@ Never edit these; record conclusions in decisions. Paper notes: [research/papers
 - [lit-2026-11-tools-inference](../research/lit-2026-11-tools-inference.md) — LANE C — TOOLS, EXECUTION ENVIRONMENTS, AND INFERENCE-SIDE ECONOMICS — papers 2026-09 .. 2026-11 · **read with lit-2026-11-ERRATA**
 - [lit-sweep-2026-10-19](../research/lit-sweep-2026-10-19.md) — Literature sweep 2026-10-19 — synthesis and decision
 - [lit-sweep-2026-11-14](../research/lit-sweep-2026-11-14.md) — Literature sweep 2026-11-14 — no paper shows subagents lifting a weak model at matched tokens
+- [miss-diagnosis-2026-11-15-dna-assembly](../research/miss-diagnosis-2026-11-15-dna-assembly.md) — Full per-run read of `dna-assembly` behind the miss diagnosis (oracle solution read; task contaminated)
+- [miss-diagnosis-2026-11-15-dna-insert](../research/miss-diagnosis-2026-11-15-dna-insert.md) — Full per-run read of `dna-insert` behind the miss diagnosis (oracle solution read; task contaminated)
+- [miss-diagnosis-2026-11-15-make-mips-interpreter](../research/miss-diagnosis-2026-11-15-make-mips-interpreter.md) — Full per-run read of `make-mips-interpreter` behind the miss diagnosis (oracle solution read; task contaminated)
 - [meta-harness-current-systems](../research/meta-harness-current-systems.md) — Current live "meta-harness-like" systems (as of 2026-10-13)
 - [meta-harness-published](../research/meta-harness-published.md) — Published Work on Meta-Harnesses for LLM Coding Agents
 - [papers-2026h2-eval-methodology](../research/papers-2026h2-eval-methodology.md) — what a 21-task agent slice can actually resolve (eval methodology, 2025-2026)
