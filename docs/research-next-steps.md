@@ -13,6 +13,9 @@ chosen fixtures, historical outcomes and current campaign evidence.
 
 ## Latest state (2026-11-12) — read this first
 
+The short session entry point is [`SESSION-NEXT.md`](../SESSION-NEXT.md) at the repo
+root: current state, decisions, next task and where to look.
+
 The Slice A session postdates everything below. Its plan and status table are in
 [next-after-slice-a](superpowers/plans/2026-11-11-next-after-slice-a.md); where the two
 disagree, that file wins.
