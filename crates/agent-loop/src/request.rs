@@ -181,9 +181,40 @@ const WORKFLOW_MINIMAL: &str = "WORKFLOW\n\
 /// Durability lives in `BudgetGuard` counters + `TurnEnd.usage_totals`;
 /// persisting these digits into the transcript would rotate the cached-prefix
 /// head every request. Pinned by `build_request_system_is_static...` tests.
-pub(crate) fn budget_line(state: &LoopState) -> String {
+pub(crate) fn budget_line(state: &LoopState, requests: bool) -> String {
     let cfg = state.budget.config();
     let counters = state.budget.counters();
+    if requests {
+        let steps = cfg.max_steps.get().saturating_sub(counters.steps);
+        let tokens = cfg.max_tokens.saturating_sub(counters.tokens);
+        // Counts the reply this line asks for. ceil is exact on 68% of banked
+        // request points with 1-3 left, floor on 25%; it overestimates
+        // earlier, since requests grow
+        // (docs/experiments/2026-11-15-miss-diagnosis.md).
+        let head = match state.last_request_tokens {
+            0 => String::new(),
+            last => {
+                let n = tokens.div_ceil(last).min(u64::from(steps));
+                format!(
+                    "at most {n} {} left, counting this one ({tokens} tokens left of {}; the last reply cost {last}); ",
+                    if n == 1 { "reply" } else { "replies" },
+                    cfg.max_tokens,
+                )
+            }
+        };
+        let tail = if head.is_empty() {
+            format!("tokens left {tokens} of {}; ", cfg.max_tokens)
+        } else {
+            String::new()
+        };
+        return format!(
+            "budgets remaining: {head}{tail}steps left {steps} of {}; actions left {} of {}",
+            cfg.max_steps,
+            cfg.actions_per_trial
+                .saturating_sub(counters.actions_this_trial),
+            cfg.actions_per_trial,
+        );
+    }
     format!(
         "budgets remaining: steps {}/{}; actions {}/{}; tokens {}/{}",
         cfg.max_steps.get().saturating_sub(counters.steps),
@@ -303,7 +334,7 @@ pub(crate) fn build_request(
     // model's declare text (the last derived row after an unverified declare
     // is the model's own assistant row). Peek only: `run` takes on
     // successful send, so a provider Err+retry re-arms instead of losing it.
-    let budget = budget_line(state);
+    let budget = budget_line(state, cfg.budget_requests);
     if let Some(last) = messages[1..].last_mut() {
         last.content.push('\n');
         last.content.push_str(&budget);

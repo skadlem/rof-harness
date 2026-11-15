@@ -381,6 +381,9 @@ pub struct RunConfig {
     pub observation_keep: usize,
     /// Intervene after this many identical failed checks with unchanged files; zero disables it.
     pub stall_threshold: usize,
+    /// Budget line in requests left, sized by the last request, without the
+    /// ambiguous `N/M` form (`--budget-line requests`).
+    pub budget_requests: bool,
 }
 
 impl Default for RunConfig {
@@ -409,6 +412,7 @@ impl Default for RunConfig {
             minimal_workflow: false,
             observation_keep: 5,
             stall_threshold: 0,
+            budget_requests: false,
         }
     }
 }

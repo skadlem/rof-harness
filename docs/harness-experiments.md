@@ -35,6 +35,7 @@ benchmark gain from the wording change is unmeasured.
 The `rof run` command exposes the following experimental controls. The native
 Harbor adapter (`tools/harbor_rof.py`) currently forwards
 `max_tokens`, `observation_keep`, `thinking_keep`, `preserve_failed_checks`,
+`budget_line`,
 `archive_output`, `shell`, `workflow`, `reasoning_effort`, `repo_lookup`,
 `repo_evidence`, `collapse_hysteresis`, `completion_check`, `history_read`,
 `compaction`, `context_capacity`, `output_reserve`, and `checkpoint_sources`.
@@ -53,6 +54,7 @@ paragraphs below identify the separate adapter and legacy-eval limitations.
 | `--thinking-keep N` | Retain reasoning text for N assistant messages | 2 |
 | `--collapse-hysteresis N` | Batch advances of the observation-collapse boundary | 0 |
 | `--stall-threshold N` | Notice repeated identical failed checks with unchanged source evidence | 0 (off) |
+| `--budget-line requests` | Print the budget line as replies left at the last reply's cost, counting the current one, with no `N/M` figures (`rof run`, `rof eval`, and the Harbor adapter's `budget_line`) | legacy |
 | `--archive-output on` | Archive command output and expose paginated retrieval through `output_read` | off |
 | `--shell on` | Add shell composition through the execution wrapper | off |
 | `--processes on` | Add persistent pipe sessions with start/poll/input/stop | off |

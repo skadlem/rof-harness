@@ -78,7 +78,10 @@ class HarborRofOptionsTest(unittest.IsolatedAsyncioTestCase):
             observation_keep=32,
             thinking_keep=256,
             max_tokens=4096,
+            budget_line="requests",
         )
+        self.assertEqual(argv[argv.index("--budget-line") + 1], "requests")
+        self.assertNotIn("--budget-line", await self.run_agent())
         self.assertEqual(argv[argv.index("--workflow") + 1], "minimal")
         self.assertEqual(argv[argv.index("--preserve-failed-checks") + 1], "on")
         self.assertEqual(argv[argv.index("--observation-keep") + 1], "32")

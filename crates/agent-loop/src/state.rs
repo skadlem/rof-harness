@@ -264,6 +264,9 @@ pub struct LoopState {
     /// Turn of the last checkpoint attempt: never twice in a row without new
     /// turns between (a refused summary is not retried every step).
     pub compacted_turn: Option<u64>,
+    /// Tokens the last settled model request charged to the budget (0 = none
+    /// yet, or after a resume); sizes the `--budget-line requests` estimate.
+    pub last_request_tokens: u64,
 }
 
 /// Mutable experiment runtime (incentive-scaffold B→+A→+C): ablation
@@ -324,6 +327,7 @@ impl LoopState {
             checkpoint: None,
             anchor: None,
             compacted_turn: None,
+            last_request_tokens: 0,
         }
     }
 
@@ -559,7 +563,9 @@ impl LoopState {
             usage: Some(usage), ..
         } = &msg
         {
+            let before = self.budget.counters().tokens;
             self.record_usage(usage);
+            self.last_request_tokens = self.budget.counters().tokens - before;
         }
         if let ProviderMsg::Failed {
             err,

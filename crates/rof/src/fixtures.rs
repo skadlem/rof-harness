@@ -229,6 +229,7 @@ pub(crate) fn args_for(dir: &std::path::Path, steps: Option<u32>) -> Args {
         minimal_workflow: false,
         observation_keep: None,
         stall_threshold: None,
+        budget_requests: false,
         archive_output: false,
         shell: false,
         processes: false,

@@ -139,6 +139,33 @@ fn build_request_system_is_static_and_budgets_ride_the_tail() {
         .items
         .iter()
         .any(|i| format!("{:?}", i.kind).contains("budgets remaining")));
+    // `--budget-line requests`: same slot and prefix, no `N/M`; the request
+    // estimate appears once a request has settled and is capped by steps.
+    let on = RunConfig {
+        budget_requests: true,
+        ..RunConfig::default()
+    };
+    let last = |state: &mut LoopState| {
+        let r = build_request(state, &registry, &root, &on);
+        assert_eq!(
+            format!("{:?}", r.messages[0]),
+            format!("{:?}", r1.messages[0])
+        );
+        r.messages.last().unwrap().content.clone()
+    };
+    assert_eq!(
+        last(&mut state),
+        "build it\nbudgets remaining: tokens left 49700 of 50000; steps left 16 of 20; actions left 24 of 30"
+    );
+    state.last_request_tokens = 20_000;
+    assert_eq!(
+        last(&mut state),
+        "build it\nbudgets remaining: at most 3 replies left, counting this one (49700 tokens left of 50000; the last reply cost 20000); steps left 16 of 20; actions left 24 of 30"
+    );
+    state.last_request_tokens = 200;
+    assert!(last(&mut state).contains("at most 16 replies left"));
+    state.last_request_tokens = 60_000;
+    assert!(last(&mut state).contains("at most 1 reply left, counting this one"));
     let _ = std::fs::remove_dir_all(&root);
 }
 

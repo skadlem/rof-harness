@@ -35,6 +35,7 @@ class RofOptions(InstalledAgentOptions):
     budget_shape: Literal["gross", "miss-plus-out"] = "gross"
     observation_keep: int | None = Field(default=None, gt=0)
     preserve_failed_checks: bool = False
+    budget_line: Literal["legacy", "requests"] = "legacy"
     archive_output: bool = False
     shell: bool = False
     repo_lookup: bool = False
@@ -196,6 +197,8 @@ class RofAgent(BaseInstalledAgent):
             args.extend(("--output-reserve", str(self.options.output_reserve)))
         if self.options.checkpoint_sources:
             args.extend(("--checkpoint-sources", "on"))
+        if self.options.budget_line != "legacy":
+            args.extend(("--budget-line", self.options.budget_line))
         if self.options.observation_keep is not None:
             args.extend(("--observation-keep", str(self.options.observation_keep)))
         if self.options.thinking_keep is not None:

@@ -314,6 +314,7 @@ fn failed_attempt_usage_is_metered_and_still_retries() {
     }));
     // Budget and run totals see the failed attempt's spend.
     assert_eq!(s.budget.counters().tokens, 120);
+    assert_eq!(s.last_request_tokens, 0, "only a settled reply sizes it");
     assert_eq!(s.budget.counters().spent_cents, 2);
     assert_eq!(s.usage_totals.input_tokens, 100);
     assert_eq!(s.usage_totals.output_tokens, 20);
@@ -506,5 +507,30 @@ fn push_assistant_never_stores_null() {
             assert_eq!(stop_reason, "Stop");
         }
         other => panic!("expected Assistant, got {other:?}"),
+    }
+}
+
+#[test]
+fn settled_reply_records_its_own_charge() {
+    let mut s = LoopState::new();
+    s.turn = 1;
+    let root = CancellationToken::new();
+    for (input, total) in [(100, 120), (300, 440)] {
+        assert!(s.start_provider_call(&root).is_some());
+        assert!(s.finish_provider_msg(ProviderMsg::Settled {
+            turn: 1,
+            message: assistant(vec![]),
+            stop: StopReason::Stop,
+            usage: Some(Usage {
+                input,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: None,
+                cost_usd: None,
+            }),
+        }));
+        assert_eq!(s.budget.counters().tokens, total);
+        assert_eq!(s.last_request_tokens, input + 20);
     }
 }

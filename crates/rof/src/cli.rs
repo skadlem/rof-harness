@@ -11,7 +11,7 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--workflow legacy|minimal] [--observation-keep N] [--preserve-failed-checks on|off] [--stall-threshold N] [--archive-output on|off] [--shell on|off] [--processes on|off] [--multi-edit on|off] [--stream on|off] [--mcp 'CMD ARGS']... [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--resume LOG] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]... [--agents FILE]
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--workflow legacy|minimal] [--observation-keep N] [--preserve-failed-checks on|off] [--stall-threshold N] [--budget-line legacy|requests] [--archive-output on|off] [--shell on|off] [--processes on|off] [--multi-edit on|off] [--stream on|off] [--mcp 'CMD ARGS']... [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--resume LOG] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]... [--agents FILE]
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
@@ -134,6 +134,7 @@ pub(crate) struct Args {
     pub minimal_workflow: bool,
     pub observation_keep: Option<usize>,
     pub stall_threshold: Option<usize>,
+    pub budget_requests: bool,
     pub archive_output: bool,
     pub shell: bool,
     pub processes: bool,
@@ -249,6 +250,7 @@ struct RunBuilder {
     minimal_workflow: Option<bool>,
     observation_keep: Option<usize>,
     stall_threshold: Option<usize>,
+    budget_requests: bool,
     archive_output: Option<bool>,
     shell: Option<bool>,
     processes: Option<bool>,
@@ -279,6 +281,21 @@ fn set_workflow(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
         Some("minimal") => true,
         other => return Err(format!("--workflow expects legacy|minimal, got {other:?}")),
     });
+    Ok(())
+}
+
+pub(crate) fn parse_budget_line(v: Option<String>) -> Result<bool, String> {
+    match v.as_deref() {
+        Some("legacy") => Ok(false),
+        Some("requests") => Ok(true),
+        other => Err(format!(
+            "--budget-line expects legacy|requests, got {other:?}"
+        )),
+    }
+}
+
+fn set_budget_line(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.budget_requests = parse_budget_line(v)?;
     Ok(())
 }
 
@@ -706,6 +723,11 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_workflow,
     },
     Flag {
+        name: "--budget-line",
+        takes_value: true,
+        set: set_budget_line,
+    },
+    Flag {
         name: "--observation-keep",
         takes_value: true,
         set: set_observation_keep,
@@ -1052,6 +1074,7 @@ fn parse_cmd(argv: &[String], cmd: &str, usage: &str) -> Result<Args, String> {
         minimal_workflow: b.minimal_workflow.unwrap_or(false),
         observation_keep: b.observation_keep,
         stall_threshold: b.stall_threshold,
+        budget_requests: b.budget_requests,
         archive_output: b.archive_output.unwrap_or(false),
         shell: b.shell.unwrap_or(false),
         processes: b.processes.unwrap_or(false),
@@ -1240,6 +1263,7 @@ pub(crate) fn run_config(args: &Args) -> RunConfig {
         minimal_workflow: args.minimal_workflow,
         observation_keep: args.observation_keep.unwrap_or(dflt.observation_keep),
         stall_threshold: args.stall_threshold.unwrap_or(dflt.stall_threshold),
+        budget_requests: args.budget_requests,
         ..RunConfig::default()
     };
     cfg.thinking_keep = args.thinking_keep.unwrap_or(dflt.thinking_keep);
@@ -1353,6 +1377,7 @@ mod tests {
                 minimal_workflow: false,
                 observation_keep: None,
                 stall_threshold: None,
+                budget_requests: false,
                 archive_output: false,
                 shell: false,
                 processes: false,
@@ -2052,6 +2077,10 @@ mod tests {
         assert_eq!(cfg.minimal_workflow, dflt.minimal_workflow);
         assert_eq!(cfg.observation_keep, dflt.observation_keep);
         assert_eq!(cfg.stall_threshold, dflt.stall_threshold);
+        assert!(!plain.budget_requests && !cfg.budget_requests);
+        let req = parse_args(&run_min(&["--budget-line", "requests"])).unwrap();
+        assert!(run_config(&req).budget_requests);
+        assert!(parse_args(&run_min(&["--budget-line", "tokens"])).is_err());
 
         let on = parse_args(&run_min(&[
             "--preserve-failed-checks",

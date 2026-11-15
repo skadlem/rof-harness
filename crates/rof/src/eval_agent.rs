@@ -248,6 +248,7 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
         minimal_workflow: a.minimal_workflow,
         observation_keep: a.observation_keep,
         stall_threshold: a.stall_threshold,
+        budget_requests: a.budget_requests,
         archive_output: a.archive_output,
         shell: a.shell,
         processes: a.processes,

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{parse_table, resolve_endpoint, Flag};
 
-pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--keep-thinking] [--allow-inert-spend-cap] [--in-container]
+pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--budget-line legacy|requests] [--keep-thinking] [--allow-inert-spend-cap] [--in-container]
 --lenient-apply: record Lenient patch-apply provenance in the report (default Strict; Strict grades are not comparable with earlier fuzz-lenient numbers)
 --agent: run the agent leg per instance instead of the oracle-container leg (fresh workdir, in-process rof-run wiring, harbor-CLI grading). Requires --model ID and --endpoint URL (or OPENAI_BASE_URL); mutually exclusive with --winnability-only. Agent budgets default to the frozen pilot recipe: 300000 tokens / 60 steps / 120 actions; explicit flags win.
 --keep-thinking: skip the thinking-off request knob for providers that reject it or when reasoning is wanted (default keeps the DeepSeek thinking-off knob, sent only on compaction-summary calls and the truncation ladder first rung; ordinary requests carry no thinking fragment)
@@ -90,6 +90,7 @@ pub(crate) struct EvalArgs {
     pub minimal_workflow: bool,
     pub observation_keep: Option<usize>,
     pub stall_threshold: Option<usize>,
+    pub budget_requests: bool,
     pub archive_output: bool,
     pub shell: bool,
     pub processes: bool,
@@ -122,6 +123,7 @@ struct EvalBuilder {
     minimal_workflow: Option<bool>,
     observation_keep: Option<usize>,
     stall_threshold: Option<usize>,
+    budget_requests: bool,
     archive_output: Option<bool>,
     shell: Option<bool>,
     processes: Option<bool>,
@@ -395,7 +397,17 @@ fn set_procedure_file(b: &mut EvalBuilder, v: Option<String>) -> Result<(), Stri
     Ok(())
 }
 
+fn set_budget_line(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
+    b.budget_requests = crate::cli::parse_budget_line(v)?;
+    Ok(())
+}
+
 const EVAL_FLAGS: &[Flag<EvalBuilder>] = &[
+    Flag {
+        name: "--budget-line",
+        takes_value: true,
+        set: set_budget_line,
+    },
     Flag {
         name: "--preserve-failed-checks",
         takes_value: true,
@@ -654,6 +666,7 @@ pub(crate) fn parse_eval(argv: &[String]) -> Result<EvalArgs, String> {
         minimal_workflow: b.minimal_workflow.unwrap_or(false),
         observation_keep: b.observation_keep,
         stall_threshold: b.stall_threshold,
+        budget_requests: b.budget_requests,
         archive_output: b.archive_output.unwrap_or(false),
         shell: b.shell.unwrap_or(false),
         processes: b.processes.unwrap_or(false),
@@ -868,6 +881,7 @@ pub(crate) fn finish_report(args: &EvalArgs, reports: Vec<eval::InstanceReport>)
                     "minimal_workflow": args.minimal_workflow,
                     "observation_keep": args.observation_keep.unwrap_or(agent_loop::RunConfig::default().observation_keep),
                     "stall_threshold": args.stall_threshold.unwrap_or(agent_loop::RunConfig::default().stall_threshold),
+                    "budget_requests": args.budget_requests,
                     "archive_output": args.archive_output,
                     "shell": args.shell,
                     "processes": args.processes,
@@ -1000,6 +1014,8 @@ mod tests {
             "7",
             "--stall-threshold",
             "4",
+            "--budget-line",
+            "requests",
             "--archive-output",
             "on",
             "--shell",
@@ -1021,6 +1037,7 @@ mod tests {
         let cfg = crate::cli::run_config(&run);
         assert!(cfg.preserve_failed_checks && cfg.minimal_workflow);
         assert_eq!((cfg.observation_keep, cfg.stall_threshold), (7, 4));
+        assert!(cfg.budget_requests);
         a.selected_procedure_ids = vec!["rust-tests".into()];
         a.procedure_file_sha256 = vec!["abc123".into()];
         a.report = Some(report_path.clone());
@@ -1033,6 +1050,7 @@ mod tests {
         assert_eq!(rc["minimal_workflow"], true);
         assert_eq!(rc["observation_keep"], 7);
         assert_eq!(rc["stall_threshold"], 4);
+        assert_eq!(rc["budget_requests"], true);
         assert_eq!(rc["archive_output"], true);
         assert_eq!(rc["shell"], true);
         assert_eq!(rc["processes"], true);
@@ -1484,6 +1502,7 @@ mod tests {
             minimal_workflow: false,
             observation_keep: None,
             stall_threshold: None,
+            budget_requests: false,
             archive_output: false,
             shell: false,
             processes: false,
