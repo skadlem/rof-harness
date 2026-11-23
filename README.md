@@ -23,6 +23,25 @@ flowchart LR
 
 **Under evaluation** · Repository evidence search, archived output and bounded completion checks. [Experiments](https://github.com/skadlem/rof-harness/blob/knowledge-vault-trial/docs/harness-experiments.md)
 
+## How context works
+
+1. **Build from the event log.** Reconstruct messages in order and keep tool calls paired with their results.
+2. **Keep recent evidence.** By default, send the last **5** tool results as recorded and retain reasoning from the last **2** assistant messages. Replace older results in the request with their byte count and a **120-character** preview. Trim older reasoning from the request.
+3. **Keep the prefix stable where possible.** Put the workflow and startup file map up front. Include pinned file excerpts while they still match. Attach the live budget to the request tail.
+4. **Recover detail on demand.** Re-open files for current contents. The development build can also page through archived command output or retrieve earlier observations by ID.
+
+Optional compaction summarizes older turns in a separate model call. The event log retains the recorded history.
+
+### Local measurements
+
+| Check | Result |
+|---|---|
+| **Request payload** | **72% fewer cumulative bytes**, **83% smaller final request** over 40 scripted 8 KiB reads. Keeping five results versus all 40. |
+| **Output recovery** | **1 MiB recovered byte-for-byte** with archive retrieval. The collapsed result was **159 bytes**, including its handle. |
+| **Batch rollback** | **16/16** injected failures restored the pre-batch files and preserved the earlier successful edit. |
+
+[Method and exact counts](docs/local-harness-checks.md) · Scripted local provider, development build `97075cf`.
+
 ## Results
 
 | Experiment | Measured result |
