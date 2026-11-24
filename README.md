@@ -1,347 +1,76 @@
-# rof
+# ROF
 
-**A coding-agent harness for autonomous repository work and terminal tasks.**
-The goal is competitive frontier-system benchmark performance, with same-model
-comparisons establishing the harness's contribution. Current measurements below
-are selected-task results, not a frontier-performance claim. The runtime provides
-a write-ahead log, configurable batch rollback, resource budgets, and evaluation
-inside the task's own container.
-
-[Capability experiments](docs/harness-experiments.md) describe the opt-in loop,
-tool and inference mechanisms available for ablation. Their local tests establish
-behaviour. Selected-task retention results are recorded below; general capability
-gains and the other experimental mechanisms remain unestablished.
-
-The [current evaluation protocol](docs/current-benchmark-pilot.md) targets pinned
-TB4.1.0 CPU tasks. The [Harness Leaderboard review](docs/harness-leaderboard-review.md)
-records useful published references and their benchmark, provider and cost limits.
-
-[Next steps and deferred work](docs/research-next-steps.md) records the active
-experiments, accounting policy, and prerequisites for revisiting deferred ideas.
-Read it when continuing this project in a new session.
-The [phased implementation plan](docs/superpowers/plans/2026-11-11-capability-phases.md)
-defines Luna worker ownership, dependencies, interfaces and validation gates.
-Phases 0–4 add paired reporting, Harbor controls, repository evidence, bounded
-public completion checks, historical retrieval and capacity/source checkpoints;
-see the [implementation record](docs/phase-3-5-implementation.md).
-The new lookup comparison stopped after one interrupted control; no matched pair
-or new capability gain is established. Accounting and missing rows are recorded
-in the implementation record.
+**A Rust coding-agent harness built to close the gap between Flash-class and frontier models.**
 
 [![CI](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml/badge.svg?branch=v2-core)](https://github.com/skadlem/rof-harness/actions/workflows/ci.yml)
-![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+![License](https://img.shields.io/badge/license-Apache--2.0-blue)
+&nbsp; [Architecture](docs/architecture.md) · [Experiments](docs/harness-experiments.md) · [Roadmap](docs/research-next-steps.md)
 
-| What it does | How it's judged | What it costs | What it refuses to be |
-|---|---|---|---|
-| Drives an OpenAI-compatible model through six tools against a scratch workdir, or inside the task's live container, until the work is done or a cap trips | The task's native verifier; Harbor supports separate verifier environments | Provider usage receipts; current selected-task costs are recorded in the evaluation protocol | A framework or a hosted service. One binary, one loop by default; MCP servers (`--mcp`) and an agent tree (`--agents`) are opt-in and unmeasured |
+## The harness
 
-The current TB4.1 development slice has three completed `session-window-debug`
-runs with native reward **0**, and three completed `wal-recovery-ordering`
-runs with native rewards **0 / 0 / 1**. These six task-level outcomes are not
-a score for the 63-task CPU suite or a frontier-performance claim. The React
-lead-form control completed with native reward **0**. Its 32/256 transfer
-attempt produced a native reward-1 artifact but was interrupted by a provider
-transport failure with one unreceipted request; it is not a clean comparison.
-The [pilot record](docs/current-benchmark-pilot.md) includes the fixed recipes,
-receipt counts, and conservative cost bounds. The passing WAL
-profile kept 32 tool observations and reasoning text for 256 assistant
-messages. The React pair changes both retention settings together; it does not
-isolate either setting. Production defaults remain unchanged.
-
-![Same cap, more budget: steps climb, passing tests do not](docs/assets/arm-envelope.svg)
-
-*A real result from the rig, not an illustration: our own "more budget will fix it" hypothesis,
-measured across 18 runs and killed. The figure is regenerated from the committed run data by
-`tools/readme_chart.py`; the tables are transcribed from the arm reports.*
-
-> [!WARNING]
-> **Void, re-measured pending.** These 18 runs predate the workspace-fidelity fixes below: the
-> agent was seeded with the task's Docker build context instead of the image's `/app`, so on
-> these cells the verifier tests it was measured against could not move. The mechanism finding
-> (steps climb, tokens climb, no test moves) stands; the capability conclusion needs a re-run on
-> the faithful pipeline.
-
-## Why running inside the container is the whole point
-
-Most harnesses hand the agent a scratch directory and then copy files into a fresh container to
-grade them. That bridge cannot represent *environment state*: a package the agent installed, a
-server it started, a database it migrated are all invisible on the other side. Tasks that require
-them are unwinnable for reasons that have nothing to do with the model.
-
-This harness inverts it. `rof eval --agent --in-container` starts the task's own environment
-container, runs the agent's tools *through* `docker exec` so installs and services persist, and
-then runs the task's verifier in that same live container. On the frozen slice, the env-mutation
-family (the verifier literally asserts "imported a package the agent installed" and "a port is
-listening") went from **structurally 0/8 under file-copy grading to 8/8 in-container**, for
-$0.11 across the eight cells.
-
-### Grading fidelity (five defects found and fixed on 2026-11-06)
-
-Each of these silently changed what was being measured, and each now has a test:
-
-| Defect | Effect before the fix | Fix |
-|---|---|---|
-| Workdir seeded from `<task>/environment` (the Docker **build context**) instead of the image's `/app` | The agent solved a different workspace than the verifier graded. accumulator: heap's verifier md5-checks and compiles `/app/main.cpp`, which the build-context seed never contained — a structurally impossible 0/6 | `reset_workdir_from_image` (`cp -a /app/.`), chowned to the host uid so host-side file tools keep writing |
-| Task tests mounted at `/tests` for the whole run | The agent could read the grader; one row opened `test_outputs.py` before working | Container starts without `/tests`; the frozen snapshot's tests are `docker cp`-ed in immediately before `bash /tests/test.sh`, like harbor's `Verifier.verify()` |
-| No wall clock on the agent phase | Rows ran until the token/step caps: an mcmc row was still working at ~2,100s where harbor stops it at 1,800s | `execute_with_deadline` cancels through the Ctrl-C token (clean `Outcome::Cancelled`, `RunEnd` still emitted, workdir still graded) |
-| `task.toml` timeouts never parsed (`timeout_sec` ≠ `timeout_secs`, and it appears in both `[verifier]` and `[agent]`) | Every cell silently ran on the 1800s default — too tight for video-processing (3600), too loose for query-optimize (900) | Section-aware parsing feeds separate verifier and agent budgets |
-| Seeded `/app` is host-owned while the container is root; empty images have no baseline commit | In-container `git` refused the repo (`dubious ownership`); an empty `/app` (kv-store-grpc) left HEAD unborn, so a row that **resolved 7/7** still carried a `snapshot rollback: … no start HEAD` halt reason | `git config --system --add safe.directory /app` after start; empty trees get an empty baseline commit and `rollback` skips the pathspec restore |
-
-> [!NOTE]
-> The verdict is the **task-written reward file**, with the verifier's exit code only as a
-> fallback. That is not pedantry: an audit found every task's `test.sh` ends with
-> `echo … > reward.txt`, so it *always exits 0*. Exit-code grading reported 25/26 on that arm —
-> the truth was 6/26. Every number below was re-derived from the reward files.
-
-## How a run works
-
-```mermaid
-flowchart TD
-  G["goal + frozen system head<br/>cached prefix"] --> F["prompt fold<br/>collapse · trim · pin"]
-  F --> M[["model reply"]]
-  M -->|"tool calls"| T{"tool gate<br/>policy · grants · syntax veto"}
-  T -->|"view · edit · write"| W1[("workdir<br/>git overlay")]
-  T -->|"exec · test"| W2[("task container<br/>docker exec")]
-  M -->|"plain text"| C{"claim vs evidence"}
-  W1 --> L[("WAL: append, fsync,<br/>then act")]
-  W2 --> L
-  C --> L
-  L --> B{"caps<br/>steps · actions · tokens · $ · wall"}
-  B -->|"budget left"| F
-  B -->|"cap or done"| R["verdict · full patch · metered bill"]
-```
-
-Three properties fall out of that shape, and they are why the loop stays small:
-
-- **The log is the truth, the prompt is a view.** Every request is derived from an append-only
-  log whose tool calls are flushed *before* dispatch. The CLI starts fresh and replaces the
-  previous WAL in a uniquely named archive before starting; crash resume is not implemented.
-- **Failed batches attempt filesystem rollback.** Git restores the batch baseline while earlier
-  batches survive. Installed packages, running services, and ignored files are outside that
-  rollback; proof-gated hunk retention is opt-in.
-- **Budgets bound admission at loop boundaries.** Unknown prices report `null` and leave the dollar
-  cap inactive. Spend is accumulated before conversion to cents and action caps are checked before each
-  dispatch. Provider, tool, and proof commands observe the run deadline; blocking Git operations
-  may extend it. Interrupted provider usage may be unknown.
-
-## What's in the box
-
-14 crates, 26.7k lines. Five layers, no cycles — and the layering is *checked*:
-`tools/readme_chart.py crates` derives every crate-to-crate edge from the manifests and
-fails if one points backwards or a crate is unbanded.
-
-```mermaid
-flowchart BT
-  B0["<b>primitives</b><br/>agent-event 0.5k · agent-log 0.5k · agent-budget 0.5k · tool-core 0.6k · provider-core 0.8k · context 0.7k · snapshot 1.3k<br/><i>vocabulary · durable log · caps · tool and provider traits · prompt fold · git overlay</i>"]
-  B1["<b>evidence</b><br/>trace 0.2k · bets 0.6k<br/><i>ordered sinks · commit proofs and ablation counters</i>"]
-  B2["<b>loop</b><br/>agent-loop 9.0k<br/><i>the loop: request fold, tool dispatch, verdict, termination</i>"]
-  B3["<b>implementations</b><br/>tools-std 3.4k · provider-openai 2.2k<br/><i>six tools behind the policy · chat-completions adapter, retry ladder, pricing</i>"]
-  B4["<b>assembly</b><br/>eval 1.8k · rof 4.7k<br/><i>slices, gates, reports · the CLI driver</i>"]
-  B1 -.-> B0
-  B2 -.-> B0
-  B3 -.-> B0
-  B4 -.-> B0
-  B2 -.-> B1
-  B4 -.-> B1
-  B4 -.-> B2
-  B4 -.-> B3
-```
-
-## What the rig has measured
-
-Every row is one arm — a fixed model, endpoint, budget recipe and grading path. Arms are never
-pooled, because they are not the same measurement.
-
-### On the faithful pipeline (2026-11-06, `deepseek-v4.1-flash` 1017, 300k/60/120)
-
-| Cell | Result | Note |
-|---|---|---|
-| log-summary-date-ranges | **3/3 solved** | ceiling cell |
-| kv-store-grpc | **3/3 solved** | fresh 0/7 cell; ~$0.01 per row; the deliverable runs in the container |
-| hf-model-inference | **2/3 solved** | r1 lost to the task's own 900s agent wall at 28 steps; r2/r3 solved in 309-352s |
-| custom-memory-heap-crash | 0/3, at its 5/6 floor | the crux test fails even with `--exec-policy any` and `gdb`/`valgrind` actually used |
-| video-processing | 0/1, at its 2/5 floor | token-capped at 33 steps |
-| query-optimize | 0/1 | wall-clocked at its 900s agent budget after 12 steps |
-| Steering nudges (`--steer on` vs `off`, 12 rows) | **Killed** | capability identical in all 6 matched pairs; 2.64x tokens per solved task with the nudges on |
-| `--exec-policy any` (3 heap rows) | **Mechanism only** | zero denials, `gdb`/`valgrind` used, crux test still fails |
-| Excluded cells | — | mcmc-sampling-stan (no rstan in-image), protein-assembly (gold 0/1, stochastic), sanitize-git-repo (gold 2/3, trips its own "no other files changed") |
-
-### Before the fidelity fixes (2026-10-12 … 2026-10-19) — mechanism stands, capability void
-
-Every in-container row below ran with the build-context seed, so on heap, mcmc and
-query-optimize the verifier tests it was measured against could not move; log-summary ran a
-generator-reconstructed variant; video-processing was the only cell whose workspace matched its
-image. Read the capability column as unmeasured, not as zero.
-
-| Arm | Result |
+| Layer | What ROF controls |
 |---|---|
-| 26-cell in-container slice, glm-5.3-flash (2026-10-12) | **6 Resolved / 19 Unresolved / 1 infra** — $0.76 total |
-| File-artifact widening, 18 tasks | 4/18 solved, partial credit on 4 more |
-| Env-mutation family (live servers, agent-installed packages) | **8/8** in-container; structurally 0/8 under file-copy grading |
-| Cost per cell, flash-tier | $0.006–$0.13 vs $6–$23 per task for frontier-tier harnesses |
-| Envelope arms: token-cap shape, miss-plus-out accounting, doubled step envelope (18 cells) | **Killed.** Walls move (47 → 60 → 87 → 113 steps, up to 4.8× gross input); capability doesn't — the same named test fails in every arm, and the deepest run loses one |
-| Command-allowlist policy `--exec-policy any` (16 cells) | **Mechanism only.** Denials fall 3–9 per row to 0 at identical spend, and no test moves |
-| Completion checklist in the goal (22 cells) | **Capability-positive, scoped.** Converts a deliverable that works where it was written but not where an evaluator runs it (5/6 → 6/6 solve); changes nothing on cells that fail on accuracy |
-| `/app/…` file-tool parity (12 cells, two binaries) | **Correctness fix.** The largest denial class was agents refused the very files the task names; class eliminated, and the already-solved cell finishes in ~half the steps |
+| **Context** | Build each request from a durable event log. Keep recent observations and reasoning, collapse older output, and retrieve evidence on demand. |
+| **Tools** | Inspect, edit, execute and test against the task workspace. Opt into repository evidence search, archived output retrieval and multi-file edits. |
+| **Loop** | Record tool calls before they run, roll back failed file batches, and enforce step, action, token and wall budgets. Opt into public completion checks or bounded review. |
+| **Evaluation** | Run in the task environment, grade with native verifiers, and record the runtime, configuration and provider usage for each trial. |
 
-<details>
-<summary><b>Receipts: how a cell is graded, and what "not comparable" means here</b></summary>
-
-- **Two estimands, never mixed.** `HarborOracle` (`rof eval --agent`) grades by copying the
-  workdir into a fresh container; `InContainerReward` (`--agent --in-container`) grades in the
-  live container from the task's reward file. Rows carry the label; a table that mixes them
-  would be lying quietly.
-- **Taxonomy.** `Resolved | Unresolved | ErrorNoReport | EmptyPatch | InfraFailure | Ambiguous`.
-  Infra failures are excluded loudly, never scored as capability — and that includes the
-  harness's own failure modes, which are catalogued (root-owned artifacts surviving host-side
-  rollback, verifier network timeouts, transport errors).
-- **Statistics.** Wilson 95% intervals on every rate; a seeded paired bootstrap (no `rand`
-  dependency) for comparisons; `Flaky` and saturation flags rather than silent averaging.
-- **Provenance.** Every report records binary git sha, the resolved budget recipe, the token-cap
-  shape, the exec policy, the apply mode, and the estimand. Agent reports also record the model,
-  nonsecret endpoint, allowlist, output limit, and thinking setting. Per-attempt task digests and
-  live-container image IDs are recorded when available; unsupported task inputs and Harbor-owned
-  images remain unknown.
-- **Frozen slices.** Task ids and `task.toml` digests are pinned in-tree; a re-frozen slice fails
-  `cargo test` before any spend.
-
-</details>
-
-<details>
-<summary><b>Receipts: the five arms behind the table above, and what each one cost</b></summary>
-
-68 graded in-container cells in one session, one model (`deepseek-v4.1-flash`), one budget
-recipe (300k tokens / 60 steps / 120 actions), one binary per arm, every row reward-graded:
-
-```
-arm              cells  verdict
-dphn-cap            18  envelope axis dead: tests flat, 1.79x/3.05x tokens per test passed
-dphn-trust          16  allowlist denials -> 0, tests unchanged
-dphn-goalchk         6  checklist converted 5/6 -> 6/6 (the one capability-positive lever)
-dphn-goalchk2       16  checklist does nothing on accuracy/correctness cells (scope found)
-dphn-apppath        12  /app parity fixed; solved cell needs ~half the steps
+```mermaid
+flowchart LR
+    L[Event log] --> C[Context window] --> M[Model] --> T[Tools] --> L
+    T --> W[Workspace] --> V[Native verifier]
 ```
 
-The point of publishing this table is that four of the five arms are negative. A harness that
-only shows you its wins cannot tell you which of its mechanisms actually work.
+## How context works
 
-What survives the fidelity fixes: the *mechanism* halves (`dphn-trust` drove denials to zero,
-`dphn-apppath` eliminated the `/app` refusal class, `dphn-cap` moved step counts without moving
-tests) and every grading-path result that does not depend on the seeded workspace. What does not
-survive: the capability halves measured on cells whose tests could not move — in practice
-`dphn-goalchk`'s 5/6 → 6/6 (re-measured on the faithful pipeline as the first item of the
-remaining work, since it is the only lever that was ever capability-positive).
+1. **Build from the event log.** Reconstruct messages in order and keep tool calls paired with their results.
+2. **Keep recent evidence.** By default, send the last **5** tool results as recorded and retain reasoning from the last **2** assistant messages. Replace older results in the request with their byte count and a **120-character** preview. Trim older reasoning from the request.
+3. **Keep the prefix stable where possible.** Put the workflow and startup file map up front. Include pinned file excerpts while they still match. Attach the live budget to the request tail.
+4. **Recover detail on demand.** Re-open files for current contents. The development build can also page through archived command output or retrieve earlier observations by ID.
 
-</details>
+Optional compaction summarizes older turns in a separate model call. The event log retains the recorded history.
+
+### Local measurements
+
+| Check | Result |
+|---|---|
+| **Request payload** | **72% fewer cumulative bytes**, **83% smaller final request** over 40 scripted 8 KiB reads. Keeping five results versus all 40. |
+| **Output recovery** | **1 MiB recovered byte-for-byte** with archive retrieval. The collapsed result was **159 bytes**, including its handle. |
+| **Batch rollback** | **16/16** injected failures restored the pre-batch files and preserved the earlier successful edit. |
+
+[Method and exact counts](docs/experiments/2026-11-23-local-harness-checks.md) · Scripted local provider, development build `97075cf`.
+
+## Results
+
+| Experiment | Measured result |
+|---|---|
+| [Terminal-Bench 2.1 Slice A](docs/experiments/2026-11-11-slice-a-faithful.md) | **5/18 solved** with DeepSeek Flash at a 300k gross-token run budget. |
+| [Reasoning retention · Terminal-Bench 4.1](docs/current-benchmark-pilot.md#wal-baseline-and-retention-ablations) | **Fail → pass** on WAL recovery with **19% fewer gross tokens**. One attempt per setting. |
+| [Budget visibility · matched A/B](docs/experiments/2026-11-23-budget-line-ab.md) | **1/4 vs 0/4** across two Slice A tasks. The treatment pass did not repeat. |
+
+**Benchmark target** · Terminal-Bench 4.1 CPU. Matched ROF configurations use the same model and budget. Track native solves and tokens per solve. [Evaluation protocol](docs/research-next-steps.md)
 
 ## Quickstart
 
+Build with Rust and Cargo. Set `DEEPSEEK_API_KEY` in your environment before running.
+
 ```sh
-cargo build -p rof
-export OPENAI_API_KEY=...
+cargo build --release -p rof
 
-# One agent run against a scratch repo; the full diff lands on stdout.
-./target/debug/rof run --goal "fix the failing test" --workdir /tmp/w \
-  --model <id> --endpoint https://api.deepseek.com/v1 \
-  --allow-cmd "cargo test" --budget-steps 20
-
-# Grade an agent inside the task's own container, from the reward file.
-./target/debug/rof eval --agent --in-container --tasks-dir <tb-tasks> \
-  --ids <task> --model <id> --endpoint <url> \
-  --allow-cmd python3 --report out.json
+workdir=$(mktemp -d)
+./target/release/rof run \
+  --goal "Write a short README for this scratch project" \
+  --workdir "$workdir" \
+  --model deepseek-flash --endpoint https://api.deepseek.com \
+  --api-key-env DEEPSEEK_API_KEY --budget-steps 10
 ```
 
-Exit codes say what happened: `0` done, `2` usage, `3` run failure (halt, cancel, provider),
-`4` missing credentials, `5` log failure, `6` snapshot failure, `7` empty input, `8` unmet public completion predicate. `--dump-events`
-writes the complete event log for replay.
+Use a disposable workspace. ROF edits it in place.
 
-## CLI
-
-`rof run` — required: `--goal`, `--workdir`, `--model`.
-
-| Flag | Meaning |
+| Command | Use |
 |---|---|
-| `--endpoint URL` | OpenAI-compatible base URL (env `OPENAI_BASE_URL`) |
-| `--allow-cmd CMD` | allowlisted command, repeatable (binary-prefix match) |
-| `--exec-policy allowlist\|any` | `any` skips the list where the process boundary is elsewhere (in-container exec); recorded in provenance |
-| `--budget-steps/-actions/-tokens N` | caps; any explicit flag lifts the 900s wall to 3600s |
-| `--max-tokens N` | per-request output ceiling |
-| `--steer on\|off` | initiative nudges (unverified-declare hold, half/late action directives, wrap-up). Default **off**: `dphn-steer2` measured them dead — no named-test change on either cell, 2.64x tokens per solved task; the workflow contract + rollback notice ship either way |
-| `--streak-steer on\|off` | experimental one-shot six-read directive; off by default, independent of `--steer` |
-| `--deliverable PATH` | repeatable output file the task names (relative to the workdir, no `..`); if missing at step 15 the crossing is logged (shadow, no behavior change). `rof eval` applies the list to every instance, so use it for single-task invocations; recorded in provenance. Unvalidated |
-| `--deliverable-steer on\|off` | also deliver one "create it now" directive for missing `--deliverable` paths; off by default, unvalidated |
-| `--reasoning-effort none\|low\|high\|xhigh\|max` | Optional per-request effort; endpoint-specific values. [Current DeepSeek docs](https://api-docs.deepseek.com/guides/thinking_mode/) support low/high/max and default to high; the earlier no-effect probe was historical |
-| `--context-file PATH` | pinned file context, repeatable |
-| `--dump-events PATH` | full event log, one run one dump |
-| `--log-path` / `--no-log` | WAL location (defaults to `<workdir>/.rof-events.jsonl`) |
-| `--resume LOG` | continue from an existing log: user/assistant/tool history is rebuilt and new items append to it; budgets start fresh, counters, verify state, snapshots and directives are not restored; a tool call with no result gets a synthetic "outcome unknown" result. Conflicts with `--log-path`, `--no-log`, `--review on` |
-| `--stream on\|off` | print assistant text as it is generated (SSE, display only; a provider retry may repeat text); `rof chat` prints to stdout, `rof run` to stderr; off by default, not exercised against a live endpoint |
-| `--mcp 'CMD ARGS'` | repeatable; spawn an MCP stdio server (argv split on whitespace, no shell) and expose its tools as `mcp__<name>`; requires `--exec-policy any`; the server inherits this process environment; tested against a scripted server and one live run with `paper-search-mcp` (2026-11-13) |
-| `--agents FILE` | stage-1 agent tree: a JSON file names roles, their tools and `spawn` edges; roles with an outgoing edge get `spawn`/`wait`, children run read-only in the same workdir with their own log `<log>.<id>`. The `child_budget_tokens` pool is carved out of `--budget-tokens` (required); per-child tokens print on stderr. `worktree` workspaces and `message` edges are rejected at load; conflicts with `--review on`; `rof eval` does not take it; off by default, unmeasured |
-| `--incentives base\|contract\|full` | prompt scaffold level |
-| `--keep-thinking`, `--thinking-keep N`, `--collapse-hysteresis N` | transcript-shape knobs |
-| `--pass-env NAME`, `--header NAME:VALUE`, `--api-key-env NAME` | provider plumbing |
+| `rof run` | Run an agent on a goal and emit its patch. |
+| `rof chat` | Work interactively in a workspace. |
+| `rof eval` | Run repeatable task evaluations. [Harbor adapter](tools/harbor_rof.py) |
 
-`rof chat` takes the same flags with `--goal` optional (it is the first message): one stdin line per
-message, history carries over, the budget applies per message, `/exit` or EOF ends with exit 0.
-
-`rof eval` adds `--tasks-dir DIR` (required), `--ids`, `--out-dir`, `--report`, `--winnability-only`,
-`--lenient-apply`, `--agent`, `--in-container`. Without `--agent` it is a scaffold, not a grader.
-Agent budgets default to 300k tokens / 60 steps / 120 actions; the agent phase also stops at the
-task's own `[agent] timeout_sec`, which harbor enforces and which is now parsed per task.
-
-<details>
-<summary><b>Flags that exist but are off, and why</b></summary>
-
-- `--compaction FRAC` — context checkpoints. Landed off; the registered validation arm turned out
-  to be inert by construction (the trigger keys on per-request prompt size while the budget is
-  cumulative billed tokens), so it awaits a redesign rather than a run.
-- `--bets` / `--proof-cmd` — proof-gated batch commits and per-hunk savepoints. Zero gate
-  interventions across six measured runs; available, unexercised, flagged.
-  Incremental proof rejects a truncated evidence patch before modifying the tree.
-- `--budget-shape miss-plus-out` — charges `(input − cache_read) + output` against the token cap.
-  Mechanism confirmed, capability unconverted; a different estimand from `gross`, so the two never
-  share a table.
-
-</details>
-
-## Boundaries
-
-**Workdir contract.** `rof run` mutates `--workdir` in place. It refuses exactly four cases
-(exit 2): the filesystem root, `$HOME`, the harness checkout itself, and a repo with uncommitted
-changes unless `--allow-dirty-workdir` is passed. Everything else runs under the operator's
-responsibility.
-
-**Security posture, stated plainly.**
-
-- File tools resolve `/app/…` to the workdir root and check path containment. Secrets denials
-  apply to requested and resolved paths and to recursive search descendants. They are not a
-  sandbox for `exec`.
-- `exec`/`test` run allowlisted commands, but allowlisting is hygiene, not isolation: permitting
-  `cargo test` or `sh` is arbitrary host code execution. `--exec-policy any` removes even that
-  hygiene, for callers whose boundary is a container; the choice is recorded in every report.
-- OS-level isolation — container, namespaces, network policy, memory caps — is the operator's job.
-  The tools build no sandbox.
-- Agent-spawned children run at `nice 19` so unattended sweeps yield to interactive work.
-
-## Build, test, license
-
-```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all -- --check
-```
-
-CI runs all three on every push, plus a stale-reference grep over tracked files. The badge count
-above is what `cargo test --workspace` reports today. Apache-2.0 — see [LICENSE](LICENSE).
-
-<details>
-<summary><b>Docs</b></summary>
-
-- [`docs/architecture.md`](docs/architecture.md) — crate responsibilities and the loop's invariants
-- [`docs/decisions.md`](docs/decisions.md) — decision log, with the measurement behind each entry
-- [`docs/roadmap.md`](docs/roadmap.md) — what's next, spend-gated
-- [`docs/threat-model.md`](docs/threat-model.md) — what the tools do and do not enforce
-- `NOTES_FOR_PI.md` — current handoff: where the project stands, what is void, what is next
-
-</details>
+[Full documentation index](docs/INDEX.md) · [License](LICENSE)

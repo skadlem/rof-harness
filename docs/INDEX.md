@@ -65,6 +65,9 @@ Update this file in the same commit as adding, superseding or voiding a note.
 - [slice-a-misses-rerun](experiments/2026-11-13-slice-a-misses-rerun.md) — 2 of 13 misses solve on the fixed binary; one is the earlier infra fix, one is variance, none attributable to the exec fixes · **record**
 - [failed-trace-audit](experiments/2026-11-14-failed-trace-audit.md) — 47 of 52 failures are token deaths, 2 claim verification; 20% of requests are a lone helper-script write that the eval prompt instructs · **record**
 - [miss-diagnosis](experiments/2026-11-15-miss-diagnosis.md) — the three stable misses reach the answer and run out before writing it; the model paces by steps and misreads the token budget line · **record**
+- [budget-line-ab](experiments/2026-11-23-budget-line-ab.md) — requests 1/4, legacy 0/4 on two Slice A tasks, with one pass that did not repeat · **record**
+- [no-evidence-census](experiments/2026-11-24-no-evidence-census.md) — 286 logged runs: the output cut drops 21% of exit verdicts, 1.5% of replies waste 8,000 reasoning tokens, rollback saves little; time, spend and repeat caps never bind · **record**
+- [local-harness-checks](experiments/2026-11-23-local-harness-checks.md) — request payload, archive recovery and rollback measurements · **record**
 
 ## Reviews (independent verdicts)
 

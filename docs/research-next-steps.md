@@ -11,14 +11,18 @@ The [phase 0–2 record](phase-0-2-implementation.md) and
 [phase 3–5 record](phase-3-5-implementation.md) distinguish implementation,
 chosen fixtures, historical outcomes and current campaign evidence.
 
-## Latest state (2026-11-12) — read this first
+## Latest state (updated 2026-11-23)
 
 The short session entry point is [`SESSION-NEXT.md`](../SESSION-NEXT.md) at the repo
 root: current state, decisions, next task and where to look.
 
-The Slice A session postdates everything below. Its plan and status table are in
-[next-after-slice-a](superpowers/plans/2026-11-11-next-after-slice-a.md); where the two
-disagree, that file wins.
+The recommended next iteration is a frozen 12-task OpenThoughts-TBLite slice,
+pending owner direction. The root handoff records the partial 4.1 CPU oracle
+preflight and the storage/build failures. No paid baseline ran on either slice.
+
+The [Slice A plan](superpowers/plans/2026-11-11-next-after-slice-a.md) records the
+initial results and decisions. The updates below and the root handoff include
+the later reruns and budget-line A/B.
 
 - **Baseline:** 5/18 on the faithful Slice A slice (`crates/eval/slices/tb-slice-a.json`, frozen recipe 300k/60/120).
   Published frontier expectation on the same tasks is 12.08/18; the gap is not
@@ -82,11 +86,13 @@ disagree, that file wins.
   out before writing the file. It paces by the step counter (25 of 27 runs cite steps, 11
   tokens) and reads the `N/M` token figure both ways. The batch rollback notice fires on
   21% of tool batches. Of three candidate changes, the first is built: `--budget-line
-  requests` (off by default, unmeasured) prints replies left at the last reply's cost. It is wired into
+  requests` (off by default) prints replies left at the last reply's cost. It is wired into
   `rof run`, `rof eval` (recorded as `run_config.budget_requests` in the report) and the
-  Harbor adapter (`budget_line`, recorded in the job's `config.json` kwargs). A paid arm
-  needs a binary built from a commit that contains it: older binaries reject the flag,
-  and a build from an uncommitted tree records a `-dirty` revision.
+  Harbor adapter (`budget_line`, recorded in the job's `config.json` kwargs).
+  **Measured (2026-11-23):** the [matched A/B](experiments/2026-11-23-budget-line-ab.md)
+  on two other Slice A tasks gave 1/4 treatment solves and 0/4 control solves.
+  The one pass did not repeat. The relative cost guardrail is undefined, so the
+  flag remains opt-in.
   Rollback notice scope and write-and-run batching are unbuilt and need the owner's design
   agreement. Each needs a paid arm on tasks other than these three. See
   [miss-diagnosis](experiments/2026-11-15-miss-diagnosis.md) and
@@ -178,7 +184,9 @@ single-field treatment changes to the fixed control options:
 | Preserve executed failing checks | `preserve_failed_checks: true` |
 | Archived output retrieval | `archive_output: true` |
 | Shell composition | `shell: true` |
-| Response allocation, if traces show truncation | `max_tokens: 16000` |
+| Response allocation (1.5% of logged replies spent all 8,000 on reasoning; see `experiments/2026-11-24-no-evidence-census.md`) | `max_tokens: 32768` |
+| Output shape: status first, head and tail, partial on timeout | `exec_output: "head-tail"` |
+| Rollback only on tool errors, notice only when files changed | `rollback_scope: "errors"` |
 
 These values are chosen experimental settings; paired native task outcomes
 will determine whether they help. Select an experiment within verified remaining headroom; this table
