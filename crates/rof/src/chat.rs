@@ -105,6 +105,7 @@ pub(crate) async fn run_chat<P: LlmClient>(
             provider,
             args,
             &policy,
+            &cancel,
             agent_loop::run(
                 &mut state,
                 Run {
@@ -265,6 +266,8 @@ mod tests {
             message: serde_json::json!({"content": text, "tool_calls": calls, "thinking": null}),
             stop_reason: "stop".into(),
             interrupted: false,
+            raw_stop_reason: None,
+            attempts: None,
         };
         let input = |id: &str, text: &str| ItemKind::Input {
             input_id: id.into(),

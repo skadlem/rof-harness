@@ -13,7 +13,8 @@
 //!
 //! The path policy covers `view`/`edit`/`write` only: root-anchored,
 //! symlink-safe, secrets-denied file access. `exec` and `test` run
-//! allowlisted host commands with a cleared environment, null stdin, and a
+//! allowlisted host commands with a cleared environment (MCP stdio servers
+//! deliberately inherit the parent process environment), null stdin, and a
 //! bounded pipe read — but allowlisting is not isolation. Permitting
 //! `cargo test`, `sh`, or any test runner hands the agent arbitrary code
 //! execution on the host: a hostile command can still reach the network,
@@ -1500,5 +1501,57 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Ok(Err(_))));
+    }
+
+    #[tokio::test]
+    async fn write_creates_missing_parent_under_app_alias() {
+        let root = tmp_root();
+        let r = reg(policy(&root));
+        let out = run(
+            &r,
+            "write",
+            json!({"path": "/app/sub/nested/out.txt", "content": "ok\n"}),
+        )
+        .await
+        .unwrap();
+        assert!(out.success, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("sub/nested/out.txt")).unwrap(),
+            "ok\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn multi_edit_replaces_readonly_file_in_writable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp_root();
+        let file = root.join("ro.txt");
+        std::fs::write(&file, "before\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let p = policy(&root);
+        let mut reg = Registry::new(Arc::new(GrantGate::new(std::collections::HashMap::from([
+            ("agent".to_string(), vec!["multi_edit".to_string()]),
+        ]))));
+        for t in experimental_tools(
+            p,
+            ExperimentalToolsConfig {
+                multi_edit: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        {
+            reg.register(t);
+        }
+        let out = run(
+            &reg,
+            "multi_edit",
+            json!({"edits": [{"path": "ro.txt", "search": "before", "replace": "after"}]}),
+        )
+        .await
+        .unwrap();
+        assert!(out.success, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "after\n");
     }
 }

@@ -51,6 +51,10 @@ pub enum ItemKind {
         message: serde_json::Value,
         stop_reason: String,
         interrupted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_stop_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempts: Option<u64>,
     },
     Attempt {
         error: String,

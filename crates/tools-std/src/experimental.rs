@@ -873,10 +873,10 @@ impl Tool for MultiEdit {
             staged.push((p, old, new, h.path));
         }
         for (written, (p, _, new, _)) in staged.iter().enumerate() {
-            if let Err(e) = std::fs::write(p, new) {
+            if let Err(e) = crate::common::overwrite(p, new.as_bytes()) {
                 let mut restore_errors = Vec::new();
                 for (rp, old, _, _) in staged[..=written].iter().rev() {
-                    if let Err(restore) = std::fs::write(rp, old) {
+                    if let Err(restore) = crate::common::overwrite(rp, old.as_bytes()) {
                         restore_errors.push(format!("{}: {restore}", rp.display()));
                     }
                 }
@@ -1101,10 +1101,12 @@ impl Tool for ProcessTool {
             "stop" => {
                 let id =
                     a.id.ok_or_else(|| ToolError::Failed("id required".into()))?;
-                let mut sessions = self.state.sessions.lock().await;
-                let mut s = sessions
-                    .remove(&id)
-                    .ok_or_else(|| ToolError::Denied("unknown process id".into()))?;
+                let mut s = {
+                    let mut sessions = self.state.sessions.lock().await;
+                    sessions
+                        .remove(&id)
+                        .ok_or_else(|| ToolError::Denied("unknown process id".into()))?
+                };
                 crate::runner::kill_tree(&mut s.child).await;
                 if cancel.is_cancelled() {
                     return Err(ToolError::Failed(

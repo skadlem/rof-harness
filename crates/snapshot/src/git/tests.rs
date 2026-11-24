@@ -714,3 +714,14 @@ fn full_patch_carries_new_file_contents() {
         "since-marker-3b77\n"
     );
 }
+
+#[test]
+fn ensure_succeeds_with_leftover_bare_git_dir() {
+    let dir = scratch("bare-git-leftover");
+    std::fs::create_dir(dir.join(".git")).unwrap();
+    std::fs::write(dir.join("a.txt"), "hello\n").unwrap();
+    assert_eq!(workdir_state(&dir), WorkdirState::NotARepo);
+    let tree = TreeService::new(&dir);
+    tree.ensure().unwrap();
+    assert_eq!(workdir_state(&dir), WorkdirState::Clean);
+}

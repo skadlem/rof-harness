@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use tool_core::{Invocation, Tool, ToolDefinition, ToolError, ToolOutcome, TOOL_WRITE};
 
 use crate::common::{parse_args, path_err, EDIT_FILE_CAP, EDIT_REPLACE_CAP};
-use crate::policy::{resolve_under, symlink_safe, Policy, ToolPathError};
+use crate::policy::{resolve_under, strip_app_alias, symlink_safe, Policy, ToolPathError};
 
 pub struct WriteTool {
     policy: Arc<Policy>,
@@ -37,7 +37,7 @@ fn write_schema() -> Value {
 /// points out of the root.
 fn create_parent_dirs(root: &Path, path: &str) -> Result<(), ToolError> {
     let mut cur = root.to_path_buf();
-    for c in Path::new(path)
+    for c in Path::new(strip_app_alias(path))
         .parent()
         .unwrap_or(Path::new(""))
         .components()

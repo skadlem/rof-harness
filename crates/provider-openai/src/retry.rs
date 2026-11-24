@@ -32,7 +32,10 @@ impl WireKnobs {
 }
 
 /// Ceiling the overflow ladder may raise `max_tokens` to. Chosen (no anchor):
-/// bounds one ladder's spend; the ladder unit test pins the bound.
+/// bounds one ladder's spend; the ladder unit test pins the bound. Note: when
+/// a caller starts at `max_tokens >= MAX_TOKENS_CEILING` with `thinking_off`
+/// unset (e.g. Harbor `--keep-thinking --max-tokens 32768`), `apply_ladder`
+/// has zero raise rungs and returns `false` on the first truncation.
 pub(crate) const MAX_TOKENS_CEILING: usize = 32_768;
 
 /// Cheapest-first reshape for one truncated (`finish_reason=length`) attempt.

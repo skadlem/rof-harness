@@ -41,6 +41,8 @@ impl LoopState {
                 message: value,
                 stop_reason: stop_label.to_owned(),
                 interrupted: false,
+                raw_stop_reason: None,
+                attempts: None,
             },
         );
     }

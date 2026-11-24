@@ -876,7 +876,26 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             .await?;
         }
         let msg_content = resp.message.content.clone();
+        let raw_stop = resp.raw_stop_reason;
+        let attempts = (resp.attempts > 0).then_some(resp.attempts);
+        let items_before = self.state.items.len();
         let outcome = self.state.step_claim(resp.message, resp.stop, &self.cfg);
+        if raw_stop.is_some() || attempts.is_some() {
+            if let Some(item) = self.state.items[items_before..]
+                .iter_mut()
+                .find(|i| matches!(i.kind, ItemKind::Assistant { .. }))
+            {
+                if let ItemKind::Assistant {
+                    raw_stop_reason,
+                    attempts: logged_attempts,
+                    ..
+                } = &mut item.kind
+                {
+                    *raw_stop_reason = raw_stop;
+                    *logged_attempts = attempts;
+                }
+            }
+        }
         self.sync().await?;
         emit_message_frames(self.state, &msg_content, Some(&billed), self.emitter);
         match outcome {

@@ -377,6 +377,8 @@ fn assistant_corrupt_row_is_explicit_marker_not_raw_json() {
                 message: bad,
                 stop_reason: "Stop".into(),
                 interrupted: false,
+                raw_stop_reason: None,
+                attempts: None,
             },
         });
         let msgs = s.derived_messages(&RunConfig::default());

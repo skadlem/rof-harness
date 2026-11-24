@@ -390,7 +390,8 @@ impl TreeService {
     }
 
     fn is_repo(&self) -> bool {
-        self.root.join(".git").exists()
+        let g = self.root.join(".git");
+        g.exists() && (!g.is_dir() || g.join("HEAD").exists())
     }
 
     fn head_unborn(&self) -> Result<bool> {

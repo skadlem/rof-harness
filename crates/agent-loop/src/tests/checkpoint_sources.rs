@@ -17,6 +17,8 @@ fn checkpoint_state() -> LoopState {
             .unwrap(),
             stop_reason: "ToolUse".into(),
             interrupted: false,
+            raw_stop_reason: None,
+            attempts: None,
         },
         ItemKind::ToolResult {
             call_id: "read".into(),

@@ -548,6 +548,8 @@ anchor, as the code says.
   retried although DeepSeek documents both as "modify your request"; zero 400/422 rows
   exist in the banked set (only 402 and 504 halt codes), so it stays recorded with its
   one-line fix, not implemented.
+  > Now (implemented 2026-11-12): plain 400 and 422 classify as `ErrorClass::Fatal` in
+  > `crates/provider-core/src/errors.rs` and are no longer retried.
 - **The agent phase is now bounded by the task's `[agent] timeout_sec`, like harbor
   (2026-11-06, third in-container fidelity gap).** `inst.timeout_secs` bounded only the
   verifier and the harbor grade run; the agent leg had no wall clock, so it ran until

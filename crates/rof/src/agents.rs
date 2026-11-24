@@ -383,6 +383,7 @@ pub(crate) async fn with_children<P: LlmClient, F: Future>(
     provider: &P,
     args: &Args,
     policy: &Arc<tools_std::Policy>,
+    cancel: &CancellationToken,
     run: F,
 ) -> F::Output {
     let Some(tree) = tree else { return run.await };
@@ -396,6 +397,7 @@ pub(crate) async fn with_children<P: LlmClient, F: Future>(
                 provider,
                 args,
                 policy.clone(),
+                cancel.child_token(),
                 req,
             )));
         }
@@ -430,6 +432,7 @@ async fn run_child<P: LlmClient>(
     provider: &P,
     args: &Args,
     policy: Arc<tools_std::Policy>,
+    cancel: CancellationToken,
     req: Req,
 ) {
     let role = &shared.cfg.roles[&req.role];
@@ -478,7 +481,7 @@ async fn run_child<P: LlmClient>(
             cfg,
         },
         vec![Input::User(input)],
-        &CancellationToken::new(),
+        &cancel,
     )
     .await;
     let text = match outcome {

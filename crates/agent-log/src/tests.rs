@@ -211,3 +211,35 @@ fn writer_round_trip() {
     assert!(matches!(items[0].kind, ItemKind::Header { .. }));
     std::fs::remove_file(&p).ok();
 }
+
+#[test]
+fn assistant_optional_metadata_is_backward_compatible() {
+    let legacy = r#"{"kind":"Assistant","message":{"content":"ok"},"stop_reason":"Stop","interrupted":false}"#;
+    let parsed: ItemKind = serde_json::from_str(legacy).unwrap();
+    assert!(matches!(
+        parsed,
+        ItemKind::Assistant {
+            raw_stop_reason: None,
+            attempts: None,
+            ..
+        }
+    ));
+    let with_meta = ItemKind::Assistant {
+        message: serde_json::json!({"content": "ok"}),
+        stop_reason: "Stop".into(),
+        interrupted: false,
+        raw_stop_reason: Some("stop".into()),
+        attempts: Some(2),
+    };
+    let encoded = serde_json::to_string(&with_meta).unwrap();
+    assert!(encoded.contains("\"raw_stop_reason\":\"stop\"") && encoded.contains("\"attempts\":2"));
+    let roundtrip: ItemKind = serde_json::from_str(&encoded).unwrap();
+    assert!(matches!(
+        roundtrip,
+        ItemKind::Assistant {
+            raw_stop_reason: Some(ref r),
+            attempts: Some(2),
+            ..
+        } if r == "stop"
+    ));
+}

@@ -692,6 +692,7 @@ async fn execute_with_deadline<P: LlmClient>(
         provider,
         args,
         &policy,
+        &cancel,
         agent_loop::run(
             &mut state,
             Run {

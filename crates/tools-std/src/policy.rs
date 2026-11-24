@@ -205,6 +205,12 @@ fn under(root: &Path, cand: &Path) -> bool {
 /// `MissingParent` (recoverable: "create it first, re-issue"), never a denial.
 /// Same-inode hardlinks with a clean spelling are not detectable by path
 /// checks; the write TOCTOU note in `write.rs` applies here too.
+/// Strip the in-container `/app/` workspace prefix so host-side and container
+/// callers resolve `/app/...` consistently.
+pub(crate) fn strip_app_alias(path: &str) -> &str {
+    path.strip_prefix("/app/").unwrap_or(path)
+}
+
 pub fn resolve_under(
     root: &Path,
     path: &str,
@@ -220,7 +226,7 @@ pub fn resolve_under(
     // they were told to edit. Stripping the prefix is strictly additive:
     // absolute `/app/...` paths were always refused, so no working call
     // changes, and `under()` still catches `..` traversal out of the root.
-    let path = path.strip_prefix("/app/").unwrap_or(path);
+    let path = strip_app_alias(path);
     let p = root.join(path);
     if !under(root, &p) {
         return Err(ToolPathError::Denied("path escapes tool root".to_string()));
