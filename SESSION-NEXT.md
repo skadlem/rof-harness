@@ -1,56 +1,78 @@
 # Session handoff · 2026-11-24
 
-## 2026-11-24 update (uncommitted)
+## Pick up here (2026-11-24): run the TB4.1 option screen
 
-- Harness audit: https://claude.ai/artifact/7SUFD4vh2TaUC4DskWZeAG (109 choices
-  with backing labels; full inventories in `target/no-evidence-census-20261124/`).
-- [No-evidence census](docs/experiments/2026-11-24-no-evidence-census.md): zero
-  model calls over 286 logged runs plus a nine-harness source survey.
-- Built, opt-in, unmeasured on tasks: `--exec-output head-tail` (Harbor
-  `exec_output`), `--rollback-scope errors` (Harbor `rollback_scope`). Prepared
-  arm `max_tokens: 32768` via the existing option. Default-on correctness fixes:
-  exec/test descriptions drop "allowlisted" under `--exec-policy any`; adapter
-  grades only exits 0/3/8, withholds usage after usage-unknown errors, and
-  versions trials by the binary hash. Contract text under hysteresis fixed.
-- Doc drift fixed in architecture, threat-model and harness-experiments notes.
-- Benchmark choice: research found TB 4.1.0 CPU (2026-11-03) the only recent,
-  cheap option with a leaderboard; OpenThoughts-TBLite dates to 2026-02-20 and
-  fails the owner's September cutoff. Owner budget for a campaign: under $10
-  (300k-cap run is about $0.083 at list price).
-- Disk is at 99%: `target/debug/incremental` was cleared; build with
-  `CARGO_INCREMENTAL=0`.
+The plan is [tb41-option-screen](docs/superpowers/plans/2026-11-24-tb41-option-screen.md).
+It covers 4 tasks × 4 arms × 3 reps, 48 runs, about $4 at price-book rates with
+a hard stop at $8. The arms are control, `exec_output: "head-tail"`,
+`rollback_scope: "errors"` and `max_tokens: 32768`.
 
-## Pick up here (2026-11-23)
+1. **Spend approval is still pending.** The owner chose to start the run in a
+   new session. Before any paid call, confirm the scope and the $8 cap, and
+   read the live provider balance.
+2. **Build the runtime from a clean worktree** at `a43c35e` or later. `goose/`
+   is untracked in the main checkout and would mark the build `-dirty`. Record
+   the binary's SHA-256 and the adapter's `runtime-bundle-<sha>` version.
+3. **Use the same Harbor setup as before.** Earlier runs used the
+   `harbor-rootlogfix` overlay and `PYTHONPATH`, not vanilla Harbor (see
+   `docs/current-benchmark-pilot.md`, "Oracle gate"). For a working
+   `harbor run -c <config>` caller, see
+   `target/tb41-cpu-baseline-20261123/oracle.py`. Use the task trees in
+   `source/tasks/`.
+4. **Run one control trial on `heat-pump-warranty` first.** Check:
+   - the version string,
+   - the exit-code grading (0/3/8),
+   - the reward file,
+   - per-request usage.
 
-The owner wants credible numbers quickly that show how much ROF's context,
-tools and loop can close the Flash-to-frontier gap. The recommended next
-experiment is a **frozen 12-task OpenThoughts-TBLite slice**. That recommendation
-has not been adopted or started. Keep Terminal-Bench 4.1 CPU for later validation.
+   Then run the 48 runs, one trial at a time, rotating arm order across reps.
+5. **Write up the result.** Raw jobs go in `target/tb41-option-screen-<date>/`.
+   Write a result note in `docs/experiments/` and add it to `docs/INDEX.md`.
+   Update the arm table in `docs/research-next-steps.md`.
 
-1. Pin the TBLite release and select 12 tasks before seeing outcomes. Include a
-   range of difficulty and expected control solves. Choose light CPU images and
-   preflight four tasks with native oracles first. Record cold setup time, verifier
-   time and disk use separately.
-2. For an approved paid comparison, use DeepSeek Flash, a starting budget of
-   100k gross tokens and 20 steps per run, and stock ROF versus one context
-   change. Freeze the same model, endpoint, reasoning effort, and caps for both
-   arms. Report native solves, gained and lost solves, tokens per solve, and
-   wall time. The promotion guardrail remains 1.3× tokens per solve.
-3. The previous spend approval covered the completed budget-line A/B. Confirm
-   the scope and cap of a new paid run and read the live balance. The separate
-   lookup campaign remains stopped.
+**Disk (fixed 2026-11-24):**
+- Docker and containerd storage now live on the `models` partition
+  (`/mnt/models`, 35 GB free).
+- They are bind-mounted onto `/var/lib/docker` and `/var/lib/containerd` via
+  `/etc/fstab`. A systemd `RequiresMountsFor` drop-in keeps the daemons from
+  starting before the mounts are up.
+- `/` has 12 GB free.
+- Build with `CARGO_INCREMENTAL=0` to keep `target/` small.
 
-For delegation when needed in this session, the owner requested OpenCode HY4
-Flash Free and Pi DeepSeek Flash at the highest available reasoning effort.
-The delegation catalog exposed both harnesses. The exact model entries and
-effort options were not confirmed. Check before delegating.
+## Done 2026-11-24
+
+- [Harness audit](https://claude.ai/artifact/7SUFD4vh2TaUC4DskWZeAG) covers 109
+  choices, each with a backing label. The full inventories are in
+  `target/no-evidence-census-20261124/`.
+- The [no-evidence census](docs/experiments/2026-11-24-no-evidence-census.md)
+  used zero model calls. It covers 286 logged runs plus a source survey of nine
+  harnesses.
+- Commit `dbf52b6` adds two opt-in options, neither measured on benchmark tasks:
+  - `--exec-output head-tail`
+  - `--rollback-scope errors`
+
+  It also turns on these correctness fixes by default:
+  - Exec and test descriptions drop "allowlisted" under `any`.
+  - The adapter grades only exits 0, 3 and 8.
+  - The adapter withholds usage after usage-unknown errors.
+  - The adapter versions trials by the binary hash.
+  - The contract text under hysteresis is fixed.
+- Commit `a43c35e` adds the docs, the census, the 2026-11-23 notes and the
+  README.
+- **Benchmark choice: TB 4.1.0 CPU (2026-11-03).** It is the only recent, cheap
+  option with a leaderboard. The 2026-11-23 OpenThoughts-TBLite recommendation
+  is dropped, because TBLite dates to 2026-02-20 and fails the owner's
+  September cutoff.
+- **Owner budget:** under $10 for this campaign.
+
+For delegation, the owner allows OpenCode HY4 Flash Free, Pi DeepSeek Flash and
+Haiku agents through T3.
 
 ## Repository and published work
 
-- Active checkout is `knowledge-vault-trial` at `97075cf`, five commits ahead
-  of its local upstream reference `6eaefaa`. Local edits include the README,
-  this handoff, the research handoff and evidence notes/index. Check
-  `git status --short --branch` before editing or committing.
+- Active checkout is `knowledge-vault-trial`, eight commits ahead of its local
+  upstream reference `6eaefaa`. The only untracked entry is `goose/`, a separate
+  repository. Check `git status --short --branch` before editing or committing.
 - Verified remote `master` at `0fb593f`. Its README leads with context,
   tooling and the loop, with container execution described as evaluation
   infrastructure. The docs-only commits are `a540b0b` and `0fb593f`.

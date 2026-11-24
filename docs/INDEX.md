@@ -20,6 +20,7 @@ Update this file in the same commit as adding, superseding or voiding a note.
 - [envelope-phases](superpowers/plans/2026-11-11-envelope-phases.md) — response to the architecture review · **proposed, unstarted**
 - [next-after-slice-a](superpowers/plans/2026-11-11-next-after-slice-a.md) — state after Slice A: 5/18, $1.56 left · **active** (2026-11-12)
 - [output-fidelity](superpowers/plans/2026-11-11-output-fidelity.md) — archive access + Harbor controls · **record** (done)
+- [tb41-option-screen](superpowers/plans/2026-11-24-tb41-option-screen.md) — three single-field arms (head-tail output, errors-only rollback, 32k responses) vs control on four TB4.1 CPU tasks, ~$4 · **proposed, unstarted**
 - [roadmap](roadmap.md) — ordered, spend-gated plan · **active**
 - [research-next-steps](research-next-steps.md) — handoff + deferred-work register · **active**
 - [harness-capability-plan](harness-capability-plan.md) — the twelve 2026-11-07 proposals · **record**
