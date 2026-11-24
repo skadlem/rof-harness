@@ -99,22 +99,21 @@ pub fn estimate_tokens(messages: &[CompactMessage], anchor: Option<&UsageAnchor>
     anchor.map(|a| a.input_tokens).unwrap_or(0) + chars_to_tokens(chars)
 }
 
-/// Trigger above the configured context window's usable input capacity.
-/// `capacity` must equal `context_capacity_tokens - output_reserve_tokens`;
-/// run-wide token allowance is not a context window and must not be passed.
-pub fn compaction_due(estimate: u64, capacity: u64, cfg: &CompactionConfig) -> bool {
+/// Trigger above the configured context window's usable input capacity
+/// (`context_capacity_tokens - output_reserve_tokens`).
+pub fn compaction_due(estimate: u64, cfg: &CompactionConfig) -> bool {
     let Some(total) = cfg.context_capacity_tokens else {
         return false;
     };
     if !cfg.enabled
         || total == 0
         || cfg.output_reserve_tokens >= total
-        || capacity != total - cfg.output_reserve_tokens
         || !cfg.frac.is_finite()
         || !(0.0..=1.0).contains(&cfg.frac)
     {
         return false;
     }
+    let capacity = total.saturating_sub(cfg.output_reserve_tokens);
     (estimate as f64) > capacity as f64 * cfg.frac
 }
 
@@ -236,14 +235,14 @@ pub fn render_checkpoint(entries: &[CheckpointEntry]) -> String {
 }
 
 fn truncate_for_summary(text: &str) -> String {
-    let total = text.chars().count();
-    if total <= SUMMARY_TOOL_CAP {
+    let head = crate::cut_chars(text, SUMMARY_TOOL_CAP);
+    let tail = &text[head.len()..];
+    if tail.is_empty() {
         return text.to_string();
     }
-    let head: String = text.chars().take(SUMMARY_TOOL_CAP).collect();
     format!(
         "{head}\n\n[... {} more characters truncated]",
-        total - SUMMARY_TOOL_CAP
+        tail.chars().count()
     )
 }
 

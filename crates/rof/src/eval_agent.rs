@@ -11,11 +11,10 @@ use std::time::{Duration, Instant};
 use agent_event::AgentEvent;
 use provider_openai::OpenAiCompat;
 
-use crate::cli::{endpoint_profile, Args};
+use crate::build_provider;
+use crate::cli::Args;
 use crate::dump::finalize_dump;
 use crate::eval_cmd::{apply_mode_for, EvalArgs};
-use crate::exit::EXIT_NO_CREDENTIALS;
-use crate::missing_credentials_message;
 use crate::workdir::validate_workdir;
 
 /// Goal rules tail, ported verbatim from the driver's `mk_goal` (plain
@@ -160,11 +159,7 @@ fn task_digest(root: &Path) -> std::io::Result<String> {
     }
     let mut h = ring::digest::Context::new(&ring::digest::SHA256);
     walk(root, &mut h)?;
-    Ok(h.finish()
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    Ok(crate::procedures::sha256_hex(h.finish()))
 }
 
 /// Fresh workdir per run (driver parity: `rm -rf` then `mkdir`), seeded with
@@ -350,21 +345,6 @@ fn verifier_string(jobs_dir: &Path) -> Option<String> {
         return last_passed_failed(&text);
     }
     None
-}
-
-/// Crash guard (driver parity): never bank an agent-less cell — a dump with
-/// no RunEnd row means the agent never finished, so the instance is infra,
-/// never a capability failure.
-fn has_run_end(events: &Path) -> bool {
-    std::fs::read_to_string(events)
-        .map(|t| {
-            t.lines().filter(|l| !l.trim().is_empty()).any(|l| {
-                serde_json::from_str::<AgentEvent>(l)
-                    .map(|e| matches!(e, AgentEvent::RunEnd { .. }))
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
 }
 
 /// Env container name for one instance: the single handle for the agent
@@ -869,7 +849,7 @@ async fn grade(
 /// The agent leg: credential gate once, then per instance — fresh seeded
 /// workdir, in-process `rof run` wiring, harbor grading, report row. Every
 /// per-instance failure is infra and the loop continues; only an
-/// un-creatable out-dir or a failed report row aborts the slice (exit 2).
+/// un-creatable out-dir or a configuration refusal aborts the slice (exit 2).
 pub(crate) async fn run_agent_leg(
     args: &EvalArgs,
     instances: &[eval::Instance],
@@ -893,318 +873,231 @@ pub(crate) async fn run_agent_leg(
         }
     };
     let api_key_env = args.api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
-    let mut provider = OpenAiCompat::new(
+    let provider = match build_provider(
         endpoint,
-        endpoint_profile(args.keep_thinking, args.reasoning_effort.as_deref()),
-    )
-    .with_key_env(api_key_env);
-    for h in &args.headers {
-        if let Some((name, value)) = h.split_once(':') {
-            provider = provider.with_header(name, value);
+        args.keep_thinking,
+        args.reasoning_effort.as_deref(),
+        api_key_env,
+        &args.headers,
+    ) {
+        Ok(p) => p,
+        Err((code, msg)) => {
+            eprintln!("{msg}");
+            return code;
         }
-    }
-    if let Err(e) = provider.check_credentials() {
-        eprintln!(
-            "{}",
-            missing_credentials_message(api_key_env, &e.to_string())
-        );
-        return EXIT_NO_CREDENTIALS;
-    }
+    };
     let mut reports = Vec::new();
     for inst in instances {
-        let source_task = args.tasks_dir.join(&inst.id);
-        for bad in eval::check_winnability(&source_task, caps) {
-            eprintln!("unwinnable {}: {bad}", inst.id);
-        }
-        let home = args.out_dir.join(&inst.id);
-        if std::fs::create_dir_all(&home).is_err() {
-            eprintln!("cannot create {}", home.display());
-            return 2;
-        }
-        // Freeze exactly the task used to seed, prompt, mount and grade this
-        // attempt; hashing the mutable source after the run is not provenance.
-        let frozen_root = home.join("task-inputs");
-        let frozen_dir = frozen_root.join(&inst.id);
-        if std::fs::remove_dir_all(&frozen_root).is_err() && frozen_root.exists() {
-            eprintln!("infra {}: cannot clear task snapshot", inst.id);
-            reports.push(infra_report(
-                inst,
-                args,
-                &home,
-                eval::Verdict::InfraFailure,
-                0,
-            ));
-            continue;
-        }
-        let (_snapshot_root, task_dir, digest, frozen) =
-            match snapshot_tree(&source_task, &frozen_dir) {
-                Ok(()) => {
-                    let digest = task_digest(&frozen_dir).ok();
-                    let frozen =
-                        match eval::load_tb_slice(&frozen_root, std::slice::from_ref(&inst.id)) {
-                            Ok(mut rows) if rows.len() == 1 => rows.remove(0),
-                            _ => {
-                                reports.push(infra_report(
-                                    inst,
-                                    args,
-                                    &home,
-                                    eval::Verdict::InfraFailure,
-                                    0,
-                                ));
-                                continue;
-                            }
-                        };
-                    (frozen_root, frozen_dir, digest, frozen)
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                    // Preserve the original task semantics when paths may escape
-                    // the task tree; no digest can identify those external inputs.
-                    (
-                        args.tasks_dir.clone(),
-                        source_task.clone(),
-                        None,
-                        inst.clone(),
-                    )
-                }
-                Err(e) => {
-                    eprintln!("infra {}: cannot snapshot task: {e}", inst.id);
-                    reports.push(infra_report(
-                        inst,
-                        args,
-                        &home,
-                        eval::Verdict::InfraFailure,
-                        0,
-                    ));
-                    continue;
-                }
-            };
-        let inst = &frozen;
-        let work = home.join("work");
-        // In-container: the workspace IS the image's `/app` (harbor parity), so
-        // seed from there and never from `<task>/environment` — that dir is the
-        // Docker build context (heap ships `program/main.cpp` there while its
-        // verifier compiles and hashes `/app/main.cpp`). Host mode has no image,
-        // so `environment/` stays its only seed source.
-        if args.in_container && !inst.image.is_empty() {
-            reset_workdir_from_image(&inst.image, &work).await;
-        } else if let Err(e) = fresh_workdir(&task_dir, &work) {
-            eprintln!("infra {}: workdir: {e}", inst.id);
-            reports.push(infra_report(
-                inst,
-                args,
-                &home,
-                eval::Verdict::InfraFailure,
-                0,
-            ));
-            continue;
-        }
-        let start = Instant::now();
-        let selected = match procedure_catalog.select(&inst.instruction) {
-            Ok(selection) => selection,
-            Err(message) => {
-                eprintln!("invalid procedure file: {message}");
-                return 2;
-            }
-        };
-        for id in selected.ids {
-            if !report_args.selected_procedure_ids.contains(&id) {
-                report_args.selected_procedure_ids.push(id);
-            }
-        }
-        let mut goal = agent_goal(&inst.instruction);
-        if !selected.instructions.is_empty() {
-            goal.push_str("\n\nExternally sourced procedure guidance (applicability matched against the original task; no learning claim):\n");
-            goal.push_str(&selected.instructions);
-        }
-        let events = home.join("events.jsonl");
-        let mut run_args = agent_args(args, &work, &goal, &events);
-        // A workdir refusal is per-instance infra failure, never capability.
-        if validate_workdir(&work, false).is_err() {
-            eprintln!("infra {}: workdir refused: {}", inst.id, work.display());
-            let wall = start.elapsed().as_secs();
-            reports.push(infra_report(
-                inst,
-                args,
-                &home,
-                eval::Verdict::InfraFailure,
-                wall,
-            ));
-            continue;
-        }
-        // In-container mode: the agent works INSIDE the task environment
-        // container (started before the run, workdir bind-mounted at /app)
-        // and the verifier execs the same live container, so installed
-        // packages and running services persist to grading; the harbor
-        // grade-task path is replaced entirely in this mode. File tools
-        // stay host-side on the bind-mounted workdir, so the deliverable
-        // patch still captures file work.
-        let container = if args.in_container {
-            if inst.image.is_empty() {
-                eprintln!("infra {}: no docker_image in task.toml", inst.id);
-                let wall = start.elapsed().as_secs();
-                reports.push(infra_report(
-                    inst,
-                    args,
-                    &home,
-                    eval::Verdict::InfraFailure,
-                    wall,
-                ));
-                continue;
-            }
-            match start_env_container(inst, &work).await {
-                Ok(name) => {
-                    run_args.exec_wrap = Some(docker_exec_wrap(&name));
-                    Some(name)
-                }
-                Err(e) => {
-                    eprintln!("infra {}: {e}", inst.id);
-                    let wall = start.elapsed().as_secs();
-                    reports.push(infra_report(
-                        inst,
-                        args,
-                        &home,
-                        eval::Verdict::InfraFailure,
-                        wall,
-                    ));
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-        let image_id = if let Some(name) = &container {
-            container_image_id(name).await
-        } else {
-            None
-        };
-        // Harbor parity: the agent phase is bounded by the task's
-        // `[agent] timeout_sec`. Without it a slow cell (R installs, package
-        // builds) spends far more wall time than the benchmark allows, and the
-        // row stops being comparable with a harbor run.
-        let deadline = Instant::now() + Duration::from_secs(inst.agent_timeout_secs);
-        // ponytail: execute() spawns a fresh ctrl-c listener per call (one
-        // per instance here) — bounded by the slice size; upgrade path: a
-        // shared CancellationToken threaded through execute().
-        let r = crate::execute_with_deadline(&provider, &run_args, Some(deadline)).await;
-        // A start-time configuration refusal is identical for every instance
-        // and carries no events, so without this it would become a slice of
-        // InfraFailure rows that read like a docker outage. Abort the campaign
-        // instead: the operator has to change a flag or a model id.
-        if let agent_loop::Outcome::Failed {
-            kind: agent_loop::FailureKind::Input,
-            message,
-        } = &r.outcome
+        match run_one_instance(
+            &provider,
+            args,
+            &mut report_args,
+            &procedure_catalog,
+            inst,
+            caps,
+        )
+        .await
         {
-            eprintln!("cannot run {}: {message}", inst.id);
-            if container.is_some() {
-                rm_env_container(&inst.id).await;
-            }
-            return 2;
-        }
-        let agent_timed_out = matches!(r.outcome, agent_loop::Outcome::Cancelled)
-            && start.elapsed().as_secs() >= inst.agent_timeout_secs;
-        if let Some(path) = run_args.dump_events.as_deref() {
-            if let Err(e) = finalize_dump(path, &r.events) {
-                eprintln!("infra {}: cannot write {path}: {e}", inst.id);
-                let wall = start.elapsed().as_secs();
-                if container.is_some() {
-                    rm_env_container(&inst.id).await;
-                }
-                reports.push(infra_report(
-                    inst,
-                    args,
-                    &home,
-                    eval::Verdict::InfraFailure,
-                    wall,
-                ));
-                continue;
-            }
-        }
-        let wall = start.elapsed().as_secs();
-        // Failed/Halted/Cancelled runs still get graded (driver parity: the
-        // workdir is graded whenever the run ended); only a missing RunEnd
-        // is infra.
-        let verdict = if !has_run_end(&events) {
-            eval::Verdict::InfraFailure
-        } else if let Some(name) = &container {
-            grade_live_container(inst, name, &home, &task_dir).await
-        } else {
-            grade(inst, args, &task_dir, &work).await
-        };
-        // The env container dies on every path, including infra grading.
-        if container.is_some() {
-            rm_env_container(&inst.id).await;
-        }
-        let patch = r.patch.unwrap_or_default();
-        match eval::instance_report_with_mode(
-            &inst.id,
-            verdict,
-            &events,
-            wall,
-            &patch,
-            apply_mode_for(args),
-            None,
-        ) {
-            Ok(mut row) => {
-                // Snapshot is mounted read-only for tests, but host-mode exec
-                // has no jail. Withhold identity if the input changed.
-                row.task_digest =
-                    digest.filter(|d| task_digest(&task_dir).ok().as_ref() == Some(d));
-                row.image_id = image_id;
-                if agent_timed_out {
-                    row.halt_reason = Some(format!(
-                        "agent wall timeout (task.toml agent.timeout_sec={}s)",
-                        inst.agent_timeout_secs
-                    ));
-                }
-                reports.push(row)
-            }
-            Err(e) => {
-                eprintln!("cannot report {}: {e}", inst.id);
-                return 2;
-            }
+            Ok(row) => reports.push(row),
+            Err(code) => return code,
         }
     }
     crate::eval_cmd::finish_report(&report_args, reports)
 }
 
-/// Zero-facts row for an instance that failed before any agent ran (wall
-/// measured regardless; the dump may not exist yet, so a hand-built row
-/// stands in when the report reader cannot).
-fn infra_report(
-    inst: &eval::Instance,
+async fn run_one_instance(
+    provider: &OpenAiCompat,
     args: &EvalArgs,
-    home: &Path,
-    verdict: eval::Verdict,
-    wall: u64,
-) -> eval::InstanceReport {
-    let events = home.join("events.jsonl");
-    match eval::instance_report_with_mode(
-        &inst.id,
-        verdict,
-        &events,
-        wall,
-        "",
-        apply_mode_for(args),
-        None,
-    ) {
-        Ok(r) => r,
-        Err(_) => eval::InstanceReport {
-            id: inst.id.clone(),
-            task_digest: None,
-            image_id: None,
-            verdict,
-            tokens_in: None,
-            tokens_out: None,
-            dollars: None,
-            wall_secs: wall,
-            steps: 0,
-            halt_reason: None,
-            patch_digest: String::new(),
-            apply_mode: apply_mode_for(args),
-            apply_detail: None,
-        },
+    report_args: &mut EvalArgs,
+    procedure_catalog: &crate::procedures::Catalog,
+    inst: &eval::Instance,
+    caps: &eval::ToolCaps,
+) -> Result<eval::InstanceReport, i32> {
+    let source_task = args.tasks_dir.join(&inst.id);
+    for bad in eval::check_winnability(&source_task, caps) {
+        eprintln!("unwinnable {}: {bad}", inst.id);
     }
+    let home = args.out_dir.join(&inst.id);
+    if std::fs::create_dir_all(&home).is_err() {
+        eprintln!("cannot create {}", home.display());
+        return Err(2);
+    }
+    let infra = |id: &str, wall: u64, events: &[AgentEvent]| {
+        eval::instance_report_from_events(
+            id.into(),
+            eval::Verdict::InfraFailure,
+            events,
+            wall.saturating_mul(1000),
+            apply_mode_for(args),
+        )
+    };
+    // Freeze exactly the task used to seed, prompt, mount and grade this
+    // attempt; hashing the mutable source after the run is not provenance.
+    let frozen_root = home.join("task-inputs");
+    let frozen_dir = frozen_root.join(&inst.id);
+    if std::fs::remove_dir_all(&frozen_root).is_err() && frozen_root.exists() {
+        eprintln!("infra {}: cannot clear task snapshot", inst.id);
+        return Ok(infra(&inst.id, 0, &[]));
+    }
+    let (task_dir, digest, frozen) = match snapshot_tree(&source_task, &frozen_dir) {
+        Ok(()) => {
+            let digest = task_digest(&frozen_dir).ok();
+            let frozen = match eval::load_tb_slice(&frozen_root, std::slice::from_ref(&inst.id)) {
+                Ok(mut rows) if rows.len() == 1 => rows.remove(0),
+                _ => return Ok(infra(&inst.id, 0, &[])),
+            };
+            (frozen_dir, digest, frozen)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            // Preserve the original task semantics when paths may escape
+            // the task tree; no digest can identify those external inputs.
+            (source_task, None, inst.clone())
+        }
+        Err(e) => {
+            eprintln!("infra {}: cannot snapshot task: {e}", inst.id);
+            return Ok(infra(&inst.id, 0, &[]));
+        }
+    };
+    let inst = &frozen;
+    let work = home.join("work");
+    // In-container: the workspace IS the image's `/app` (harbor parity), so
+    // seed from there and never from `<task>/environment` — that dir is the
+    // Docker build context (heap ships `program/main.cpp` there while its
+    // verifier compiles and hashes `/app/main.cpp`). Host mode has no image,
+    // so `environment/` stays its only seed source.
+    if args.in_container && !inst.image.is_empty() {
+        reset_workdir_from_image(&inst.image, &work).await;
+    } else if let Err(e) = fresh_workdir(&task_dir, &work) {
+        eprintln!("infra {}: workdir: {e}", inst.id);
+        return Ok(infra(&inst.id, 0, &[]));
+    }
+    let start = Instant::now();
+    let selected = match procedure_catalog.select(&inst.instruction) {
+        Ok(selection) => selection,
+        Err(message) => {
+            eprintln!("invalid procedure file: {message}");
+            return Err(2);
+        }
+    };
+    for id in &selected.ids {
+        if !report_args.selected_procedure_ids.contains(id) {
+            report_args.selected_procedure_ids.push(id.clone());
+        }
+    }
+    let mut goal = agent_goal(&inst.instruction);
+    selected.append_to(&mut goal);
+    let events = home.join("events.jsonl");
+    let mut run_args = agent_args(args, &work, &goal, &events);
+    // A workdir refusal is per-instance infra failure, never capability.
+    if validate_workdir(&work, false).is_err() {
+        eprintln!("infra {}: workdir refused: {}", inst.id, work.display());
+        return Ok(infra(&inst.id, start.elapsed().as_secs(), &[]));
+    }
+    // In-container mode: the agent works INSIDE the task environment
+    // container (started before the run, workdir bind-mounted at /app)
+    // and the verifier execs the same live container, so installed
+    // packages and running services persist to grading; the harbor
+    // grade-task path is replaced entirely in this mode. File tools
+    // stay host-side on the bind-mounted workdir, so the deliverable
+    // patch still captures file work.
+    let container = if args.in_container {
+        if inst.image.is_empty() {
+            eprintln!("infra {}: no docker_image in task.toml", inst.id);
+            return Ok(infra(&inst.id, start.elapsed().as_secs(), &[]));
+        }
+        match start_env_container(inst, &work).await {
+            Ok(name) => {
+                run_args.exec_wrap = Some(docker_exec_wrap(&name));
+                Some(name)
+            }
+            Err(e) => {
+                eprintln!("infra {}: {e}", inst.id);
+                return Ok(infra(&inst.id, start.elapsed().as_secs(), &[]));
+            }
+        }
+    } else {
+        None
+    };
+    let image_id = if let Some(name) = &container {
+        container_image_id(name).await
+    } else {
+        None
+    };
+    // Harbor parity: the agent phase is bounded by the task's
+    // `[agent] timeout_sec`. Without it a slow cell (R installs, package
+    // builds) spends far more wall time than the benchmark allows, and the
+    // row stops being comparable with a harbor run.
+    let deadline = Instant::now() + Duration::from_secs(inst.agent_timeout_secs);
+    // ponytail: execute() spawns a fresh ctrl-c listener per call (one
+    // per instance here) — bounded by the slice size; upgrade path: a
+    // shared CancellationToken threaded through execute().
+    let r = crate::execute_with_deadline(provider, &run_args, Some(deadline)).await;
+    // A start-time configuration refusal is identical for every instance
+    // and carries no events, so without this it would become a slice of
+    // InfraFailure rows that read like a docker outage. Abort the campaign
+    // instead: the operator has to change a flag or a model id.
+    if let agent_loop::Outcome::Failed {
+        kind: agent_loop::FailureKind::Input,
+        message,
+    } = &r.outcome
+    {
+        eprintln!("cannot run {}: {message}", inst.id);
+        if container.is_some() {
+            rm_env_container(&inst.id).await;
+        }
+        return Err(2);
+    }
+    let agent_timed_out = matches!(r.outcome, agent_loop::Outcome::Cancelled)
+        && start.elapsed().as_secs() >= inst.agent_timeout_secs;
+    if let Some(path) = run_args.dump_events.as_deref() {
+        if let Err(e) = finalize_dump(path, &r.events) {
+            eprintln!("infra {}: cannot write {path}: {e}", inst.id);
+            let wall = start.elapsed().as_secs();
+            if container.is_some() {
+                rm_env_container(&inst.id).await;
+            }
+            return Ok(infra(&inst.id, wall, &r.events));
+        }
+    }
+    let wall = start.elapsed().as_secs();
+    // Failed/Halted/Cancelled runs still get graded (driver parity: the
+    // workdir is graded whenever the run ended); only a missing RunEnd
+    // is infra.
+    let verdict = if !r
+        .events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::RunEnd { .. }))
+    {
+        eval::Verdict::InfraFailure
+    } else if let Some(name) = &container {
+        grade_live_container(inst, name, &home, &task_dir).await
+    } else {
+        grade(inst, args, &task_dir, &work).await
+    };
+    // The env container dies on every path, including infra grading.
+    if container.is_some() {
+        rm_env_container(&inst.id).await;
+    }
+    let patch = r.patch.unwrap_or_default();
+    let mut row = eval::instance_report_from_events(
+        inst.id.clone(),
+        verdict,
+        &r.events,
+        wall.saturating_mul(1000),
+        apply_mode_for(args),
+    );
+    row.patch_digest = eval::patch_digest(&patch);
+    // Snapshot is mounted read-only for tests, but host-mode exec
+    // has no jail. Withhold identity if the input changed.
+    row.task_digest = digest.filter(|d| task_digest(&task_dir).ok().as_ref() == Some(d));
+    row.image_id = image_id;
+    if agent_timed_out {
+        row.halt_reason = Some(format!(
+            "agent wall timeout (task.toml agent.timeout_sec={}s)",
+            inst.agent_timeout_secs
+        ));
+    }
+    Ok(row)
 }
 
 #[cfg(test)]
@@ -1424,29 +1317,6 @@ mod tests {
         assert_eq!(v["tasks"][0]["path"], "/out/some-task/grade-task");
         assert_eq!(v["agents"][0]["name"], "oracle");
         assert!(v.as_object().unwrap().len() == 4, "no extra keys: {v}");
-    }
-
-    #[test]
-    fn no_run_end_means_infra() {
-        let dir = tmp_created();
-        let p = dir.join("events.jsonl");
-        std::fs::write(
-            &p,
-            concat!(
-                "{\"type\":\"MessageEnd\",\"id\":1,\"message\":{\"role\":\"Assistant\",\"content\":\"\"},\"interrupted\":false,\"usage\":null}\n",
-                "{\"type\":\"RunEnd\",\"outcome\":{\"Failed\":\"steps\"},\"messages\":[]}\n",
-            ),
-        )
-        .unwrap();
-        assert!(has_run_end(&p));
-        std::fs::write(
-            &p,
-            "{\"type\":\"MessageEnd\",\"id\":1,\"message\":{\"role\":\"Assistant\",\"content\":\"\"},\"interrupted\":false,\"usage\":null}\n",
-        )
-        .unwrap();
-        assert!(!has_run_end(&p), "crash guard: no RunEnd row");
-        assert!(!has_run_end(&dir.join("absent.jsonl")));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use serde_json::Value;
 use std::time::Duration;
-use tool_core::{CallStatus, Invocation, ToolCall, ToolError};
+use tool_core::ToolError;
 
 use crate::policy::{Policy, ToolPathError};
 
@@ -130,12 +130,11 @@ pub(crate) fn parse_args<T: serde::de::DeserializeOwned>(args: &Value) -> Result
     serde_json::from_value(args.clone()).map_err(|e| ToolError::Failed(format!("bad args: {e}")))
 }
 
-pub(crate) fn dispatch(call: &ToolCall) -> CallStatus {
-    CallStatus::Dispatch(Invocation {
-        call_id: call.call_id.clone(),
-        name: call.name.clone(),
-        args: call.args.clone(),
-    })
+/// Drop the first `n` bytes, rounding up to a char boundary so a leading
+/// partial UTF-8 sequence never survives.
+pub(crate) fn drop_front_bytes(s: &mut String, n: usize) {
+    let cut = s.ceil_char_boundary(n.min(s.len()));
+    s.drain(..cut);
 }
 
 /// Overwrite `p`. A file the tool cannot open for writing but whose directory

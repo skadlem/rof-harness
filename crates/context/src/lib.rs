@@ -1,17 +1,11 @@
-//! Budgeted prompt selection: one budget, dedupe, windowing for the file
-//! map and named files. Rule: select what enters, never summarize the edit
-//! surface. Volatile named files are must_include and excluded from mid-layer
-//! double delivery: the caller keeps them out of the mid layer, this crate
-//! delivers them last.
+//! Prompt helpers: file map, named-file reads, collapse boundary, char
+//! truncation, and compaction checkpoint estimation/cut-point/payload.
 
-mod assemble;
 mod collapse;
 mod compact;
 mod files;
-mod types;
 mod window;
 
-pub use assemble::ContextAssembler;
 pub use collapse::{collapse_boundary, COLLAPSE_HYSTERESIS, COLLAPSE_KEEP};
 pub use compact::{
     compaction_due, cut_point, estimate_tokens, parse_checkpoint, render_checkpoint,
@@ -20,8 +14,7 @@ pub use compact::{
     SUMMARY_TOOL_CAP,
 };
 pub use files::{file_map, named_file_contents, FILE_MAP_WALK_CAP};
-pub use types::{ContextItem, Fidelity, ItemKey};
-pub use window::{cut_chars, window_anchored, MIN_WINDOW, WINDOW_LINES};
+pub use window::cut_chars;
 
 #[cfg(test)]
 mod tests;

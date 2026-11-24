@@ -2,12 +2,6 @@ use crate::oracle::{ApplyMode, Verdict};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Strict-apply grades are not comparable with earlier fuzz-lenient
-/// benchmark numbers: the same patch can grade differently, so any
-/// cross-run comparison must check `InstanceReport.apply_mode` first.
-pub const APPLY_COMPARABILITY_NOTE: &str =
-    "Strict-apply grades are not comparable with earlier fuzz-lenient benchmark numbers.";
-
 /// Per-instance report: capability numbers plus the scaffold-study metrics
 /// that are the real objective (tokens-per-solved, no-action turns).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,75 +146,26 @@ pub struct RunReport {
     pub provenance: Option<RunProvenance>,
 }
 
-impl RunReport {
-    /// Guardrail metric (≤1.3× budget): `None` when nothing solved, or when
-    /// any instance's token counts are unknown (a partial sum would hide the
-    /// missing dump behind a smaller number).
-    pub fn tokens_per_solved(&self) -> Option<f64> {
-        let solved = self
-            .instances
-            .iter()
-            .filter(|r| r.verdict == Verdict::Resolved)
-            .count();
-        if solved == 0 {
-            return None;
-        }
-        let total = self
-            .instances
-            .iter()
-            .try_fold(0u64, |sum, r| Some(sum + r.tokens_in? + r.tokens_out?))?;
-        Some(total as f64 / solved as f64)
-    }
-}
-
-/// Build a per-instance report from a rof `--dump-events` JSONL dump. The
-/// LAST `TurnEnd.usage_totals` is the run's cumulative bill (each TurnEnd
+/// Build a per-instance report from in-memory [`agent_event::AgentEvent`]s.
+/// The LAST `TurnEnd.usage_totals` is the run's cumulative bill (each TurnEnd
 /// folds the running totals), `MessageEnd` count is the step count, and the
-/// `RunEnd` outcome becomes `halt_reason`. A dump with no TurnEnd at all
-/// (missing/truncated) leaves `tokens_in`/`tokens_out`/`dollars` `None` —
-/// absence, never a zero. `wall_secs` and `patch` are
-/// caller-measured (the dump carries neither). Typed event parsing: a schema
-/// drift is a compile error here, never silently zero.
-pub fn instance_report(
-    id: &str,
+/// `RunEnd` outcome becomes `halt_reason`. A stream with no TurnEnd at all
+/// (missing/truncated), or carrying `wallclock-usage-unknown` /
+/// `provider-usage-unknown`, leaves `tokens_in`/`tokens_out`/`dollars` `None` —
+/// absence, never a zero.
+pub fn instance_report_from_events(
+    instance_id: String,
     verdict: Verdict,
-    events_jsonl: &Path,
-    wall_secs: u64,
-    patch: &str,
-) -> std::io::Result<InstanceReport> {
-    instance_report_with_mode(
-        id,
-        verdict,
-        events_jsonl,
-        wall_secs,
-        patch,
-        ApplyMode::Strict,
-        None,
-    )
-}
-
-/// [`instance_report`] plus the patch-apply provenance: which [`ApplyMode`]
-/// graded the instance and the applier's stderr. Strict grades are not
-/// comparable with earlier fuzz-lenient benchmark numbers
-/// ([`APPLY_COMPARABILITY_NOTE`]).
-pub fn instance_report_with_mode(
-    id: &str,
-    verdict: Verdict,
-    events_jsonl: &Path,
-    wall_secs: u64,
-    patch: &str,
+    events: &[agent_event::AgentEvent],
+    wall_ms: u64,
     apply_mode: ApplyMode,
-    apply_detail: Option<&str>,
-) -> std::io::Result<InstanceReport> {
+) -> InstanceReport {
     use agent_event::{AgentEvent, RunOutcome, UsageReport};
-    let text = std::fs::read_to_string(events_jsonl)?;
     let mut totals: Option<UsageReport> = None;
     let mut steps = 0u32;
     let mut halt: Option<String> = None;
     let mut usage_unknown = false;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let ev: AgentEvent = serde_json::from_str(line)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    for ev in events {
         match ev {
             AgentEvent::Error { error }
                 if matches!(
@@ -231,10 +176,10 @@ pub fn instance_report_with_mode(
                 usage_unknown = true;
             }
             AgentEvent::MessageEnd { .. } => steps += 1,
-            AgentEvent::TurnEnd { usage_totals, .. } => totals = Some(usage_totals),
+            AgentEvent::TurnEnd { usage_totals, .. } => totals = Some(usage_totals.clone()),
             AgentEvent::RunEnd { outcome, .. } => {
                 halt = match outcome {
-                    RunOutcome::Failed(r) => Some(r),
+                    RunOutcome::Failed(r) => Some(r.clone()),
                     RunOutcome::Aborted => Some("aborted".into()),
                     RunOutcome::Passed => None,
                 }
@@ -242,8 +187,8 @@ pub fn instance_report_with_mode(
             _ => {}
         }
     }
-    Ok(InstanceReport {
-        id: id.into(),
+    InstanceReport {
+        id: instance_id,
         task_digest: None,
         image_id: None,
         verdict,
@@ -259,18 +204,50 @@ pub fn instance_report_with_mode(
             .as_ref()
             .filter(|_| !usage_unknown)
             .and_then(|t| t.cost_usd),
-        wall_secs,
+        wall_secs: wall_ms / 1000,
         steps,
         halt_reason: halt,
-        patch_digest: patch_digest(patch),
+        patch_digest: String::new(),
         apply_mode,
-        apply_detail: apply_detail.map(str::to_owned),
-    })
+        apply_detail: None,
+    }
+}
+
+/// Build a per-instance report from a rof `--dump-events` JSONL dump plus
+/// patch-apply provenance (`apply_mode` and applier stderr).
+pub fn instance_report_with_mode(
+    id: &str,
+    verdict: Verdict,
+    events_jsonl: &Path,
+    wall_secs: u64,
+    patch: &str,
+    apply_mode: ApplyMode,
+    apply_detail: Option<&str>,
+) -> std::io::Result<InstanceReport> {
+    let text = std::fs::read_to_string(events_jsonl)?;
+    let events: Vec<agent_event::AgentEvent> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut r = instance_report_from_events(
+        id.into(),
+        verdict,
+        &events,
+        wall_secs.saturating_mul(1000),
+        apply_mode,
+    );
+    r.patch_digest = patch_digest(patch);
+    r.apply_detail = apply_detail.map(str::to_owned);
+    Ok(r)
 }
 
 /// Identity digest for grouping identical patches across runs. Not
 /// cryptographic (`DefaultHasher` is per-toolchain); grouping, not integrity.
-fn patch_digest(patch: &str) -> String {
+pub fn patch_digest(patch: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     patch.hash(&mut h);

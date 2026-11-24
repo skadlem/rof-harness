@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tool_core::{CallStatus, Tool, ToolCall};
-use tools_std::{default_denied_globs, experimental_tools, ExperimentalToolsConfig, Policy};
+use tools_std::{experimental_tools, ExperimentalToolsConfig, Policy};
 
 static N: AtomicUsize = AtomicUsize::new(0);
 
@@ -19,15 +19,8 @@ fn temp_root() -> PathBuf {
 
 fn policy(root: PathBuf, allow_any_cmd: bool) -> Arc<Policy> {
     Arc::new(Policy {
-        root,
-        allowed_commands: vec![],
-        allowed_prefixes: vec![],
-        syntax_cmd: None,
-        denied_globs: default_denied_globs(),
-        pass_env: vec![],
         allow_any_cmd,
-        exec_wrap: None,
-        head_tail_output: false,
+        ..Policy::for_root(root)
     })
 }
 

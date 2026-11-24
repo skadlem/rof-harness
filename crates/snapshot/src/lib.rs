@@ -9,7 +9,7 @@ mod patch;
 mod types;
 
 pub use git::{workdir_state, TreeService};
+pub use patch::split_patch;
 pub use types::{
-    DiffSummary, PatchText, SnapshotError, WorkdirState, PATCH_MAX_BYTES, PATCH_MAX_LINES,
-    PATCH_TRUNCATED_MARKER,
+    DiffSummary, PatchText, WorkdirState, PATCH_MAX_BYTES, PATCH_MAX_LINES, PATCH_TRUNCATED_MARKER,
 };

@@ -1,24 +1,19 @@
-//! Multi-tick drivers: headless `run` and channel `drive_tick`.
+//! Multi-tick driver: headless [`run`].
 
 use crate::proof::BatchSnapshot;
-#[cfg(test)]
-use crate::settle_tool_msg;
 use crate::state::THINKING_KEEP;
-use crate::state::{ProviderMsg, ToolMsg};
 use crate::verify::is_verification_call;
 use crate::{
-    append_to, batch_hunks, build_request, checkpoint, incremental_hunks, note_tool_execution,
-    outcome_log_reason, outcome_to_result, pin_snapshot, refund_batch, settle_tool_tail,
+    append_to, batch_hunks, build_request, checkpoint, freeze_context_head, incremental_hunks,
+    note_tool_execution, outcome_log_reason, outcome_to_result, refund_batch, settle_tool_tail,
     snapshot_batch, turn_end_reason_to_event, turn_id, BetsHook, ClaimOutcome, FailureKind,
     IncentivesLevel, Input, LoopState, Outcome, Phase, PhaseVerdict, ROLLBACK_NOTICE,
 };
 use agent_budget::{halt_name, BudgetHalt};
 use agent_event::{
     AgentError, AgentEvent, DeltaKind, Emitter, Message, MessageDelta, Role,
-    RunOutcome as EventRunOutcome, TurnEndReason as EventTurnEndReason, UsageReport,
+    RunOutcome as EventRunOutcome, UsageReport,
 };
-#[cfg(test)]
-use agent_event::{ControlAck, ControlKind, ControlStatus};
 use agent_log::{Item, ItemKind, LogWriter, LOG_VERSION};
 use provider_core::{AssistantMessage, LlmClient, LlmError, Request, Response, Usage};
 use serde_json::Value;
@@ -28,13 +23,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(test)]
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tool_core::{Invocation, ToolCall, ToolResult};
 
-/// Provider settle usage → the live-event payload. `cache_write` stays out:
-/// the live vocabulary names only what consumers read.
+/// Provider settle usage → the live-event payload.
 pub(crate) fn usage_report(u: &Usage) -> UsageReport {
     UsageReport {
         input_tokens: u.input,
@@ -49,13 +41,13 @@ pub(crate) fn usage_report(u: &Usage) -> UsageReport {
 /// Reuses the open Partial id when a stream preceded the settle.
 pub(crate) fn emit_message_frames(
     state: &mut LoopState,
-    message: &AssistantMessage,
+    content: &str,
     usage: Option<&Usage>,
     emitter: &mut Emitter,
 ) {
     let partial = Message {
         role: Role::Assistant,
-        content: message.content.clone(),
+        content: content.to_owned(),
     };
     let id = match state.open_msg.take() {
         Some(id) => id,
@@ -76,7 +68,7 @@ pub(crate) fn emit_message_frames(
         id,
         delta: MessageDelta {
             kind: DeltaKind::Text,
-            text: Some(message.content.clone()),
+            text: Some(content.to_owned()),
         },
         partial: partial.clone(),
     });
@@ -86,204 +78,6 @@ pub(crate) fn emit_message_frames(
         interrupted: false,
         usage: usage.map(usage_report),
     });
-}
-
-/// Channel test harness over the same step helpers `run` ships.
-///
-/// `run` is the canonical shipped driver (headless multi-tick assembly on
-/// real siblings); `drive_tick` is a thin test harness for select!-shape
-/// tests, driving one inbox/provider/tool/cancel tick through the shared
-/// helpers (`step_claim` + `emit_message_frames`, `settle_tool_msg` =
-/// `note_tool_execution` + `record_tool_result` + `settle_tool_tail`). No
-/// harness-local copies: `VerifyHold`, `record_tool_result`,
-/// `observe_action`, and the `edits`/`actions` increments behave identically
-/// because both drivers call the same fns.
-///
-/// Ordering rule: the durable log append always
-/// precedes its terminal frame in code order — `step_claim` /
-/// `record_tool_result` / the TurnEnd append below run before the matching
-/// `emit`, so replay from the log agrees with replay from events.
-#[cfg(test)]
-pub async fn drive_tick(
-    state: &mut LoopState,
-    inbox: &mut mpsc::Receiver<Input>,
-    provider_rx: &mut mpsc::Receiver<ProviderMsg>,
-    tool_rx: &mut mpsc::Receiver<ToolMsg>,
-    cancel: &CancellationToken,
-    emitter: &mut Emitter,
-    cfg: &RunConfig,
-) -> PhaseVerdict {
-    let turn_before = state.turn;
-    tokio::select! {
-        _ = cancel.cancelled() => {
-            state.stop_hard = true;
-            state.gate.begin_abort();
-            let id = state.next_emit_id();
-            emitter.emit(AgentEvent::Control(ControlAck {
-                id,
-                kind: ControlKind::Stop,
-                status: ControlStatus::Applied,
-                note: "cancel token fired".into(),
-            }));
-        }
-        Some(input) = inbox.recv() => {
-            // Control acks ride the same stream, so live and replay agree.
-            let (kind, note) = match &input {
-                Input::User(_) => (ControlKind::Steer, "steering queued"),
-                Input::Crash(_) => (ControlKind::Steer, "crash queued"),
-                Input::StopHard | Input::StopWhenIdle => (ControlKind::Stop, "stop latched"),
-            };
-            state.apply_input(input); // TurnStart append happens here when idle...
-            let id = state.next_emit_id();
-            emitter.emit(AgentEvent::Control(ControlAck {
-                id,
-                kind,
-                status: ControlStatus::Applied,
-                note: note.into(),
-            }));
-            if state.turn != turn_before {
-                emitter.emit(AgentEvent::TurnStart { turn: state.turn });
-            }
-        }
-        Some(pm) = provider_rx.recv() => {
-            settle_provider_tick(state, pm, emitter, cfg);
-            // else: STALE GUARD, dropped without an event.
-        }
-        Some(tm) = tool_rx.recv() => {
-            // Shared with `run`: `settle_tool_msg` = `note_tool_execution`
-            // (`observe_action` + `edits += 1` on ok `edit`|`write`) +
-            // `record_tool_result` + `settle_tool_tail`, the same order `run`
-            // uses per executed call.
-            let shadow = tm.clone();
-            if settle_tool_msg(state, tm, cfg) {
-                // ToolResult appended above; terminal frame after.
-                emitter.emit(AgentEvent::ToolEnd {
-                    id: shadow.call_id,
-                    result: Value::String(shadow.result.content),
-                    is_error: shadow.result.is_error,
-                });
-            }
-        }
-        else => {}
-    }
-    let verdict = state.terminate(cfg);
-    // turn_before > 0: the 0 -> 1 opening has no prior turn to close.
-    if state.turn != turn_before && turn_before > 0 && matches!(verdict, PhaseVerdict::Continue) {
-        // Same hop as run(): closer is durable already, frames follow in order.
-        emitter.emit(AgentEvent::TurnEnd {
-            turn: turn_before,
-            reason: hopped_turn_reason(state, turn_before),
-            usage_totals: state.usage_totals.clone(),
-        });
-        emitter.emit(AgentEvent::TurnStart { turn: state.turn });
-    }
-    if let PhaseVerdict::Return(ref outcome) = verdict {
-        let reason = outcome_log_reason(outcome, state.turn_reason.as_ref());
-        state.stick_turn_reason(reason.clone());
-        // Durable TurnEnd first, terminal frame second — never inverted.
-        append_to(
-            &mut state.items,
-            ItemKind::TurnEnd {
-                turn_id: turn_id(state.turn),
-                reason: reason.clone(),
-            },
-        );
-        emitter.emit(AgentEvent::TurnEnd {
-            turn: state.turn,
-            reason: turn_end_reason_to_event(&reason),
-            usage_totals: state.usage_totals.clone(),
-        });
-    }
-    verdict
-}
-
-/// Test-harness provider settle: the `drive_tick` provider arm, extracted so
-/// the harness stays under the size target. Same order as `run`'s settle
-/// (`finish_provider_msg`, then `step_claim` + frames). Stale turns drop
-/// without an event.
-#[cfg(test)]
-fn settle_provider_tick(
-    state: &mut LoopState,
-    pm: ProviderMsg,
-    emitter: &mut Emitter,
-    cfg: &RunConfig,
-) {
-    if pm.turn() == state.turn {
-        let owned = pm.clone();
-        state.finish_provider_msg(pm); // usage metered + Attempt appended here...
-        match owned {
-            ProviderMsg::Partial { text, .. } => {
-                let id = match state.open_msg {
-                    Some(id) => id,
-                    None => {
-                        let id = state.next_emit_id();
-                        emitter.emit(AgentEvent::MessageStart {
-                            id,
-                            role: Role::Assistant,
-                            partial: Message {
-                                role: Role::Assistant,
-                                content: String::new(),
-                            },
-                        });
-                        state.open_msg = Some(id);
-                        id
-                    }
-                };
-                emitter.emit(AgentEvent::MessageUpdate {
-                    id,
-                    delta: MessageDelta {
-                        kind: DeltaKind::Text,
-                        text: Some(text.clone()),
-                    },
-                    partial: Message {
-                        role: Role::Assistant,
-                        content: text,
-                    },
-                });
-            }
-            ProviderMsg::Settled {
-                message,
-                stop,
-                usage,
-                ..
-            } => {
-                // ...and Assistant + ToolCall appends inside step_claim...
-                // Shared with `run`: the same `step_claim` + frames order.
-                let outcome = state.step_claim(message.clone(), stop, cfg);
-                emit_message_frames(state, &message, usage.as_ref(), emitter); // ...before these frames.
-                match outcome {
-                    ClaimOutcome::Dispatch(calls) => {
-                        for c in &calls {
-                            emitter.emit(AgentEvent::ToolStart {
-                                id: c.call_id.clone(),
-                                name: c.name.clone(),
-                                args: c.args.clone(),
-                            });
-                        }
-                    }
-                    ClaimOutcome::VerifyHold => {
-                        // Same as `run`'s `VerifyHold => continue`: the
-                        // turn stays alive (`call_model` latched in
-                        // `step_claim`) and the next request carries
-                        // `verify.hold` on its tail. No `ToolStart`.
-                    }
-                    ClaimOutcome::Done
-                    | ClaimOutcome::Truncated(_)
-                    | ClaimOutcome::Refused
-                    | ClaimOutcome::HardExit(_) => {}
-                }
-            }
-            ProviderMsg::Failed { err, .. } => {
-                emitter.emit(AgentEvent::Error {
-                    error: AgentError {
-                        code: "provider-failed".into(),
-                        message: err,
-                    },
-                });
-            }
-        }
-    }
-    // else: STALE GUARD, dropped without an event.
 }
 
 /// What the token cap counts. `Gross` charges `input + output` (today's
@@ -324,8 +118,7 @@ impl std::str::FromStr for BudgetShape {
 pub const DELIVERABLE_CHECK_STEP: usize = 15;
 
 /// Headless run knobs. `drain_timeout` defaults to 30s (unattended runs must
-/// not wedge on a stuck tool); the context budget reuses v1's 24k evidence
-/// window until the histogram retunes it.
+/// not wedge on a stuck tool).
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     /// Opt-in six-read intervention; counterfactual crossings are logged in both arms.
@@ -338,7 +131,6 @@ pub struct RunConfig {
     pub goal: String,
     pub model: String,
     pub max_tokens: usize,
-    pub context_budget_chars: usize,
     pub context_files: Vec<String>,
     pub drain_timeout: Duration,
     pub log_path: Option<PathBuf>,
@@ -400,7 +192,6 @@ impl Default for RunConfig {
             goal: "run".into(),
             model: "run-model".into(),
             max_tokens: 2000,
-            context_budget_chars: 24_000,
             context_files: Vec::new(),
             drain_timeout: Duration::from_secs(30),
             log_path: None,
@@ -443,23 +234,6 @@ pub(crate) fn event_outcome(outcome: &Outcome) -> EventRunOutcome {
         Outcome::Failed { message, .. } => EventRunOutcome::Failed(message.clone()),
         Outcome::Cancelled => EventRunOutcome::Aborted,
     }
-}
-
-/// The durable closer for a hopped turn, read back from the log so live and
-/// replay agree exactly.
-pub(crate) fn hopped_turn_reason(state: &LoopState, before: u64) -> EventTurnEndReason {
-    state
-        .items
-        .iter()
-        .rev()
-        .find_map(|i| match &i.kind {
-            ItemKind::TurnEnd {
-                turn_id: tid,
-                reason,
-            } if tid == &turn_id(before) => Some(turn_end_reason_to_event(reason)),
-            _ => None,
-        })
-        .unwrap_or(EventTurnEndReason::Completed)
 }
 
 /// Blocking fs/git work off the async executor: snapshot, file-map, pins,
@@ -659,10 +433,9 @@ impl<P> RunCtx<'_, '_, P> {
 
     /// Log-before-event by construction: the durable row is appended and
     /// synced before its live frame emits. Rows without a frame pass `None`.
-    /// State helpers shared with `drive_tick` (`step_claim`,
-    /// `record_tool_result`, `finish_provider_msg`) own their appends, so
-    /// their frames still emit after an explicit `sync` at the same site —
-    /// the same order, pinned by the characterization tests.
+    /// State helpers (`step_claim`, `record_tool_result`,
+    /// `on_provider_failed`) own their appends, so their frames still emit
+    /// after an explicit `sync` at the same site.
     async fn record(&mut self, kind: ItemKind, frame: Option<AgentEvent>) -> Result<(), Outcome> {
         append_to(&mut self.state.items, kind);
         self.sync().await?;
@@ -672,40 +445,88 @@ impl<P> RunCtx<'_, '_, P> {
         Ok(())
     }
 
-    /// Follow-up opened a new turn mid-`terminate` (closer already appended
-    /// there): sync it, then emit its frame before the new TurnStart.
-    async fn close_hop(&mut self, before: u64) -> Result<(), Outcome> {
-        if self.state.turn == before || before == 0 {
-            return Ok(());
+    fn wallclock_deadline(&self) -> Option<tokio::time::Instant> {
+        let wall = self.state.budget.config().max_wallclock;
+        (!wall.is_zero())
+            .then(|| tokio::time::Instant::now() + wall.saturating_sub(self.state.budget.elapsed()))
+    }
+
+    fn abort_turn(&mut self, turn_token: &CancellationToken) {
+        turn_token.cancel();
+        self.state.stop_hard = true;
+    }
+
+    async fn rollback_tree(&mut self, with_notice: bool) -> Result<(), Outcome> {
+        if with_notice {
+            self.record(
+                ItemKind::Attempt {
+                    error: ROLLBACK_NOTICE.into(),
+                    will_retry: true,
+                },
+                None,
+            )
+            .await?;
+            self.state.push_directive(ROLLBACK_NOTICE.into(), &self.cfg);
         }
-        self.sync().await?;
-        let reason = hopped_turn_reason(self.state, before);
-        let usage = self.state.usage_totals.clone();
-        self.emitter.emit(AgentEvent::TurnEnd {
-            turn: before,
-            reason,
-            usage_totals: usage,
-        });
-        self.emitter.emit(AgentEvent::TurnStart {
-            turn: self.state.turn,
-        });
+        let tree = self.tree.clone();
+        match blocking(move || tree.rollback()).await {
+            Ok(left) if !left.is_empty() => {
+                // Root-owned paths the host-side git cannot delete: the batch is
+                // rolled back for every path it COULD restore, and the survivors
+                // are named. Failing the stage here loses the row for a
+                // permission bit (observed on Slice A).
+                let shown = left.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+                self.record(
+                    ItemKind::Attempt {
+                        error: format!("rollback left {} unremovable path(s): {shown}", left.len()),
+                        will_retry: false,
+                    },
+                    None,
+                )
+                .await?;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(Outcome::Failed {
+                    kind: FailureKind::Snapshot,
+                    message: format!("snapshot rollback: {e}"),
+                });
+            }
+        }
         Ok(())
     }
 
-    /// Shared tail for terminal-ish claims (Done past its fast path,
-    /// Truncated, and the post-batch verdict): terminate, hop the turn, or
-    /// park Done when idle.
-    async fn settle_terminal(&mut self, before: u64) -> Result<(), Outcome> {
+    /// Shared step/terminal settlement: optional last-step Done grace (an
+    /// already-started final step whose `record_step` hit `max_steps` wins
+    /// when drained), then `terminate`, then parked-idle Done.
+    fn settle_step(&mut self, allow_step_grace: bool) -> Result<Head, Outcome> {
+        if allow_step_grace
+            && !self.state.in_flight
+            && self.state.open_tools() == 0
+            && !self.state.call_model
+            && self.state.steering.is_empty()
+            && matches!(
+                self.state.budget.exceeded().as_ref().map(|e| &e.halt),
+                Some(BudgetHalt::Steps)
+            )
+        {
+            return Err(Outcome::Done);
+        }
         match self.state.terminate(&self.cfg) {
             PhaseVerdict::Return(o) => Err(o),
-            _ => {
-                self.close_hop(before).await?;
+            PhaseVerdict::Break => Ok(Head::Yield),
+            PhaseVerdict::Continue => {
                 if self.state.phase == Phase::Idle && self.state.is_idle() {
-                    return Err(Outcome::Done);
+                    Err(Outcome::Done)
+                } else {
+                    Ok(Head::Again)
                 }
-                Ok(())
             }
         }
+    }
+
+    fn settle_terminal(&mut self, allow_step_grace: bool) -> Result<(), Outcome> {
+        self.settle_step(allow_step_grace).map(|_| ())
     }
 }
 
@@ -794,40 +615,28 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         // Prefix-cache freeze on the blocking worker: the directory walk
         // and pin reads are fs IO, never executor work.
         let root = self.workdir.to_path_buf();
-        self.state.file_map =
-            Some(blocking(move || context::file_map(&root, 200).join("\n")).await);
-        let root = self.workdir.to_path_buf();
         let files = self.cfg.context_files.clone();
-        self.state.pins = Some(blocking(move || pin_snapshot(&files, &root)).await);
+        let (file_map, pins) = blocking(move || freeze_context_head(&root, &files)).await;
+        self.state.file_map = Some(file_map);
+        self.state.pins = Some(pins);
         None
     }
 
-    /// Loop head: cancel latch, steering admission, bets step head, then the
-    /// provider admission gate with `terminate` as the fallback.
-    /// Grace runs inside `start_provider_call`, the halt lands after.
+    /// Loop head: cancel latch, steering admission, then the provider admission
+    /// gate with `terminate` as the fallback. Grace runs inside
+    /// `start_provider_call`, the halt lands after.
     async fn step_head(&mut self) -> Result<Head, Outcome> {
         if self.cancel.is_cancelled() {
             self.state.stop_hard = true;
-            self.state.gate.begin_abort();
         }
         self.state.admit_steering();
         self.sync().await?;
-        // Bets site 1: step head.
-        if let PhaseVerdict::Return(o) = self.bets.on_step_head(self.state.step as u64) {
-            return Ok(Head::Exit(o));
-        }
         // Grace runs here (may_step inside); terminate halts after.
         match self.state.start_provider_call(&self.root) {
             Some(t) => Ok(Head::Call(t)),
-            None => match self.state.terminate(&self.cfg) {
-                PhaseVerdict::Return(o) => Ok(Head::Exit(o)),
-                PhaseVerdict::Break => Ok(Head::Yield),
-                PhaseVerdict::Continue => {
-                    if self.state.phase == Phase::Idle && self.state.is_idle() {
-                        return Ok(Head::Exit(Outcome::Done));
-                    }
-                    Ok(Head::Again)
-                }
+            None => match self.settle_step(false) {
+                Ok(head) => Ok(head),
+                Err(o) => Ok(Head::Exit(o)),
             },
         }
     }
@@ -880,10 +689,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
     /// One provider round: checkpoint race, request build, cancel-raced
     /// `complete`, then settle (failure or claim).
     async fn provider_round(&mut self, turn_token: CancellationToken) -> Result<(), Outcome> {
-        let wall = self.state.budget.config().max_wallclock;
-        let deadline = (!wall.is_zero()).then(|| {
-            tokio::time::Instant::now() + wall.saturating_sub(self.state.budget.elapsed())
-        });
+        let deadline = self.wallclock_deadline();
         // Checkpoint before the real request, after the budget admitted the
         // step: the summary request is real spend and must never be paid for
         // a step the guard would have refused. Raced against cancel so Ctrl-C
@@ -904,9 +710,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             if checkpoint_started {
                 self.provider_usage_unknown();
             }
-            turn_token.cancel();
-            self.state.stop_hard = true;
-            self.state.gate.begin_abort();
+            self.abort_turn(&turn_token);
             return self.settle_provider_error(LlmError::Cancelled).await;
         }
         self.check_deliverables().await?;
@@ -940,9 +744,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 if provider_started {
                     self.provider_usage_unknown();
                 }
-                turn_token.cancel();
-                self.state.stop_hard = true;
-                self.state.gate.begin_abort();
+                self.abort_turn(&turn_token);
                 Err(LlmError::Metered {
                     source: Box::new(LlmError::Cancelled),
                     usage: None,
@@ -968,7 +770,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
     }
 
     async fn wallclock_halt(&mut self, provider_started: bool) -> Result<(), Outcome> {
-        self.state.in_flight = None;
+        self.state.in_flight = false;
         let message = if provider_started {
             self.state.usage_totals.cost_usd = None;
             "wallclock deadline interrupted a provider request; usage may be incomplete"
@@ -1017,13 +819,8 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             }
             other => (format!("{other:?}"), None),
         };
-        let turn = self.state.turn;
-        self.state.finish_provider_msg(ProviderMsg::Failed {
-            turn,
-            err: msg.clone(),
-            cancelled,
-            usage,
-        });
+        self.state
+            .on_provider_failed(&msg, cancelled, usage.as_ref());
         self.sync().await?;
         self.emitter.emit(AgentEvent::Error {
             error: AgentError {
@@ -1034,16 +831,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         if self.state.call_model {
             return Ok(()); // in-step retry reuses the same assembly
         }
-        match self.state.terminate(&self.cfg) {
-            PhaseVerdict::Return(o) => Err(o),
-            _ => {
-                // Never spin: parked-idle without input is Done.
-                if self.state.phase == Phase::Idle && self.state.is_idle() {
-                    return Err(Outcome::Done);
-                }
-                Ok(())
-            }
-        }
+        self.settle_terminal(false)
     }
 
     /// Settled response: anchor, meter the bill, claim, sync, frames, then
@@ -1063,7 +851,6 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         // provider: consume the hold now. A provider Err below keeps
         // it armed for the in-step retry.
         self.state.verify.hold.take();
-        let turn = self.state.turn;
         // Checkpoint anchor: this request's history length and its
         // provider-reported prompt tokens (the final attempt's, not
         // the retry ladder's sum). History only (`len() - 1`: the one
@@ -1076,12 +863,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         // Meter the BILL, not just the final attempt: a recovered
         // retry ladder was billed every failed re-send too.
         let billed = resp.billed_usage();
-        self.state.finish_provider_msg(ProviderMsg::Settled {
-            turn,
-            message: resp.message.clone(),
-            stop: resp.stop,
-            usage: Some(billed.clone()),
-        });
+        self.state.on_provider_settled(Some(&billed));
         if streak_delivered {
             self.state.experiment.streak_pending = false;
             self.record(
@@ -1093,11 +875,10 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             )
             .await?;
         }
-        let outcome = self
-            .state
-            .step_claim(resp.message.clone(), resp.stop, &self.cfg);
+        let msg_content = resp.message.content.clone();
+        let outcome = self.state.step_claim(resp.message, resp.stop, &self.cfg);
         self.sync().await?;
-        emit_message_frames(self.state, &resp.message, Some(&billed), self.emitter);
+        emit_message_frames(self.state, &msg_content, Some(&billed), self.emitter);
         match outcome {
             ClaimOutcome::VerifyHold => {
                 // Unverified declare held: the turn stays alive and
@@ -1111,36 +892,12 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 if let Some(command) = self.cfg.completion_check.clone() {
                     return self.settle_completion_check(&command, turn_token).await;
                 }
-                // Already-started final step: `record_step` at the head
-                // may have hit max, so `terminate`'s `exceeded` would
-                // preempt this Done with Halted(steps). The admitted
-                // step's declare wins when drained with no followups.
-                if self.state.in_flight.is_none()
-                    && self.state.open_tools() == 0
-                    && !self.state.call_model
-                    && self.state.steering.is_empty()
-                    && self.state.followups.is_empty()
-                    && matches!(
-                        self.state.budget.exceeded().as_ref().map(|e| &e.halt),
-                        Some(BudgetHalt::Steps)
-                    )
-                {
-                    return Err(Outcome::Done);
-                }
-                let before = self.state.turn;
-                self.settle_terminal(before).await
+                self.settle_terminal(true)
             }
-            ClaimOutcome::Truncated(_) | ClaimOutcome::Refused => {
-                let before = self.state.turn;
-                self.settle_terminal(before).await
-            }
+            ClaimOutcome::Truncated(_) | ClaimOutcome::Refused => self.settle_terminal(false),
             ClaimOutcome::HardExit(label) => {
-                self.state.fatal_error = Some(label.clone());
-                self.state.gate.close(label);
-                match self.state.terminate(&self.cfg) {
-                    PhaseVerdict::Return(o) => Err(o),
-                    _ => Ok(()),
-                }
+                self.state.fatal_error = Some(label);
+                self.settle_terminal(false)
             }
             ClaimOutcome::Dispatch(calls) => {
                 for c in &calls {
@@ -1222,7 +979,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             },
         );
         self.sync().await?;
-        emit_message_frames(self.state, &declaration, None, self.emitter);
+        emit_message_frames(self.state, &declaration.content, None, self.emitter);
         self.emitter.emit(AgentEvent::ToolStart {
             id: call_id.clone(),
             name: tool_core::TOOL_TEST.into(),
@@ -1264,10 +1021,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 self.cfg.streak_steer,
             );
         }
-        self.state.record_tool_result(ToolMsg {
-            call_id: call_id.clone(),
-            result: result.clone(),
-        });
+        self.state.record_tool_result(&call_id, result.clone());
         settle_tool_tail(self.state, &self.cfg);
         self.sync().await?;
         self.emitter.emit(AgentEvent::ToolEnd {
@@ -1284,15 +1038,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 return Err(Outcome::Halted(halt_name(&exceeded.halt).into()));
             }
             self.state.call_model = false;
-            if self
-                .state
-                .budget
-                .exceeded()
-                .is_some_and(|e| e.halt == BudgetHalt::Steps)
-            {
-                return Err(Outcome::Done);
-            }
-            return self.settle_terminal(self.state.turn).await;
+            return self.settle_terminal(true);
         }
         let denied = result.content.starts_with("denied:")
             || result.content.starts_with("ask denied")
@@ -1305,43 +1051,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             });
         }
         if dispatched && result.is_error && (!self.cfg.preserve_failed_checks || !completed) {
-            self.record(
-                ItemKind::Attempt {
-                    error: ROLLBACK_NOTICE.into(),
-                    will_retry: true,
-                },
-                None,
-            )
-            .await?;
-            self.state.push_directive(ROLLBACK_NOTICE.into(), &self.cfg);
-            let tree = self.tree.clone();
-            match blocking(move || tree.rollback()).await {
-                Ok(left) if !left.is_empty() => {
-                    // Root-owned paths the host-side git cannot delete: the batch is
-                    // rolled back for every path it COULD restore, and the survivors
-                    // are named. Failing the stage here loses the row for a
-                    // permission bit (observed on Slice A).
-                    let shown = left.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-                    self.record(
-                        ItemKind::Attempt {
-                            error: format!(
-                                "rollback left {} unremovable path(s): {shown}",
-                                left.len()
-                            ),
-                            will_retry: false,
-                        },
-                        None,
-                    )
-                    .await?;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(Outcome::Failed {
-                        kind: FailureKind::Snapshot,
-                        message: format!("snapshot rollback: {e}"),
-                    });
-                }
-            }
+            self.rollback_tree(true).await?;
         }
         if self.cancel.is_cancelled() || self.state.stop_hard {
             return Err(Outcome::Cancelled);
@@ -1440,10 +1150,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         match self.registry.resolve(&inv.name) {
             Some(tool) => {
                 let tool_token = turn_token.child_token();
-                let wall = self.state.budget.config().max_wallclock;
-                let deadline = (!wall.is_zero()).then(|| {
-                    tokio::time::Instant::now() + wall.saturating_sub(self.state.budget.elapsed())
-                });
+                let deadline = self.wallclock_deadline();
                 let raced = tokio::select! {
                     biased;
                     _ = self.cancel.cancelled() => Some(None),
@@ -1452,9 +1159,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 };
                 match raced {
                     Some(None) => {
-                        turn_token.cancel();
-                        self.state.stop_hard = true;
-                        self.state.gate.begin_abort();
+                        self.abort_turn(turn_token);
                         (
                             ToolResult {
                                 content: "cancelled".into(),
@@ -1511,42 +1216,38 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
             let action_cap = self.state.budget.config().actions_per_trial;
             let wall = self.state.budget.config().max_wallclock;
             if !wall.is_zero() && self.state.budget.elapsed() >= wall {
-                self.state.record_tool_result(ToolMsg {
-                    call_id: c.call_id.clone(),
-                    result: ToolResult {
+                self.state.record_tool_result(
+                    &c.call_id,
+                    ToolResult {
                         content: "wallclock budget exhausted before dispatch".into(),
                         is_error: true,
                     },
-                });
+                );
             } else if action_cap > 0
                 && self.state.budget.counters().actions_this_trial >= action_cap
             {
-                self.state.record_tool_result(ToolMsg {
-                    call_id: c.call_id.clone(),
-                    result: ToolResult {
+                self.state.record_tool_result(
+                    &c.call_id,
+                    ToolResult {
                         content: "action budget exhausted before dispatch".into(),
                         is_error: true,
                     },
-                });
+                );
             } else if self.cancel.is_cancelled() {
-                let content = "aborted before dispatch".to_owned();
-                self.state.record_tool_result(ToolMsg {
-                    call_id: c.call_id.clone(),
-                    result: ToolResult {
-                        content: content.clone(),
+                self.state.record_tool_result(
+                    &c.call_id,
+                    ToolResult {
+                        content: "aborted before dispatch".into(),
                         is_error: true,
                     },
-                });
+                );
                 batch_failed = true;
             } else {
                 let inv = match self.registry.prepare(self.agent, c.clone()) {
                     tool_core::CallStatus::Dispatch(inv) => Some(inv),
                     tool_core::CallStatus::Result(res) => {
                         batch_failed |= res.is_error;
-                        self.state.record_tool_result(ToolMsg {
-                            call_id: c.call_id.clone(),
-                            result: res,
-                        });
+                        self.state.record_tool_result(&c.call_id, res);
                         None
                     }
                 };
@@ -1560,13 +1261,8 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                         || (self.cfg.rollback_errors_only && completed && res.is_error);
                     check_failed |= failed_check;
                     batch_failed |= res.is_error && !failed_check;
-                    // Shared with `drive_tick`: the same
-                    // `note_tool_execution` + `record` order.
                     let _ = note_tool_execution(self.state, &name, &args, &res);
-                    self.state.record_tool_result(ToolMsg {
-                        call_id: c.call_id.clone(),
-                        result: res.clone(),
-                    });
+                    self.state.record_tool_result(&c.call_id, res.clone());
                     if executed_failed_check {
                         self.monitor_failed_check(&name, &c.args, &res.content)
                             .await?;
@@ -1636,10 +1332,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 .filter(|_| wall.is_zero() || self.state.budget.elapsed() < wall);
             let probe = match proof_cmd {
                 Some(cmd) => {
-                    let deadline = (!wall.is_zero()).then(|| {
-                        tokio::time::Instant::now()
-                            + wall.saturating_sub(self.state.budget.elapsed())
-                    });
+                    let deadline = self.wallclock_deadline();
                     incremental_hunks(self.tree.clone(), self.workdir, cmd, deadline).await
                 }
                 None => batch_hunks(self.tree.clone(), !batch_failed && !check_failed).await,
@@ -1663,51 +1356,9 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         // Errors-only scope: a failed batch that changed no file has nothing
         // to revert, so it gets neither a rollback nor the notice.
         if batch_failed && !(self.cfg.rollback_errors_only && hunks.is_empty()) {
-            // Pre-effect record: the rollback destroys the
-            // batch's successful edits, so the notice is
-            // durable before the tree moves. `Attempt` is the
-            // existing log-only vocabulary (no model row, no
-            // new event); the model-visible copy rides the
-            // directive channel on the next tool tail.
-            // ponytail: `record` with no frame keeps the row durable
-            // without inventing an event for it.
-            self.record(
-                ItemKind::Attempt {
-                    error: ROLLBACK_NOTICE.into(),
-                    will_retry: true,
-                },
-                None,
-            )
-            .await?;
-            self.state.push_directive(ROLLBACK_NOTICE.into(), &self.cfg);
-            let tree = self.tree.clone();
-            match blocking(move || tree.rollback()).await {
-                Ok(left) if !left.is_empty() => {
-                    // Root-owned paths the host-side git cannot delete: the batch is
-                    // rolled back for every path it COULD restore, and the survivors
-                    // are named. Failing the stage here loses the row for a
-                    // permission bit (observed on Slice A).
-                    let shown = left.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-                    self.record(
-                        ItemKind::Attempt {
-                            error: format!(
-                                "rollback left {} unremovable path(s): {shown}",
-                                left.len()
-                            ),
-                            will_retry: false,
-                        },
-                        None,
-                    )
-                    .await?;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(Outcome::Failed {
-                        kind: FailureKind::Snapshot,
-                        message: format!("snapshot rollback: {e}"),
-                    });
-                }
-            }
+            // Pre-effect record: the rollback destroys the batch's successful
+            // edits, so the notice is durable before the tree moves.
+            self.rollback_tree(true).await?;
             // Rolled-back edits must not linger in the
             // counters: refund to the pre-batch snapshot.
             refund_batch(self.state, &batch_snap);
@@ -1769,34 +1420,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 }
             }
             bets::CommitVerdict::Aborted { .. } => {
-                let tree = self.tree.clone();
-                match blocking(move || tree.rollback()).await {
-                    Ok(left) if !left.is_empty() => {
-                        // Root-owned paths the host-side git cannot delete: the batch is
-                        // rolled back for every path it COULD restore, and the survivors
-                        // are named. Failing the stage here loses the row for a
-                        // permission bit (observed on Slice A).
-                        let shown = left.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-                        self.record(
-                            ItemKind::Attempt {
-                                error: format!(
-                                    "rollback left {} unremovable path(s): {shown}",
-                                    left.len()
-                                ),
-                                will_retry: false,
-                            },
-                            None,
-                        )
-                        .await?;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        return Err(Outcome::Failed {
-                            kind: FailureKind::Snapshot,
-                            message: format!("snapshot rollback: {e}"),
-                        });
-                    }
-                }
+                self.rollback_tree(false).await?;
                 // Gate-aborted batch is a full rollback: the
                 // counters refund like the tool-error path.
                 // (`Partial` keeps its prefix, so its
@@ -1804,12 +1428,7 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                 refund_batch(self.state, &snap);
             }
         }
-        // Bets site 2 step hook (unchanged): Return ends the run.
-        if let PhaseVerdict::Return(o) = self.bets.on_step() {
-            return Err(o);
-        }
-        let before = self.state.turn;
-        self.settle_terminal(before).await
+        self.settle_terminal(false)
     }
 
     /// Headless drive: one step head + provider round per turn until a
@@ -1837,13 +1456,12 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
 /// [`tool_core::Registry`] tools, [`BudgetGuard`] step head,
 /// [`snapshot::TreeService`] baseline-per-batch with batch-scope rollback
 /// (proven prefix survives: the baseline commits it first), context prompt,
-/// [`BetsHook`] step-head gate (`on_step_head`) + proof-gated post-batch gate
-/// (`on_post_batch`: Committed stands, Partial restores the kept hunks,
-/// Aborted rolls the batch back), [`Emitter`] frames, [`LogWriter`]
-/// file record. Termination order is [`LoopState::terminate`] (§10); the
-/// grace step runs inside `start_provider_call`, the halt lands after.
-/// Inputs seed here (Crash queues like User, recorded with Crash source);
-/// followups ride `state.followups`. Parked-idle with empty queues is Done.
+/// [`BetsHook`] proof-gated post-batch gate (`on_post_batch`: Committed stands,
+/// Partial restores the kept hunks, Aborted rolls the batch back), [`Emitter`]
+/// frames, [`LogWriter`] file record. Termination order is
+/// [`LoopState::terminate`]; the grace step runs inside
+/// `start_provider_call`, the halt lands after. Parked-idle with empty queues
+/// is Done.
 ///
 /// Single source of truth: `cfg` owns every run knob (incentives, drain
 /// deadline, fold knobs, compaction, proof command, budget shape). The one

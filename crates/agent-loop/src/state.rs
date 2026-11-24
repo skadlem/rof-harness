@@ -1,10 +1,10 @@
 //! Shared turn/step state: `LoopState`, items, and the durable-log helpers.
 
-use crate::{BudgetShape, EffectGate, RunConfig, VerifyState};
+use crate::{BudgetShape, RunConfig, VerifyState};
 use agent_budget::{config_for, halt_name, BudgetGuard, Capability};
 use agent_event::{TurnEndReason as EventTurnEndReason, UsageReport};
 use agent_log::{InputSource, Item, ItemKind, RecoveryCode, TurnEndReason};
-use provider_core::{AssistantMessage, StopReason, Usage};
+use provider_core::{AssistantMessage, Usage};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
@@ -26,7 +26,6 @@ pub(crate) const STEP_RETRY_BUDGET: u32 = 2;
 pub enum Phase {
     Idle,
     Running,
-    Maintenance,
 }
 
 #[derive(Debug, Clone)]
@@ -66,9 +65,6 @@ pub enum FailureKind {
 #[derive(Debug, Clone)]
 pub enum Input {
     User(String),
-    Crash(String),
-    StopHard,
-    StopWhenIdle,
 }
 
 /// One queued steering line plus the source the log must record. `From`
@@ -97,51 +93,6 @@ impl From<&str> for QueuedInput {
     }
 }
 
-/// Provider traffic: what a single-flight provider task ships back.
-/// `pub(crate)`: the channel harness (`drive_tick`) is test-only; `run`
-/// builds these rows directly from `complete`.
-#[derive(Debug, Clone)]
-pub(crate) enum ProviderMsg {
-    // Test-only reads: `run` builds these rows from `complete` and
-    // `finish_provider_msg` consumes them without reading every field back;
-    // the `drive_tick` harness and unit tests read the rest.
-    #[allow(dead_code)]
-    Partial { turn: u64, text: String },
-    Settled {
-        turn: u64,
-        #[allow(dead_code)]
-        message: AssistantMessage,
-        #[allow(dead_code)]
-        stop: StopReason,
-        usage: Option<Usage>,
-    },
-    Failed {
-        turn: u64,
-        err: String,
-        cancelled: bool,
-        /// Usage the failed attempts carried (summed by the adapter). Metered
-        /// by `finish_provider_msg`: a failed ladder is still billed spend.
-        usage: Option<Usage>,
-    },
-}
-
-impl ProviderMsg {
-    pub fn turn(&self) -> u64 {
-        match *self {
-            ProviderMsg::Partial { turn, .. }
-            | ProviderMsg::Settled { turn, .. }
-            | ProviderMsg::Failed { turn, .. } => turn,
-        }
-    }
-}
-
-/// Tool traffic: one finished call. `pub(crate)`: see [`ProviderMsg`].
-#[derive(Debug, Clone)]
-pub(crate) struct ToolMsg {
-    pub call_id: String,
-    pub result: ToolResult,
-}
-
 /// Claim-phase outcome for one settled assistant message.
 /// `VerifyHold` (Full incentives only) holds the turn alive on an unverified
 /// declare: the run continues and the directive rides the next request tail
@@ -157,21 +108,9 @@ pub enum ClaimOutcome {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct InFlight {
-    // Test-only reads (stale-guard assertions): prod tracks single-flight
-    // occupancy through the `Option`, never the contents.
-    #[allow(dead_code)]
-    pub turn: u64,
-    #[allow(dead_code)]
-    pub token: CancellationToken,
-}
-
-#[derive(Debug, Clone)]
 pub struct ToolCallState {
     pub name: String,
-    /// Args JSON at claim time, for the shared `observe_action` sig
-    /// (`"{name}:{args}"`): `run` and `drive_tick` reconstruct the identical
-    /// sig from this row, so the same-action tripwire sees the same bytes.
+    /// Args JSON at claim time, for the `observe_action` sig (`"{name}:{args}"`).
     pub args: String,
     /// True when this call is a verification run (`test`, or `exec` with
     /// pytest in args): an ok result marks verification since the last write.
@@ -215,14 +154,10 @@ pub struct LoopState {
     /// run-start bytes, changed -> dropped to the normal view/edit flow.
     pub pins: Option<Vec<(String, String)>>,
     pub steering: VecDeque<QueuedInput>,
-    pub followups: VecDeque<String>,
-    pub wake_requested: bool,
     pub call_model: bool,
-    pub(crate) in_flight: Option<InFlight>,
+    pub(crate) in_flight: bool,
     pub tool_calls: HashMap<String, ToolCallState>,
-    pub gate: EffectGate,
     pub stop_hard: bool,
-    pub stop_when_idle: bool,
     pub turn_reason: Option<TurnEndReason>,
     pub budget: BudgetGuard,
     /// What the token cap counts; seeded from [`RunConfig::budget_shape`] at
@@ -301,14 +236,10 @@ impl LoopState {
             file_map: None,
             pins: None,
             steering: VecDeque::new(),
-            followups: VecDeque::new(),
-            wake_requested: false,
             call_model: false,
-            in_flight: None,
+            in_flight: false,
             tool_calls: HashMap::new(),
-            gate: EffectGate::new(),
             stop_hard: false,
-            stop_when_idle: false,
             turn_reason: None,
             budget: BudgetGuard::new(config_for(Capability::UnattendedBatch), Instant::now()),
             budget_shape: BudgetShape::Gross,
@@ -404,14 +335,11 @@ impl LoopState {
         self.phase = Phase::Idle;
         self.turn_reason = None;
         self.fatal_error = None;
-        self.gate = EffectGate::new();
         self.stop_hard = false;
-        self.stop_when_idle = false;
         self.call_model = false;
         self.drain_until = None;
-        self.in_flight = None;
+        self.in_flight = false;
         self.steering.clear();
-        self.followups.clear();
         self.step_retries = STEP_RETRY_BUDGET;
     }
 
@@ -428,18 +356,14 @@ impl LoopState {
 
     /// The one boolean: do we talk to the model now?
     pub fn should_call_model(&self) -> bool {
-        if !self.gate.is_open() || self.stop_hard {
+        if self.stop_hard || self.fatal_error.is_some() {
             return false;
         }
-        self.call_model
-            || (!self.steering.is_empty() && self.in_flight.is_none() && self.open_tools() == 0)
+        self.call_model || (!self.steering.is_empty() && !self.in_flight && self.open_tools() == 0)
     }
 
     pub fn is_idle(&self) -> bool {
-        self.in_flight.is_none()
-            && self.open_tools() == 0
-            && self.steering.is_empty()
-            && self.followups.is_empty()
+        !self.in_flight && self.open_tools() == 0 && self.steering.is_empty()
     }
 
     pub(crate) fn open_turn(&mut self) {
@@ -459,41 +383,17 @@ impl LoopState {
         );
     }
 
-    /// Inbox classification by phase: Running steers, Idle opens a turn,
-    /// Maintenance latches a wake for replay. Controls are data, not methods.
+    /// Inbox classification by phase: Running steers, Idle opens a turn.
     pub fn apply_input(&mut self, input: Input) {
-        // Crash queues exactly like User; only the recorded source differs.
-        // Resume semantics are deferred: the Crash row is data for a later pass.
-        let queued = match input {
-            Input::User(text) => QueuedInput {
-                text,
-                source: InputSource::External,
-            },
-            Input::Crash(text) => QueuedInput {
-                text,
-                source: InputSource::Crash,
-            },
-            Input::StopHard => {
-                self.stop_hard = true;
-                self.gate.begin_abort();
-                return;
-            }
-            Input::StopWhenIdle => {
-                self.stop_when_idle = true;
-                return;
-            }
+        let Input::User(text) = input;
+        let queued = QueuedInput {
+            text,
+            source: InputSource::External,
         };
-        match self.phase {
-            Phase::Idle => {
-                self.open_turn();
-                self.steering.push_back(queued);
-            }
-            Phase::Running => self.steering.push_back(queued),
-            Phase::Maintenance => {
-                self.steering.push_back(queued);
-                self.wake_requested = true;
-            }
+        if self.phase == Phase::Idle {
+            self.open_turn();
         }
+        self.steering.push_back(queued);
     }
 
     /// Step pre-boundary: the only place steering enters the transcript.
@@ -511,10 +411,6 @@ impl LoopState {
             );
             admitted += 1;
         }
-        if self.wake_requested && self.phase == Phase::Idle {
-            self.wake_requested = false;
-            self.open_turn();
-        }
         admitted
     }
 
@@ -522,17 +418,14 @@ impl LoopState {
     /// Step head: the BudgetGuard AND-gate runs here, once per step, so its
     /// one grace step fires exactly once; never recreate the guard per step.
     pub fn start_provider_call(&mut self, root: &CancellationToken) -> Option<CancellationToken> {
-        if self.in_flight.is_some() || self.gate.admit().is_err() {
+        if self.in_flight || self.stop_hard || self.fatal_error.is_some() {
             return None;
         }
         if self.budget.may_step().is_err() {
             return None;
         }
         let token = root.child_token();
-        self.in_flight = Some(InFlight {
-            turn: self.turn,
-            token: token.clone(),
-        });
+        self.in_flight = true;
         self.step += 1;
         self.budget.record_step();
         // Per-step budget as named: a fresh step head resets, an in-step retry
@@ -550,59 +443,47 @@ impl LoopState {
         Some(token)
     }
 
-    /// Returns false when the message is stale (wrong turn) and was dropped.
-    /// Spend/tokens land here from provider Usage: steps at the step head,
-    /// tokens + spend on settle and on a metered failure. Tokens/spend are
-    /// never refunded.
-    pub(crate) fn finish_provider_msg(&mut self, msg: ProviderMsg) -> bool {
-        if msg.turn() != self.turn {
-            return false; // STALE GUARD: late landing from an interrupted turn.
-        }
-        self.in_flight = None;
-        if let ProviderMsg::Settled {
-            usage: Some(usage), ..
-        } = &msg
-        {
+    /// Settle a completed provider call: clear single-flight, meter billed
+    /// usage, and size the next request's `--budget-line requests` estimate.
+    pub(crate) fn on_provider_settled(&mut self, usage: Option<&Usage>) {
+        self.in_flight = false;
+        if let Some(usage) = usage {
             let before = self.budget.counters().tokens;
             self.record_usage(usage);
             self.last_request_tokens = self.budget.counters().tokens - before;
         }
-        if let ProviderMsg::Failed {
-            err,
-            cancelled,
-            usage,
-            ..
-        } = msg
-        {
-            // Attempts that returned usage are billed: meter before the
-            // refund/retry fork so an exhausted ladder's re-sends are never
-            // invisible (pre-generation failures carry no usage to meter).
-            if let Some(u) = &usage {
-                self.record_usage(u);
-            }
-            if cancelled {
-                self.budget.refund_step(); // no progress: bounded inside the guard
-                return true;
-            }
-            let retry = self.step_retries > 0;
-            if retry {
-                self.step_retries -= 1;
-            }
-            append_to(
-                &mut self.items,
-                ItemKind::Attempt {
-                    error: err.clone(),
-                    will_retry: retry,
-                },
-            );
-            if retry {
-                self.call_model = true; // in-step retry reuses the same assembly
-            } else {
-                self.fatal_error = Some(err.clone());
-                self.gate.close(err);
-            }
+    }
+
+    /// Settle a failed provider call: clear single-flight, meter any billed
+    /// usage, refund on cancel, or consume a step retry / latch fatal error.
+    pub(crate) fn on_provider_failed(&mut self, err: &str, cancelled: bool, usage: Option<&Usage>) {
+        self.in_flight = false;
+        // Attempts that returned usage are billed: meter before the
+        // refund/retry fork so an exhausted ladder's re-sends are never
+        // invisible (pre-generation failures carry no usage to meter).
+        if let Some(u) = usage {
+            self.record_usage(u);
         }
-        true
+        if cancelled {
+            self.budget.refund_step(); // no progress: bounded inside the guard
+            return;
+        }
+        let retry = self.step_retries > 0;
+        if retry {
+            self.step_retries -= 1;
+        }
+        append_to(
+            &mut self.items,
+            ItemKind::Attempt {
+                error: err.to_owned(),
+                will_retry: retry,
+            },
+        );
+        if retry {
+            self.call_model = true; // in-step retry reuses the same assembly
+        } else {
+            self.fatal_error = Some(err.to_owned());
+        }
     }
 
     /// Tokens meter every settle and every metered failure; spend converts
@@ -642,37 +523,6 @@ impl LoopState {
         }
     }
 
-    /// dsh step-local crash repair: synthetic error results for unanswered calls.
-    pub fn crash_repair(&mut self, reason: &str) -> usize {
-        let open: Vec<String> = self
-            .tool_calls
-            .iter()
-            .filter(|(_, c)| c.result.is_none())
-            .map(|(id, _)| id.clone())
-            .collect();
-        let mut repaired = 0;
-        for id in open {
-            let content = format!("unanswered tool call ({reason})");
-            append_to(
-                &mut self.items,
-                ItemKind::ToolResult {
-                    call_id: id.clone(),
-                    content: content.clone(),
-                    is_error: true,
-                    recovery: Some(RecoveryCode::ToolOutcomeUnknown),
-                },
-            );
-            if let Some(c) = self.tool_calls.get_mut(&id) {
-                c.result = Some(ToolResult {
-                    content,
-                    is_error: true,
-                });
-                repaired += 1;
-            }
-        }
-        repaired
-    }
-
     /// Ordered termination, top-down, first match wins. `cfg` is the single
     /// source of run configuration (drain deadline here).
     pub fn terminate(&mut self, cfg: &RunConfig) -> PhaseVerdict {
@@ -681,7 +531,7 @@ impl LoopState {
             let until = *self
                 .drain_until
                 .get_or_insert_with(|| Instant::now() + cfg.drain_timeout);
-            if (self.in_flight.is_some() || self.open_tools() > 0) && Instant::now() < until {
+            if (self.in_flight || self.open_tools() > 0) && Instant::now() < until {
                 return PhaseVerdict::Break;
             }
             return PhaseVerdict::Return(Outcome::Cancelled);
@@ -706,7 +556,7 @@ impl LoopState {
             });
         }
         if self.turn_reason == Some(TurnEndReason::MaxTokens)
-            && self.in_flight.is_none()
+            && !self.in_flight
             && self.open_tools() == 0
         {
             return PhaseVerdict::Return(Outcome::Halted("max-tokens".into()));
@@ -715,27 +565,8 @@ impl LoopState {
         if self.call_model {
             return PhaseVerdict::Continue;
         }
-        // 5. Semantic termination: drained turn, empty queues, follow-up poll.
-        // The old turn closes here (sticky reason or Completed) so the log
-        // never holds two open turns; the new turn opens right after.
-        if self.in_flight.is_none() && self.open_tools() == 0 && self.steering.is_empty() {
-            if let Some(text) = self.followups.pop_front() {
-                let reason = self.turn_reason.take().unwrap_or(TurnEndReason::Completed);
-                append_to(
-                    &mut self.items,
-                    ItemKind::TurnEnd {
-                        turn_id: turn_id(self.turn),
-                        reason,
-                    },
-                );
-                self.open_turn();
-                self.steering.push_back(QueuedInput::from(text));
-                return PhaseVerdict::Continue;
-            }
-            // A live driver parks here awaiting inbox; StopWhenIdle exits instead.
-            if self.stop_when_idle {
-                return PhaseVerdict::Return(Outcome::Done);
-            }
+        // 5. Semantic termination: drained turn, empty queues.
+        if !self.in_flight && self.open_tools() == 0 && self.steering.is_empty() {
             self.phase = Phase::Idle;
         }
         PhaseVerdict::Continue

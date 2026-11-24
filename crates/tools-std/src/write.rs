@@ -4,13 +4,10 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tool_core::{
-    CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome, TOOL_WRITE,
-};
+use tool_core::{Invocation, Tool, ToolDefinition, ToolError, ToolOutcome, TOOL_WRITE};
 
-use crate::common::{dispatch, parse_args, path_err, EDIT_FILE_CAP, EDIT_REPLACE_CAP};
+use crate::common::{parse_args, path_err, EDIT_FILE_CAP, EDIT_REPLACE_CAP};
 use crate::policy::{resolve_under, symlink_safe, Policy, ToolPathError};
-use crate::runner::check_syntax;
 
 pub struct WriteTool {
     policy: Arc<Policy>,
@@ -74,13 +71,10 @@ impl Tool for WriteTool {
             schema: write_schema(),
         }
     }
-    fn prepare(&self, call: &ToolCall) -> CallStatus {
-        dispatch(call)
-    }
     async fn execute(
         &self,
         inv: Invocation,
-        cancel: CancellationToken,
+        _cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: WriteArgs = parse_args(&inv.args)?;
         if args.content.len() > EDIT_REPLACE_CAP {
@@ -98,11 +92,6 @@ impl Tool for WriteTool {
             .unwrap_or(false)
         {
             return Err(ToolError::Failed("file over 512KB cap".to_string()));
-        }
-        if let Some(argv) = self.policy.syntax_cmd.clone() {
-            if !argv.is_empty() {
-                check_syntax(&self.policy, &args.content, &cancel).await?;
-            }
         }
         // New files are created with `create_new`: the create is atomic, so
         // a file that appears between the checks above and the open fails

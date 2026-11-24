@@ -10,7 +10,6 @@ fn main() {
     let caps = eval::ToolCaps {
         can_create: true,
         can_patch: true,
-        exec_prefixes: vec!["python3".into()],
     };
     let mut bad = 0usize;
     for id in v["ids"].as_array().expect("slice ids") {

@@ -275,6 +275,9 @@ struct ReasonDetail {
 pub(crate) struct BodyFail {
     pub(crate) msg: String,
     pub(crate) usage: Option<Usage>,
+    pub(crate) truncated: bool,
+    pub(crate) content_chars: usize,
+    pub(crate) reasoning_chars: usize,
 }
 
 /// Wire usage -> `Usage`; None when the body shipped no usage object at all.
@@ -288,7 +291,6 @@ pub(crate) fn wire_usage(u: Option<WireUsage>, model: &str) -> Option<Usage> {
                 .prompt_tokens_details
                 .map(|d| d.cached_tokens)
                 .unwrap_or(0),
-            cache_write: 0,
             reasoning: u
                 .completion_tokens_details
                 .map(|d| d.reasoning_tokens)
@@ -310,11 +312,17 @@ pub(crate) fn parse_body(
     let resp: ChatResp = serde_json::from_value(v.clone()).map_err(|e| BodyFail {
         msg: format!("bad chat body: {e}"),
         usage: None,
+        truncated: false,
+        content_chars: 0,
+        reasoning_chars: 0,
     })?;
     let wire = wire_usage(resp.usage, model);
     let choice = resp.choices.into_iter().next().ok_or_else(|| BodyFail {
         msg: format!("empty content from {model} (finish_reason=None; reasoning_content=0 chars); the endpoint shipped no text"),
         usage: wire.clone(),
+        truncated: false,
+        content_chars: 0,
+        reasoning_chars: 0,
     })?;
     let finish = choice.finish_reason.clone();
     let text = choice.message.content.clone();
@@ -341,40 +349,40 @@ pub(crate) fn parse_body(
         thinking: (!reasoning.trim().is_empty()).then_some(reasoning.clone()),
     };
     let stop = infer_stop(finish.as_deref(), &message);
-    let (input, output, cache_read, reasoning_tok) = wire
-        .as_ref()
-        .map(|u| (u.input, u.output, u.cache_read, u.reasoning))
-        .unwrap_or((0, 0, 0, None));
+    let content_chars = text.trim().len();
+    let reasoning_chars = reasoning.trim().len();
     if stop == StopReason::MaxTokens {
         return Err(BodyFail {
             msg: format!(
-                "output truncated at {max_tokens} tokens (finish_reason=length; content={} chars; reasoning_content={} chars); raise max_tokens",
-                text.trim().len(),
-                reasoning.trim().len()
+                "output truncated at {max_tokens} tokens (finish_reason=length; content={content_chars} chars; reasoning_content={reasoning_chars} chars); raise max_tokens",
             ),
             usage: wire,
+            truncated: true,
+            content_chars,
+            reasoning_chars,
         });
     }
     if text.trim().is_empty() && message.tool_calls.is_empty() {
         return Err(BodyFail {
             msg: format!(
-                "empty content from {model} (finish_reason={finish:?}; reasoning_content={} chars); the endpoint shipped no text",
-                reasoning.trim().len()
+                "empty content from {model} (finish_reason={finish:?}; reasoning_content={reasoning_chars} chars); the endpoint shipped no text",
             ),
             usage: wire,
+            truncated: false,
+            content_chars,
+            reasoning_chars,
         });
     }
     Ok(Response {
         message,
         stop,
-        usage: Usage {
-            input,
-            output,
-            cache_read,
-            cache_write: 0,
-            reasoning: reasoning_tok,
-            cost_usd: wire.as_ref().and_then(|u| u.cost_usd),
-        },
+        usage: wire.unwrap_or(Usage {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            reasoning: None,
+            cost_usd: None,
+        }),
         latency_ms: 0,
         attempts: 1,
         raw_stop_reason: finish,
@@ -386,7 +394,6 @@ pub(crate) fn parse_body(
 mod tests {
     use super::*;
     use crate::client::EndpointProfile;
-    use crate::retry::chars_after;
     use crate::test_support::req_with_tool;
     use provider_core::{ProviderMessage, Thinking};
     use std::collections::HashMap;
@@ -542,7 +549,6 @@ mod tests {
                 "reasoning_effort": "low"
             })),
             reasoning_effort: Some("max".into()),
-            ..EndpointProfile::default()
         };
         let mut off = req.clone();
         off.thinking = Thinking::Off;
@@ -580,7 +586,6 @@ mod tests {
         assert_eq!(r.stop, StopReason::ToolUse);
         assert_eq!(r.usage.reasoning, Some(30));
         assert_eq!(r.usage.total_tokens(), 110);
-        assert_eq!(r.usage.content_tokens(), 70);
     }
     #[test]
     fn reasoning_field_is_captured_when_reasoning_content_is_absent() {
@@ -634,6 +639,8 @@ mod tests {
         assert!(e.msg.contains("finish_reason=length"), "{}", e.msg);
         assert!(e.msg.contains("content=4 chars"), "{}", e.msg);
         assert!(e.msg.contains("reasoning_content=3 chars"), "{}", e.msg);
+        assert!(e.truncated);
+        assert_eq!((e.content_chars, e.reasoning_chars), (4, 3));
         // The billed usage rides the failure, not just the message.
         let u = e.usage.expect("truncated body carried usage");
         assert_eq!((u.input, u.output), (5, 64));
@@ -643,19 +650,8 @@ mod tests {
         });
         let e2 = parse_body(&empty, "m", 64).unwrap_err();
         assert!(e2.msg.contains("empty content"), "{}", e2.msg);
+        assert!(!e2.truncated);
         assert!(e2.usage.is_none(), "no usage object -> None, never zeros");
-    }
-    #[test]
-    fn truncation_message_parses_content_and_reasoning_counts() {
-        let v = serde_json::json!({
-            "choices": [{"message": {"content": "", "reasoning_content": "rrrr"},
-                         "finish_reason": "length"}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 8}
-        });
-        let f = parse_body(&v, "m", 64).unwrap_err();
-        assert_eq!(chars_after(&f.msg, "; content="), 0);
-        assert_eq!(chars_after(&f.msg, "; reasoning_content="), 4);
-        assert_eq!(chars_after("no counts here", "; content="), 0);
     }
     #[test]
     fn brace_in_string_tool_args_survive() {
@@ -757,7 +753,6 @@ mod tests {
     #[test]
     fn extras_merge_and_profile_threshold_default() {
         let profile = EndpointProfile::default();
-        assert_eq!(profile.emission_threshold_chars, 12_000);
         assert_eq!(
             profile.thinking_off.as_ref().unwrap()["thinking"]["type"],
             "disabled"

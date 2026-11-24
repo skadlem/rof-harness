@@ -5,15 +5,13 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
-use agent_event::{AgentEvent, Emitter};
-use agent_loop::{FailureKind, Input, LoopState, NoBets, Outcome, Run};
+use agent_event::AgentEvent;
+use agent_loop::{FailureKind, Input, NoBets, Outcome, Run};
 use provider_core::LlmClient;
-use tokio_util::sync::CancellationToken;
 
 use crate::cli::{budget_for, run_config, Args};
 use crate::exit::exit_code;
-use crate::workdir::{exclude_sidecar, resolve_log_path};
-use crate::{policy_for, preserve_log, Gate};
+use crate::SessionBootstrap;
 
 type Out = Arc<Mutex<dyn Write + Send>>;
 
@@ -58,53 +56,24 @@ pub(crate) async fn run_chat<P: LlmClient>(
     mut input: impl BufRead,
     out: Out,
 ) -> i32 {
-    let policy = Arc::new(policy_for(args));
-    let mut reg = match crate::registry_with_mcp(args, policy.clone()).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("cannot configure tools: {e}");
-            return 3;
+    let SessionBootstrap {
+        policy,
+        registry: reg,
+        mut agent_tree,
+        mut state,
+        gate,
+        mut emitter,
+        cancel,
+        ..
+    } = match crate::bootstrap_session(args, false).await {
+        Ok(s) => s,
+        Err((kind, message)) => {
+            eprintln!("{message}");
+            return exit_code(&Outcome::Failed { kind, message });
         }
-    };
-    let mut tree = args.agents.as_ref().map(crate::agents::Tree::new);
-    if let Some(t) = &tree {
-        t.register_root(&mut reg);
-    }
-    let mut state = LoopState::new();
-    if let Some(p) = args.resume.as_deref() {
-        if let Err(e) = state.restore_from(std::path::Path::new(p)) {
-            eprintln!("--resume {p}: {e}");
-            return 5;
-        }
-    }
-    let gate = Gate {
-        incremental: args.proof_cmd.is_some(),
     };
     let bets: &dyn agent_loop::BetsHook = if args.bets { &gate } else { &NoBets };
-    let mut emitter = Emitter::new();
     emitter.on(tap(out.clone(), args.stream));
-    let cancel = CancellationToken::new();
-    tokio::spawn({
-        let cancel = cancel.clone();
-        async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                cancel.cancel();
-            }
-        }
-    });
-    // Same sidecar rules as `run`: a fresh session archives the old WAL, a
-    // resumed one keeps and appends to it.
-    let log_path = resolve_log_path(args);
-    if let (Some(p), None) = (log_path.as_deref(), args.resume.as_deref()) {
-        if let Err(e) = preserve_log(p, &args.workdir) {
-            eprintln!("cannot preserve WAL: {e}");
-            return 5;
-        }
-    }
-    let _ = snapshot::TreeService::new(&args.workdir).ensure();
-    if let Some(p) = log_path.as_deref() {
-        exclude_sidecar(&args.workdir, p);
-    }
     let mut next = Some(args.goal.clone()).filter(|g| !g.is_empty());
     loop {
         let msg = match next.take() {
@@ -132,7 +101,7 @@ pub(crate) async fn run_chat<P: LlmClient>(
             }
         };
         let outcome = crate::agents::with_children(
-            tree.as_mut(),
+            agent_tree.as_mut(),
             provider,
             args,
             &policy,

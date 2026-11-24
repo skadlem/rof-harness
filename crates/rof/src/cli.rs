@@ -309,12 +309,16 @@ fn set_exec_output(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> 
     Ok(())
 }
 
+pub(crate) fn parse_workflow(v: Option<String>) -> Result<bool, String> {
+    match v.as_deref() {
+        Some("legacy") => Ok(false),
+        Some("minimal") => Ok(true),
+        other => Err(format!("--workflow expects legacy|minimal, got {other:?}")),
+    }
+}
+
 fn set_workflow(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    b.minimal_workflow = Some(match v.as_deref() {
-        Some("legacy") => false,
-        Some("minimal") => true,
-        other => return Err(format!("--workflow expects legacy|minimal, got {other:?}")),
-    });
+    b.minimal_workflow = Some(parse_workflow(v)?);
     Ok(())
 }
 
@@ -333,11 +337,26 @@ fn set_budget_line(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> 
     Ok(())
 }
 
-pub(crate) fn set_positive_usize(flag: &str, v: Option<String>) -> Result<usize, String> {
+pub(crate) fn parse_int<T: std::str::FromStr>(
+    flag: &str,
+    kind: &str,
+    v: Option<String>,
+) -> Result<T, String> {
     let s = v.unwrap_or_default();
-    let n: usize = s
-        .parse()
-        .map_err(|_| format!("{flag} needs a positive integer, got {s:?}"))?;
+    s.parse()
+        .map_err(|_| format!("{flag} needs a {kind} integer, got {s:?}"))
+}
+
+pub(crate) fn parse_positive_u32(flag: &str, v: Option<String>) -> Result<u32, String> {
+    let n: u32 = parse_int(flag, "positive", v)?;
+    if n == 0 {
+        return Err(format!("{flag} must be > 0"));
+    }
+    Ok(n)
+}
+
+pub(crate) fn set_positive_usize(flag: &str, v: Option<String>) -> Result<usize, String> {
+    let n: usize = parse_int(flag, "positive", v)?;
     if n == 0 {
         return Err(format!("{flag} must be > 0"));
     }
@@ -350,11 +369,7 @@ fn set_observation_keep(b: &mut RunBuilder, v: Option<String>) -> Result<(), Str
 }
 
 fn set_stall_threshold(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    b.stall_threshold = Some(
-        s.parse()
-            .map_err(|_| format!("--stall-threshold needs a non-negative integer, got {s:?}"))?,
-    );
+    b.stall_threshold = Some(parse_int("--stall-threshold", "non-negative", v)?);
     Ok(())
 }
 
@@ -402,9 +417,12 @@ fn set_review(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn parse_procedure_file(v: Option<String>) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(v.ok_or("--procedure-file needs a path")?))
+}
+
 fn set_procedure_file(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    b.procedure_files
-        .push(PathBuf::from(v.ok_or("--procedure-file needs a path")?));
+    b.procedure_files.push(parse_procedure_file(v)?);
     Ok(())
 }
 
@@ -464,20 +482,12 @@ fn set_keep_thinking(b: &mut RunBuilder, _: Option<String>) -> Result<(), String
 pub(crate) const EFFORT_LEVELS: [&str; 5] = ["none", "low", "high", "xhigh", "max"];
 
 fn set_steer(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    b.steer = Some(match v.as_deref() {
-        Some("on") => true,
-        Some("off") => false,
-        other => return Err(format!("--steer expects on|off, got {other:?}")),
-    });
+    b.steer = Some(parse_toggle("--steer", v)?);
     Ok(())
 }
 
 fn set_streak_steer(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    b.streak_steer = Some(match v.as_deref() {
-        Some("on") => true,
-        Some("off") => false,
-        other => return Err(format!("--streak-steer expects on|off, got {other:?}")),
-    });
+    b.streak_steer = Some(parse_toggle("--streak-steer", v)?);
     Ok(())
 }
 
@@ -496,21 +506,13 @@ pub(crate) fn parse_deliverable(v: Option<String>) -> Result<PathBuf, String> {
     Ok(p)
 }
 
-pub(crate) fn parse_on_off(flag: &str, v: Option<String>) -> Result<bool, String> {
-    match v.as_deref() {
-        Some("on") => Ok(true),
-        Some("off") => Ok(false),
-        other => Err(format!("{flag} expects on|off, got {other:?}")),
-    }
-}
-
 fn set_deliverable(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
     b.deliverables.push(parse_deliverable(v)?);
     Ok(())
 }
 
 fn set_stream(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    b.stream = Some(parse_on_off("--stream", v)?);
+    b.stream = Some(parse_toggle("--stream", v)?);
     Ok(())
 }
 
@@ -524,19 +526,23 @@ fn set_mcp(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
 }
 
 fn set_deliverable_steer(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    b.deliverable_steer = Some(parse_on_off("--deliverable-steer", v)?);
+    b.deliverable_steer = Some(parse_toggle("--deliverable-steer", v)?);
     Ok(())
 }
 
-fn set_reasoning_effort(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+pub(crate) fn parse_reasoning_effort(v: Option<String>) -> Result<String, String> {
     let level = v.ok_or("--reasoning-effort needs a level")?;
     if !EFFORT_LEVELS.contains(&level.as_str()) {
         return Err(format!(
-            "--reasoning-effort expects {} , got {level:?}",
+            "--reasoning-effort expects {}, got {level:?}",
             EFFORT_LEVELS.join("|")
         ));
     }
-    b.reasoning_effort = Some(level);
+    Ok(level)
+}
+
+fn set_reasoning_effort(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.reasoning_effort = Some(parse_reasoning_effort(v)?);
     Ok(())
 }
 
@@ -555,59 +561,42 @@ fn set_context_file(b: &mut RunBuilder, v: Option<String>) -> Result<(), String>
 }
 
 fn set_max_tokens(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    b.max_tokens = Some(
-        s.parse()
-            .map_err(|_| format!("--max-tokens needs a positive integer, got {s:?}"))?,
-    );
+    b.max_tokens = Some(parse_int("--max-tokens", "positive", v)?);
     Ok(())
 }
 
 fn set_budget_tokens(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    b.budget_tokens = Some(
-        s.parse()
-            .map_err(|_| format!("--budget-tokens needs a positive integer, got {s:?}"))?,
-    );
+    b.budget_tokens = Some(parse_int("--budget-tokens", "positive", v)?);
     Ok(())
+}
+
+pub(crate) fn parse_exec_policy(v: Option<String>) -> Result<tools_std::ExecPolicy, String> {
+    v.unwrap_or_default().parse()
 }
 
 fn set_exec_policy(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    b.exec_policy = Some(s.parse()?);
+    b.exec_policy = Some(parse_exec_policy(v)?);
     Ok(())
 }
 
-fn set_budget_shape(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+pub(crate) fn parse_budget_shape(v: Option<String>) -> Result<agent_loop::BudgetShape, String> {
     let s = v.unwrap_or_default();
-    b.budget_shape = Some(
-        s.parse()
-            .map_err(|_| format!("--budget-shape needs gross or miss-plus-out, got {s:?}"))?,
-    );
+    s.parse()
+        .map_err(|_| format!("--budget-shape needs gross or miss-plus-out, got {s:?}"))
+}
+
+fn set_budget_shape(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.budget_shape = Some(parse_budget_shape(v)?);
     Ok(())
 }
 
 fn set_budget_steps(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    let n: u32 = s
-        .parse()
-        .map_err(|_| format!("--budget-steps needs a positive integer, got {s:?}"))?;
-    if n == 0 {
-        return Err("--budget-steps must be > 0".into());
-    }
-    b.budget_steps = Some(n);
+    b.budget_steps = Some(parse_positive_u32("--budget-steps", v)?);
     Ok(())
 }
 
 fn set_budget_actions(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    let n: u32 = s
-        .parse()
-        .map_err(|_| format!("--budget-actions needs a positive integer, got {s:?}"))?;
-    if n == 0 {
-        return Err("--budget-actions must be > 0".into());
-    }
-    b.budget_actions = Some(n);
+    b.budget_actions = Some(parse_positive_u32("--budget-actions", v)?);
     Ok(())
 }
 
@@ -691,20 +680,12 @@ fn set_history_read(b: &mut RunBuilder, v: Option<String>) -> Result<(), String>
 }
 
 fn set_thinking_keep(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    b.thinking_keep = Some(
-        s.parse()
-            .map_err(|_| format!("--thinking-keep needs a positive integer, got {s:?}"))?,
-    );
+    b.thinking_keep = Some(parse_int("--thinking-keep", "positive", v)?);
     Ok(())
 }
 
 fn set_collapse_hysteresis(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    b.collapse_hysteresis = Some(
-        s.parse()
-            .map_err(|_| format!("--collapse-hysteresis needs a positive integer, got {s:?}"))?,
-    );
+    b.collapse_hysteresis = Some(parse_int("--collapse-hysteresis", "positive", v)?);
     Ok(())
 }
 
@@ -1272,7 +1253,6 @@ pub(crate) fn endpoint_profile(
 ) -> EndpointProfile {
     let mut p = if keep_thinking {
         EndpointProfile {
-            emission_threshold_chars: 12_000,
             thinking_off: None,
             reasoning_effort: None,
         }
@@ -1955,7 +1935,6 @@ mod tests {
         let on = endpoint_profile(true, None);
         assert!(on.thinking_off.is_none(), "keep-thinking sends no knob");
         let off = endpoint_profile(false, None);
-        assert_eq!(off.emission_threshold_chars, on.emission_threshold_chars);
         assert!(
             off.thinking_off.is_some(),
             "default keeps the DeepSeek thinking-off body"

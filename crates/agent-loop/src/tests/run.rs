@@ -1,11 +1,7 @@
 use crate::request::CHECKPOINT_PREFIX;
-use crate::run::drive_tick;
-use crate::state::ProviderMsg;
-use crate::state::ToolMsg;
 use crate::*;
 use agent_event::AgentEvent;
 use agent_event::Emitter;
-use agent_log::Item;
 use agent_log::ItemKind;
 use provider_core::LlmError;
 use provider_core::Request;
@@ -15,10 +11,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tool_core::ToolCall;
-use tool_core::ToolResult;
 use tool_core::{
     CallStatus as CoreCallStatus, GrantGate, Invocation as CoreInvocation,
     Registry as CoreRegistry, Tool as CoreTool, ToolCall as CoreToolCall,
@@ -26,9 +19,9 @@ use tool_core::{
 };
 
 use super::{
-    compaction, edit_registry, event_order, full_event_order, last_totals, response, run_kinds,
-    run_registry, run_script, run_tmp, script_resp, summary_resp, text_resp, text_response,
-    tool_use_message, usage, write_round, FakeLlm, Scripted, WriteFile,
+    compaction, full_event_order, last_totals, response, run_kinds, run_registry, run_script,
+    run_tmp, script_resp, summary_resp, text_resp, text_response, write_round, FakeLlm, Scripted,
+    WriteFile,
 };
 
 struct StreakView;
@@ -340,249 +333,36 @@ async fn streak_followed_by_write_in_batch_does_not_deliver() {
 }
 
 #[tokio::test]
-async fn drive_tick_select_spine() {
-    let mut s = LoopState::new();
-    let (itx, mut irx) = mpsc::channel(8);
-    let (_ptx, mut prx) = mpsc::channel(8);
-    let (_ttx, mut trx) = mpsc::channel(8);
-    let cancel = CancellationToken::new();
-    let mut emitter = Emitter::new();
-    itx.send(Input::User("go".into())).await.unwrap();
-    let verdict = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(verdict, PhaseVerdict::Continue));
-    assert_eq!(s.turn, 1);
-    itx.send(Input::StopHard).await.unwrap();
-    let verdict = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(verdict, PhaseVerdict::Return(Outcome::Cancelled)));
-}
-
-#[tokio::test]
 async fn cancel_token_drives_stop() {
-    let mut s = LoopState::new();
-    let (_itx, mut irx) = mpsc::channel(8);
-    let (_ptx, mut prx) = mpsc::channel(8);
-    let (_ttx, mut trx) = mpsc::channel(8);
-    let cancel = CancellationToken::new();
-    let mut emitter = Emitter::new();
-    cancel.cancel();
-    let verdict = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(verdict, PhaseVerdict::Return(Outcome::Cancelled)));
-}
-
-#[tokio::test]
-async fn e2e_full_turn_tool_call_orders_log_before_events() {
-    use agent_event::check_pairing;
-    let mut s = LoopState::new();
-    let mut emitter = Emitter::new();
-    let (itx, mut irx) = mpsc::channel(8);
-    let (ptx, mut prx) = mpsc::channel(8);
-    let (ttx, mut trx) = mpsc::channel(8);
-    let cancel = CancellationToken::new();
-    let registry = edit_registry();
-
-    itx.send(Input::User("build it".into())).await.unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(v, PhaseVerdict::Continue));
-    s.admit_steering(); // pre-boundary: the only place steering enters the log
-    let root = CancellationToken::new();
-    assert!(s.start_provider_call(&root).is_some()); // step head: may_step + record
-    ptx.send(ProviderMsg::Partial {
-        turn: 1,
-        text: "thinking ".into(),
-    })
-    .await
-    .unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(v, PhaseVerdict::Continue));
-    ptx.send(ProviderMsg::Settled {
-        turn: 1,
-        message: tool_use_message(),
-        stop: StopReason::ToolUse,
-        usage: Some(usage()),
-    })
-    .await
-    .unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(v, PhaseVerdict::Continue));
-    // Pre-effect: the ToolCall row is durable before anything executes.
-    let call_seq = s
-        .items
-        .iter()
-        .position(|i| matches!(&i.kind, ItemKind::ToolCall { call_id, .. } if call_id == "c1"))
-        .expect("ToolCall logged at claim");
-    let prepared = registry.prepare(
-        "agent",
-        ToolCall {
-            call_id: "c1".into(),
-            name: "edit".into(),
-            args: serde_json::json!({"path": "f"}),
-        },
-    );
-    let inv = match prepared {
-        tool_core::CallStatus::Dispatch(inv) => inv,
-        tool_core::CallStatus::Result(r) => panic!("gate must allow the fake: {}", r.content),
+    let root = run_tmp("precancel");
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([text_resp("never")])),
     };
-    let outcome = registry
-        .resolve("edit")
-        .unwrap()
-        .execute(inv, CancellationToken::new())
-        .await
-        .expect("fake tool runs");
-    ttx.send(ToolMsg {
-        call_id: "c1".into(),
-        result: ToolResult {
-            content: outcome.content,
-            is_error: false,
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
         },
-    })
-    .await
-    .unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
+        vec![Input::User("go".into())],
         &cancel,
-        &mut emitter,
-        &RunConfig::default(),
     )
     .await;
-    // Batch done, results owed back to the model: the tick parks on.
-    assert!(matches!(v, PhaseVerdict::Continue));
-    // A hard stop drains the parked idle and closes the turn.
-    itx.send(Input::StopHard).await.unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(v, PhaseVerdict::Return(Outcome::Cancelled)));
-
-    // Events arrive ordered; every Start pairs with its End.
-    let order = event_order(emitter.history());
-    for pair in [
-        ("TurnStart", "MessageStart"),
-        ("MessageStart", "MessageEnd"),
-        ("MessageEnd", "ToolStart"),
-        ("ToolStart", "ToolEnd"),
-        ("ToolEnd", "TurnEnd"),
-    ] {
-        let (a, b) = (
-            order.iter().position(|k| *k == pair.0),
-            order.iter().position(|k| *k == pair.1),
-        );
-        assert!(a < b, "{pair:?} out of order in {order:?}");
-    }
-    assert!(order.contains(&"Control")); // the steer ack rides the stream
-    assert!(check_pairing(emitter.history()));
-    // Partial + settle share one message id: a single Start, two Updates.
-    assert_eq!(order.iter().filter(|k| **k == "MessageStart").count(), 1);
-    assert_eq!(order.iter().filter(|k| **k == "MessageUpdate").count(), 2);
-    // Log rows precede their frames, in transcript order.
-    let kinds: Vec<&str> = s
-        .items
-        .iter()
-        .map(|i| match &i.kind {
-            ItemKind::TurnStart { .. } => "TurnStart",
-            ItemKind::Input { .. } => "Input",
-            ItemKind::Assistant { .. } => "Assistant",
-            ItemKind::ToolCall { .. } => "ToolCall",
-            ItemKind::ToolResult { .. } => "ToolResult",
-            ItemKind::TurnEnd { .. } => "TurnEnd",
-            _ => "other",
-        })
-        .collect();
-    assert_eq!(
-        kinds,
-        vec![
-            "TurnStart",
-            "Input",
-            "Assistant",
-            "ToolCall",
-            "ToolResult",
-            "TurnEnd"
-        ]
-    );
-    let result_seq = s
-        .items
-        .iter()
-        .position(|i| matches!(&i.kind, ItemKind::ToolResult { .. }))
-        .unwrap();
-    assert!(call_seq < result_seq); // pre-effect, never inverted
-                                    // Budget consumed from the fake Usage.
-    assert_eq!(s.budget.counters().steps, 1);
-    assert_eq!(s.budget.counters().tokens, 150);
-    assert_eq!(s.budget.counters().spent_cents, 2);
-    // F1a: the settle's usage rides MessageEnd; TurnEnd carries the totals.
-    assert!(emitter.history().iter().any(|e| matches!(
-        e,
-        AgentEvent::MessageEnd { usage: Some(u), .. }
-            if u.input_tokens == 100 && u.output_tokens == 50 && u.cost_usd == Some(0.02)
-    )));
-    assert!(emitter.history().iter().any(|e| matches!(
-        e,
-        AgentEvent::TurnEnd { usage_totals, .. }
-            if usage_totals.input_tokens == 100 && usage_totals.cost_usd == Some(0.02)
-    )));
+    assert!(matches!(outcome, Outcome::Cancelled));
+    assert!(client.requests.lock().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -1094,7 +874,6 @@ async fn run_meters_failed_attempt_usage_then_retries() {
             input: 100,
             output: 20,
             cache_read: 0,
-            cache_write: 0,
             reasoning: None,
             cost_usd: Some(0.02),
         },
@@ -1157,7 +936,6 @@ async fn run_exhausted_ladder_is_never_retried_in_step() {
                 input: 100,
                 output: 20,
                 cache_read: 0,
-                cache_write: 0,
                 reasoning: None,
                 cost_usd: Some(0.02),
             }),
@@ -1238,7 +1016,7 @@ fn project_durable(rows: &[&'static str]) -> Vec<&'static str> {
 }
 
 #[tokio::test]
-async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
+async fn run_agrees_on_durable_before_emit_order() {
     use agent_event::check_pairing;
 
     // The shared script: user turn, one write tool call, its result, final text.
@@ -1250,7 +1028,6 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
         )
     }
 
-    // --- leg 1: run() on real siblings ---
     let run_root = run_tmp("shared-run");
     let run_client = FakeLlm {
         order: Arc::new(Mutex::new(Vec::new())),
@@ -1285,145 +1062,10 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
     assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
     let _ = std::fs::remove_dir_all(&run_root);
 
-    // --- leg 2: drive_tick on the same script ---
-    let tick_root = run_tmp("shared-tick");
-    let registry = run_registry(&tick_root);
-    let mut s = LoopState::new();
-    s.stop_when_idle = true; // the scripted run is done after the final text
-    let mut emitter = Emitter::new();
-    let (itx, mut irx) = mpsc::channel(8);
-    let (ptx, mut prx) = mpsc::channel(8);
-    let (ttx, mut trx) = mpsc::channel(8);
-    let cancel = CancellationToken::new();
-
-    itx.send(Input::User("go".into())).await.unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(v, PhaseVerdict::Continue));
-    s.admit_steering(); // pre-boundary: the only place steering enters the log
-    let root = CancellationToken::new();
-    assert!(s.start_provider_call(&root).is_some());
-    ptx.send(ProviderMsg::Settled {
-        turn: 1,
-        message: response(vec![write_call("c1")], StopReason::ToolUse).message,
-        stop: StopReason::ToolUse,
-        usage: None,
-    })
-    .await
-    .unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(v, PhaseVerdict::Continue));
-    // The ToolCall row is durable (at claim) before the tool runs.
-    let prepared = registry.prepare(
-        "agent",
-        ToolCall {
-            call_id: "c1".into(),
-            name: "write".into(),
-            args: serde_json::json!({"path": "w.txt", "content": "x\n"}),
-        },
-    );
-    let inv = match prepared {
-        tool_core::CallStatus::Dispatch(inv) => inv,
-        tool_core::CallStatus::Result(r) => panic!("gate must allow the fake: {}", r.content),
-    };
-    let out = registry
-        .resolve("write")
-        .unwrap()
-        .execute(inv, CancellationToken::new())
-        .await
-        .expect("write tool runs");
-    ttx.send(ToolMsg {
-        call_id: "c1".into(),
-        result: ToolResult {
-            content: out.content,
-            is_error: false,
-        },
-    })
-    .await
-    .unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(v, PhaseVerdict::Continue));
-    // Shared `settle_tool_msg` already counted the write (`edits += 1`)
-    // like `run`'s `note_tool_execution`: no manual increment here.
-    assert!(s.start_provider_call(&root).is_some());
-    ptx.send(ProviderMsg::Settled {
-        turn: 1,
-        message: text_response("done").message,
-        stop: StopReason::Stop,
-        usage: None,
-    })
-    .await
-    .unwrap();
-    // Unverified declare held: the turn stays alive, no Done yet.
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(v, PhaseVerdict::Continue));
-    assert!(s.start_provider_call(&root).is_some());
-    ptx.send(ProviderMsg::Settled {
-        turn: 1,
-        message: text_response("done").message,
-        stop: StopReason::Stop,
-        usage: None,
-    })
-    .await
-    .unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(v, PhaseVerdict::Return(Outcome::Done)));
-    let _ = std::fs::remove_dir_all(&tick_root);
-
-    // --- drift guard: same durable order, same frame order, frames follow rows ---
-    let rows_of = |items: &[Item]| -> Vec<&'static str> {
-        run_kinds(items)
-            .into_iter()
-            .filter(|k| *k != "Header")
-            .collect()
-    };
-    let run_rows = rows_of(&run_state.items);
-    let tick_rows = rows_of(&s.items);
-    assert_eq!(run_rows, tick_rows, "durable rows drifted between drivers");
+    let run_rows: Vec<&'static str> = run_kinds(&run_state.items)
+        .into_iter()
+        .filter(|k| *k != "Header")
+        .collect();
     assert_eq!(
         run_rows,
         vec![
@@ -1439,23 +1081,12 @@ async fn shared_scenario_both_drivers_agree_on_durable_before_emit_order() {
         ]
     );
     let run_frames = frame_order(run_emitter.history());
-    let tick_frames = frame_order(emitter.history());
-    assert_eq!(
-        run_frames, tick_frames,
-        "frame order drifted between drivers"
-    );
     assert_eq!(
         project_durable(&run_rows),
         run_frames,
         "run(): frames must follow the durable rows"
     );
-    assert_eq!(
-        project_durable(&tick_rows),
-        tick_frames,
-        "drive_tick(): frames must follow the durable rows"
-    );
     assert!(check_pairing(run_emitter.history()));
-    assert!(check_pairing(emitter.history()));
 }
 
 /// Cancel during `provider.complete` aborts promptly: the step records a
@@ -1526,7 +1157,6 @@ async fn cancel_during_provider_complete_aborts_promptly_as_cancelled() {
         "cancelled records no Attempt row"
     );
     assert!(state.stop_hard);
-    assert_eq!(state.gate.status(), GateStatus::Aborting);
     assert!(emitter.history().iter().any(|e| matches!(
         e,
         AgentEvent::Error { error } if error.code == "provider-failed"

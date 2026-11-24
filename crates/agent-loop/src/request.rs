@@ -7,6 +7,7 @@ use provider_core::{
     AssistantMessage, LlmClient, LlmError, ProviderMessage, Request, StopReason, Thinking,
 };
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::Path;
 
 pub(crate) const READ_STREAK_DIRECTIVE: &str = "You have read six files or search results in a row without making a successful edit or write. Decide whether you have enough evidence to make a change; if so, make the smallest useful change and check it. Otherwise, state the specific missing evidence and obtain it.";
@@ -230,6 +231,7 @@ pub(crate) fn budget_line(state: &LoopState, requests: bool) -> String {
 /// Named files are pinned verbatim up to this cap; snapshot and comparison
 /// must read the same window or an unchanged pin would look edited.
 pub(crate) const PIN_CAP_CHARS: usize = 8000;
+pub(crate) const FILE_MAP_MAX_PATHS: usize = 200;
 
 /// Run-start pin contents: one read per named file, reused for the whole run
 /// (see [`LoopState::pins`]). Unreadable files are simply not pinned.
@@ -244,26 +246,36 @@ pub(crate) fn pin_snapshot(files: &[String], workdir: &Path) -> Vec<(String, Str
         .collect()
 }
 
+/// Run-start prefix-cache head freeze: file map + named-file pins.
+pub(crate) fn freeze_context_head(
+    workdir: &Path,
+    context_files: &[String],
+) -> (String, Vec<(String, String)>) {
+    (
+        context::file_map(workdir, FILE_MAP_MAX_PATHS).join("\n"),
+        pin_snapshot(context_files, workdir),
+    )
+}
+
 /// Prompt build: static workflow contract + run-start file map (cached-prefix
-/// head) + named files as volatiles (delivered last), fitted to
-/// `context_budget_chars` in the system string. Every byte of that head is
-/// frozen for the run — DeepSeek-style prefix caching only fires on
-/// byte-identical prefixes. Named files freeze the same way ([`LoopState::pins`])
-/// and drop out of the request if their file changed since run start. The live
-/// budget line is the sole per-request variation
-/// (wire-only clone of `Request.messages`, never `state.items`; the empty-history
-/// edge makes it the sole `user` message): it is appended to the last
-/// outgoing message only and never to the transcript, so the durable log stays
-/// exactly what was recorded. History is delivered exactly once, raw, as
-/// messages (collapse-5 rides [`LoopState::derived_messages`]) — never fitted
-/// into the system copy. Summarizes only when `--compaction` is on (checkpoint).
+/// head) + named files (delivered last). Every byte of that head is frozen for
+/// the run — DeepSeek-style prefix caching only fires on byte-identical
+/// prefixes. Named files freeze the same way ([`LoopState::pins`]) and drop
+/// out of the request if their file changed since run start. The live budget
+/// line is the sole per-request variation (wire-only clone of
+/// `Request.messages`, never `state.items`; the empty-history edge makes it the
+/// sole `user` message): it is appended to the last outgoing message only and
+/// never to the transcript, so the durable log stays exactly what was
+/// recorded. History is delivered exactly once, raw, as messages (collapse-5
+/// rides [`LoopState::derived_messages`]). Summarizes only when `--compaction`
+/// is on (checkpoint).
 pub(crate) fn build_request(
     state: &mut LoopState,
     registry: &tool_core::Registry,
     workdir: &Path,
     cfg: &RunConfig,
 ) -> Request {
-    let mut asm = context::ContextAssembler::new(cfg.context_budget_chars);
+    let mut sections = Vec::new();
     if cfg.incentives >= IncentivesLevel::Contract {
         let workflow = if cfg.minimal_workflow {
             WORKFLOW_MINIMAL.to_owned()
@@ -281,32 +293,20 @@ pub(crate) fn build_request(
                 ),
             )
         };
-        asm.add(context::ContextItem {
-            key: context::ItemKey {
-                path: "workflow-contract".into(),
-                region: "contract".into(),
-                role: "system".into(),
-            },
-            fidelity: context::Fidelity::Exact,
-            must_include: true,
-            text: workflow,
-        });
+        sections.push(format!("--- workflow-contract\n{workflow}"));
     }
     // Frozen by `run` at start; the lazy fallback keeps direct callers honest.
+    if state.file_map.is_none() && state.pins.is_none() {
+        let (map, pins) = freeze_context_head(workdir, &cfg.context_files);
+        state.file_map = Some(map);
+        state.pins = Some(pins);
+    }
     let map_text = state
         .file_map
-        .get_or_insert_with(|| context::file_map(workdir, 200).join("\n"))
+        .get_or_insert_with(|| context::file_map(workdir, FILE_MAP_MAX_PATHS).join("\n"))
         .clone();
-    asm.add(context::ContextItem {
-        key: context::ItemKey {
-            path: "file-map".into(),
-            region: "map".into(),
-            role: "system".into(),
-        },
-        fidelity: context::Fidelity::Exact,
-        must_include: true,
-        text: map_text,
-    });
+    sections.push(format!("--- file-map\n{map_text}"));
+    let mut seen_pins = HashSet::new();
     for (f, start) in state
         .pins
         .get_or_insert_with(|| pin_snapshot(&cfg.context_files, workdir))
@@ -316,22 +316,13 @@ pub(crate) fn build_request(
         let unchanged = context::named_file_contents(workdir, f, PIN_CAP_CHARS)
             .map(|c| c == *start)
             .unwrap_or(false);
-        if unchanged {
-            asm.add_volatile(context::ContextItem {
-                key: context::ItemKey {
-                    path: f.clone(),
-                    region: "named".into(),
-                    role: "system".into(),
-                },
-                fidelity: context::Fidelity::Exact,
-                must_include: true,
-                text: start.clone(),
-            });
+        if unchanged && seen_pins.insert(f.as_str()) {
+            sections.push(format!("--- {f}\n{start}"));
         }
     }
     let mut messages = vec![ProviderMessage {
         role: "system".into(),
-        content: asm.assemble(),
+        content: sections.join("\n\n"),
         tool_calls: Vec::new(),
         tool_call_id: None,
         thinking: None,
@@ -481,11 +472,7 @@ pub(crate) async fn checkpoint<P: LlmClient>(
         compact_view(&folded)
     };
     let estimate = context::estimate_tokens(&view, state.anchor.as_ref());
-    let capacity = cc
-        .context_capacity_tokens
-        .and_then(|total| total.checked_sub(cc.output_reserve_tokens))
-        .unwrap_or(0);
-    if !context::compaction_due(estimate, capacity, cc) {
+    if !context::compaction_due(estimate, cc) {
         return false;
     }
     let Some(cut) = context::cut_point(&view, cc.keep_tokens) else {

@@ -1,17 +1,12 @@
 use crate::request::build_request;
-use crate::run::drive_tick;
-use crate::state::ToolMsg;
 use crate::*;
-use agent_event::AgentEvent;
-use agent_event::Emitter;
-use agent_log::InputSource;
+use agent_event::{AgentEvent, Emitter};
 use agent_log::ItemKind;
 use provider_core::StopReason;
 use provider_core::Usage;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -61,10 +56,7 @@ fn budget_nudge_appends_to_tool_result_tail_once() {
         &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
-    assert!(s.record_tool_result(ToolMsg {
-        call_id: "a".into(),
-        result: result(),
-    }));
+    assert!(s.record_tool_result("a", result()));
     let warn = s.budget.config().warn_steps.get();
     s.budget.counters_mut().steps = warn;
     let text = s
@@ -100,10 +92,7 @@ fn no_tail_keeps_directive_queued_and_nudge_latch_unburned() {
         ),
         ClaimOutcome::Dispatch(_)
     ));
-    assert!(s.record_tool_result(ToolMsg {
-        call_id: "a".into(),
-        result: result(),
-    }));
+    assert!(s.record_tool_result("a", result()));
     assert_eq!(s.deliver_directives(), 1);
     let nudge = s
         .apply_budget_nudge(&crate::RunConfig::default())
@@ -156,10 +145,7 @@ fn directives_ride_the_tail_once_each() {
         ),
         ClaimOutcome::Dispatch(_)
     ));
-    assert!(s.record_tool_result(ToolMsg {
-        call_id: "a".into(),
-        result: result(),
-    }));
+    assert!(s.record_tool_result("a", result()));
     assert_eq!(s.deliver_directives(), 1);
     match s.items.last().map(|i| &i.kind) {
         Some(ItemKind::ToolResult { content, .. }) => {
@@ -323,7 +309,7 @@ async fn run_halt_budget_steps_after_grace_with_budget_frame() {
 }
 
 #[tokio::test]
-async fn run_halt_same_action_and_crash_input_source() {
+async fn run_halt_same_action() {
     // Same action + same observation x4 trips the tripwire.
     let root = run_tmp("trip");
     std::fs::write(root.join("f.txt"), "x\n").unwrap();
@@ -367,79 +353,6 @@ async fn run_halt_same_action_and_crash_input_source() {
         "got {outcome:?}"
     );
     let _ = std::fs::remove_dir_all(&root);
-    // Crash queues like User but keeps the Crash source in the log.
-    let root = run_tmp("crash");
-    let order = Arc::new(Mutex::new(Vec::new()));
-    let client = FakeLlm {
-        order,
-        requests: Default::default(),
-        queue: Mutex::new(VecDeque::from([text_resp("recovered")])),
-    };
-    let registry = run_registry(&root);
-    let mut state = LoopState::new();
-    let mut emitter = Emitter::new();
-    let outcome = run(
-        &mut state,
-        Run {
-            provider: &client,
-            registry: &registry,
-            agent: "agent",
-            workdir: &root,
-            emitter: &mut emitter,
-            bets: &NoBets,
-            cfg: RunConfig::default(),
-        },
-        vec![Input::Crash("boom state".into())],
-        &cancel,
-    )
-    .await;
-    assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
-    // items[0] is the run Header, [1] the TurnStart, [2] the admitted Crash.
-    match &state.items[2].kind {
-        ItemKind::Input { source, text, .. } => {
-            assert_eq!(*source, InputSource::Crash);
-            assert_eq!(text, "boom state");
-        }
-        other => panic!("expected Crash Input, got {other:?}"),
-    }
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
-async fn e2e_budget_halt_after_grace_fires_once() {
-    let mut s = LoopState::new();
-    let mut emitter = Emitter::new();
-    let (itx, mut irx) = mpsc::channel(8);
-    let (_ptx, mut prx) = mpsc::channel(8);
-    let (_ttx, mut trx) = mpsc::channel(8);
-    let cancel = CancellationToken::new();
-    let max = s.budget.config().max_steps.get();
-    s.budget.counters_mut().steps = max;
-    // Grace fires exactly once through the loop's guard.
-    assert!(s.budget.may_step().is_ok());
-    assert!(s.budget.may_step().is_err());
-    // Step head now refuses; the tick halts with a BudgetExceeded frame.
-    let root = CancellationToken::new();
-    assert!(s.start_provider_call(&root).is_none());
-    // A live inbox send drives the tick (a senders-dropped tick stalls here).
-    itx.send(Input::User("too late".into())).await.unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(v, PhaseVerdict::Return(Outcome::Halted(ref s)) if s == "steps"));
-    match emitter.history().last().unwrap() {
-        AgentEvent::TurnEnd { reason, .. } => {
-            assert_eq!(*reason, agent_event::TurnEndReason::BudgetExceeded)
-        }
-        other => panic!("expected TurnEnd, got {other:?}"),
-    }
 }
 
 #[test]
@@ -510,14 +423,12 @@ async fn last_step_done_wins_over_steps_halt() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A bill with explicit prompt/output/cache shares. `cache_write` is kept
-/// non-zero where it matters: it must play no part in either shape's charge.
-fn billed_usage(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Usage {
+/// A bill with explicit prompt/output/cache shares.
+fn billed_usage(input: u64, output: u64, cache_read: u64) -> Usage {
     Usage {
         input,
         output,
         cache_read,
-        cache_write,
         reasoning: None,
         cost_usd: Some(0.02),
     }
@@ -534,18 +445,17 @@ fn budget_shape_default_is_gross() {
 
 #[test]
 fn record_usage_charges_by_shape() {
-    // Gross: input + output (today's behavior); cache_write never adds.
+    // Gross: input + output (today's behavior).
     let mut gross = LoopState::new();
-    gross.record_usage(&billed_usage(100, 10, 60, 5));
+    gross.record_usage(&billed_usage(100, 10, 60));
     assert_eq!(gross.budget.counters().tokens, 110);
-    // MissPlusOut: (input - cache_read) + output — cache reads off the cap;
-    // cache writes stay out (not a subtrahend, not an addend).
+    // MissPlusOut: (input - cache_read) + output — cache reads off the cap.
     let mut miss = LoopState::new();
     miss.budget_shape = BudgetShape::MissPlusOut;
-    miss.record_usage(&billed_usage(100, 10, 60, 5));
+    miss.record_usage(&billed_usage(100, 10, 60));
     assert_eq!(miss.budget.counters().tokens, 50);
     // Over-reported cache_read clamps the input share at 0, never underflows.
-    miss.record_usage(&billed_usage(10, 10, 60, 5));
+    miss.record_usage(&billed_usage(10, 10, 60));
     assert_eq!(miss.budget.counters().tokens, 60); // 50 + (0 + 10)
 }
 
@@ -553,7 +463,7 @@ fn record_usage_charges_by_shape() {
 async fn run_seeds_budget_shape_from_config() {
     // The cap charge follows `cfg.budget_shape`; reporting stays gross.
     let mut resp = text_response("all done");
-    resp.usage = billed_usage(100, 10, 60, 0);
+    resp.usage = billed_usage(100, 10, 60);
     let cfg = RunConfig {
         budget_shape: BudgetShape::MissPlusOut,
         ..RunConfig::default()
@@ -625,7 +535,6 @@ fn subcent_costs_accumulate_toward_spend_cap() {
         input: 1,
         output: 1,
         cache_read: 0,
-        cache_write: 0,
         reasoning: None,
         cost_usd: Some(0.004),
     };

@@ -53,7 +53,7 @@ mod tests {
     use crate::common::{
         EDIT_FILE_CAP, EDIT_REPLACE_CAP, EXEC_TIMEOUT, OUT_CAP, READ_FILE_CAP, VIEW_CAP,
     };
-    use crate::runner::{run_allowed, spawn_argv, split_cmd, stage_and_check};
+    use crate::runner::{run_allowed, spawn_argv, split_cmd};
     use crate::view::{view_page, view_read_cap};
     use serde_json::{json, Value};
     use std::collections::HashMap;
@@ -78,32 +78,13 @@ mod tests {
 
     fn policy(root: &Path) -> Arc<Policy> {
         Arc::new(Policy {
-            root: root.to_path_buf(),
-            allowed_commands: vec!["true".to_string(), "false".to_string()],
-            allowed_prefixes: vec!["echo".to_string(), "cargo test".to_string()],
-            syntax_cmd: None,
-            denied_globs: default_denied_globs(),
-            pass_env: Vec::new(),
-            allow_any_cmd: false,
-            exec_wrap: None,
-            head_tail_output: false,
-        })
-    }
-
-    fn syntax_policy(root: &Path, argv: &[&str]) -> Arc<Policy> {
-        // The checker runs as `argv + tempfile` through `run_allowed`, so
-        // the checker binary must be prefix-allowlisted.
-        let prefix = argv.join(" ");
-        Arc::new(Policy {
-            root: root.to_path_buf(),
-            allowed_commands: vec!["true".to_string(), "false".to_string()],
-            allowed_prefixes: vec!["echo".to_string(), prefix],
-            syntax_cmd: Some(argv.iter().map(|s| s.to_string()).collect()),
-            denied_globs: default_denied_globs(),
-            pass_env: Vec::new(),
-            allow_any_cmd: false,
-            exec_wrap: None,
-            head_tail_output: false,
+            allowed_prefixes: vec![
+                "true".to_string(),
+                "false".to_string(),
+                "echo".to_string(),
+                "cargo test".to_string(),
+            ],
+            ..Policy::for_root(root.to_path_buf())
         })
     }
 
@@ -545,79 +526,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn write_syntax_veto_leaves_file_untouched() {
-        let root = tmp_root();
-        std::fs::write(root.join("f.txt"), "hello\n").unwrap();
-        let r = reg(syntax_policy(&root, &["false"]));
-        let err = run(&r, "write", json!({"path": "f.txt", "content": "bye\n"}))
-            .await
-            .unwrap_err();
-        assert!(err.contains("syntax check failed"), "{err}");
-        assert_eq!(
-            std::fs::read_to_string(root.join("f.txt")).unwrap(),
-            "hello\n"
-        );
-    }
-
     // --- exec ---
-
-    #[tokio::test]
-    async fn edit_syntax_veto_leaves_file_untouched() {
-        let root = tmp_root();
-        std::fs::write(root.join("f.txt"), "hello\n").unwrap();
-        let r = reg(syntax_policy(&root, &["false"]));
-        let err = run(
-            &r,
-            "edit",
-            json!({"path": "f.txt", "search": "hello", "replace": "bye"}),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.contains("syntax check failed"), "{err}");
-        assert_eq!(
-            std::fs::read_to_string(root.join("f.txt")).unwrap(),
-            "hello\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn edit_syntax_pass_on_true_writes() {
-        let root = tmp_root();
-        std::fs::write(root.join("f.txt"), "hello\n").unwrap();
-        let r = reg(syntax_policy(&root, &["true"]));
-        let out = run(
-            &r,
-            "edit",
-            json!({"path": "f.txt", "search": "hello", "replace": "bye"}),
-        )
-        .await
-        .unwrap();
-        assert!(out.content.contains("patched"));
-        assert_eq!(
-            std::fs::read_to_string(root.join("f.txt")).unwrap(),
-            "bye\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn edit_unconfigured_syntax_skips_with_zero_behavior_change() {
-        let root = tmp_root();
-        std::fs::write(root.join("f.txt"), "hello\n").unwrap();
-        assert!(policy(&root).syntax_cmd.is_none());
-        let r = reg(policy(&root));
-        run(
-            &r,
-            "edit",
-            json!({"path": "f.txt", "search": "hello", "replace": "bye"}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(root.join("f.txt")).unwrap(),
-            "bye\n"
-        );
-    }
 
     #[test]
     fn denied_glob_blocks_env_allows_example() {
@@ -877,15 +786,8 @@ mod tests {
         // it first (kill_on_drop) or the timed-out exec keeps mutating root.
         let root = tmp_root();
         let pol = Policy {
-            root: root.clone(),
-            allowed_commands: vec![],
             allowed_prefixes: vec!["sh".to_string()],
-            syntax_cmd: None,
-            denied_globs: default_denied_globs(),
-            pass_env: Vec::new(),
-            allow_any_cmd: false,
-            exec_wrap: None,
-            head_tail_output: false,
+            ..Policy::for_root(root.clone())
         };
         let err = run_allowed(
             &pol,
@@ -911,15 +813,8 @@ mod tests {
         // view of its niceness.
         let root = tmp_root();
         let pol = Policy {
-            root: root.clone(),
-            allowed_commands: vec![],
             allowed_prefixes: vec!["python3".to_string()],
-            syntax_cmd: None,
-            denied_globs: default_denied_globs(),
-            pass_env: Vec::new(),
-            allow_any_cmd: false,
-            exec_wrap: None,
-            head_tail_output: false,
+            ..Policy::for_root(root.clone())
         };
         let (ok, out, _) = run_allowed(
             &pol,
@@ -941,15 +836,8 @@ mod tests {
         // marker a second later. The process-group kill must take both.
         let root = tmp_root();
         let pol = Policy {
-            root: root.clone(),
-            allowed_commands: vec![],
             allowed_prefixes: vec!["sh".to_string()],
-            syntax_cmd: None,
-            denied_globs: default_denied_globs(),
-            pass_env: Vec::new(),
-            allow_any_cmd: false,
-            exec_wrap: None,
-            head_tail_output: false,
+            ..Policy::for_root(root.clone())
         };
         let err = run_allowed(
             &pol,
@@ -971,15 +859,8 @@ mod tests {
     async fn exec_cancel_kills_group_promptly() {
         let root = tmp_root();
         let pol = Policy {
-            root: root.clone(),
-            allowed_commands: vec![],
             allowed_prefixes: vec!["sh".to_string()],
-            syntax_cmd: None,
-            denied_globs: default_denied_globs(),
-            pass_env: Vec::new(),
-            allow_any_cmd: false,
-            exec_wrap: None,
-            head_tail_output: false,
+            ..Policy::for_root(root.clone())
         };
         let cancel = CancellationToken::new();
         let killer = cancel.clone();
@@ -1014,15 +895,8 @@ mod tests {
         // the verdict, condensing, and outer cap behave as before.
         let root = tmp_root();
         let pol = Policy {
-            root: root.clone(),
-            allowed_commands: vec![],
             allowed_prefixes: vec!["head".to_string(), "cat".to_string()],
-            syntax_cmd: None,
-            denied_globs: default_denied_globs(),
-            pass_env: Vec::new(),
-            allow_any_cmd: false,
-            exec_wrap: None,
-            head_tail_output: false,
+            ..Policy::for_root(root.clone())
         };
         let start = std::time::Instant::now();
         let (ok, content, truncated) = run_allowed(
@@ -1060,15 +934,8 @@ mod tests {
         // shell operators fail before the allowlist with the file fix.
         let root = tmp_root();
         let pol = Policy {
-            root: root.clone(),
-            allowed_commands: vec![],
             allowed_prefixes: vec!["python3".to_string(), "echo".to_string()],
-            syntax_cmd: None,
-            denied_globs: default_denied_globs(),
-            pass_env: Vec::new(),
-            allow_any_cmd: false,
-            exec_wrap: None,
-            head_tail_output: false,
+            ..Policy::for_root(root.clone())
         };
         for cmd in [
             "python3 - <<'EOF'\nprint(1)\nEOF",
@@ -1125,15 +992,8 @@ mod tests {
         // whole tokens are rejected by the shell-op guard.
         let root = tmp_root();
         let pol = Policy {
-            root: root.clone(),
-            allowed_commands: vec![],
             allowed_prefixes: vec!["python3".to_string(), "sh".to_string()],
-            syntax_cmd: None,
-            denied_globs: default_denied_globs(),
-            pass_env: Vec::new(),
-            allow_any_cmd: false,
-            exec_wrap: None,
-            head_tail_output: false,
+            ..Policy::for_root(root.clone())
         };
         let (ok, out, _) = run_allowed(
             &pol,
@@ -1162,15 +1022,8 @@ mod tests {
         // allowlisted commands.
         let root = tmp_root();
         let pol = Policy {
-            root: root.clone(),
-            allowed_commands: vec![],
             allowed_prefixes: vec!["echo".to_string()],
-            syntax_cmd: None,
-            denied_globs: default_denied_globs(),
-            pass_env: Vec::new(),
-            allow_any_cmd: false,
-            exec_wrap: None,
-            head_tail_output: false,
+            ..Policy::for_root(root.clone())
         };
         let (ok, out, _) = run_allowed(
             &pol,
@@ -1192,15 +1045,9 @@ mod tests {
         // denial; a wrap leaked into the check would say "not allowlisted").
         let root = tmp_root();
         let pol = Policy {
-            root: root.clone(),
-            allowed_commands: vec![],
             allowed_prefixes: vec!["echo".to_string()],
-            syntax_cmd: None,
-            denied_globs: default_denied_globs(),
-            pass_env: Vec::new(),
-            allow_any_cmd: false,
             exec_wrap: Some(vec!["/nonexistent-rof-wrap/bin".to_string()]),
-            head_tail_output: false,
+            ..Policy::for_root(root.clone())
         };
         let err = run_allowed(&pol, "echo hi", EXEC_TIMEOUT, &CancellationToken::new())
             .await
@@ -1298,50 +1145,6 @@ mod tests {
         );
         std::env::remove_var("TOOLS_STD_TEST_PING");
         std::env::remove_var("OPENAI_API_KEY");
-    }
-
-    #[tokio::test]
-    async fn syntax_check_argv_handles_space_in_path() {
-        // Staging under a dir with a space: the old join-then-split
-        // round-trip fed `cat` three paths and failed; real argv passes.
-        let base = tmp_root().join("dir with space");
-        tokio::fs::create_dir_all(&base).await.unwrap();
-        let root = tmp_root();
-        let pol = Policy {
-            root: root.clone(),
-            allowed_commands: vec![],
-            allowed_prefixes: vec!["cat".to_string()],
-            syntax_cmd: Some(vec!["cat".to_string()]),
-            denied_globs: default_denied_globs(),
-            pass_env: Vec::new(),
-            allow_any_cmd: false,
-            exec_wrap: None,
-            head_tail_output: false,
-        };
-        stage_and_check(
-            &pol,
-            &["cat".to_string()],
-            "hello\n",
-            &CancellationToken::new(),
-            &base,
-        )
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn write_syntax_passes_with_space_in_root() {
-        let root = tmp_root().join("work dir");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("f.txt"), "hello\n").unwrap();
-        let r = reg(syntax_policy(&root, &["true"]));
-        run(&r, "write", json!({"path": "f.txt", "content": "bye\n"}))
-            .await
-            .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(root.join("f.txt")).unwrap(),
-            "bye\n"
-        );
     }
 
     #[test]
@@ -1483,15 +1286,8 @@ mod tests {
         assert!(noisy.len() > OUT_CAP);
         std::fs::write(root.join("noisy.txt"), &noisy).unwrap();
         let pol = Arc::new(Policy {
-            root: root.clone(),
-            allowed_commands: vec![],
             allowed_prefixes: vec!["cat".to_string()],
-            syntax_cmd: None,
-            denied_globs: default_denied_globs(),
-            pass_env: Vec::new(),
-            allow_any_cmd: false,
-            exec_wrap: None,
-            head_tail_output: false,
+            ..Policy::for_root(root.clone())
         });
         let out = run(&reg(pol), "test", json!({"cmd": "cat noisy.txt"}))
             .await

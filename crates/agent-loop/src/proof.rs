@@ -1,14 +1,12 @@
 //! Batch proof: patch splitting, incremental hunks, and bets wiring.
 
 use crate::run::blocking;
-#[cfg(test)]
-use crate::state::ToolMsg;
-use crate::{LoopState, PhaseVerdict};
+use crate::LoopState;
 use agent_budget::BudgetHalt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tool_core::{ToolOutcome, ToolResult, TOOL_EDIT, TOOL_WRITE};
+use tool_core::{ToolOutcome, ToolResult};
 
 #[cfg(unix)]
 struct ProofGroup(u32);
@@ -27,25 +25,13 @@ pub(crate) const ROLLBACK_NOTICE: &str = "a tool in your last batch failed and t
 
 /// Bets hook with a no-op default: loop compiles and ships with bets disabled.
 ///
-/// Receivers are `&self` (the contract's `&mut self` does not fit `Run::bets`
-/// staying `&dyn`, which the frozen `rof` call site requires); hooks that need
-/// mutable state use interior mutability, as the test hook `RecBets` does.
+/// Receivers are `&self` (`Run::bets` is `&dyn`, which `rof` requires); hooks
+/// that need mutable state use interior mutability.
 pub trait BetsHook: Send + Sync {
-    fn on_step(&self) -> PhaseVerdict {
-        PhaseVerdict::Continue
-    }
-    /// Site 1 (step head): `step` is `LoopState::step` as the head is reached
-    /// (steps started so far). Defaults to [`on_step`](Self::on_step), so hooks
-    /// implementing only `on_step` keep firing at both sites.
-    fn on_step_head(&self, _step: u64) -> PhaseVerdict {
-        self.on_step()
-    }
-    /// Site 2 (post-batch): proof-gated commit over the batch's patch fragments
-    /// (`(hunk, proof_passed)`; the proof flag is uniform today — the batch's
-    /// tool results all passed — per-hunk incremental proof is the later
-    /// ablation). Permissive default = feature off unless a hook opts in:
-    /// `Committed` leaves the batch as the existing path left it, `Partial`
-    /// restores `savepoint.kept_hunks`, `Aborted` rolls the batch back.
+    /// Post-batch: proof-gated commit over the batch's patch fragments
+    /// (`(hunk, proof_passed)`). Permissive default = feature off unless a hook
+    /// opts in: `Committed` leaves the batch as the existing path left it,
+    /// `Partial` restores `savepoint.kept_hunks`, `Aborted` rolls the batch back.
     fn on_post_batch(
         &self,
         _claim: &bets::Claim,
@@ -59,46 +45,8 @@ pub struct NoBets;
 
 impl BetsHook for NoBets {}
 
-/// Split `TreeService::patch` text into the fragments
-/// `TreeService::restore_hunks` accepts: one file header (`diff --git` /
-/// `index` / `---` / `+++`) directly followed by exactly one `@@` hunk — the
-/// same companion splitter the snapshot tests exercise. Untracked-file
-/// evidence (appended without an `@@`) rides the trailing fragment's tail; a
-/// restore that hits it fails closed to baseline. On a truncated patch the
-/// final fragment may be incomplete, so it is dropped.
-pub(crate) fn split_patch(patch: &snapshot::PatchText) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut header = String::new();
-    let mut cur: Option<String> = None;
-    for line in patch.text.lines() {
-        if line.starts_with("diff --git") {
-            if let Some(done) = cur.take() {
-                out.push(done);
-            }
-            header = line.to_string();
-        } else if line.starts_with("@@") {
-            if let Some(done) = cur.take() {
-                out.push(done);
-            }
-            cur = Some(format!("{header}\n{line}"));
-        } else if let Some(hunk) = cur.as_mut() {
-            hunk.push('\n');
-            hunk.push_str(line);
-        } else {
-            header.push('\n');
-            header.push_str(line);
-        }
-    }
-    if let Some(done) = cur {
-        out.push(done);
-    }
-    if patch.truncated {
-        out.pop(); // the marker landed in the last fragment: never restore it
-    }
-    out
-}
-
 /// The batch's patch fragments with the uniform proof flag attached to each.
+/// On a truncated patch the final fragment may be incomplete, so it is dropped.
 /// Snapshot reads run on the blocking worker (git IO off the executor).
 pub(crate) async fn batch_hunks(
     tree: Arc<snapshot::TreeService>,
@@ -109,10 +57,11 @@ pub(crate) async fn batch_hunks(
         let patch = tree
             .patch(&diff)
             .map_err(|e| format!("snapshot patch: {e}"))?;
-        Ok(split_patch(&patch)
-            .into_iter()
-            .map(|h| (h, proof_passed))
-            .collect())
+        let mut hunks = snapshot::split_patch(&patch.text);
+        if patch.truncated {
+            hunks.pop(); // the marker landed in the last fragment: never restore it
+        }
+        Ok(hunks.into_iter().map(|h| (h, proof_passed)).collect())
     })
     .await
 }
@@ -145,7 +94,7 @@ pub(crate) async fn incremental_hunks(
             if patch.truncated {
                 return Err("snapshot patch truncated; refusing proof restoration".to_string());
             }
-            Ok::<_, String>(split_patch(&patch))
+            Ok::<_, String>(snapshot::split_patch(&patch.text))
         }
     })
     .await?;
@@ -242,17 +191,6 @@ pub(crate) fn outcome_to_result(outcome: ToolOutcome) -> ToolResult {
     }
 }
 
-/// Shared step helpers: `run` (the shipped driver) and `drive_tick` (the
-/// channel test harness) call the same fns, so `VerifyHold`,
-/// `record_tool_result`, `observe_action`, and the `edits`/`actions`
-/// increments behave identically. No driver inlines its own copy.
-///
-/// Per-tool execution effects: the `observe_action` tripwire input plus the
-/// `edits += 1` on a successful `edit`|`write`. Callers run this BEFORE
-/// `record_tool_result` (the `run` order), so the counters describe the
-/// execution the durable `ToolResult` row then records. Returns the
-/// tripwire halt, if any (callers let `terminate` own the halt; the return
-/// is observed, never branched on inline).
 pub(crate) fn note_tool_execution(
     state: &mut LoopState,
     name: &str,
@@ -260,7 +198,7 @@ pub(crate) fn note_tool_execution(
     result: &ToolResult,
 ) -> Option<BudgetHalt> {
     let halt = state.observe_action(&format!("{name}:{args_str}"), &result.content);
-    if !result.is_error && (name == TOOL_EDIT || name == TOOL_WRITE || name == "multi_edit") {
+    if !result.is_error && crate::is_edit_tool(name) {
         state.edits += 1;
     }
     halt
@@ -269,39 +207,11 @@ pub(crate) fn note_tool_execution(
 /// Shared tool-tail settlement: counter directives, the budget wrap-up nudge,
 /// and delivery onto the newest `ToolResult` tail. Must run BEFORE the log
 /// sync, so the file never holds a stale tail and the row keeps the exact
-/// model-visible text. Both drivers call this after every recorded tool
-/// result.
+/// model-visible text.
 pub(crate) fn settle_tool_tail(state: &mut LoopState, cfg: &crate::RunConfig) {
     state.queue_directives(cfg);
     state.apply_budget_nudge(cfg);
     state.deliver_directives();
-}
-
-/// Shared single-result settlement for the channel harness: the same
-/// observe/`edits`/`record`/tail order `run` uses per executed call. Looks
-/// the `name`/`args` sig up from the claim row, so the tripwire sees the
-/// identical bytes. Returns false when the call id was unknown or already
-/// answered (no effects applied). Test-only: the only caller is the
-/// `drive_tick` harness.
-#[cfg(test)]
-pub(crate) fn settle_tool_msg(state: &mut LoopState, msg: ToolMsg, cfg: &crate::RunConfig) -> bool {
-    let open = matches!(
-        state.tool_calls.get(&msg.call_id),
-        Some(c) if c.result.is_none()
-    );
-    if !open {
-        return false;
-    }
-    let (name, args_str) = state
-        .tool_calls
-        .get(&msg.call_id)
-        .map(|c| (c.name.clone(), c.args.clone()))
-        .unwrap_or_default();
-    let _ = note_tool_execution(state, &name, &args_str, &msg.result);
-    let recorded = state.record_tool_result(msg);
-    debug_assert!(recorded);
-    settle_tool_tail(state, cfg);
-    true
 }
 
 /// Batch-scope edit and verification snapshot for a full rollback.

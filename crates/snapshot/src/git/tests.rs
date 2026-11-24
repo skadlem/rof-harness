@@ -1,5 +1,10 @@
 use super::*;
-use crate::{PATCH_MAX_BYTES, PATCH_MAX_LINES, PATCH_TRUNCATED_MARKER};
+use crate::{split_patch, PATCH_MAX_BYTES, PATCH_MAX_LINES, PATCH_TRUNCATED_MARKER};
+
+/// No change at all: both the tracked and the untracked side are empty.
+fn clean(d: &DiffSummary) -> bool {
+    d.changed.is_empty() && d.untracked.is_empty()
+}
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rof-snap-{name}-{}", std::process::id()));
@@ -65,7 +70,7 @@ fn baseline_modify_diff_detects_changed_and_untracked() {
     std::fs::write(dir.join("a.rs"), "one\n").unwrap();
     tree.ensure().unwrap();
     tree.baseline().unwrap();
-    assert!(tree.diff().unwrap().is_empty());
+    assert!(clean(&tree.diff().unwrap()));
 
     std::fs::write(dir.join("a.rs"), "two\n").unwrap();
     std::fs::write(dir.join("b.rs"), "new\n").unwrap();
@@ -91,7 +96,7 @@ fn rollback_restores_byte_identical_tree() {
     tree.rollback().unwrap();
     assert_eq!(std::fs::read(dir.join("a.rs")).unwrap(), before);
     assert!(!dir.join("b.rs").exists());
-    assert!(tree.diff().unwrap().is_empty());
+    assert!(clean(&tree.diff().unwrap()));
 }
 
 #[cfg(unix)]
@@ -250,11 +255,11 @@ fn double_baseline_is_harmless() {
     tree.ensure().unwrap();
     tree.baseline().unwrap();
     tree.baseline().unwrap(); // nothing to commit: benign, not an error
-    assert!(tree.diff().unwrap().is_empty());
+    assert!(clean(&tree.diff().unwrap()));
 }
 
 #[test]
-fn patch_since_start_spans_every_baseline() {
+fn full_patch_spans_every_baseline() {
     let dir = scratch("since-start");
     let tree = TreeService::new(&dir);
     std::fs::write(dir.join("a.rs"), "one\n").unwrap();
@@ -267,18 +272,13 @@ fn patch_since_start_spans_every_baseline() {
     std::fs::write(dir.join("b.rs"), "new\n").unwrap();
     tree.baseline().unwrap();
     assert!(
-        tree.diff().unwrap().is_empty(),
+        clean(&tree.diff().unwrap()),
         "last baseline absorbed both batches"
     );
 
-    let (d, p) = tree.patch_since_start().unwrap();
-    assert_eq!(d.changed, vec!["a.rs", "b.rs"]);
-    assert!(
-        p.text.contains("-one") && p.text.contains("+two"),
-        "{}",
-        p.text
-    );
-    assert!(p.text.contains("b/b.rs"), "{}", p.text);
+    let p = tree.patch_since_start_full().unwrap();
+    assert!(p.contains("-one") && p.contains("+two"), "{p}");
+    assert!(p.contains("b/b.rs"), "{p}");
 }
 
 #[test]
@@ -299,10 +299,7 @@ fn ensure_excludes_bytecode_from_commits() {
         !committed.contains(".pyc") && !committed.contains("__pycache__"),
         "bytecode reached the commit: {committed}"
     );
-    assert!(
-        tree.diff().unwrap().is_empty(),
-        "junk stays out of evidence"
-    );
+    assert!(clean(&tree.diff().unwrap()), "junk stays out of evidence");
 }
 
 #[test]
@@ -329,7 +326,7 @@ fn baseline_stable_under_hostile_locale_env() {
         Some(v) => std::env::set_var("LANG", v),
         None => std::env::remove_var("LANG"),
     }
-    assert!(tree.diff().unwrap().is_empty());
+    assert!(clean(&tree.diff().unwrap()));
 }
 
 #[test]
@@ -346,7 +343,7 @@ fn parent_git_dir_env_is_ignored() {
         tree.ensure()?;
         tree.baseline()?;
         std::fs::write(dir.join("a.rs"), "two\n").unwrap();
-        assert!(!tree.diff()?.is_empty());
+        assert!(!clean(&tree.diff()?));
         tree.rollback()?;
         assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), "one\n");
         Ok(())
@@ -457,59 +454,6 @@ fn new_file_under_build_reaches_baseline_and_patch() {
 }
 
 #[test]
-fn with_excludes_re_adds_build_silence() {
-    let dir = scratch("with-excludes");
-    let tree = TreeService::new(&dir).with_excludes(&["target/", "build/"]);
-    std::fs::write(dir.join("a.rs"), "one\n").unwrap();
-    std::fs::create_dir_all(dir.join("build")).unwrap();
-    std::fs::write(dir.join("build/out.bin"), "junk\n").unwrap();
-    tree.ensure().unwrap();
-    tree.baseline().unwrap();
-
-    let ls = tree.git(["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
-    let committed = String::from_utf8_lossy(&ls.stdout).into_owned();
-    assert!(committed.contains("a.rs"), "{committed}");
-    assert!(
-        !committed.contains("out.bin"),
-        "caller-silenced output reached the commit: {committed}"
-    );
-    assert!(tree.diff().unwrap().is_empty());
-}
-
-/// One `git diff --patch` fragment per hunk: each file's header lines
-/// (`diff --git`/`index`/`---`/`+++`) lead its first `@@`, later `@@`
-/// lines repeat that header. Fragments end without a trailing newline —
-/// the shape a line-splitting caller hands over.
-fn split_patch(patch: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut header = String::new();
-    let mut cur: Option<String> = None;
-    for line in patch.lines() {
-        if line.starts_with("diff --git") {
-            if let Some(done) = cur.take() {
-                out.push(done);
-            }
-            header = line.to_string();
-        } else if line.starts_with("@@") {
-            if let Some(done) = cur.take() {
-                out.push(done);
-            }
-            cur = Some(format!("{header}\n{line}"));
-        } else if let Some(hunk) = cur.as_mut() {
-            hunk.push('\n');
-            hunk.push_str(line);
-        } else {
-            header.push('\n');
-            header.push_str(line);
-        }
-    }
-    if let Some(done) = cur {
-        out.push(done);
-    }
-    out
-}
-
-#[test]
 fn restore_hunks_keeps_only_the_prefix_hunk() {
     let dir = scratch("restore-prefix");
     let tree = TreeService::new(&dir);
@@ -526,7 +470,7 @@ fn restore_hunks_keeps_only_the_prefix_hunk() {
     assert_eq!(hunks.len(), 2);
 
     let d = tree.restore_hunks(&hunks[..1]).unwrap();
-    assert!(!d.is_empty());
+    assert!(!clean(&d));
     assert_eq!(d.changed, vec!["a.rs"]); // hunk 2's file reverted
     assert_eq!(
         std::fs::read_to_string(dir.join("a.rs")).unwrap(),
@@ -549,7 +493,7 @@ fn restore_hunks_empty_equals_plain_rollback() {
     std::fs::write(dir.join("a.rs"), "two\n").unwrap();
     std::fs::write(dir.join("made.rs"), "new\n").unwrap();
     let d = tree.restore_hunks(&[]).unwrap();
-    assert!(d.is_empty());
+    assert!(clean(&d));
     assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), "one\n");
     assert!(!dir.join("made.rs").exists());
 }
@@ -572,7 +516,7 @@ fn restore_hunks_malformed_hunk_errors_and_restores_baseline() {
     let e = tree.restore_hunks(&hunks).unwrap_err();
     assert!(e.to_string().contains("git apply"), "{e}");
     // Chosen error state: rolled back to baseline, nothing half-restored.
-    assert!(tree.diff().unwrap().is_empty());
+    assert!(clean(&tree.diff().unwrap()));
     assert_eq!(
         std::fs::read_to_string(dir.join("a.rs")).unwrap(),
         "one\ntwo\nthree\nfour\n"
@@ -632,9 +576,9 @@ fn patch_since_start_full_is_unbounded_with_new_file_contents() {
 }
 
 #[test]
-fn bounded_patch_since_start_still_truncates_same_tree() {
+fn bounded_patch_still_truncates_same_tree() {
     let (_dir, tree) = big_tree("bounded-big");
-    let (_, bounded) = tree.patch_since_start().unwrap();
+    let bounded = tree.patch(&tree.diff().unwrap()).unwrap();
     assert!(bounded.truncated, "bounded variant still cuts");
     assert!(
         bounded.text.contains(PATCH_TRUNCATED_MARKER),
@@ -668,9 +612,9 @@ fn patch_since_start_full_empty_workdir_is_an_empty_patch_not_an_error() {
     let dir = scratch("full-empty");
     let tree = TreeService::new(&dir);
     tree.ensure().unwrap();
-    let (summary, patch) = tree.patch_since_start().unwrap();
-    assert!(summary.changed.is_empty() && summary.untracked.is_empty());
-    assert_eq!(patch.text, "");
+    let diff = tree.diff().unwrap();
+    assert!(clean(&diff));
+    assert_eq!(tree.patch(&diff).unwrap().text, "");
     assert_eq!(tree.patch_since_start_full().unwrap(), "", "nothing yet");
     // And what the run creates afterwards IS in the patch.
     std::fs::write(dir.join("created.txt"), "hi\n").unwrap();
@@ -744,7 +688,7 @@ fn partial_prefix_with_new_file_restores_instead_of_failing() {
 }
 
 #[test]
-fn patch_since_start_bounded_carries_new_file_contents() {
+fn full_patch_carries_new_file_contents() {
     let dir = scratch("since-newfile");
     let tree = TreeService::new(&dir);
     std::fs::write(dir.join("a.rs"), "one\n").unwrap();
@@ -752,15 +696,12 @@ fn patch_since_start_bounded_carries_new_file_contents() {
     std::fs::write(dir.join("a.rs"), "two\n").unwrap();
     tree.baseline().unwrap();
     std::fs::write(dir.join("made.rs"), "since-marker-3b77\n").unwrap();
-    let (d, p) = tree.patch_since_start().unwrap();
-    assert!(!p.truncated);
-    assert_eq!(d.changed, vec!["a.rs", "made.rs"]);
+    let p = tree.patch_since_start_full().unwrap();
     assert!(
-        p.text.contains("+two") && p.text.contains("+since-marker-3b77"),
-        "tracked edit plus new-file contents: {}",
-        p.text
+        p.contains("+two") && p.contains("+since-marker-3b77"),
+        "tracked edit plus new-file contents: {p}"
     );
-    assert_eq!(split_patch(&p.text).len(), 2, "{}", p.text);
+    assert_eq!(split_patch(&p).len(), 2, "{p}");
     // Whole-run hunks are start-relative (not baseline-relative), so the
     // restorable check stays on the per-batch patch: it carries the same
     // new-file hunk and replays it from baseline.

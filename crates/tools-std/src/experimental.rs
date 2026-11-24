@@ -10,14 +10,14 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
-use tool_core::{CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome};
+use tool_core::{Invocation, Tool, ToolDefinition, ToolError, ToolOutcome};
 
 use crate::common::{
-    apply_hunk, cap_chars, dispatch, parse_args, path_err, EDIT_FILE_CAP, EDIT_REPLACE_CAP,
+    apply_hunk, cap_chars, drop_front_bytes, parse_args, path_err, EDIT_FILE_CAP, EDIT_REPLACE_CAP,
     EXEC_TIMEOUT, OUT_CAP,
 };
 use crate::policy::{resolve_under, Policy};
-use crate::runner::{cmd_schema, run_allowed_raw, split_cmd};
+use crate::runner::{cmd_schema, run_allowed_raw, split_cmd, CmdArgs};
 use crate::{edit_tool, exec_tool, test_tool, view_tool, write_tool};
 
 #[derive(Default, Clone, Debug)]
@@ -139,9 +139,6 @@ impl Tool for ArchivedExec {
         );
         definition
     }
-    fn prepare(&self, call: &ToolCall) -> CallStatus {
-        dispatch(call)
-    }
     async fn execute(
         &self,
         inv: Invocation,
@@ -180,12 +177,6 @@ impl Tool for ArchivedExec {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CmdArgs {
-    cmd: String,
-}
-
 struct OutputRead {
     handles: Artifacts,
 }
@@ -200,7 +191,7 @@ struct ReadArgs {
     search: Option<String>,
 }
 fn default_limit() -> usize {
-    8000
+    OUT_CAP
 }
 #[async_trait]
 impl Tool for OutputRead {
@@ -208,11 +199,8 @@ impl Tool for OutputRead {
         ToolDefinition {
             name: "output_read".into(),
             description: "read archived output by run-owned handle; offset is a byte offset for pages or a match index for search, and limit is page bytes or match count respectively".into(),
-            schema: json!({"type":"object","required":["handle"],"additionalProperties":false,"properties":{"handle":{"type":"string","maxLength":80},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32768},"search":{"type":"string","maxLength":4096}}}),
+            schema: json!({"type":"object","required":["handle"],"additionalProperties":false,"properties":{"handle":{"type":"string","maxLength":80},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":HISTORY_PAGE_MAX},"search":{"type":"string","maxLength":4096}}}),
         }
-    }
-    fn prepare(&self, c: &ToolCall) -> CallStatus {
-        dispatch(c)
     }
     async fn execute(
         &self,
@@ -220,8 +208,10 @@ impl Tool for OutputRead {
         _: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let a: ReadArgs = parse_args(&inv.args)?;
-        if a.limit == 0 || a.limit > 32768 {
-            return Err(ToolError::Failed("limit must be 1..32768".into()));
+        if a.limit == 0 || a.limit > HISTORY_PAGE_MAX {
+            return Err(ToolError::Failed(format!(
+                "limit must be 1..{HISTORY_PAGE_MAX}"
+            )));
         }
         if a.search
             .as_ref()
@@ -268,14 +258,17 @@ impl Tool for OutputRead {
                 {
                     let current = total;
                     total += 1;
-                    if current < a.offset || matches.len() >= a.limit || response_bytes >= 32768 {
+                    if current < a.offset
+                        || matches.len() >= a.limit
+                        || response_bytes >= HISTORY_PAGE_MAX
+                    {
                         continue;
                     }
                     let start = hit.saturating_sub(128);
                     let end = (hit + query.len() + 128).min(carry.len());
                     let snippet = String::from_utf8_lossy(&carry[start..end]).into_owned();
                     response_bytes += snippet.len() + 1;
-                    if response_bytes <= 32768 {
+                    if response_bytes <= HISTORY_PAGE_MAX {
                         matches.push(snippet);
                     }
                 }
@@ -443,14 +436,9 @@ impl Tool for HistoryRead {
         ToolDefinition {
             name: "history_read".into(),
             description: "read a paged historical tool observation from this run's fixed WAL; retrieves the recorded result and never replays the command".into(),
-            schema: json!({"type":"object","required":["item_id"],"additionalProperties":false,"properties":{"item_id":{"type":"string","minLength":1,"maxLength":128},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":32768}}}),
+            schema: json!({"type":"object","required":["item_id"],"additionalProperties":false,"properties":{"item_id":{"type":"string","minLength":1,"maxLength":128},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":HISTORY_PAGE_MAX}}}),
         }
     }
-
-    fn prepare(&self, call: &ToolCall) -> CallStatus {
-        dispatch(call)
-    }
-
     async fn execute(
         &self,
         invocation: Invocation,
@@ -509,9 +497,6 @@ impl Tool for Shell {
                 "run an explicitly enabled shell command through the configured exec wrapper".into(),
             schema: cmd_schema(),
         }
-    }
-    fn prepare(&self, c: &ToolCall) -> CallStatus {
-        dispatch(c)
     }
     async fn execute(
         &self,
@@ -581,9 +566,6 @@ struct RepoLookup {
 impl Tool for RepoLookup {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition{name:"repo_lookup".into(),description:if self.evidence { "find literal occurrences and heuristic definition, test-path, and configuration-path candidates; skips symlinks and files over 1 MiB, scans at most 100,000 entries, 10,000 files, or 64 MiB; no semantic call graph" } else { "find literal symbol occurrences; skips symlinks and files over 1 MiB, scans at most 100,000 entries, 10,000 files, or 64 MiB; no semantic call graph" }.into(),schema:json!({"type":"object","required":["symbol"],"additionalProperties":false,"properties":{"symbol":{"type":"string","minLength":1,"maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":500}}})}
-    }
-    fn prepare(&self, c: &ToolCall) -> CallStatus {
-        dispatch(c)
     }
     async fn execute(
         &self,
@@ -751,9 +733,10 @@ impl Tool for RepoLookup {
                 format!("\n[{}]", reasons.join("; "))
             }
         };
+        let cap_note = format!("output omitted at {OUT_CAP}-character limit");
         let mut note = make_note(&reasons);
         if body.chars().count() + note.chars().count() > OUT_CAP {
-            reasons.push("output omitted at 8000-character limit");
+            reasons.push(&cap_note);
             note = make_note(&reasons);
         }
         let room = OUT_CAP.saturating_sub(note.chars().count());
@@ -858,13 +841,10 @@ impl Tool for MultiEdit {
             schema: json!({"type":"object","required":["edits"],"additionalProperties":false,"properties":{"edits":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","required":["path","search","replace"],"additionalProperties":false,"properties":{"path":{"type":"string","maxLength":4096},"search":{"type":"string","maxLength":65536},"replace":{"type":"string","maxLength":262144}}}}}}),
         }
     }
-    fn prepare(&self, c: &ToolCall) -> CallStatus {
-        dispatch(c)
-    }
     async fn execute(
         &self,
         inv: Invocation,
-        cancel: CancellationToken,
+        _cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let a: MultiArgs = parse_args(&inv.args)?;
         if a.edits.is_empty() || a.edits.len() > 32 {
@@ -890,9 +870,6 @@ impl Tool for MultiEdit {
             }
             let old = std::fs::read_to_string(&p).map_err(|e| ToolError::Failed(e.to_string()))?;
             let new = apply_hunk(&old, &h.search, &h.replace).map_err(ToolError::Failed)?;
-            if self.policy.syntax_cmd.is_some() {
-                crate::runner::check_syntax(&self.policy, &new, &cancel).await?;
-            }
             staged.push((p, old, new, h.path));
         }
         for (written, (p, _, new, _)) in staged.iter().enumerate() {
@@ -979,11 +956,8 @@ impl Tool for ProcessTool {
         ToolDefinition {
             name: "process".into(),
             description: "manage bounded pipe sessions (no PTY): start, poll, input, stop; stopping a Docker exec client may leave its container command running".into(),
-            schema: json!({"type":"object","required":["action"],"additionalProperties":false,"properties":{"action":{"type":"string","enum":["start","poll","input","stop"]},"id":{"type":"string","maxLength":80},"cmd":{"type":"string","minLength":1,"maxLength":4096},"data":{"type":"string","maxLength":8192},"limit":{"type":"integer","minimum":1,"maximum":32768}}}),
+            schema: json!({"type":"object","required":["action"],"additionalProperties":false,"properties":{"action":{"type":"string","enum":["start","poll","input","stop"]},"id":{"type":"string","maxLength":80},"cmd":{"type":"string","minLength":1,"maxLength":4096},"data":{"type":"string","maxLength":8192},"limit":{"type":"integer","minimum":1,"maximum":HISTORY_PAGE_MAX}}}),
         }
-    }
-    fn prepare(&self, c: &ToolCall) -> CallStatus {
-        dispatch(c)
     }
     async fn execute(
         &self,
@@ -1075,7 +1049,7 @@ impl Tool for ProcessTool {
                 })
                 .await
                 .unwrap_or_else(|_| String::new());
-                let limit = a.limit.min(32768);
+                let limit = a.limit.min(HISTORY_PAGE_MAX);
                 Ok(ToolOutcome {
                     content: format!(
                         "{status}\n{}",
@@ -1165,13 +1139,9 @@ async fn drain_session<R: AsyncReadExt + Unpin>(
                 if s.len() > 65536 {
                     dropped.store(true, Ordering::Relaxed);
                     let cut = s.len() - 65536;
-                    let ix = s.ceil_char_boundary(cut);
-                    s.drain(..ix);
+                    drop_front_bytes(&mut s, cut);
                 }
             }
         }
     }
 }
-
-#[cfg(test)]
-mod tests {}

@@ -165,24 +165,26 @@ def _run(argv, cwd, deadline, stdout_path, stderr_path):
     return {"status": status, "returncode": code, "elapsed_seconds": round(time.monotonic() - started, 3)}
 
 
-def _usage(events_path):
-    totals = None
+def _read_events(events_path):
+    totals, has_run_end = None, False
     try:
         lines = events_path.read_text().splitlines()
     except OSError:
-        return None
+        return None, False
     for line in lines:
         try:
             event = json.loads(line)
-            if event.get("type") == "TurnEnd" and isinstance(event.get("usage_totals"), dict):
-                totals = event["usage_totals"]
         except json.JSONDecodeError:
             continue
-    if totals is None:
-        return None
-    return {key: totals.get(key) for key in (
+        kind = event.get("type")
+        if kind == "TurnEnd" and isinstance(event.get("usage_totals"), dict):
+            totals = event["usage_totals"]
+        elif kind == "RunEnd":
+            has_run_end = True
+    usage = None if totals is None else {key: totals.get(key) for key in (
         "input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens", "cost_usd"
     )}
+    return usage, has_run_end
 
 
 def _digest(path):
@@ -250,6 +252,7 @@ def _attempt(plan, index, goal, deadline, frozen_checks):
         check["passed"] = False
         check["status"] = "check_modified"
         check["modified_inputs"] = modified_checks
+    usage, has_run_end = _read_events(events)
     attempt = {
         "candidate": name,
         "goal": goal,
@@ -259,7 +262,7 @@ def _attempt(plan, index, goal, deadline, frozen_checks):
         "run": run,
         "infrastructure_failures": [],
         "check": check,
-        "usage": _usage(events),
+        "usage": usage,
         "worktree": str(worktree),
         "logs": {"run_stdout": str(base / "run.stdout"), "run_stderr": str(base / "run.stderr"),
                  "check_stdout": str(base / "check.stdout"), "check_stderr": str(base / "check.stderr"),
@@ -267,27 +270,14 @@ def _attempt(plan, index, goal, deadline, frozen_checks):
     }
     if run["status"] != "completed":
         attempt["infrastructure_failures"].append(f"rof process {run['status']}")
+    # exit 8 (unmet completion check) is unreachable: this script never passes --completion-check
     elif run["returncode"] not in (0, 3):
         attempt["infrastructure_failures"].append(f"rof exited {run['returncode']}")
-    elif not _has_run_end(events):
+    elif not has_run_end:
         attempt["infrastructure_failures"].append("events have no RunEnd")
     if check["status"] in ("not_started", "timeout", "launch_error"):
         attempt["infrastructure_failures"].append(f"public check {check['status']}")
     return attempt
-
-
-def _has_run_end(events_path):
-    try:
-        lines = events_path.read_text().splitlines()
-    except OSError:
-        return False
-    for line in lines:
-        try:
-            if json.loads(line).get("type") == "RunEnd":
-                return True
-        except json.JSONDecodeError:
-            continue
-    return False
 
 
 def run_plan(plan_path):

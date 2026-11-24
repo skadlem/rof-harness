@@ -6,7 +6,6 @@ pub enum ErrorClass {
     Retryable,
     Overload,
     AuthStale,
-    ContextOverflow,
     Fatal,
 }
 
@@ -24,7 +23,6 @@ pub enum LlmError {
         body: String,
     },
     Cancelled,
-    AllFailed(String),
     /// A failure that still carried billed usage (truncated 200 body,
     /// parseable non-2xx body). `source` is the typed failure the ladder
     /// gave up on; `usage` sums every failed attempt inside one `complete`
@@ -42,9 +40,7 @@ pub enum LlmError {
 impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LlmError::Transport(m) | LlmError::Auth(m) | LlmError::AllFailed(m) => {
-                write!(f, "{m}")
-            }
+            LlmError::Transport(m) | LlmError::Auth(m) => write!(f, "{m}"),
             LlmError::Http { status, body, .. } => write!(f, "{status}: {body}"),
             LlmError::Cancelled => write!(f, "cancelled"),
             LlmError::Metered { source, .. } => write!(f, "{source}"),
@@ -58,34 +54,20 @@ impl std::fmt::Display for LlmError {
 pub fn classify_error(e: &LlmError) -> ErrorClass {
     match e {
         LlmError::Cancelled | LlmError::Auth(_) => ErrorClass::Fatal,
-        LlmError::AllFailed(_) => ErrorClass::Retryable,
         LlmError::Transport(msg) => classify_message(msg),
         LlmError::Http { status, body, .. } => classify_http(*status, body),
         LlmError::Metered { source, .. } => classify_error(source),
     }
 }
 
-/// Status-first table: overflow text wins (a 400 can carry it), 401/403 are
-/// fatal even when the body cries stale (staleness retries only via a
-/// refreshable source, which never surfaces as `Http`), overload text wins
-/// over a bare 429, then the retryable statuses, then a plain 400/422 (the
-/// request itself is bad) is fatal, then the body table.
+/// Status-first table: 401/403 are fatal even when the body cries stale
+/// (staleness retries only via a refreshable source, which never surfaces
+/// as `Http`), overload text wins over a bare 429, then the retryable
+/// statuses, then a plain 400/422 (the request itself is bad) is fatal,
+/// then the body table.
 fn classify_http(status: u16, body: &str) -> ErrorClass {
     let t = body.to_lowercase();
     let has = |p: &[&str]| p.iter().any(|k| t.contains(k));
-    if has(&[
-        "context_length_exceeded",
-        "context_overflow",
-        "context overflow",
-        "context window",
-        "prompt too long",
-        "input too long",
-        "too many tokens",
-        "out of context",
-        "token limit",
-    ]) {
-        return ErrorClass::ContextOverflow;
-    }
     if status == 401 || status == 403 {
         return ErrorClass::Fatal;
     }
@@ -107,24 +89,12 @@ fn classify_http(status: u16, body: &str) -> ErrorClass {
 }
 
 /// Fails-open string table (blacklist, not allowlist): unknown errors retry.
-/// ContextOverflow never retries at the same shape; 402 retries (OpenRouter
-/// sends it on transient credit/queue states).
+/// Overflow/fatal strings never retry; 402 retries (OpenRouter sends it on
+/// transient credit/queue states).
 fn classify_message(s: &str) -> ErrorClass {
     let t = s.to_lowercase();
     let has = |p: &[&str]| p.iter().any(|k| t.contains(k));
     if has(&[
-        "context_length_exceeded",
-        "context_overflow",
-        "context overflow",
-        "context window",
-        "prompt too long",
-        "input too long",
-        "too many tokens",
-        "out of context",
-        "token limit",
-    ]) {
-        ErrorClass::ContextOverflow
-    } else if has(&[
         "server_is_overloaded",
         "slow_down",
         "server overloaded",
@@ -136,6 +106,15 @@ fn classify_message(s: &str) -> ErrorClass {
     } else if t.contains("402") {
         ErrorClass::Retryable
     } else if has(&[
+        "context_length_exceeded",
+        "context_overflow",
+        "context overflow",
+        "context window",
+        "prompt too long",
+        "input too long",
+        "too many tokens",
+        "out of context",
+        "token limit",
         "invalid_prompt",
         "invalid_api_key",
         "invalid_token",

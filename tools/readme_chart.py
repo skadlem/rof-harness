@@ -104,9 +104,7 @@ def chart(rows, out):
                      if CELLS[r["task"]] == "mcmc" else
                      f'<rect x="{cx-4.6:.1f}" y="{cy-4.6:.1f}" width="9.2" height="9.2" rx="1.6" fill="{fill}" '
                      f'stroke="{col}" stroke-width="1.8"/>')
-            s.append(shape[:-2] + f'><title>{esc(r["task"])} {esc(r["rep"])} · arm {esc(r["arm"])} · '
-                                  f'{r["tin"]//1000}k tokens · {field} {v}</title></{shape[-6:-1]}>'
-                     if False else shape)
+            s.append(shape)
         if idx == 0:
             # label the two extremes only: the control's spend and the joint arm's.
             for arm, dx, dy, anchor in (("J", 12, -9, "start"),):

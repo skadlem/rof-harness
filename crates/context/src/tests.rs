@@ -1,101 +1,5 @@
 use super::*;
 
-fn mk(path: &str, region: &str, text: &str, fidelity: Fidelity, must: bool) -> ContextItem {
-    ContextItem {
-        key: ItemKey {
-            path: path.into(),
-            region: region.into(),
-            role: "t".into(),
-        },
-        fidelity,
-        must_include: must,
-        text: text.into(),
-    }
-}
-
-#[test]
-fn dedupe_by_key() {
-    let mut a = ContextAssembler::new(100_000);
-    a.add(mk("s/a.rs", "cur", "impl A {}", Fidelity::Exact, true));
-    a.add(mk("s/a.rs", "cur", "impl A {}", Fidelity::Exact, true));
-    assert_eq!(a.assemble().matches("impl A {}").count(), 1);
-}
-
-#[test]
-fn same_path_two_regions_is_not_a_duplicate() {
-    let mut a = ContextAssembler::new(100_000);
-    a.add(mk("s/a.rs", "head", "pub mod a;", Fidelity::Exact, true));
-    a.add(mk("s/a.rs", "tail", "fn main() {}", Fidelity::Exact, true));
-    let out = a.assemble();
-    assert!(out.contains("pub mod a;") && out.contains("fn main() {}"));
-}
-
-#[test]
-fn must_include_survives_tiny_budget() {
-    let mut a = ContextAssembler::new(10);
-    a.add(mk(
-        "big.rs",
-        "cur",
-        &"x".repeat(5000),
-        Fidelity::Exact,
-        true,
-    ));
-    a.add(mk(
-        "opt.rs",
-        "cur",
-        &"y".repeat(5000),
-        Fidelity::Exact,
-        false,
-    ));
-    let out = a.assemble();
-    assert!(out.contains('x') && !out.contains('y'));
-}
-
-#[test]
-fn windowed_narrows_by_halving_until_it_fits() {
-    let mut a = ContextAssembler::new(3000);
-    a.add(mk(
-        "s/a.rs",
-        "cur",
-        &"fn anchor_sym() {}\n".repeat(300),
-        Fidelity::Windowed {
-            anchor: "anchor_sym".into(),
-            cap: 4000,
-        },
-        true,
-    ));
-    let out = a.assemble();
-    assert!(out.contains("anchor_sym"));
-    assert!(out.chars().count() < 3000);
-}
-
-#[test]
-fn oversized_must_include_narrows_to_floor_never_silent_cut() {
-    let mut a = ContextAssembler::new(10);
-    a.add(mk(
-        "s/a.rs",
-        "cur",
-        &"fn anchor_sym() {}\n".repeat(600),
-        Fidelity::Windowed {
-            anchor: "anchor_sym".into(),
-            cap: 8000,
-        },
-        true,
-    ));
-    let out = a.assemble();
-    assert!(out.contains("anchor_sym"));
-    assert!(out.chars().count() <= MIN_WINDOW + 200);
-}
-
-#[test]
-fn window_anchored_on_symbol() {
-    let text = "a\n".repeat(3000) + "fn target_sym() {}\n" + &"b\n".repeat(3000);
-    let w = window_anchored(&text, "target_sym", 2000);
-    assert!(w.contains("target_sym") && w.chars().count() <= 2000 + 100);
-    let w2 = window_anchored(&text, "absent", 2000);
-    assert!(w2.contains("elided"));
-}
-
 #[test]
 fn cut_chars_respects_multibyte_boundaries() {
     let t = "λ".repeat(10);
@@ -193,20 +97,20 @@ fn compaction_due_is_strict_and_disabled_never_fires() {
         checkpoint_sources: false,
     };
     assert!(
-        !compaction_due(111_616, 223_232, &cfg),
+        !compaction_due(111_616, &cfg),
         "at the usable-capacity threshold"
     );
-    assert!(compaction_due(111_617, 223_232, &cfg), "just above");
-    assert!(!compaction_due(111_615, 223_232, &cfg), "just below");
+    assert!(compaction_due(111_617, &cfg), "just above");
+    assert!(!compaction_due(111_615, &cfg), "just below");
     let off = CompactionConfig {
         enabled: false,
         ..cfg
     };
-    assert!(!compaction_due(u64::MAX, 1, &off));
+    assert!(!compaction_due(u64::MAX, &off));
 }
 
 #[test]
-fn compaction_requires_known_valid_capacity_and_uses_supplied_usable_capacity() {
+fn compaction_requires_known_valid_capacity_and_uses_usable_capacity() {
     let base = CompactionConfig {
         enabled: true,
         frac: 0.5,
@@ -215,13 +119,12 @@ fn compaction_requires_known_valid_capacity_and_uses_supplied_usable_capacity() 
         output_reserve_tokens: 20_000,
         checkpoint_sources: false,
     };
-    assert!(!compaction_due(40_000, 80_000, &base));
-    assert!(compaction_due(40_001, 80_000, &base));
+    assert!(!compaction_due(40_000, &base));
+    assert!(compaction_due(40_001, &base));
     // Total run allowance is intentionally irrelevant to this API.
-    assert!(!compaction_due(40_000, 80_000, &base));
+    assert!(!compaction_due(40_000, &base));
     assert!(!compaction_due(
         1_000_000,
-        80_000,
         &CompactionConfig {
             context_capacity_tokens: None,
             ..base.clone()
@@ -229,7 +132,6 @@ fn compaction_requires_known_valid_capacity_and_uses_supplied_usable_capacity() 
     ));
     assert!(!compaction_due(
         1_000_000,
-        80_000,
         &CompactionConfig {
             context_capacity_tokens: Some(0),
             ..base.clone()
@@ -237,16 +139,10 @@ fn compaction_requires_known_valid_capacity_and_uses_supplied_usable_capacity() 
     ));
     assert!(!compaction_due(
         1_000_000,
-        80_000,
         &CompactionConfig {
             output_reserve_tokens: 100_000,
-            ..base.clone()
+            ..base
         }
-    ));
-    assert!(!compaction_due(
-        40_001,
-        80_001,
-        &CompactionConfig { ..base }
     ));
 }
 

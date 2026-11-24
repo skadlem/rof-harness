@@ -2,7 +2,6 @@ use super::*;
 use async_trait::async_trait;
 use serde_json::json;
 use serde_json::Value;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -59,25 +58,15 @@ impl Tool for FakeTool {
 
 struct AllowAll;
 impl PermissionGate for AllowAll {
-    fn check(&self, _: &str, _: &str, _: &Value, _: Option<&Path>) -> GateDecision {
+    fn check(&self, _: &str, _: &str, _: &Value) -> GateDecision {
         GateDecision::Allow
     }
 }
 struct DenyAll;
 impl PermissionGate for DenyAll {
-    fn check(&self, _: &str, _: &str, _: &Value, _: Option<&Path>) -> GateDecision {
+    fn check(&self, _: &str, _: &str, _: &Value) -> GateDecision {
         GateDecision::Deny {
             reason: "no".into(),
-            fatal: false,
-        }
-    }
-}
-struct AskAll;
-impl PermissionGate for AskAll {
-    fn check(&self, _: &str, _: &str, _: &Value, _: Option<&Path>) -> GateDecision {
-        GateDecision::Ask {
-            prompt: "ok?".into(),
-            display: "ok?".into(),
         }
     }
 }
@@ -139,18 +128,6 @@ fn gate_deny_is_error_result() {
 }
 
 #[test]
-fn gate_ask_fails_closed_without_answerer() {
-    let r = reg(Arc::new(AskAll), vec![FakeTool::new("a", json!({}))]);
-    match r.prepare("agent", call("1", "a", json!({}))) {
-        CallStatus::Result(res) => {
-            assert!(res.is_error);
-            assert!(res.content.contains("non-interactive"));
-        }
-        CallStatus::Dispatch(_) => panic!("ask must fail closed"),
-    }
-}
-
-#[test]
 fn unknown_tool_is_error_result() {
     let r = reg(Arc::new(AllowAll), vec![]);
     match r.prepare("agent", call("1", "nope", json!({}))) {
@@ -207,15 +184,15 @@ fn bound_text_truncates_head_tail_with_marker() {
 fn grant_gate_denies_unknown_agent_and_tool() {
     let g = GrantGate::new([("coder".to_string(), vec!["a".to_string()])].into());
     assert!(matches!(
-        g.check("coder", "a", &json!({}), None),
+        g.check("coder", "a", &json!({})),
         GateDecision::Allow
     ));
     assert!(matches!(
-        g.check("coder", "b", &json!({}), None),
+        g.check("coder", "b", &json!({})),
         GateDecision::Deny { .. }
     ));
     assert!(matches!(
-        g.check("stranger", "a", &json!({}), None),
+        g.check("stranger", "a", &json!({})),
         GateDecision::Deny { .. }
     ));
 }
@@ -244,11 +221,11 @@ fn tool_name_consts_match_definitions() {
 fn grant_gate_prefix_grant_covers_only_its_prefix() {
     let g = GrantGate::new([("coder".to_string(), vec!["mcp__*".to_string()])].into());
     assert!(matches!(
-        g.check("coder", "mcp__echo", &json!({}), None),
+        g.check("coder", "mcp__echo", &json!({})),
         GateDecision::Allow
     ));
     assert!(matches!(
-        g.check("coder", "exec", &json!({}), None),
+        g.check("coder", "exec", &json!({})),
         GateDecision::Deny { .. }
     ));
 }

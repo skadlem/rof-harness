@@ -1,21 +1,18 @@
 use async_trait::async_trait;
 use provider_core::{
-    classify_error, parse_retry_after, Credentials, Delta, LlmClient, LlmError, Request, Response,
-    Usage,
+    classify_error, parse_retry_after, Credentials, Delta, ErrorClass, LlmClient, LlmError,
+    Request, Response, Usage,
 };
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
 use crate::protocol::{parse_body, wire_body, wire_usage, BodyFail, ChatResp, StreamAcc};
-use crate::retry::{
-    apply_ladder, chars_after, is_cold_start, merge_usage, schedule_delay, WireKnobs,
-};
+use crate::retry::{apply_ladder, is_cold_start, schedule_delay, WireKnobs};
 
 /// Per-endpoint capability profile. Thresholds are re-measured per endpoint,
 /// never transferred (v1 profile.rs lesson).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointProfile {
-    pub emission_threshold_chars: usize,
     /// Exact JSON fragment merged into the request body to switch thinking
     /// off. DeepSeek documents `{"thinking":{"type":"disabled"}}`;
     /// a 2026-10-19 api.deepseek.com probe did not detect a change from its
@@ -37,7 +34,6 @@ pub struct EndpointProfile {
 impl Default for EndpointProfile {
     fn default() -> Self {
         Self {
-            emission_threshold_chars: 12_000,
             thinking_off: Some(serde_json::json!({"thinking": {"type": "disabled"}})),
             reasoning_effort: None,
         }
@@ -122,6 +118,7 @@ impl OpenAiCompat {
 
     /// Override the whole-request ceiling (tests, slow endpoints). Zero
     /// construction-site changes elsewhere: the default stays `REQUEST_TIMEOUT`.
+    #[cfg(test)]
     pub fn with_request_timeout(mut self, d: Duration) -> Self {
         self.request_timeout = d;
         self
@@ -233,7 +230,10 @@ impl OpenAiCompat {
                     last_label = f.msg.clone();
                     last_err = *f.error;
                     last_retryable = f.retryable;
-                    usage_acc = merge_usage(usage_acc, f.usage.map(|u| *u));
+                    usage_acc = match (usage_acc, f.usage.map(|u| *u)) {
+                        (Some(a), Some(n)) => Some(a.plus(&n)),
+                        (a, n) => a.or(n),
+                    };
                     if !f.retryable {
                         break;
                     }
@@ -284,8 +284,15 @@ struct OnceFail {
 /// Stale-credential text. Only a refreshable source may retry it; a static
 /// env key treats the same body as fatal Auth.
 fn is_stale_msg(s: &str) -> bool {
-    let t = s.to_lowercase();
-    t.contains("expired") || t.contains("stale")
+    classify_error(&LlmError::Transport(s.to_string())) == ErrorClass::AuthStale
+}
+
+fn is_retryable(e: &LlmError, truncated: bool) -> bool {
+    truncated
+        || matches!(
+            classify_error(e),
+            ErrorClass::Retryable | ErrorClass::Overload | ErrorClass::AuthStale
+        )
 }
 
 impl OpenAiCompat {
@@ -397,12 +404,7 @@ impl OpenAiCompat {
                 retry_after: after,
                 body: short,
             });
-            let retryable = matches!(
-                classify_error(&error),
-                provider_core::ErrorClass::Retryable
-                    | provider_core::ErrorClass::Overload
-                    | provider_core::ErrorClass::AuthStale
-            );
+            let retryable = is_retryable(&error, false);
             return Err(OnceFail {
                 msg,
                 error,
@@ -421,30 +423,28 @@ impl OpenAiCompat {
                 .await
                 .map_err(|e| transport_fail(e.to_string()))?,
         };
-        parse_body(&v, model, k.max_tokens).map_err(|BodyFail { msg, usage }| {
-            let truncated = msg.contains("finish_reason=length");
-            let error = Box::new(LlmError::Transport(msg.clone()));
-            let retryable = if truncated {
-                true
-            } else {
-                matches!(
-                    classify_error(&error),
-                    provider_core::ErrorClass::Retryable
-                        | provider_core::ErrorClass::Overload
-                        | provider_core::ErrorClass::AuthStale
-                )
-            };
-            OnceFail {
-                content_chars: chars_after(&msg, "; content="),
-                reasoning_chars: chars_after(&msg, "; reasoning_content="),
-                msg,
-                error,
-                after: None,
-                retryable,
-                truncated,
-                usage: usage.map(Box::new),
-            }
-        })
+        parse_body(&v, model, k.max_tokens).map_err(
+            |BodyFail {
+                 msg,
+                 usage,
+                 truncated,
+                 content_chars,
+                 reasoning_chars,
+             }| {
+                let error = Box::new(LlmError::Transport(msg.clone()));
+                let retryable = is_retryable(&error, truncated);
+                OnceFail {
+                    msg,
+                    error,
+                    after: None,
+                    retryable,
+                    truncated,
+                    content_chars,
+                    reasoning_chars,
+                    usage: usage.map(Box::new),
+                }
+            },
+        )
     }
 }
 

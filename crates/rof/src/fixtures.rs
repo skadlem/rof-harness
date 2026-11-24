@@ -77,7 +77,6 @@ pub(crate) fn usage() -> Usage {
         input: 1,
         output: 1,
         cache_read: 0,
-        cache_write: 0,
         reasoning: None,
         cost_usd: None,
     }

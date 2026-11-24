@@ -1,12 +1,8 @@
 use crate::proof::outcome_to_result;
 use crate::request::build_request;
-use crate::run::drive_tick;
-use crate::state::ProviderMsg;
-use crate::state::ToolMsg;
 use crate::verify::is_verification_call;
 use crate::verify::VERIFY_NUDGE;
 use crate::*;
-use agent_event::AgentEvent;
 use agent_event::Emitter;
 use agent_log::ItemKind;
 use provider_core::ProviderMessage;
@@ -17,7 +13,6 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tool_core::{
     CallStatus as CoreCallStatus, GrantGate, Invocation as CoreInvocation,
@@ -122,10 +117,7 @@ fn verify_nudge_failed_test_is_not_passing() {
         &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
-    assert!(s.record_tool_result(ToolMsg {
-        call_id: "e1".into(),
-        result: result(),
-    }));
+    assert!(s.record_tool_result("e1", result()));
     s.edits += 1;
     let outcome = s.step_claim(
         assistant(vec![ToolCallRef {
@@ -137,13 +129,13 @@ fn verify_nudge_failed_test_is_not_passing() {
         &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
-    assert!(s.record_tool_result(ToolMsg {
-        call_id: "t1".into(),
-        result: ToolResult {
+    assert!(s.record_tool_result(
+        "t1",
+        ToolResult {
             content: "1 failed".into(),
             is_error: true,
         },
-    }));
+    ));
     assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
 }
 
@@ -170,10 +162,7 @@ fn verify_nudge_failed_test_outcome_does_not_verify() {
         success: false,
     });
     assert!(failing.is_error);
-    assert!(s.record_tool_result(ToolMsg {
-        call_id: "t1".into(),
-        result: failing,
-    }));
+    assert!(s.record_tool_result("t1", failing));
     assert!(!s.verify.verified_since_write);
     assert!(matches!(declare(&mut s), ClaimOutcome::VerifyHold));
 }
@@ -239,10 +228,7 @@ fn verify_nudge_silent_in_base_and_contract() {
             &cfg,
         );
         assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
-        assert!(s.record_tool_result(ToolMsg {
-            call_id: "e1".into(),
-            result: result(),
-        }));
+        assert!(s.record_tool_result("e1", result()));
         s.edits += 1;
         assert!(matches!(
             s.step_claim(assistant(vec![]), StopReason::Stop, &cfg),
@@ -325,102 +311,6 @@ fn verify_hold_rides_next_request_tail_once_and_leaves_log() {
         .iter()
         .all(|m| !m.content.contains(VERIFY_NUDGE)));
     let _ = std::fs::remove_dir_all(&root);
-}
-
-/// `drive_tick` VerifyHold parity: an unverified declare holds the turn
-/// alive through the shared `step_claim` path, exactly like `run`'s
-/// `VerifyHold => continue` (no `ToolStart`, `call_model` latched,
-/// `verify.hold` set for the next request tail).
-#[tokio::test]
-async fn drive_tick_verify_hold_matches_run() {
-    let mut s = LoopState::new();
-    s.stop_when_idle = true;
-    let mut emitter = Emitter::new();
-    let (_itx, mut irx) = mpsc::channel(8);
-    let (ptx, mut prx) = mpsc::channel(8);
-    let (ttx, mut trx) = mpsc::channel(8);
-    let cancel = CancellationToken::new();
-    s.apply_input(Input::User("go".into()));
-    s.admit_steering();
-    let root = CancellationToken::new();
-    assert!(s.start_provider_call(&root).is_some());
-    // One successful write via the shared harness path: `edits` and the
-    // `observe_action` tripwire increment exactly like `run`.
-    ptx.send(ProviderMsg::Settled {
-        turn: 1,
-        message: assistant(vec![ToolCallRef {
-            id: "e1".into(),
-            name: "write".into(),
-            args: serde_json::json!({"path": "w.txt"}),
-        }]),
-        stop: StopReason::ToolUse,
-        usage: None,
-    })
-    .await
-    .unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(v, PhaseVerdict::Continue));
-    ttx.send(ToolMsg {
-        call_id: "e1".into(),
-        result: ToolResult {
-            content: "wrote w.txt".into(),
-            is_error: false,
-        },
-    })
-    .await
-    .unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(v, PhaseVerdict::Continue));
-    assert_eq!(s.edits, 1);
-    assert_eq!(s.budget.counters().actions_this_trial, 1);
-    assert!(!s.verify.verified_since_write);
-    // Unverified declare: held, not Done. No `ToolStart` for the empty
-    // declare, `call_model` keeps the turn alive for the next request.
-    assert!(s.start_provider_call(&root).is_some());
-    let frames_before = emitter.history().len();
-    ptx.send(ProviderMsg::Settled {
-        turn: 1,
-        message: assistant(vec![]),
-        stop: StopReason::Stop,
-        usage: None,
-    })
-    .await
-    .unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
-    )
-    .await;
-    assert!(matches!(v, PhaseVerdict::Continue));
-    assert!(s.call_model);
-    assert_eq!(s.verify.hold.as_deref(), Some(VERIFY_NUDGE));
-    assert_eq!(s.verify.nudges_used, 1);
-    assert!(emitter.history()[frames_before..]
-        .iter()
-        .all(|e| !matches!(e, AgentEvent::ToolStart { .. })));
 }
 
 // --- PHASE 5 fixes: attribution, headroom, replay, termination, log boundary ---

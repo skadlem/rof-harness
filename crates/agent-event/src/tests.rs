@@ -170,7 +170,7 @@ fn pairing_invariant() {
 }
 
 #[test]
-fn listener_isolation_and_bounded_tap() {
+fn listener_isolation_and_panic_guard() {
     let mut bus = Emitter::new();
     let seen = Arc::new(Mutex::new(0u32));
     let s = seen.clone();
@@ -178,19 +178,11 @@ fn listener_isolation_and_bounded_tap() {
         *s.lock().unwrap() += 1;
     });
     bus.on(|_| panic!("boom"));
-    let rx = bus.tap(8);
     bus.emit(AgentEvent::TurnStart { turn: 1 });
     // The panicking listener became one Error event; the guard held (no loop).
     assert_eq!(bus.history().len(), 2);
     assert!(matches!(bus.history()[1], AgentEvent::Error { .. }));
     assert_eq!(*seen.lock().unwrap(), 2);
-    assert!(matches!(
-        rx.try_recv().unwrap(),
-        AgentEvent::TurnStart { .. }
-    ));
-    assert!(matches!(rx.try_recv().unwrap(), AgentEvent::Error { .. }));
-    // A dead tap never errors the loop.
-    drop(rx);
     bus.emit(AgentEvent::TurnEnd {
         turn: 1,
         reason: TurnEndReason::Aborted,

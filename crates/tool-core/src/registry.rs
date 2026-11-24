@@ -44,14 +44,9 @@ impl Registry {
     /// The one door: gate, then resolve, then strict-validate, then `prepare`.
     /// Every early exit is a bounded error `Result` — never dispatched, never thrown.
     pub fn prepare(&self, agent: &str, call: ToolCall) -> CallStatus {
-        match self.gate.check(agent, &call.name, &call.args, None) {
-            GateDecision::Deny { reason, .. } => {
+        match self.gate.check(agent, &call.name, &call.args) {
+            GateDecision::Deny { reason } => {
                 return CallStatus::Result(error_result(format!("denied: {reason}")));
-            }
-            GateDecision::Ask { prompt, .. } => {
-                return CallStatus::Result(error_result(format!(
-                    "ask denied (non-interactive, no approver): {prompt}"
-                )));
             }
             GateDecision::Allow => {}
         }

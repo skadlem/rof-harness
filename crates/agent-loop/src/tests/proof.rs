@@ -1,9 +1,6 @@
 use crate::proof::note_tool_execution;
 use crate::proof::refund_batch;
 use crate::proof::snapshot_batch;
-use crate::run::drive_tick;
-use crate::state::ProviderMsg;
-use crate::state::ToolMsg;
 use crate::*;
 use agent_event::{AgentEvent, Emitter, UsageReport};
 use agent_log::ItemKind;
@@ -13,14 +10,12 @@ use provider_core::ToolCallRef;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tool_core::ToolResult;
 
 use super::{
     assistant, call, event_order, full_event_order, ok_round, run_kinds, run_registry, run_tmp,
-    script_resp, text_resp, text_response, tool_use_message, FakeLlm, GateBatch, RecBets, Scripted,
-    RUN_N,
+    script_resp, text_resp, text_response, FakeLlm, GateBatch, RecBets, Scripted, RUN_N,
 };
 
 #[test]
@@ -50,37 +45,13 @@ fn truncation_fails_batch_unexecuted() {
 }
 
 #[test]
-fn crash_repair_synthesizes_results() {
-    let mut s = LoopState::new();
-    s.turn = 1;
-    let outcome = s.step_claim(
-        assistant(vec![call("a"), call("b")]),
-        StopReason::ToolUse,
-        &RunConfig::default(),
-    );
-    assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
-    assert_eq!(s.crash_repair("boom"), 2);
-    assert_eq!(s.crash_repair("boom"), 0); // idempotent
-    for id in ["a", "b"] {
-        let res = s.tool_calls[id].result.as_ref().unwrap();
-        assert!(res.is_error);
-    }
-    assert!(s.batch_complete());
-}
-
-#[test]
 fn cancelled_provider_msg_refunds_bounded() {
     let mut s = LoopState::new();
     s.turn = 1;
     let root = CancellationToken::new();
     assert!(s.start_provider_call(&root).is_some());
     assert_eq!(s.budget.counters().steps, 1);
-    assert!(s.finish_provider_msg(ProviderMsg::Failed {
-        turn: 1,
-        err: "cancelled".into(),
-        cancelled: true,
-        usage: None,
-    }));
+    s.on_provider_failed("cancelled", true, None);
     assert_eq!(s.budget.counters().steps, 0);
     assert_eq!(s.budget.counters().refunds, 1);
     // Floor holds: refunding an empty counter mints nothing.
@@ -93,56 +64,52 @@ fn cancelled_provider_msg_refunds_bounded() {
 
 #[tokio::test]
 async fn e2e_truncation_halts_with_no_tool_start() {
-    let mut s = LoopState::new();
+    let root = run_tmp("trunc");
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([script_resp(
+            vec![(
+                "c1",
+                "write",
+                serde_json::json!({"path": "a.txt", "content": "x"}),
+            )],
+            StopReason::MaxTokens,
+        )])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
     let mut emitter = Emitter::new();
-    let (_itx, mut irx) = mpsc::channel(8);
-    let (ptx, mut prx) = mpsc::channel(8);
-    let (_ttx, mut trx) = mpsc::channel(8);
-    let cancel = CancellationToken::new();
-    s.apply_input(Input::User("go".into()));
-    s.admit_steering();
-    let root = CancellationToken::new();
-    assert!(s.start_provider_call(&root).is_some());
-    ptx.send(ProviderMsg::Settled {
-        turn: 1,
-        message: tool_use_message(),
-        stop: StopReason::MaxTokens,
-        usage: None,
-    })
-    .await
-    .unwrap();
-    let v = drive_tick(
-        &mut s,
-        &mut irx,
-        &mut prx,
-        &mut trx,
-        &cancel,
-        &mut emitter,
-        &RunConfig::default(),
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
     )
     .await;
-    assert!(matches!(v, PhaseVerdict::Return(Outcome::Halted(ref s)) if s == "max-tokens"));
+    assert!(matches!(outcome, Outcome::Halted(ref s) if s == "max-tokens"));
+    assert!(!root.join("a.txt").exists(), "truncated call must not run");
     // Truncated batch: answered with errors, never dispatched.
     let order = event_order(emitter.history());
     assert!(!order.contains(&"ToolStart"));
     assert!(order.contains(&"TurnEnd"));
-    match emitter.history().last().unwrap() {
-        AgentEvent::TurnEnd { reason, .. } => {
-            assert_eq!(*reason, agent_event::TurnEndReason::MaxSteps)
-        }
-        other => panic!("expected TurnEnd, got {other:?}"),
-    }
-    assert_eq!(s.turn_reason, Some(TurnEndReason::MaxTokens));
-    // F1a: no provider usage = None on MessageEnd, zero totals on TurnEnd.
-    assert!(emitter
-        .history()
-        .iter()
-        .any(|e| matches!(e, AgentEvent::MessageEnd { usage: None, .. })));
     assert!(emitter.history().iter().any(|e| matches!(
         e,
-        AgentEvent::TurnEnd { usage_totals, .. }
-            if *usage_totals == UsageReport::default()
+        AgentEvent::TurnEnd {
+            reason: agent_event::TurnEndReason::MaxSteps,
+            ..
+        }
     )));
+    assert_eq!(state.turn_reason, Some(TurnEndReason::MaxTokens));
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
@@ -190,7 +157,6 @@ async fn run_e2e_multi_turn_proven_prefix_kept_failed_batch_rolled_back() {
     };
     let registry = run_registry(&root);
     let mut state = LoopState::new();
-    state.followups.push_back("second task".into());
     let mut emitter = Emitter::new();
     let cancel = CancellationToken::new();
     let cfg = RunConfig {
@@ -207,9 +173,26 @@ async fn run_e2e_multi_turn_proven_prefix_kept_failed_batch_rolled_back() {
             workdir: &root,
             emitter: &mut emitter,
             bets: &NoBets,
-            cfg,
+            cfg: cfg.clone(),
         },
         vec![Input::User("build it".into())],
+        &cancel,
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
+    state.reset_for_input();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg,
+        },
+        vec![Input::User("second task".into())],
         &cancel,
     )
     .await;
@@ -528,7 +511,7 @@ async fn run_failed_batch_records_rollback_notice_and_queues_it_for_the_model() 
 }
 
 #[tokio::test]
-async fn run_bets_hook_fires_at_step_head_and_post_batch_in_order() {
+async fn run_bets_hook_fires_at_post_batch_in_order() {
     let root = run_tmp("bets");
     std::fs::write(root.join("f.txt"), "old\n").unwrap();
     let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -572,11 +555,10 @@ async fn run_bets_hook_fires_at_step_head_and_post_batch_in_order() {
     )
     .await;
     assert!(matches!(outcome, Outcome::Done), "got {outcome:?}");
-    // Step-head, post-batch, step-head interleave with the three model
-    // calls (the held declare adds one round trip, no batch hooks).
+    // Post-batch hook fires after the tool batch, between model calls.
     assert_eq!(
         *order.lock().unwrap(),
-        vec!["bets", "model", "bets", "bets", "model", "bets", "model"],
+        vec!["model", "bets", "model", "model"],
     );
     assert_eq!(
         std::fs::read_to_string(root.join("f.txt")).unwrap(),
@@ -736,8 +718,8 @@ impl BetsHook for AbortBatch {
 }
 
 #[test]
-fn no_bets_defaults_keep_the_run_ungated_and_step_head_delegates() {
-    // Site 2 default = permissive Committed: feature off unless a hook opts in.
+fn no_bets_defaults_keep_the_run_ungated() {
+    // Default = permissive Committed: feature off unless a hook opts in.
     let claim = bets::Claim {
         predicted_verdict: "all green".into(),
         on_mismatch: "rollback".into(),
@@ -745,18 +727,6 @@ fn no_bets_defaults_keep_the_run_ungated_and_step_head_delegates() {
     assert!(matches!(
         NoBets.on_post_batch(&claim, &[]),
         bets::CommitVerdict::Committed
-    ));
-    assert!(matches!(NoBets.on_step_head(3), PhaseVerdict::Continue));
-    // Site 1 default delegates to on_step: an on_step-only hook still gates.
-    struct StopOnStep;
-    impl BetsHook for StopOnStep {
-        fn on_step(&self) -> PhaseVerdict {
-            PhaseVerdict::Return(Outcome::Done)
-        }
-    }
-    assert!(matches!(
-        StopOnStep.on_step_head(0),
-        PhaseVerdict::Return(Outcome::Done)
     ));
 }
 
@@ -900,10 +870,7 @@ fn rollback_refunds_edits_and_verified_but_keeps_actions() {
         is_error: false,
     };
     let _ = note_tool_execution(&mut s, &wname, &wargs, &w1);
-    assert!(s.record_tool_result(ToolMsg {
-        call_id: "w1".into(),
-        result: w1,
-    }));
+    assert!(s.record_tool_result("w1", w1));
     // The batch moved the counters and dirtied the verified flag.
     assert_eq!(s.edits, edits_before + 1);
     assert_eq!(s.budget.counters().actions_this_trial, actions_before + 1);

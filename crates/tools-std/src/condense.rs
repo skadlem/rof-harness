@@ -8,6 +8,8 @@
 
 use std::collections::HashSet;
 
+use crate::common::drop_front_bytes;
+
 fn is_noise(t: &str) -> bool {
     t.is_empty()
         || t.starts_with("Compiling")
@@ -17,6 +19,20 @@ fn is_noise(t: &str) -> bool {
         || t.starts_with("Blocking")
         || (t.starts_with("test ") && t.ends_with("... ok"))
 }
+
+/// Signal substrings and whether each ranks as specific (verdict-shaped)
+/// rather than high-volume (`error`/`warning`).
+const KEEP: [(&str, bool); 9] = [
+    ("FAILED", true),
+    ("error", false),
+    ("panicked", true),
+    ("assertion", true),
+    ("warning", false),
+    ("test result", true),
+    ("failures:", true),
+    ("left:", true),
+    ("right:", true),
+];
 
 const TAIL_LINES: usize = 12;
 const TAIL_BYTES: usize = 2000;
@@ -45,11 +61,10 @@ fn condense_tail(s: &str) -> String {
         // Even the last line alone exceeds the budget: keep its tail bytes.
         first -= 1;
         let line = all[first];
-        let mut from = line.len().saturating_sub(TAIL_BYTES);
-        while !line.is_char_boundary(from) {
-            from += 1;
-        }
-        line[from..].to_string()
+        let mut tail = line.to_string();
+        let cut = tail.len().saturating_sub(TAIL_BYTES);
+        drop_front_bytes(&mut tail, cut);
+        tail
     } else {
         all[first..].join("\n")
     };
@@ -69,17 +84,6 @@ fn condense_tail(s: &str) -> String {
 /// tail instead of the empty-result sentence; baseline suppression alone
 /// keeps that sentence.
 pub fn condense_output(s: &str, baseline: Option<&str>) -> String {
-    const KEEP: [&str; 9] = [
-        "FAILED",
-        "error",
-        "panicked",
-        "assertion",
-        "warning",
-        "test result",
-        "failures:",
-        "left:",
-        "right:",
-    ];
     let base: Option<HashSet<&str>> = baseline.map(|b| b.lines().collect());
     let mut kept: Vec<&str> = Vec::new();
     let mut matched = 0usize;
@@ -90,7 +94,7 @@ pub fn condense_output(s: &str, baseline: Option<&str>) -> String {
             dropped += 1;
             continue;
         }
-        if KEEP.iter().any(|k| t.contains(k)) {
+        if KEEP.iter().any(|(k, _)| t.contains(k)) {
             matched += 1;
             if base.as_ref().is_some_and(|bs| bs.contains(line)) {
                 dropped += 1;
@@ -163,17 +167,7 @@ fn head_tail(idx: &[usize], budget: usize) -> Vec<usize> {
 }
 
 fn is_specific(t: &str) -> bool {
-    [
-        "FAILED",
-        "panicked",
-        "assertion",
-        "test result",
-        "failures:",
-        "left:",
-        "right:",
-    ]
-    .iter()
-    .any(|k| t.contains(k))
+    KEEP.iter().any(|(k, specific)| *specific && t.contains(k))
 }
 
 #[cfg(test)]

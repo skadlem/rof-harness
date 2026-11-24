@@ -22,8 +22,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tool_core::{
-    bound_text, CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome,
-    MAX_MODEL_CHARS,
+    bound_text, Invocation, Tool, ToolDefinition, ToolError, ToolOutcome, MAX_MODEL_CHARS,
 };
 
 use crate::cli::{run_config, Args};
@@ -245,14 +244,6 @@ fn definition(name: &str, description: &str, props: Value, required: &[&str]) ->
     }
 }
 
-fn dispatch(call: &ToolCall) -> CallStatus {
-    CallStatus::Dispatch(Invocation {
-        call_id: call.call_id.clone(),
-        name: call.name.clone(),
-        args: call.args.clone(),
-    })
-}
-
 fn ok(content: String) -> Result<ToolOutcome, ToolError> {
     Ok(ToolOutcome {
         content,
@@ -277,9 +268,6 @@ impl Tool for Spawn {
             json!({"role": {"type": "string"}, "brief": {"type": "string"}}),
             &["role", "brief"],
         )
-    }
-    fn prepare(&self, call: &ToolCall) -> CallStatus {
-        dispatch(call)
     }
     async fn execute(
         &self,
@@ -350,9 +338,6 @@ impl Tool for Wait {
             json!({"ids": {"type": "array", "items": {"type": "string"}}}),
             &["ids"],
         )
-    }
-    fn prepare(&self, call: &ToolCall) -> CallStatus {
-        dispatch(call)
     }
     async fn execute(
         &self,

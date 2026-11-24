@@ -9,7 +9,6 @@ fn billed_usage_folds_failed_attempts_into_the_bill() {
         input: i,
         output: o,
         cache_read: 0,
-        cache_write: 0,
         reasoning: None,
         cost_usd: cost,
     };
@@ -35,7 +34,6 @@ fn plus_keeps_reasoning_subset_and_known_cost() {
         input: 1,
         output: 10,
         cache_read: 2,
-        cache_write: 0,
         reasoning: Some(4),
         cost_usd: None,
     };
@@ -43,7 +41,6 @@ fn plus_keeps_reasoning_subset_and_known_cost() {
         input: 1,
         output: 10,
         cache_read: 2,
-        cache_write: 0,
         reasoning: Some(3),
         cost_usd: Some(0.5),
     };
@@ -121,7 +118,6 @@ fn class_of(e: &LlmError) -> &'static str {
         ErrorClass::Retryable => "retry",
         ErrorClass::Overload => "overload",
         ErrorClass::AuthStale => "stale",
-        ErrorClass::ContextOverflow => "overflow",
         ErrorClass::Fatal => "fatal",
     }
 }
@@ -134,8 +130,8 @@ fn classifier_table() {
         ("429 Too Many Requests", "retry"),
         ("500 Internal Server Error", "retry"),
         ("weird novel provider wobble", "retry"),
-        ("context_length_exceeded: too many tokens", "overflow"),
-        ("prompt is too long for context window", "overflow"),
+        ("context_length_exceeded: too many tokens", "fatal"),
+        ("prompt is too long for context window", "fatal"),
         ("server_is_overloaded, try again", "overload"),
         ("client slow_down, back off", "overload"),
         ("token expired, refresh needed", "stale"),
@@ -167,12 +163,11 @@ fn classifier_status_first_then_string_fallback() {
         "fatal"
     );
     assert_eq!(class_of(&http(403, "forbidden")), "fatal");
-    // Overflow text wins over a bare status.
+    // A plain 400/422 is a bad request: retrying the same body cannot help.
     assert_eq!(
         class_of(&http(400, "context_length_exceeded: too many tokens")),
-        "overflow"
+        "fatal"
     );
-    // A plain 400/422 is a bad request: retrying the same body cannot help.
     assert_eq!(class_of(&http(400, "bad request")), "fatal");
     assert_eq!(class_of(&http(422, "unprocessable entity")), "fatal");
     assert_eq!(class_of(&http(500, "boom")), "retry");
@@ -203,17 +198,10 @@ fn reasoning_is_subset_never_double_counted() {
         input: 10,
         output: 100,
         cache_read: 0,
-        cache_write: 0,
         reasoning: Some(30),
         cost_usd: None,
     };
     assert_eq!(u.total_tokens(), 110);
-    assert_eq!(u.content_tokens(), 70);
-    let over = Usage {
-        reasoning: Some(999),
-        ..u.clone()
-    };
-    assert_eq!(over.content_tokens(), 0);
 }
 #[test]
 fn absent_finish_reason_infers_stop_vs_tool_use() {
@@ -228,12 +216,6 @@ fn absent_finish_reason_infers_stop_vs_tool_use() {
         infer_stop(Some("tool_calls"), &msg_with_tools()),
         StopReason::ToolUse
     );
-}
-#[test]
-fn refused_is_terminal_error_distinct_from_max_tokens() {
-    assert!(StopReason::Refused.is_terminal() && StopReason::Refused.is_error());
-    assert!(StopReason::MaxTokens.is_terminal() && !StopReason::MaxTokens.is_error());
-    assert!(!StopReason::Pending.is_terminal());
 }
 
 /// Adapter that implements nothing: exactly who would inherit the
@@ -293,7 +275,6 @@ impl LlmClient for OldClient {
                 input: 1,
                 output: 1,
                 cache_read: 0,
-                cache_write: 0,
                 reasoning: None,
                 cost_usd: None,
             },

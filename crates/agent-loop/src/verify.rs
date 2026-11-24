@@ -1,6 +1,5 @@
 //! Mid-run verification nudge: declare hold and verification calls.
 
-use crate::state::ToolMsg;
 use crate::{append_to, ClaimOutcome, IncentivesLevel, LoopState, RunConfig, ToolCallState};
 use agent_log::{ItemKind, TurnEndReason};
 use provider_core::{AssistantMessage, StopReason};
@@ -201,28 +200,15 @@ impl LoopState {
         if cfg.max_steps.get().saturating_sub(counters.steps) < 2 {
             return None;
         }
-        // Explicit per-cap reads (duplicating `exceeded` for provenance):
-        // tokens/spend/wallclock each veto the hold when already tripped.
-        if cfg.max_tokens > 0 && counters.tokens >= cfg.max_tokens {
-            return None;
-        }
-        if let Some(limit) = cfg.max_spend_cents {
-            if counters.spent_cents >= limit {
-                return None;
-            }
-        }
-        if !cfg.max_wallclock.is_zero() && self.budget.elapsed() >= cfg.max_wallclock {
-            return None;
-        }
         self.verify.nudges_used += 1;
         self.verify.edits_at_last_nudge = self.edits;
         Some(VERIFY_NUDGE.into())
     }
 
     /// Returns true when the call id was known and still open.
-    pub(crate) fn record_tool_result(&mut self, msg: ToolMsg) -> bool {
+    pub(crate) fn record_tool_result(&mut self, call_id: &str, result: ToolResult) -> bool {
         let open = matches!(
-            self.tool_calls.get(&msg.call_id),
+            self.tool_calls.get(call_id),
             Some(c) if c.result.is_none()
         );
         if !open {
@@ -231,32 +217,28 @@ impl LoopState {
         append_to(
             &mut self.items,
             ItemKind::ToolResult {
-                call_id: msg.call_id.clone(),
-                content: msg.result.content.clone(),
-                is_error: msg.result.is_error,
+                call_id: call_id.to_owned(),
+                content: result.content.clone(),
+                is_error: result.is_error,
                 recovery: None,
             },
         );
-        let probe = self.tool_calls.get(&msg.call_id).map(|c| {
+        let probe = self.tool_calls.get(call_id).map(|c| {
             (
                 c.name.clone(),
                 c.is_verification,
                 serde_json::from_str::<Value>(&c.args).unwrap_or_default(),
             )
         });
-        let ok = !msg.result.is_error;
-        if let Some(c) = self.tool_calls.get_mut(&msg.call_id) {
-            c.result = Some(msg.result);
+        let ok = !result.is_error;
+        if let Some(c) = self.tool_calls.get_mut(call_id) {
+            c.result = Some(result);
         }
         if ok {
             if let Some((name, is_verification, args)) = probe {
                 // A successful write, shell, or process input may mutate files.
                 // A passing verification covers mutations since the last one.
-                if name == TOOL_EDIT
-                    || name == TOOL_WRITE
-                    || name == "multi_edit"
-                    || may_mutate_workspace(&name, &args)
-                {
+                if is_edit_tool(&name) || may_mutate_workspace(&name, &args) {
                     self.verify.verified_since_write = false;
                 } else if is_verification {
                     self.verify.verified_since_write = true;
@@ -268,6 +250,10 @@ impl LoopState {
         }
         true
     }
+}
+
+pub(crate) fn is_edit_tool(name: &str) -> bool {
+    matches!(name, TOOL_EDIT | TOOL_WRITE | "multi_edit")
 }
 
 /// A passing result on one of these counts as a verification run since the

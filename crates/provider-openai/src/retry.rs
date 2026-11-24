@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use provider_core::{Request, Usage};
+use provider_core::Request;
 
 use crate::client::EndpointProfile;
 
@@ -61,15 +61,6 @@ pub(crate) fn apply_ladder(
     false
 }
 
-/// Fold a failed attempt's usage into the running total. Attempts are
-/// independent requests, so billed tokens sum (`Usage::plus`).
-pub(crate) fn merge_usage(acc: Option<Usage>, next: Option<Usage>) -> Option<Usage> {
-    match (acc, next) {
-        (Some(a), Some(n)) => Some(a.plus(&n)),
-        (a, n) => a.or(n),
-    }
-}
-
 /// Cap on a server-requested `Retry-After` delay. Pi fails fast above its
 /// 60 s `maxRetryDelayMs` default (`provider-retry.ts:44-58`): a longer ask is
 /// terminal, never slept on.
@@ -124,19 +115,6 @@ pub(crate) fn schedule_delay(
 /// errors keep the short ladder.
 pub(crate) fn is_cold_start(msg: &str) -> bool {
     msg.contains("503")
-}
-
-/// Digits after `marker` in a message (`"; content=4 chars"` -> 4). The
-/// ladder needs the counts to pick its rung.
-pub(crate) fn chars_after(text: &str, marker: &str) -> usize {
-    let Some(i) = text.find(marker) else {
-        return 0;
-    };
-    let rest = &text[i + marker.len()..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end].parse().unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -64,8 +64,8 @@ root and leave root-owned outputs in the bind-mounted workdir.
 adapter, `tools/harbor_rof.py`, runs `rof run` in the task container instead).
 It loads a frozen task slice and writes one JSON row per instance (verdict,
 token and dollar totals, steps, halt reason, provenance), and computes no
-intervals (`wilson_ci`, `paired_bootstrap`, `ComparisonReport` exist in `eval`,
-tests only). Without `--agent` it is a scaffold: no command, no reward, so
+intervals (offline paired statistics live in `tools/rof_compare.py`). Without
+`--agent` it is a scaffold: no command, no reward, so
 instances grade ErrorNoReport. Patch apply is Strict by default, Lenient under
 `--lenient-apply`. Every report carries `eval::RunProvenance`: the binary's
 short git sha (embedded by `crates/rof/build.rs`, `unknown` when git is
@@ -161,8 +161,7 @@ declares roles (tools, optional prompt, token/step budget), limits (`max_depth`,
 
 ## Crate map
 
-- `agent-loop` — the loop. `run()` is the shipped sequential driver;
-  `drive_tick` a test harness over the same step helpers. Owns state,
+- `agent-loop` — the loop. `run()` is the shipped sequential driver. Owns state,
   verification nudge, request building, proof gating, cancellation. The
   verification nudge, half/late action directives and wrap-up nudge run only
   with `--steer on`; `steer` defaults off on `rof run` and `rof eval`, the
@@ -197,11 +196,10 @@ declares roles (tools, optional prompt, token/step budget), limits (`max_depth`,
 | `agent-budget` | step/action/token/spend caps, halts, `with_steps()` (warn clamp + refund re-derive); `config_for` presets per capability, run budgets resolve in `cli::budget_for`. |
 | `snapshot` | git-overlay tree: baselines, rollbacks, bounded evidence patch, unbounded `patch_since_start_full()` deliverable. |
 | `provider-core` / `provider-openai` | `LlmClient` trait + OpenAI-compatible client. Separate retry bounds: cold-start 503 retries use eight attempts, ordinary retryable errors five, and the truncation output-token ladder its own bounded escalation (`provider-openai/src/retry.rs`). |
-| `eval` | slice loading (`load_tb_slice`), winnability, per-instance rows (verdicts from the `rof eval --agent` leg); `wilson_ci` / `paired_bootstrap` are test-only. |
+| `eval` | slice loading (`load_tb_slice`), winnability, per-instance rows (verdicts from the `rof eval --agent` leg). |
 | `agent-event` / `agent-log` | live event vocabulary (11 variants; pinned in `exit.rs::NAMES`); durable JSONL log. |
 | `context` | compaction/file-map. |
-| `bets` | three capability bets, feature-flagged. |
-| `trace` | ordered sink + live forward + JSONL append; token totals as passed-in counts only. |
+| `bets` | capability bets A/B (claim + proof-gated commits), feature-flagged. |
 
 ## Data flow
 

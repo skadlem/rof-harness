@@ -1,5 +1,3 @@
-use crate::state::ProviderMsg;
-use crate::state::ToolMsg;
 use crate::*;
 use agent_budget::config_for;
 use agent_budget::BudgetConfig;
@@ -19,18 +17,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tool_core::ToolResult;
 use tool_core::{
     CallStatus as CoreCallStatus, GrantGate, Invocation as CoreInvocation,
     Registry as CoreRegistry, Tool as CoreTool, ToolCall as CoreToolCall,
     ToolDefinition as CoreToolDef, ToolError as CoreToolError, ToolOutcome as CoreToolOutcome,
 };
-use tool_core::{ToolCall, ToolResult};
 
 mod budget;
 mod checkpoint_sources;
 mod completion;
 mod fold;
-mod gate;
 mod proof;
 mod request;
 mod run;
@@ -53,82 +50,10 @@ fn call(id: &str) -> ToolCallRef {
     }
 }
 
-fn settled(turn: u64) -> ProviderMsg {
-    ProviderMsg::Settled {
-        turn,
-        message: assistant(vec![]),
-        stop: StopReason::Stop,
-        usage: None,
-    }
-}
-
 fn result() -> ToolResult {
     ToolResult {
         content: "ok".into(),
         is_error: false,
-    }
-}
-
-struct FakeEdit;
-
-#[async_trait::async_trait]
-impl tool_core::Tool for FakeEdit {
-    fn definition(&self) -> tool_core::ToolDefinition {
-        tool_core::ToolDefinition {
-            name: "edit".into(),
-            description: "fake edit".into(),
-            schema: serde_json::json!({}),
-        }
-    }
-    fn prepare(&self, call: &ToolCall) -> tool_core::CallStatus {
-        tool_core::CallStatus::Dispatch(tool_core::Invocation {
-            call_id: call.call_id.clone(),
-            name: call.name.clone(),
-            args: call.args.clone(),
-        })
-    }
-    async fn execute(
-        &self,
-        inv: tool_core::Invocation,
-        _cancel: CancellationToken,
-    ) -> Result<tool_core::ToolOutcome, tool_core::ToolError> {
-        Ok(tool_core::ToolOutcome {
-            content: format!("edited {}", inv.call_id),
-            truncated: false,
-            success: true,
-        })
-    }
-}
-
-fn edit_registry() -> tool_core::Registry {
-    let gate = std::sync::Arc::new(tool_core::GrantGate::new(
-        [("agent".to_string(), vec!["edit".to_string()])].into(),
-    ));
-    let mut r = tool_core::Registry::new(gate);
-    r.register(std::sync::Arc::new(FakeEdit));
-    r
-}
-
-fn tool_use_message() -> AssistantMessage {
-    AssistantMessage {
-        content: "fixing".into(),
-        tool_calls: vec![provider_core::ToolCallRef {
-            id: "c1".into(),
-            name: "edit".into(),
-            args: serde_json::json!({"path": "f"}),
-        }],
-        thinking: None,
-    }
-}
-
-fn usage() -> Usage {
-    Usage {
-        input: 100,
-        output: 50,
-        cache_read: 0,
-        cache_write: 0,
-        reasoning: None,
-        cost_usd: Some(0.02),
     }
 }
 
@@ -217,7 +142,6 @@ fn response(calls: Vec<(&str, &str, serde_json::Value)>, stop: StopReason) -> Re
             input: 10,
             output: 5,
             cache_read: 0,
-            cache_write: 0,
             reasoning: None,
             cost_usd: Some(0.01),
         },
@@ -244,7 +168,6 @@ fn text_response(text: &str) -> Response {
             input: 10,
             output: 5,
             cache_read: 0,
-            cache_write: 0,
             reasoning: None,
             cost_usd: Some(0.01),
         },
@@ -412,9 +335,13 @@ struct RecBets {
 }
 
 impl BetsHook for RecBets {
-    fn on_step(&self) -> PhaseVerdict {
+    fn on_post_batch(
+        &self,
+        _claim: &bets::Claim,
+        _hunks: &[(String, bool)],
+    ) -> bets::CommitVerdict {
         self.order.lock().unwrap().push("bets".into());
-        PhaseVerdict::Continue
+        bets::CommitVerdict::Committed
     }
 }
 
@@ -439,8 +366,8 @@ fn summary_resp(text: &str, stop: StopReason, input: u64) -> Scripted {
     Scripted::Respond(r)
 }
 
-/// One scripted run; hands back everything the checkpoint assertions need.
-/// `followups` open later turns (a checkpoint is per turn).
+/// One scripted run (plus optional subsequent turns on the same `LoopState`);
+/// hands back everything the checkpoint assertions need.
 async fn run_script(
     name: &str,
     queue: Vec<Scripted>,
@@ -465,12 +392,9 @@ async fn run_script(
         },
         Instant::now(),
     );
-    for f in followups {
-        state.followups.push_back(f.into());
-    }
     let mut emitter = Emitter::new();
     let cancel = CancellationToken::new();
-    let outcome = run(
+    let mut outcome = run(
         &mut state,
         Run {
             provider: &client,
@@ -479,12 +403,30 @@ async fn run_script(
             workdir: &root,
             emitter: &mut emitter,
             bets: &NoBets,
-            cfg,
+            cfg: cfg.clone(),
         },
         vec![Input::User(goal.into())],
         &cancel,
     )
     .await;
+    for f in followups {
+        state.reset_for_input();
+        outcome = run(
+            &mut state,
+            Run {
+                provider: &client,
+                registry: &registry,
+                agent: "agent",
+                workdir: &root,
+                emitter: &mut emitter,
+                bets: &NoBets,
+                cfg: cfg.clone(),
+            },
+            vec![Input::User(f.into())],
+            &cancel,
+        )
+        .await;
+    }
     let _ = std::fs::remove_dir_all(&root);
     (outcome, requests, state, emitter)
 }
@@ -553,10 +495,7 @@ fn ok_round(s: &mut LoopState, id: &str, name: &str, args: Value) {
         &RunConfig::default(),
     );
     assert!(matches!(outcome, ClaimOutcome::Dispatch(_)));
-    assert!(s.record_tool_result(ToolMsg {
-        call_id: id.into(),
-        result: result(),
-    }));
+    assert!(s.record_tool_result(id, result()));
     if name == "edit" || name == "write" {
         s.edits += 1;
     }

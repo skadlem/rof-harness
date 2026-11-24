@@ -73,17 +73,14 @@ impl agent_loop::BetsHook for Gate {
 /// to `exec`/`test` children without ever leaking the provider key.
 fn policy_for(args: &Args) -> tools_std::Policy {
     tools_std::Policy {
-        root: args.workdir.clone(),
         // --allow-cmd entries are binary prefixes (no shell: `&&`/`|` are
         // literal args, so exact-string matching would allow nothing useful).
-        allowed_commands: Vec::new(),
         allowed_prefixes: args.allow_cmd.clone(),
-        syntax_cmd: None,
-        denied_globs: tools_std::default_denied_globs(),
         pass_env: args.pass_env.clone(),
         allow_any_cmd: args.exec_policy == tools_std::ExecPolicy::Any,
         exec_wrap: args.exec_wrap.clone(),
         head_tail_output: args.head_tail_output,
+        ..tools_std::Policy::for_root(args.workdir.clone())
     }
 }
 
@@ -273,14 +270,13 @@ impl<P: LlmClient> LlmClient for CappedProvider<'_, P> {
 }
 
 fn review_registry(policy: Arc<tools_std::Policy>) -> tool_core::Registry {
-    let names = ["view", "search"].into_iter().map(str::to_owned).collect();
-    let mut registry = tool_core::Registry::new(Arc::new(GrantGate::new(HashMap::from([(
-        "agent".to_string(),
-        names,
-    )]))));
-    registry.register(Arc::new(tools_std::view_tool(policy.clone())));
-    registry.register(Arc::new(tools_std::search_tool(policy)));
-    registry
+    registry_from(
+        vec![
+            Arc::new(tools_std::view_tool(policy.clone())),
+            Arc::new(tools_std::search_tool(policy)),
+        ],
+        &[],
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // phase needs the caller-owned budget, emitter, cancellation and frozen run inputs.
@@ -403,108 +399,60 @@ fn preserve_log(path: &Path, workdir: &Path) -> std::io::Result<()> {
     unreachable!()
 }
 
-async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
-    execute_with_deadline(provider, args, None).await
+fn fail_run(kind: FailureKind, message: String) -> RunResult {
+    RunResult {
+        outcome: Outcome::Failed { kind, message },
+        patch: Ok(String::new()),
+        events: Vec::new(),
+    }
 }
 
-/// Same run with an optional wall-clock deadline, used by the eval agent leg to
-/// enforce the task's `[agent] timeout_sec` the way harbor does. The deadline
-/// cancels through the same token Ctrl-C uses, so the loop still ends with
-/// `Outcome::Cancelled`, emits `RunEnd` and leaves a gradeable workdir — a
-/// dropped future would look like an infra failure instead.
-async fn execute_with_deadline<P: LlmClient>(
-    provider: &P,
+pub(crate) struct SessionBootstrap {
+    pub policy: Arc<tools_std::Policy>,
+    pub registry: tool_core::Registry,
+    pub agent_tree: Option<agents::Tree>,
+    pub state: LoopState,
+    pub gate: Gate,
+    pub emitter: Emitter,
+    pub cancel: CancellationToken,
+    pub tree: TreeService,
+}
+
+/// Shared session setup for `rof run` (`seed_budget = true`) and `rof chat`
+/// (`seed_budget = false`, where budgets reset per user message).
+pub(crate) async fn bootstrap_session(
     args: &Args,
-    deadline: Option<Instant>,
-) -> RunResult {
-    let procedure_catalog = match procedures::load(&args.procedure_files) {
-        Ok(selection) => selection,
-        Err(message) => {
-            return RunResult {
-                outcome: Outcome::Failed {
-                    kind: FailureKind::Input,
-                    message,
-                },
-                patch: Ok(String::new()),
-                events: Vec::new(),
-            };
-        }
-    };
-    let procedures = match procedure_catalog.select(&args.goal) {
-        Ok(selection) => selection,
-        Err(message) => {
-            return RunResult {
-                outcome: Outcome::Failed {
-                    kind: FailureKind::Input,
-                    message,
-                },
-                patch: Ok(String::new()),
-                events: Vec::new(),
-            }
-        }
-    };
+    seed_budget: bool,
+) -> Result<SessionBootstrap, (FailureKind, String)> {
     let policy = Arc::new(policy_for(args));
-    let reg = match registry_with_mcp(args, policy.clone()).await {
-        Ok(reg) => reg,
-        Err(message) => {
-            return RunResult {
-                outcome: Outcome::Failed {
-                    kind: FailureKind::Provider,
-                    message: format!("cannot configure tools: {message}"),
-                },
-                patch: Ok(String::new()),
-                events: Vec::new(),
-            };
-        }
-    };
-    let mut reg = reg;
-    let mut agent_tree = args.agents.as_ref().map(agents::Tree::new);
+    let mut registry = registry_with_mcp(args, policy.clone()).await.map_err(|m| {
+        (
+            FailureKind::Provider,
+            format!("cannot configure tools: {m}"),
+        )
+    })?;
+    let agent_tree = args.agents.as_ref().map(agents::Tree::new);
     if let Some(t) = &agent_tree {
-        t.register_root(&mut reg);
+        t.register_root(&mut registry);
     }
     let mut state = LoopState::new();
     if let Some(p) = args.resume.as_deref() {
-        if let Err(e) = state.restore_from(Path::new(p)) {
-            return RunResult {
-                outcome: Outcome::Failed {
-                    kind: FailureKind::Log,
-                    message: format!("--resume {p}: {e}"),
-                },
-                patch: Ok(String::new()),
-                events: Vec::new(),
-            };
-        }
+        state
+            .restore_from(Path::new(p))
+            .map_err(|e| (FailureKind::Log, format!("--resume {p}: {e}")))?;
     }
-    // Pre-seeded budget: `run` never rebuilds it (precedence is documented
-    // on `agent_loop::run`: cfg-over-state). A `$` guard that cannot fire is a
-    // configuration error, so it stops the run before any provider request
-    // instead of warning and proceeding unguarded.
-    state.budget = match budget_for(args) {
-        Ok(budget) => budget,
-        Err(message) => {
-            return RunResult {
-                outcome: Outcome::Failed {
-                    kind: FailureKind::Input,
-                    message,
-                },
-                patch: Ok(String::new()),
-                events: Vec::new(),
-            };
-        }
-    };
+    if seed_budget {
+        // Pre-seeded budget: `run` never rebuilds it (precedence is documented
+        // on `agent_loop::run`: cfg-over-state). A `$` guard that cannot fire is a
+        // configuration error, so it stops the run before any provider request
+        // instead of warning and proceeding unguarded.
+        state.budget = budget_for(args).map_err(|m| (FailureKind::Input, m))?;
+    }
     let gate = Gate {
         incremental: args.proof_cmd.is_some(),
     };
-    let bets_hook: &dyn agent_loop::BetsHook = if args.bets { &gate } else { &NoBets };
     let mut emitter = Emitter::new();
     let cancel = CancellationToken::new();
-    if let Some(d) = deadline {
-        let cancel = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await;
-            cancel.cancel();
-        });
-    }
     // First Ctrl-C cancels the run; the loop reports Outcome::Cancelled.
     tokio::spawn({
         let cancel = cancel.clone();
@@ -518,19 +466,13 @@ async fn execute_with_deadline<P: LlmClient>(
     // outside the workdir before creating a new one.
     let log_path = resolve_log_path(args);
     if let (Some(p), None) = (log_path.as_deref(), args.resume.as_deref()) {
-        if let Err(e) = preserve_log(p, &args.workdir) {
-            return RunResult {
-                outcome: Outcome::Failed {
-                    kind: FailureKind::Log,
-                    message: format!("cannot preserve WAL: {e}"),
-                },
-                patch: Ok(String::new()),
-                events: Vec::new(),
-            };
-        }
+        preserve_log(p, &args.workdir)
+            .map_err(|e| (FailureKind::Log, format!("cannot preserve WAL: {e}")))?;
     }
-    if let Some(path) = args.dump_events.as_deref() {
-        let _ = std::fs::remove_file(path);
+    if seed_budget {
+        if let Some(path) = args.dump_events.as_deref() {
+            let _ = std::fs::remove_file(path);
+        }
     }
     // Freeze the run-start HEAD `patch_since_start_full` diffs from; the loop's
     // own ensure() is idempotent and reports the same failure as a run error.
@@ -544,120 +486,124 @@ async fn execute_with_deadline<P: LlmClient>(
     if let Some(p) = log_path.as_deref() {
         exclude_sidecar(&args.workdir, p);
     }
-    if let Some(path) = args.dump_events.as_deref() {
-        exclude_sidecar(&args.workdir, Path::new(path));
-        let _ = attach_dump(&mut emitter, path);
-    }
-    let mut primary_input = args.goal.clone();
-    if !procedures.instructions.is_empty() {
-        primary_input.push_str("\n\nExternally sourced procedure guidance (applicability matched against the original task; no learning claim):\n");
-        primary_input.push_str(&procedures.instructions);
-    }
-    let mut outcome = agents::with_children(
-        agent_tree.as_mut(),
-        provider,
-        args,
-        &policy,
-        agent_loop::run(
-            &mut state,
-            Run {
-                provider,
-                registry: &reg,
-                agent: "agent",
-                workdir: &args.workdir,
-                emitter: &mut emitter,
-                bets: bets_hook,
-                cfg: run_config(args),
-            },
-            vec![Input::User(primary_input)],
-            &cancel,
-        ),
-    )
-    .await;
-    let primary_outcome = outcome.clone();
-    let mut effective_run_end = false;
-    if args.review && matches!(outcome, Outcome::Done) && state.budget.exceeded().is_none() {
-        let patch_before_review = tree.patch_since_start_full().unwrap_or_default();
-        let review_prompt = format!(
-            "Fresh-context review. Original task:\n{}\n\nCurrent full patch:\n{}\n\nUse only the available view/search tools to inspect the current workspace and patch. Look for a concrete defect and a reproducible way to show it. Do not edit files or run a hidden verifier. Return exactly one JSON object: {{\"defect\":boolean,\"evidence\":string,\"reproduction\":string}}. Both strings must be non-empty; if no concrete defect is supported, explain what you inspected and set reproduction to \"none found\".",
-            args.goal, bounded_review_patch(&patch_before_review),
-        );
-        let review_tools = review_registry(policy.clone());
-        let capped_provider = CappedProvider {
-            inner: provider,
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            max: 2,
-        };
-        let review_outcome = run_fresh_phase(
-            &capped_provider,
-            args,
-            &review_tools,
-            &mut state,
-            &mut emitter,
-            &NoBets,
-            &cancel,
-            "review",
-            review_prompt,
-        )
-        .await;
-        let finding = if matches!(review_outcome, Outcome::Done) {
-            latest_assistant_text(&emitter).and_then(|text| parse_review_finding(&text))
-        } else {
-            None
-        };
-        match finding {
-            Some((true, evidence, reproduction)) if state.budget.exceeded().is_none() => {
-                review_diagnostic(
-                    &mut emitter,
-                    "review-defect",
-                    &format!("evidence: {evidence}; reproduction: {reproduction}"),
-                );
-                let repair_input = format!(
-                    "Continue the original task: {}\n\nA fresh read-only review found a concrete possible defect. Evidence: {}\nReproduction: {}\n\nInspect, reproduce with available tools when feasible, and repair the defect. Then run the relevant checks and report completion.",
-                    args.goal, evidence, reproduction,
-                );
-                outcome = run_fresh_phase(
-                    provider,
-                    args,
-                    &reg,
-                    &mut state,
-                    &mut emitter,
-                    bets_hook,
-                    &cancel,
-                    "repair",
-                    repair_input,
-                )
-                .await;
-            }
-            Some((true, evidence, reproduction)) => {
-                review_diagnostic(&mut emitter, "review-repair-skipped", &format!("budget exhausted after finding: evidence: {evidence}; reproduction: {reproduction}"));
-                outcome = primary_outcome.clone();
-                effective_run_end = true;
-            }
-            Some((false, evidence, reproduction)) => {
-                review_diagnostic(
-                    &mut emitter,
-                    "review-no-defect",
-                    &format!("evidence: {evidence}; reproduction: {reproduction}"),
-                );
-                outcome = primary_outcome.clone();
-                effective_run_end = true;
-            }
-            None if matches!(review_outcome, Outcome::Cancelled) => {
-                review_diagnostic(
-                    &mut emitter,
-                    "review-cancelled",
-                    "review was cancelled; cancellation applies to the full run",
-                );
-                outcome = Outcome::Cancelled;
-            }
-            None => {
-                review_diagnostic(&mut emitter, "review-unknown", &format!("review ended as {review_outcome:?} or returned no valid structured evidence; retaining primary result"));
-                outcome = primary_outcome.clone();
-                effective_run_end = true;
-            }
+    if seed_budget {
+        if let Some(path) = args.dump_events.as_deref() {
+            exclude_sidecar(&args.workdir, Path::new(path));
+            let _ = attach_dump(&mut emitter, path);
         }
     }
+    Ok(SessionBootstrap {
+        policy,
+        registry,
+        agent_tree,
+        state,
+        gate,
+        emitter,
+        cancel,
+        tree,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_review_stage<P: LlmClient>(
+    provider: &P,
+    args: &Args,
+    policy: &Arc<tools_std::Policy>,
+    reg: &tool_core::Registry,
+    state: &mut LoopState,
+    emitter: &mut Emitter,
+    bets_hook: &dyn agent_loop::BetsHook,
+    cancel: &CancellationToken,
+    tree: &TreeService,
+    primary_outcome: Outcome,
+) -> Outcome {
+    let patch_before_review = tree.patch_since_start_full().unwrap_or_default();
+    let review_prompt = format!(
+        "Fresh-context review. Original task:\n{}\n\nCurrent full patch:\n{}\n\nUse only the available view/search tools to inspect the current workspace and patch. Look for a concrete defect and a reproducible way to show it. Do not edit files or run a hidden verifier. Return exactly one JSON object: {{\"defect\":boolean,\"evidence\":string,\"reproduction\":string}}. Both strings must be non-empty; if no concrete defect is supported, explain what you inspected and set reproduction to \"none found\".",
+        args.goal,
+        bounded_review_patch(&patch_before_review),
+    );
+    let review_tools = review_registry(policy.clone());
+    let capped_provider = CappedProvider {
+        inner: provider,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        max: 2,
+    };
+    let review_outcome = run_fresh_phase(
+        &capped_provider,
+        args,
+        &review_tools,
+        state,
+        emitter,
+        &NoBets,
+        cancel,
+        "review",
+        review_prompt,
+    )
+    .await;
+    let finding = if matches!(review_outcome, Outcome::Done) {
+        latest_assistant_text(emitter).and_then(|text| parse_review_finding(&text))
+    } else {
+        None
+    };
+    let (outcome, effective_run_end) = match finding {
+        Some((true, evidence, reproduction)) if state.budget.exceeded().is_none() => {
+            review_diagnostic(
+                emitter,
+                "review-defect",
+                &format!("evidence: {evidence}; reproduction: {reproduction}"),
+            );
+            let repair_input = format!(
+                "Continue the original task: {}\n\nA fresh read-only review found a concrete possible defect. Evidence: {}\nReproduction: {}\n\nInspect, reproduce with available tools when feasible, and repair the defect. Then run the relevant checks and report completion.",
+                args.goal, evidence, reproduction,
+            );
+            let repaired = run_fresh_phase(
+                provider,
+                args,
+                reg,
+                state,
+                emitter,
+                bets_hook,
+                cancel,
+                "repair",
+                repair_input,
+            )
+            .await;
+            (repaired, false)
+        }
+        Some((true, evidence, reproduction)) => {
+            review_diagnostic(
+                emitter,
+                "review-repair-skipped",
+                &format!("budget exhausted after finding: evidence: {evidence}; reproduction: {reproduction}"),
+            );
+            (primary_outcome, true)
+        }
+        Some((false, evidence, reproduction)) => {
+            review_diagnostic(
+                emitter,
+                "review-no-defect",
+                &format!("evidence: {evidence}; reproduction: {reproduction}"),
+            );
+            (primary_outcome, true)
+        }
+        None if matches!(review_outcome, Outcome::Cancelled) => {
+            review_diagnostic(
+                emitter,
+                "review-cancelled",
+                "review was cancelled; cancellation applies to the full run",
+            );
+            (Outcome::Cancelled, false)
+        }
+        None => {
+            review_diagnostic(
+                emitter,
+                "review-unknown",
+                &format!("review ended as {review_outcome:?} or returned no valid structured evidence; retaining primary result"),
+            );
+            (primary_outcome, true)
+        }
+    };
     if effective_run_end {
         let run_id = state.emit_next;
         state.emit_next = state.emit_next.saturating_add(1);
@@ -693,6 +639,90 @@ async fn execute_with_deadline<P: LlmClient>(
             messages: Vec::new(),
         });
     }
+    outcome
+}
+
+async fn execute<P: LlmClient>(provider: &P, args: &Args) -> RunResult {
+    execute_with_deadline(provider, args, None).await
+}
+
+/// Same run with an optional wall-clock deadline, used by the eval agent leg to
+/// enforce the task's `[agent] timeout_sec` the way harbor does. The deadline
+/// cancels through the same token Ctrl-C uses, so the loop still ends with
+/// `Outcome::Cancelled`, emits `RunEnd` and leaves a gradeable workdir — a
+/// dropped future would look like an infra failure instead.
+async fn execute_with_deadline<P: LlmClient>(
+    provider: &P,
+    args: &Args,
+    deadline: Option<Instant>,
+) -> RunResult {
+    let procedure_catalog = match procedures::load(&args.procedure_files) {
+        Ok(selection) => selection,
+        Err(message) => return fail_run(FailureKind::Input, message),
+    };
+    let procedures = match procedure_catalog.select(&args.goal) {
+        Ok(selection) => selection,
+        Err(message) => return fail_run(FailureKind::Input, message),
+    };
+    let SessionBootstrap {
+        policy,
+        registry: reg,
+        mut agent_tree,
+        mut state,
+        gate,
+        mut emitter,
+        cancel,
+        tree,
+    } = match bootstrap_session(args, true).await {
+        Ok(s) => s,
+        Err((kind, message)) => return fail_run(kind, message),
+    };
+    let bets_hook: &dyn agent_loop::BetsHook = if args.bets { &gate } else { &NoBets };
+    if let Some(d) = deadline {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await;
+            cancel.cancel();
+        });
+    }
+    let mut primary_input = args.goal.clone();
+    procedures.append_to(&mut primary_input);
+    let mut outcome = agents::with_children(
+        agent_tree.as_mut(),
+        provider,
+        args,
+        &policy,
+        agent_loop::run(
+            &mut state,
+            Run {
+                provider,
+                registry: &reg,
+                agent: "agent",
+                workdir: &args.workdir,
+                emitter: &mut emitter,
+                bets: bets_hook,
+                cfg: run_config(args),
+            },
+            vec![Input::User(primary_input)],
+            &cancel,
+        ),
+    )
+    .await;
+    if args.review && matches!(outcome, Outcome::Done) && state.budget.exceeded().is_none() {
+        outcome = run_review_stage(
+            provider,
+            args,
+            &policy,
+            &reg,
+            &mut state,
+            &mut emitter,
+            bets_hook,
+            &cancel,
+            &tree,
+            outcome,
+        )
+        .await;
+    }
     // The per-Dispatch baseline commits absorb what landed, so the index-based
     // `tree.diff()` reports an empty patch; report the whole run instead.
     // Full uncut deliverable: no 8KiB/200-line evidence bound, new-file
@@ -721,6 +751,33 @@ async fn execute_with_deadline<P: LlmClient>(
 /// the fix (export it, or point `--api-key-env` elsewhere) is on the line.
 pub(crate) fn missing_credentials_message(api_key_env: &str, err: &str) -> String {
     format!("rof: {err}; set ${api_key_env} or pass --api-key-env NAME")
+}
+
+/// Build the OpenAI-compatible provider, validate `--header` entries, and run
+/// the fail-fast credential gate before any spend.
+pub(crate) fn build_provider(
+    endpoint: &str,
+    keep_thinking: bool,
+    reasoning_effort: Option<&str>,
+    api_key_env: &str,
+    headers: &[String],
+) -> Result<OpenAiCompat, (i32, String)> {
+    let mut provider =
+        OpenAiCompat::new(endpoint, endpoint_profile(keep_thinking, reasoning_effort))
+            .with_key_env(api_key_env);
+    for h in headers {
+        let Some((name, value)) = h.split_once(':') else {
+            return Err((2, format!("--header needs NAME:VALUE, got {h:?}")));
+        };
+        provider = provider.with_header(name, value);
+    }
+    if let Err(e) = provider.check_credentials() {
+        return Err((
+            EXIT_NO_CREDENTIALS,
+            missing_credentials_message(api_key_env, &e.to_string()),
+        ));
+    }
+    Ok(provider)
 }
 
 #[tokio::main]
@@ -769,27 +826,19 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let mut provider = OpenAiCompat::new(
+    let provider = match build_provider(
         &endpoint,
-        endpoint_profile(args.keep_thinking, args.reasoning_effort.as_deref()),
-    )
-    .with_key_env(&args.api_key_env);
-    for h in &args.headers {
-        if let Some((name, value)) = h.split_once(':') {
-            provider = provider.with_header(name, value);
-        } else {
-            eprintln!("--header needs NAME:VALUE, got {h:?}");
-            std::process::exit(2);
+        args.keep_thinking,
+        args.reasoning_effort.as_deref(),
+        &args.api_key_env,
+        &args.headers,
+    ) {
+        Ok(p) => p,
+        Err((code, msg)) => {
+            eprintln!("{msg}");
+            std::process::exit(code);
         }
-    }
-    // Fail fast before any spend: S3's key-presence check, auth-setup exit.
-    if let Err(e) = provider.check_credentials() {
-        eprintln!(
-            "{}",
-            missing_credentials_message(&args.api_key_env, &e.to_string())
-        );
-        std::process::exit(EXIT_NO_CREDENTIALS);
-    }
+    };
     if chat {
         let out = Arc::new(std::sync::Mutex::new(std::io::stdout()));
         let code = if args.stream {

@@ -3,7 +3,11 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::cli::{parse_table, resolve_endpoint, Flag};
+use crate::cli::{
+    parse_budget_line, parse_budget_shape, parse_deliverable, parse_exec_policy, parse_int,
+    parse_positive_u32, parse_procedure_file, parse_reasoning_effort, parse_table, parse_toggle,
+    parse_workflow, resolve_endpoint, set_positive_usize, Flag,
+};
 
 pub(crate) const EVAL_USAGE: &str = "usage: rof eval --tasks-dir DIR [--ids a,b] [--out-dir DIR] [--report PATH] [--winnability-only] [--lenient-apply] [--agent] [--model ID] [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--budget-line legacy|requests] [--keep-thinking] [--allow-inert-spend-cap] [--in-container]
 --lenient-apply: record Lenient patch-apply provenance in the report (default Strict; Strict grades are not comparable with earlier fuzz-lenient numbers)
@@ -222,36 +226,27 @@ fn set_allow_cmd(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
 }
 
 fn set_deliverable(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.deliverables.push(crate::cli::parse_deliverable(v)?);
+    b.deliverables.push(parse_deliverable(v)?);
     Ok(())
 }
 
 fn set_deliverable_steer(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.deliverable_steer = Some(crate::cli::parse_on_off("--deliverable-steer", v)?);
+    b.deliverable_steer = Some(parse_toggle("--deliverable-steer", v)?);
     Ok(())
 }
 
 fn set_budget_tokens(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    b.budget_tokens = Some(
-        s.parse()
-            .map_err(|_| format!("--budget-tokens needs a positive integer, got {s:?}"))?,
-    );
+    b.budget_tokens = Some(parse_int("--budget-tokens", "positive", v)?);
     Ok(())
 }
 
 fn set_exec_policy(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    b.exec_policy = Some(s.parse()?);
+    b.exec_policy = Some(parse_exec_policy(v)?);
     Ok(())
 }
 
 fn set_budget_shape(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    b.budget_shape = Some(
-        s.parse()
-            .map_err(|_| format!("--budget-shape needs gross or miss-plus-out, got {s:?}"))?,
-    );
+    b.budget_shape = Some(parse_budget_shape(v)?);
     Ok(())
 }
 
@@ -261,35 +256,17 @@ fn set_allow_inert_spend_cap(b: &mut EvalBuilder, _: Option<String>) -> Result<(
 }
 
 fn set_budget_steps(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    let n: u32 = s
-        .parse()
-        .map_err(|_| format!("--budget-steps needs a positive integer, got {s:?}"))?;
-    if n == 0 {
-        return Err("--budget-steps must be > 0".into());
-    }
-    b.budget_steps = Some(n);
+    b.budget_steps = Some(parse_positive_u32("--budget-steps", v)?);
     Ok(())
 }
 
 fn set_budget_actions(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    let n: u32 = s
-        .parse()
-        .map_err(|_| format!("--budget-actions needs a positive integer, got {s:?}"))?;
-    if n == 0 {
-        return Err("--budget-actions must be > 0".into());
-    }
-    b.budget_actions = Some(n);
+    b.budget_actions = Some(parse_positive_u32("--budget-actions", v)?);
     Ok(())
 }
 
 fn set_max_tokens(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    b.max_tokens = Some(
-        s.parse()
-            .map_err(|_| format!("--max-tokens needs a positive integer, got {s:?}"))?,
-    );
+    b.max_tokens = Some(parse_int("--max-tokens", "positive", v)?);
     Ok(())
 }
 
@@ -299,32 +276,17 @@ fn set_keep_thinking(b: &mut EvalBuilder, _: Option<String>) -> Result<(), Strin
 }
 
 fn set_steer(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.steer = Some(match v.as_deref() {
-        Some("on") => true,
-        Some("off") => false,
-        other => return Err(format!("--steer expects on|off, got {other:?}")),
-    });
+    b.steer = Some(parse_toggle("--steer", v)?);
     Ok(())
 }
 
 fn set_streak_steer(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.streak_steer = Some(match v.as_deref() {
-        Some("on") => true,
-        Some("off") => false,
-        other => return Err(format!("--streak-steer expects on|off, got {other:?}")),
-    });
+    b.streak_steer = Some(parse_toggle("--streak-steer", v)?);
     Ok(())
 }
 
 fn set_reasoning_effort(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    let level = v.ok_or("--reasoning-effort needs a level")?;
-    if !crate::cli::EFFORT_LEVELS.contains(&level.as_str()) {
-        return Err(format!(
-            "--reasoning-effort expects {}, got {level:?}",
-            crate::cli::EFFORT_LEVELS.join("|")
-        ));
-    }
-    b.reasoning_effort = Some(level);
+    b.reasoning_effort = Some(parse_reasoning_effort(v)?);
     Ok(())
 }
 
@@ -334,71 +296,62 @@ fn set_in_container(b: &mut EvalBuilder, _: Option<String>) -> Result<(), String
 }
 
 fn set_preserve_failed_checks(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.preserve_failed_checks = crate::cli::parse_toggle("--preserve-failed-checks", v)?;
+    b.preserve_failed_checks = parse_toggle("--preserve-failed-checks", v)?;
     Ok(())
 }
 
 fn set_workflow(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.minimal_workflow = Some(match v.as_deref() {
-        Some("legacy") => false,
-        Some("minimal") => true,
-        other => return Err(format!("--workflow expects legacy|minimal, got {other:?}")),
-    });
+    b.minimal_workflow = Some(parse_workflow(v)?);
     Ok(())
 }
 
 fn set_observation_keep(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.observation_keep = Some(crate::cli::set_positive_usize("--observation-keep", v)?);
+    b.observation_keep = Some(set_positive_usize("--observation-keep", v)?);
     Ok(())
 }
 
 fn set_stall_threshold(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    let s = v.unwrap_or_default();
-    let n: usize = s
-        .parse()
-        .map_err(|_| format!("--stall-threshold needs a non-negative integer, got {s:?}"))?;
-    b.stall_threshold = Some(n);
+    b.stall_threshold = Some(parse_int("--stall-threshold", "non-negative", v)?);
     Ok(())
 }
 
 fn set_archive_output(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.archive_output = Some(crate::cli::parse_toggle("--archive-output", v)?);
+    b.archive_output = Some(parse_toggle("--archive-output", v)?);
     Ok(())
 }
 
 fn set_shell(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.shell = Some(crate::cli::parse_toggle("--shell", v)?);
+    b.shell = Some(parse_toggle("--shell", v)?);
     Ok(())
 }
 
 fn set_processes(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.processes = Some(crate::cli::parse_toggle("--processes", v)?);
+    b.processes = Some(parse_toggle("--processes", v)?);
     Ok(())
 }
 
 fn set_repo_lookup(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.repo_lookup = Some(crate::cli::parse_toggle("--repo-lookup", v)?);
+    b.repo_lookup = Some(parse_toggle("--repo-lookup", v)?);
     Ok(())
 }
 
 fn set_multi_edit(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.multi_edit = Some(crate::cli::parse_toggle("--multi-edit", v)?);
+    b.multi_edit = Some(parse_toggle("--multi-edit", v)?);
     Ok(())
 }
 
 fn set_review(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.review = crate::cli::parse_toggle("--review", v)?;
+    b.review = parse_toggle("--review", v)?;
     Ok(())
 }
 
 fn set_procedure_file(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.procedure_files
-        .push(PathBuf::from(v.ok_or("--procedure-file needs a path")?));
+    b.procedure_files.push(parse_procedure_file(v)?);
     Ok(())
 }
 
 fn set_budget_line(b: &mut EvalBuilder, v: Option<String>) -> Result<(), String> {
-    b.budget_requests = crate::cli::parse_budget_line(v)?;
+    b.budget_requests = parse_budget_line(v)?;
     Ok(())
 }
 
@@ -740,7 +693,6 @@ fn eval_winnability_caps() -> eval::ToolCaps {
     eval::ToolCaps {
         can_create: true,
         can_patch: true,
-        exec_prefixes: Vec::new(),
     }
 }
 

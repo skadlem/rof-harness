@@ -6,13 +6,12 @@ fn call_catch(listener: &dyn Fn(&AgentEvent), event: &AgentEvent) -> bool {
 
 /// One emission seam for live and replay: an ordered record plus fan-out.
 /// Listeners are sync callbacks — never awaited, so a hung TUI cannot hang a
-/// headless run. By-value clones per tap; `Arc` only if profiling says so.
+/// headless run. By-value clones per listener; `Arc` only if profiling says so.
 #[derive(Default)]
 pub struct Emitter {
     history: Vec<AgentEvent>,
     #[allow(clippy::type_complexity)]
     listeners: Vec<Box<dyn Fn(&AgentEvent) + Send>>,
-    taps: Vec<std::sync::mpsc::SyncSender<AgentEvent>>,
 }
 
 impl Emitter {
@@ -22,13 +21,6 @@ impl Emitter {
 
     pub fn on(&mut self, listener: impl Fn(&AgentEvent) + Send + 'static) {
         self.listeners.push(Box::new(listener));
-    }
-
-    // ponytail: bounded sync_channel + try_send never blocks the loop; a full or dead tap drops newest silently while history() stays the lossless record — host sizes capacity, add backpressure only when a consumer needs lossless live delivery.
-    pub fn tap(&mut self, capacity: usize) -> std::sync::mpsc::Receiver<AgentEvent> {
-        let (tx, rx) = std::sync::mpsc::sync_channel(capacity.max(1));
-        self.taps.push(tx);
-        rx
     }
 
     /// Ordered, non-blocking delivery. LOOP-OWNED RULE: the loop must append
@@ -47,12 +39,6 @@ impl Emitter {
                 failed = true;
             }
         }
-        self.taps.retain(|t| {
-            !matches!(
-                t.try_send(self.history[last].clone()),
-                Err(std::sync::mpsc::TrySendError::Disconnected(_))
-            )
-        });
         if failed && !is_error_delivery {
             self.emit_inner(
                 AgentEvent::Error {

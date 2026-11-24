@@ -3,9 +3,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tool_core::{CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome};
+use tool_core::{Invocation, Tool, ToolDefinition, ToolError, ToolOutcome};
 
-use crate::common::{cap_chars, dispatch, parse_args, path_err, OUT_CAP, READ_FILE_CAP, VIEW_CAP};
+use crate::common::{cap_chars, parse_args, path_err, OUT_CAP, READ_FILE_CAP, VIEW_CAP};
 use crate::policy::{resolve_under, Policy};
 
 /// `max_bytes` narrows the read, never widens it: the output bound is
@@ -104,9 +104,6 @@ impl Tool for ViewTool {
             description: "read a file under the tool root, byte-capped; optional 1-indexed offset pages by line".to_string(),
             schema: view_schema(),
         }
-    }
-    fn prepare(&self, call: &ToolCall) -> CallStatus {
-        dispatch(call)
     }
     async fn execute(
         &self,

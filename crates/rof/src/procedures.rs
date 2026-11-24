@@ -9,6 +9,15 @@ pub(crate) struct Selection {
     pub instructions: String,
 }
 
+impl Selection {
+    pub(crate) fn append_to(&self, goal: &mut String) {
+        if !self.instructions.is_empty() {
+            goal.push_str("\n\nExternally sourced procedure guidance (applicability matched against the original task; no learning claim):\n");
+            goal.push_str(&self.instructions);
+        }
+    }
+}
+
 struct Procedure {
     id: String,
     cue: String,
@@ -21,12 +30,12 @@ pub(crate) struct Catalog {
     pub file_sha256: Vec<String>,
 }
 
+pub(crate) fn sha256_hex(digest: ring::digest::Digest) -> String {
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub(crate) fn sha256(bytes: &[u8]) -> String {
-    ring::digest::digest(&ring::digest::SHA256, bytes)
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    sha256_hex(ring::digest::digest(&ring::digest::SHA256, bytes))
 }
 
 pub(crate) fn load(paths: &[impl AsRef<Path>]) -> Result<Catalog, String> {

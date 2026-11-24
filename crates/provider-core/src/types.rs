@@ -52,27 +52,11 @@ pub enum StopReason {
     Deferred,
 }
 
-impl StopReason {
-    /// Everything but `Pending` is terminal.
-    pub fn is_terminal(&self) -> bool {
-        !matches!(self, StopReason::Pending)
-    }
-    /// Terminal-with-error. Refused counts; MaxTokens does not (it is a
-    /// reshape-and-retry signal, not a failure). Deferred is type-only.
-    pub fn is_error(&self) -> bool {
-        matches!(
-            self,
-            StopReason::Refused | StopReason::Error | StopReason::Aborted
-        )
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
-    pub cache_write: u64,
     /// Subset of output, not additional. None = provider doesn't report.
     pub reasoning: Option<u64>,
     pub cost_usd: Option<f64>,
@@ -83,12 +67,6 @@ impl Usage {
     pub fn total_tokens(&self) -> u64 {
         self.input + self.output
     }
-    /// Output minus reasoning (the visible content share). Saturates: a
-    /// provider that over-reports reasoning yields 0, never underflow.
-    pub fn content_tokens(&self) -> u64 {
-        self.output
-            .saturating_sub(self.reasoning.unwrap_or(0).min(self.output))
-    }
 
     /// Sum of two independently billed requests (retry-ladder re-sends):
     /// token fields add, reasoning stays a subset of output, cost adds when
@@ -98,7 +76,6 @@ impl Usage {
         u.input = u.input.saturating_add(next.input);
         u.output = u.output.saturating_add(next.output);
         u.cache_read = u.cache_read.saturating_add(next.cache_read);
-        u.cache_write = u.cache_write.saturating_add(next.cache_write);
         if let Some(r) = next.reasoning {
             u.reasoning = Some(u.reasoning.unwrap_or(0).saturating_add(r));
         }

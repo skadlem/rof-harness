@@ -1,4 +1,4 @@
-use crate::{BranchOutcome, ClaimAssessment, CommitVerdict};
+use crate::{ClaimAssessment, CommitVerdict};
 use serde::{Deserialize, Serialize};
 
 /// Ablation metrics. The loop reads these; the B→+A→+C ablation decides on them.
@@ -7,8 +7,6 @@ pub struct AblationMetrics {
     pub rollbacks: u64,
     pub proven_hunks: u64,
     pub claim_mismatches: u64,
-    pub branch_wins: u64,
-    pub branch_spend_cents: u64,
 }
 
 impl AblationMetrics {
@@ -27,13 +25,6 @@ impl AblationMetrics {
             }
             CommitVerdict::Aborted { .. } => self.rollbacks += 1,
         }
-    }
-
-    pub fn note_race(&mut self, winner: Option<u32>, raced: &[BranchOutcome]) {
-        if winner.is_some() {
-            self.branch_wins += 1;
-        }
-        self.branch_spend_cents += raced.iter().map(|b| b.spend_cents).sum::<u64>();
     }
 }
 
@@ -64,24 +55,5 @@ mod tests {
             reason: "x".to_string(),
         });
         assert_eq!(m.rollbacks, 2);
-
-        let raced = vec![
-            BranchOutcome {
-                branch_id: 0,
-                verifier_score: 0.9,
-                spend_cents: 30,
-            },
-            BranchOutcome {
-                branch_id: 1,
-                verifier_score: 0.4,
-                spend_cents: 20,
-            },
-        ];
-        m.note_race(Some(0), &raced);
-        assert_eq!(m.branch_wins, 1);
-        assert_eq!(m.branch_spend_cents, 50);
-        m.note_race(None, &[]);
-        assert_eq!(m.branch_wins, 1);
-        assert_eq!(m.branch_spend_cents, 50);
     }
 }

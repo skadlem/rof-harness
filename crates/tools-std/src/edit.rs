@@ -3,13 +3,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tool_core::{
-    CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome, TOOL_EDIT,
-};
+use tool_core::{Invocation, Tool, ToolDefinition, ToolError, ToolOutcome, TOOL_EDIT};
 
-use crate::common::{apply_hunk, dispatch, parse_args, path_err, EDIT_FILE_CAP, EDIT_REPLACE_CAP};
+use crate::common::{apply_hunk, parse_args, path_err, EDIT_FILE_CAP, EDIT_REPLACE_CAP};
 use crate::policy::{resolve_under, Policy};
-use crate::runner::check_syntax;
 
 pub struct EditTool {
     policy: Arc<Policy>,
@@ -46,13 +43,10 @@ impl Tool for EditTool {
             schema: edit_schema(),
         }
     }
-    fn prepare(&self, call: &ToolCall) -> CallStatus {
-        dispatch(call)
-    }
     async fn execute(
         &self,
         inv: Invocation,
-        cancel: CancellationToken,
+        _cancel: CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
         let args: EditArgs = parse_args(&inv.args)?;
         if args.replace.len() > EDIT_REPLACE_CAP {
@@ -81,11 +75,6 @@ impl Tool for EditTool {
         let original = std::fs::read_to_string(&p).map_err(|e| ToolError::Failed(e.to_string()))?;
         let updated =
             apply_hunk(&original, &args.search, &args.replace).map_err(ToolError::Failed)?;
-        if let Some(argv) = self.policy.syntax_cmd.clone() {
-            if !argv.is_empty() {
-                check_syntax(&self.policy, &updated, &cancel).await?;
-            }
-        }
         crate::common::overwrite(&p, updated.as_bytes())
             .map_err(|e| ToolError::Failed(e.to_string()))?;
         Ok(ToolOutcome {

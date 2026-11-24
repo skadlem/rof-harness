@@ -35,12 +35,7 @@ pub struct ToolCall {
     pub args: Value,
 }
 
-#[derive(Debug, Clone)]
-pub struct Invocation {
-    pub call_id: String,
-    pub name: String,
-    pub args: Value,
-}
+pub type Invocation = ToolCall;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutcome {
@@ -90,7 +85,10 @@ pub enum CallStatus {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
-    fn prepare(&self, call: &ToolCall) -> CallStatus;
+    /// Default: dispatch unchanged. Override only to intercept or refuse.
+    fn prepare(&self, call: &ToolCall) -> CallStatus {
+        CallStatus::Dispatch(call.clone())
+    }
     async fn execute(
         &self,
         inv: Invocation,

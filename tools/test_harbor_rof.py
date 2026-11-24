@@ -90,6 +90,10 @@ class HarborRofOptionsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(argv[argv.index("--thinking-keep") + 1], "256")
         self.assertEqual(argv[argv.index("--max-tokens") + 1], "4096")
 
+    async def test_xhigh_reasoning_effort_reaches_argv(self):
+        argv = await self.run_agent(reasoning_effort="xhigh")
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "xhigh")
+
     async def test_lookup_and_hysteresis_are_independent(self):
         lookup = await self.run_agent(repo_lookup=True)
         self.assertIn("--repo-lookup", lookup)

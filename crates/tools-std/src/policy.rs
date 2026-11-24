@@ -32,11 +32,7 @@ impl std::str::FromStr for ExecPolicy {
 #[derive(Debug, Clone)]
 pub struct Policy {
     pub root: PathBuf,
-    pub allowed_commands: Vec<String>,
     pub allowed_prefixes: Vec<String>,
-    /// Optional edit-gate argv prefix (e.g. `["python3", "-m", "py_compile"]`);
-    /// `None` skips the check with zero behavior change.
-    pub syntax_cmd: Option<Vec<String>>,
     /// Deny-globs matched against the root-relative path (e.g. `**/*.env`).
     pub denied_globs: Vec<String>,
     /// Extra env names forwarded to `exec`/`test` children on top of the
@@ -61,6 +57,23 @@ pub struct Policy {
     /// first line, head+tail kept around an omission marker, and partial
     /// output returned on timeout. `false` keeps the legacy head cut.
     pub head_tail_output: bool,
+}
+
+impl Policy {
+    /// Strict defaults for one root: empty allowlist, no env pass-through,
+    /// no wrap, legacy head cut. Callers add only what they need —
+    /// `..Policy::for_root(root)`.
+    pub fn for_root(root: PathBuf) -> Self {
+        Self {
+            root,
+            allowed_prefixes: Vec::new(),
+            denied_globs: default_denied_globs(),
+            pass_env: Vec::new(),
+            allow_any_cmd: false,
+            exec_wrap: None,
+            head_tail_output: false,
+        }
+    }
 }
 
 /// The stock secrets deny-glob. Callers constructing `Policy` literally
@@ -169,6 +182,19 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
+/// First deny-glob hit for a root-relative path, `.env` templates excepted.
+fn denied(globs: &[String], rel: &str) -> Option<String> {
+    for g in globs {
+        if g.starts_with("**/.env") && is_env_template(rel) {
+            continue;
+        }
+        if glob_match(g, rel) {
+            return Some(format!("path matches denied glob: {rel}"));
+        }
+    }
+    None
+}
+
 fn under(root: &Path, cand: &Path) -> bool {
     normalize(cand).starts_with(normalize(root))
 }
@@ -204,15 +230,8 @@ pub fn resolve_under(
         .map(|r| r.to_string_lossy().replace('\\', "/"))
         .unwrap_or_default();
     let rel = rel.trim_start_matches('/');
-    for g in denied_globs {
-        if g.starts_with("**/.env") && is_env_template(rel) {
-            continue;
-        }
-        if glob_match(g, rel) {
-            return Err(ToolPathError::Denied(format!(
-                "path matches denied glob: {rel}"
-            )));
-        }
+    if let Some(reason) = denied(denied_globs, rel) {
+        return Err(ToolPathError::Denied(reason));
     }
     if write && p.components().any(|c| c.as_os_str() == ".git") {
         return Err(ToolPathError::Denied(
@@ -231,15 +250,8 @@ pub fn resolve_under(
     if let (Some(real), Ok(canon_root)) = (resolved, std::fs::canonicalize(root)) {
         if let Ok(rel) = real.strip_prefix(canon_root) {
             let rel = rel.to_string_lossy().replace('\\', "/");
-            for g in denied_globs {
-                if g.starts_with("**/.env") && is_env_template(&rel) {
-                    continue;
-                }
-                if glob_match(g, &rel) {
-                    return Err(ToolPathError::Denied(format!(
-                        "path matches denied glob: {rel}"
-                    )));
-                }
+            if let Some(reason) = denied(denied_globs, &rel) {
+                return Err(ToolPathError::Denied(reason));
             }
         }
     }

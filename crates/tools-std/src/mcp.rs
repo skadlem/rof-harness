@@ -20,11 +20,10 @@ use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tool_core::{
-    bound_text, CallStatus, Invocation, Registry, Tool, ToolCall, ToolDefinition, ToolError,
-    ToolOutcome, MAX_MODEL_CHARS,
+    bound_text, Invocation, Registry, Tool, ToolDefinition, ToolError, ToolOutcome, MAX_MODEL_CHARS,
 };
 
-use crate::common::{dispatch, EXEC_TIMEOUT};
+use crate::common::EXEC_TIMEOUT;
 use crate::policy::ExecPolicy;
 use crate::runner::GroupGuard;
 
@@ -165,9 +164,6 @@ pub struct McpTool {
 impl Tool for McpTool {
     fn definition(&self) -> ToolDefinition {
         self.def.clone()
-    }
-    fn prepare(&self, call: &ToolCall) -> CallStatus {
-        dispatch(call)
     }
     async fn execute(
         &self,
@@ -311,7 +307,7 @@ pub async fn register_mcp_stdio(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use tool_core::GrantGate;
+    use tool_core::{CallStatus, GrantGate, ToolCall};
 
     const SERVER: &str = r#"mode=$1
 [ -n "$2" ] && echo $$ > "$2"

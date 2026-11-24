@@ -6,6 +6,20 @@ use std::sync::{Arc, Mutex};
 
 use agent_event::{AgentEvent, Emitter};
 
+fn open_dump_file(path: &str) -> Result<std::fs::File, String> {
+    let _ = std::fs::remove_file(path);
+    if let Some(dir) = Path::new(path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| e.to_string())
+}
+
 /// Incremental `--dump-events` mirror: truncate the previous dump (one run,
 /// one dump, same as before), then append each emitted event as one JSON
 /// line with flush + fsync before returning, so a kill leaves a valid
@@ -15,17 +29,7 @@ use agent_event::{AgentEvent, Emitter};
 /// fsync but never breaks the run; the WAL stays the fail-closed
 /// record, this file its best-effort mirror.
 pub(crate) fn attach_dump(emitter: &mut Emitter, path: &str) -> Result<(), String> {
-    let _ = std::fs::remove_file(path);
-    if let Some(dir) = Path::new(path).parent() {
-        if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| e.to_string())?;
+    let file = open_dump_file(path)?;
     let shared = Arc::new(Mutex::new(file));
     emitter.on(move |event| {
         if let Ok(line) = serde_json::to_string(event) {
@@ -42,13 +46,17 @@ pub(crate) fn attach_dump(emitter: &mut Emitter, path: &str) -> Result<(), Strin
     Ok(())
 }
 
-/// One run's events as JSONL (one object per line, LF) via `trace::TraceSink`.
-/// The sink only appends, so a dump replaces the previous file: one run, one dump.
+/// One run's events as JSONL (one object per line, LF); replaces any previous
+/// dump at `path` (one run, one dump).
 pub(crate) fn write_dump(path: &str, events: &[AgentEvent]) -> Result<(), String> {
-    let _ = std::fs::remove_file(path);
-    let sink = trace::TraceSink::with_file(Path::new(path)).map_err(|e| e.to_string())?;
-    for e in events {
-        sink.emit(e.clone());
+    use std::io::Write as _;
+    let mut file = open_dump_file(path)?;
+    for event in events {
+        let mut buf = serde_json::to_string(event)
+            .map_err(|e| e.to_string())?
+            .into_bytes();
+        buf.push(b'\n');
+        file.write_all(&buf).map_err(|e| e.to_string())?;
     }
     Ok(())
 }

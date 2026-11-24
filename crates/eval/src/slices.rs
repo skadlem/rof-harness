@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Normalized instance across benchmark families.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,7 +19,7 @@ pub struct Instance {
 }
 
 fn default_timeout() -> u64 {
-    DEFAULT_TIMEOUT_SECS
+    1800
 }
 
 /// One integer read inside a specific `[section]` of a minimal task.toml.
@@ -53,9 +53,6 @@ fn section_int(content: &str, section: &str, key: &str) -> Option<u64> {
     }
     None
 }
-
-/// Default per-instance timeout (Commit0's 1800s floor, bench-landscape §5).
-pub const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
 fn toml_str(content: &str, keys: &[&str]) -> String {
     for line in content.lines() {
@@ -132,103 +129,12 @@ pub fn load_tb_slice(dir: &Path, ids: &[String]) -> std::io::Result<Vec<Instance
                     .unwrap_or_default(),
                 timeout_secs: section_int(&toml, "verifier", "timeout_sec")
                     .or_else(|| toml_int(&toml, &["timeout", "timeout_secs", "time_limit"]))
-                    .unwrap_or(DEFAULT_TIMEOUT_SECS),
+                    .unwrap_or_else(default_timeout),
                 agent_timeout_secs: section_int(&toml, "agent", "timeout_sec")
-                    .unwrap_or(DEFAULT_TIMEOUT_SECS),
+                    .unwrap_or_else(default_timeout),
             })
         })
         .collect()
-}
-
-/// SWE-family adapter: JSONL rows → FAIL_TO_PASS / PASS_TO_PASS lists.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SweInstance {
-    pub id: String,
-    pub repo: String,
-    pub fail_to_pass: Vec<String>,
-    pub pass_to_pass: Vec<String>,
-    pub test_patch: String,
-}
-
-fn str_field(v: &serde_json::Value, keys: &[&str]) -> String {
-    for k in keys {
-        if let Some(s) = v.get(*k).and_then(|x| x.as_str()) {
-            return s.to_string();
-        }
-    }
-    String::new()
-}
-
-fn str_list(v: &serde_json::Value, keys: &[&str]) -> Vec<String> {
-    for k in keys {
-        if let Some(x) = v.get(*k) {
-            if let Some(arr) = x.as_array() {
-                return arr
-                    .iter()
-                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
-                    .collect();
-            }
-            if let Some(s) = x.as_str() {
-                let t = s.trim();
-                if t.starts_with('[') {
-                    let fixed = t.replace('\'', "\"");
-                    if let Ok(arr) = serde_json::from_str::<Vec<String>>(&fixed) {
-                        return arr;
-                    }
-                }
-                return t
-                    .trim_matches(['[', ']'])
-                    .split(',')
-                    .map(|p| p.trim().trim_matches(['"', '\'']).to_string())
-                    .filter(|p| !p.is_empty())
-                    .collect();
-            }
-        }
-    }
-    Vec::new()
-}
-
-fn swe_row(v: &serde_json::Value) -> SweInstance {
-    let mut id = str_field(v, &["instance_id", "instance", "id"]);
-    if id.is_empty() {
-        let (org, repo, num) = (
-            str_field(v, &["org"]),
-            str_field(v, &["repo"]),
-            v.get("number").map(|n| n.to_string()).unwrap_or_default(),
-        );
-        if !repo.is_empty() {
-            id = format!("{org}__{repo}-{num}");
-        }
-    }
-    let mut repo = str_field(v, &["repo"]);
-    if repo.is_empty() {
-        repo = str_field(v, &["org"]);
-    }
-    SweInstance {
-        id,
-        repo,
-        fail_to_pass: str_list(v, &["FAIL_TO_PASS", "fail_to_pass"]),
-        pass_to_pass: str_list(v, &["PASS_TO_PASS", "pass_to_pass"]),
-        test_patch: str_field(v, &["test_patch", "test_patch_text", "fix_patch", "patch"]),
-    }
-}
-
-pub fn load_swe_slice(jsonl: &Path, ids: &[String]) -> std::io::Result<Vec<SweInstance>> {
-    let text = std::fs::read_to_string(jsonl)?;
-    Ok(text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .map(|v| swe_row(&v))
-        .filter(|s| ids.is_empty() || ids.iter().any(|id| id == &s.id))
-        .collect())
-}
-
-/// Slice definition: frozen ids + tags living in-repo, reproducible byte-for-byte.
-pub fn slice_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("slices")
-        .join(format!("{name}.json"))
 }
 
 /// Freeze-time winnability: every artifact the verifier reads must be
@@ -238,7 +144,6 @@ pub fn slice_path(name: &str) -> PathBuf {
 pub struct ToolCaps {
     pub can_create: bool,
     pub can_patch: bool,
-    pub exec_prefixes: Vec<String>,
 }
 
 /// Parse `artifacts = [...]` from task.toml: single- or multi-line arrays,

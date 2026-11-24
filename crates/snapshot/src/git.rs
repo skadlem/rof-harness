@@ -1,5 +1,5 @@
 use crate::patch::bound_patch;
-use crate::types::{DiffSummary, PatchText, SnapshotError, WorkdirState};
+use crate::types::{DiffSummary, PatchText, WorkdirState};
 use std::io::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -35,13 +35,10 @@ pub fn workdir_state(root: &Path) -> WorkdirState {
 
 pub struct TreeService {
     root: PathBuf,
-    /// HEAD at [`TreeService::ensure`]: the ref [`TreeService::patch_since_start`]
+    /// HEAD at [`TreeService::ensure`]: the ref [`TreeService::patch_since_start_full`]
     /// diffs from. Recorded once because `baseline()` moves HEAD per batch, so a
     /// diff against it forgets every earlier batch.
     start: OnceLock<String>,
-    /// Copy-local ignore list written to `.git/info/exclude` by
-    /// [`TreeService::ensure`].
-    excludes: Vec<String>,
 }
 
 /// Copy-local ignore defaults: bytecode and package-manager outputs that
@@ -55,25 +52,13 @@ impl TreeService {
         Self {
             root: root.to_path_buf(),
             start: OnceLock::new(),
-            excludes: DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
         }
-    }
-
-    /// Override the copy-local ignore list (replaces the defaults): e.g. a
-    /// task whose build output must stay out of evidence re-adds `build/`.
-    pub fn with_excludes(mut self, excludes: &[&str]) -> Self {
-        self.excludes = excludes.iter().map(|s| s.to_string()).collect();
-        self
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     /// Idempotent: `init` when no repo, one commit when HEAD is unborn
     /// (`checkout` refuses an unborn HEAD, so rollback needs that commit).
     /// Seeds the bytecode exclude before that commit and records the start
-    /// HEAD for [`TreeService::patch_since_start`].
+    /// HEAD for [`TreeService::patch_since_start_full`].
     pub fn ensure(&self) -> Result<()> {
         if !self.is_repo() {
             self.git(["init", "--quiet"])?;
@@ -109,17 +94,16 @@ impl TreeService {
         let path = info.join("exclude");
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         // Stale harness lines (`build/`, `dist/` were defaults before they
-        // started hiding new deliverable files) are dropped unless the caller
-        // re-added them via `with_excludes`; every other existing line is
-        // kept, then missing configured patterns are appended.
+        // started hiding new deliverable files) are dropped; every other
+        // existing line is kept, then missing default patterns are appended.
         let mut lines: Vec<String> = text
             .lines()
-            .filter(|l| (*l != "build/" && *l != "dist/") || self.excludes.iter().any(|e| e == *l))
+            .filter(|l| *l != "build/" && *l != "dist/")
             .map(str::to_string)
             .collect();
-        for pat in &self.excludes {
+        for pat in DEFAULT_EXCLUDES {
             if !lines.iter().any(|l| l == pat) {
-                lines.push(pat.clone());
+                lines.push(pat.to_string());
             }
         }
         let mut out = lines.join("\n");
@@ -180,27 +164,14 @@ impl TreeService {
         self.diff_at(None)
     }
 
-    /// The whole run's patch, not the last batch's: `diff`/`patch` semantics
-    /// against the start HEAD recorded at [`TreeService::ensure`]. A per-batch
-    /// `baseline()` commits what landed, so the index-based [`TreeService::diff`]
-    /// reports an empty patch once a later batch follows.
-    pub fn patch_since_start(&self) -> Result<(DiffSummary, PatchText)> {
-        let start = self.start.get().ok_or_else(|| {
-            other("patch_since_start: ensure() has not recorded a start HEAD".into())
-        })?;
-        let diff = self.diff_at(Some(start))?;
-        let patch = self.patch_at(&diff, Some(start))?;
-        Ok((diff, patch))
-    }
-
-    /// The whole run's FULL patch for the deliverable path: the same start
-    /// HEAD and tracked `diff --patch` as [`TreeService::patch_since_start`],
-    /// but unbounded (no [`crate::PATCH_MAX_BYTES`]/[`crate::PATCH_MAX_LINES`] cut, no
+    /// The whole run's FULL patch for the deliverable path: the start HEAD
+    /// recorded at [`TreeService::ensure`] and tracked `diff --patch`, unbounded (no
+    /// [`crate::PATCH_MAX_BYTES`]/[`crate::PATCH_MAX_LINES`] cut, no
     /// [`crate::PATCH_TRUNCATED_MARKER`]) and with new-file CONTENTS for untracked
     /// paths via `git diff --no-index -- /dev/null <file>` instead of the
     /// stub-only headers the bounded model-evidence path emits. Unborn HEAD
     /// (no start recorded) stays `Err`, as today; the caller maps it.
-    pub fn patch_since_start_full(&self) -> std::result::Result<String, SnapshotError> {
+    pub fn patch_since_start_full(&self) -> std::result::Result<String, Error> {
         let start = self.start.get().ok_or_else(|| {
             other("patch_since_start_full: ensure() has not recorded a start HEAD".into())
         })?;
@@ -440,7 +411,7 @@ impl TreeService {
         {
             // Nothing staged. A workdir that starts EMPTY (kv-store-grpc's
             // image ships an empty /app) still needs a baseline revision:
-            // without one `head_unborn` stays true and `patch_since_start`
+            // without one `head_unborn` stays true and `patch_since_start_full`
             // fails with "ensure() has not recorded a start HEAD".
             if self.head_unborn()? {
                 self.git(["commit", "--allow-empty", "--quiet", "-m", message])?;

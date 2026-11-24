@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::io::Error;
 
 /// Same change set as [`crate::TreeService::diff`]: changed paths, stat evidence,
 /// plus the untracked subset (status alone would miss created files).
@@ -9,17 +8,6 @@ pub struct DiffSummary {
     pub stat: String,
     pub untracked: Vec<String>,
 }
-
-impl DiffSummary {
-    pub fn is_empty(&self) -> bool {
-        self.changed.is_empty()
-    }
-}
-
-/// Error type for [`crate::TreeService::patch_since_start_full`]: the same I/O
-/// error the git-overlay helpers already return, named so the
-/// deliverable-patch contract spells its failure mode.
-pub type SnapshotError = Error;
 
 /// Patch-text bounds: either cap alone leaves a hole (many tiny lines fit
 /// in few bytes; one minified line is one line however long).

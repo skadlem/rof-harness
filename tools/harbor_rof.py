@@ -51,7 +51,7 @@ class RofOptions(InstalledAgentOptions):
     output_reserve: int | None = Field(default=None, ge=0)
     checkpoint_sources: bool = False
     workflow: Literal["legacy", "minimal"] = "legacy"
-    reasoning_effort: Literal["low", "high", "max"] | None = None
+    reasoning_effort: Literal["low", "high", "xhigh", "max"] | None = None
     thinking_keep: int | None = Field(default=None, gt=0)
     exec_output: Literal["legacy", "head-tail"] = "legacy"
     rollback_scope: Literal["all", "errors"] = "all"

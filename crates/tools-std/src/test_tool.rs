@@ -1,11 +1,9 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tool_core::{
-    CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome, TOOL_TEST,
-};
+use tool_core::{Invocation, Tool, ToolDefinition, ToolError, ToolOutcome, TOOL_TEST};
 
-use crate::common::{dispatch, parse_args, policy_wording, EXEC_TIMEOUT};
+use crate::common::{parse_args, policy_wording, EXEC_TIMEOUT};
 use crate::policy::Policy;
 use crate::runner::{cmd_schema, run_allowed, CmdArgs};
 
@@ -24,9 +22,6 @@ impl Tool for TestTool {
             ),
             schema: cmd_schema(),
         }
-    }
-    fn prepare(&self, call: &ToolCall) -> CallStatus {
-        dispatch(call)
     }
     async fn execute(
         &self,

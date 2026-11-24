@@ -1,10 +1,8 @@
-use crate::state::InFlight;
-use crate::state::ProviderMsg;
 use crate::state::{turn_end_reason_to_event, STEP_RETRY_BUDGET};
 use crate::verify::stop_label;
 use crate::*;
 use agent_budget::BudgetHalt;
-use agent_log::{InputSource, Item, ItemKind, TurnEndReason};
+use agent_log::{Item, ItemKind, TurnEndReason};
 use provider_core::AssistantMessage;
 use provider_core::StopReason;
 use provider_core::Usage;
@@ -12,18 +10,14 @@ use serde_json::Value;
 use std::time::{Duration, SystemTime};
 use tokio_util::sync::CancellationToken;
 
-use super::{assistant, settled};
-
 #[test]
 fn should_call_model_truth_table() {
     let mut s = LoopState::new();
     assert!(!s.should_call_model()); // fresh: nothing to do
     s.call_model = true;
     assert!(s.should_call_model());
-    s.gate.begin_abort();
-    assert!(!s.should_call_model()); // aborting gate says nay
-    s.gate.close("x".into());
-    assert!(!s.should_call_model());
+    s.fatal_error = Some("x".into());
+    assert!(!s.should_call_model()); // fatal error says nay
     let mut s = LoopState::new();
     s.call_model = true;
     s.stop_hard = true;
@@ -31,10 +25,7 @@ fn should_call_model_truth_table() {
     let mut s = LoopState::new(); // pending steering, free slot
     s.steering.push_back("hi".into());
     assert!(s.should_call_model());
-    s.in_flight = Some(InFlight {
-        turn: 0,
-        token: CancellationToken::new(),
-    });
+    s.in_flight = true;
     assert!(!s.should_call_model()); // single-flight occupied
     let mut s = LoopState::new(); // pending steering, tool still open
     s.steering.push_back("hi".into());
@@ -51,19 +42,6 @@ fn should_call_model_truth_table() {
 }
 
 #[test]
-fn stale_turn_guard_drops_late_provider_msg() {
-    let mut s = LoopState::new();
-    s.turn = 1;
-    let root = CancellationToken::new();
-    assert!(s.start_provider_call(&root).is_some());
-    s.turn = 2; // interrupt opened a newer turn
-    assert!(!s.finish_provider_msg(settled(1))); // stale: dropped
-    assert!(s.in_flight.is_some());
-    assert!(s.finish_provider_msg(settled(2)));
-    assert!(s.in_flight.is_none());
-}
-
-#[test]
 fn single_flight_provider_call() {
     let mut s = LoopState::new();
     s.turn = 1;
@@ -72,7 +50,7 @@ fn single_flight_provider_call() {
     assert!(!child.is_cancelled());
     assert!(s.start_provider_call(&root).is_none()); // second refused
     assert_eq!(s.budget.counters().steps, 1);
-    assert!(s.finish_provider_msg(settled(1)));
+    s.on_provider_settled(None);
     assert!(s.start_provider_call(&root).is_some()); // slot freed
 }
 #[test]
@@ -97,25 +75,11 @@ fn termination_order() {
         s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Failed { .. })
     ));
-    let mut s = LoopState::new(); // budget beats done-shaped state
-    s.stop_when_idle = true;
-    let max = s.budget.config().max_steps.get();
-    s.budget.counters_mut().steps = max;
-    assert!(matches!(
-        s.terminate(&RunConfig::default()),
-        PhaseVerdict::Return(Outcome::Halted(_))
-    ));
     let mut s = LoopState::new(); // refusal is terminal-with-error
     s.turn_reason = Some(TurnEndReason::Error("refused".into()));
     assert!(matches!(
         s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Failed { .. })
-    ));
-    let mut s = LoopState::new(); // idle + StopWhenIdle exits
-    s.stop_when_idle = true;
-    assert!(matches!(
-        s.terminate(&RunConfig::default()),
-        PhaseVerdict::Return(Outcome::Done)
     ));
     // guard halt labels surface verbatim
     let mut s = LoopState::new();
@@ -143,15 +107,6 @@ fn steering_admitted_only_at_pre_boundary() {
     s.apply_input(Input::User("hi".into()));
     assert_eq!((s.turn, s.phase), (1, Phase::Running));
     assert!(matches!(s.items[0].kind, ItemKind::TurnStart { .. }));
-
-    let mut s = LoopState::new(); // maintenance latches, idle replays
-    s.phase = Phase::Maintenance;
-    s.apply_input(Input::User("m".into()));
-    assert!(s.wake_requested);
-    s.phase = Phase::Idle;
-    s.admit_steering();
-    assert_eq!((s.phase, s.turn), (Phase::Running, 1));
-    assert!(!s.wake_requested);
 }
 
 /// RAII turn guard: appends TurnEnd on drop, always, even on unwind.
@@ -264,32 +219,22 @@ fn in_step_retry_then_hard_exit() {
     s.turn = 1;
     let root = CancellationToken::new();
     s.start_provider_call(&root);
-    assert!(s.finish_provider_msg(ProviderMsg::Failed {
-        turn: 1,
-        err: "flaky".into(),
-        cancelled: false,
-        usage: None,
-    }));
+    s.on_provider_failed("flaky", false, None);
     assert!(s.call_model); // retry reuses the open step
-    assert!(s.in_flight.is_none());
+    assert!(!s.in_flight);
     assert!(matches!(
         s.terminate(&RunConfig::default()),
         PhaseVerdict::Continue
     ));
     s.step_retries = 0;
     s.start_provider_call(&root);
-    assert!(s.finish_provider_msg(ProviderMsg::Failed {
-        turn: 1,
-        err: "dead".into(),
-        cancelled: false,
-        usage: None,
-    }));
+    s.on_provider_failed("dead", false, None);
     assert_eq!(s.fatal_error.as_deref(), Some("dead"));
     assert!(matches!(
         s.terminate(&RunConfig::default()),
         PhaseVerdict::Return(Outcome::Failed { .. })
     ));
-    assert!(!s.should_call_model()); // closed gate says nay
+    assert!(!s.should_call_model()); // fatal error says nay
 }
 
 #[test]
@@ -302,16 +247,10 @@ fn failed_attempt_usage_is_metered_and_still_retries() {
         input: 100,
         output: 20,
         cache_read: 0,
-        cache_write: 0,
         reasoning: Some(5),
         cost_usd: Some(0.02),
     };
-    assert!(s.finish_provider_msg(ProviderMsg::Failed {
-        turn: 1,
-        err: "output truncated at 64 tokens".into(),
-        cancelled: false,
-        usage: Some(u),
-    }));
+    s.on_provider_failed("output truncated at 64 tokens", false, Some(&u));
     // Budget and run totals see the failed attempt's spend.
     assert_eq!(s.budget.counters().tokens, 120);
     assert_eq!(s.last_request_tokens, 0, "only a settled reply sizes it");
@@ -381,25 +320,6 @@ fn turn_end_reason_log_to_event_mapping() {
     );
 }
 
-#[test]
-fn crash_input_queues_like_user_with_crash_source() {
-    let mut s = LoopState::new();
-    s.apply_input(Input::Crash("boom state".into()));
-    assert_eq!((s.turn, s.phase), (1, Phase::Running));
-    assert_eq!(s.admit_steering(), 1);
-    match &s.items[1].kind {
-        ItemKind::Input { source, text, .. } => {
-            assert_eq!(*source, InputSource::Crash);
-            assert_eq!(text, "boom state");
-        }
-        other => panic!("expected Crash Input, got {other:?}"),
-    }
-    // Running-phase crash also just queues.
-    s.apply_input(Input::Crash("again".into()));
-    assert_eq!(s.steering.len(), 1);
-    assert_eq!(s.steering[0].source, InputSource::Crash);
-}
-
 /// Per-step budget: a fresh step head resets to [`STEP_RETRY_BUDGET`]
 /// (init 2), an in-step retry continuation keeps its remaining budget so
 /// 3 consecutive fails still exhaust. Run-wide would exhaust after any 2
@@ -413,24 +333,14 @@ fn step_retries_resets_on_fresh_step_head_not_retry_continuation() {
     let root = CancellationToken::new();
     assert!(s.start_provider_call(&root).is_some());
     assert_eq!(s.step_retries, 2);
-    assert!(s.finish_provider_msg(ProviderMsg::Failed {
-        turn: 1,
-        err: "e1".into(),
-        cancelled: false,
-        usage: None,
-    }));
+    s.on_provider_failed("e1", false, None);
     assert_eq!(s.step_retries, 1);
     assert!(s.call_model); // retry latched
                            // Retry continuation keeps the remaining 1 (no reset).
     assert!(s.start_provider_call(&root).is_some());
     assert_eq!(s.step_retries, 1, "retry must not reset");
     // Settle the retry successfully; the next fresh step resets to 2.
-    assert!(s.finish_provider_msg(ProviderMsg::Settled {
-        turn: 1,
-        message: assistant(vec![]),
-        stop: StopReason::Stop,
-        usage: None,
-    }));
+    s.on_provider_settled(None);
     assert_eq!(s.step_retries, 1, "success does not itself reset");
     assert!(s.start_provider_call(&root).is_some());
     assert_eq!(s.step_retries, 2, "fresh step after success resets");
@@ -517,18 +427,12 @@ fn settled_reply_records_its_own_charge() {
     let root = CancellationToken::new();
     for (input, total) in [(100, 120), (300, 440)] {
         assert!(s.start_provider_call(&root).is_some());
-        assert!(s.finish_provider_msg(ProviderMsg::Settled {
-            turn: 1,
-            message: assistant(vec![]),
-            stop: StopReason::Stop,
-            usage: Some(Usage {
-                input,
-                output: 20,
-                cache_read: 0,
-                cache_write: 0,
-                reasoning: None,
-                cost_usd: None,
-            }),
+        s.on_provider_settled(Some(&Usage {
+            input,
+            output: 20,
+            cache_read: 0,
+            reasoning: None,
+            cost_usd: None,
         }));
         assert_eq!(s.budget.counters().tokens, total);
         assert_eq!(s.last_request_tokens, input + 20);

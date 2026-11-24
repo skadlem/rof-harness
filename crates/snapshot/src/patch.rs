@@ -21,3 +21,37 @@ pub(crate) fn bound_patch(text: &str) -> PatchText {
         truncated,
     }
 }
+
+/// Splits `git diff --patch` text into the fragments
+/// [`crate::TreeService::restore_hunks`] accepts: one `diff --git` file header
+/// (`index` / `---` / `+++` lines included) directly followed by exactly one
+/// `@@` hunk. Later hunks of the same file repeat that header, because `git
+/// apply` rejects a bare `@@`. Fragments carry no trailing newline.
+pub fn split_patch(patch: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut header = String::new();
+    let mut cur: Option<String> = None;
+    for line in patch.lines() {
+        if line.starts_with("diff --git") {
+            if let Some(done) = cur.take() {
+                out.push(done);
+            }
+            header = line.to_string();
+        } else if line.starts_with("@@") {
+            if let Some(done) = cur.take() {
+                out.push(done);
+            }
+            cur = Some(format!("{header}\n{line}"));
+        } else if let Some(hunk) = cur.as_mut() {
+            hunk.push('\n');
+            hunk.push_str(line);
+        } else {
+            header.push('\n');
+            header.push_str(line);
+        }
+    }
+    if let Some(done) = cur {
+        out.push(done);
+    }
+    out
+}

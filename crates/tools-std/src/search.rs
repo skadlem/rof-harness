@@ -4,9 +4,9 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tool_core::{CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome};
+use tool_core::{Invocation, Tool, ToolDefinition, ToolError, ToolOutcome};
 
-use crate::common::{cap_chars, dispatch, parse_args, path_err, OUT_CAP, READ_FILE_CAP};
+use crate::common::{cap_chars, parse_args, path_err, OUT_CAP, READ_FILE_CAP};
 use crate::policy::{resolve_under, Policy};
 
 pub struct SearchTool {
@@ -125,9 +125,6 @@ impl Tool for SearchTool {
             description: "literal substring search over files under the tool root".to_string(),
             schema: search_schema(),
         }
-    }
-    fn prepare(&self, call: &ToolCall) -> CallStatus {
-        dispatch(call)
     }
     async fn execute(
         &self,

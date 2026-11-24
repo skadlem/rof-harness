@@ -1,16 +1,13 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 use tool_core::{bound_text, ToolError};
 
-use crate::common::{cap_chars, prefix_allowed, EXEC_TIMEOUT, OUT_CAP};
+use crate::common::{cap_chars, prefix_allowed, OUT_CAP};
 use crate::condense::condense_output;
 use crate::policy::Policy;
 
@@ -83,18 +80,43 @@ const PASS_ENV: [&str; 9] = [
 /// hatch is the write-script-to-file path). Args genuinely starting with
 /// the prefixes (e.g. `grep ">=x" f`) are over-matched — accepted
 /// tradeoff, they are rarer than the silent redirects they prevent.
-const SHELL_OPS: [&str; 15] = [
-    "<", ">", ">>", "<<", "<<<", "|", "||", "&&", "&", ";", "2>", "1>", "2>&1", "1>&2", "&>",
-];
+const SHELL_OPS: [&str; 5] = ["|", "||", "&&", "&", ";"];
 
 fn is_shell_op(tok: &str) -> bool {
-    tok.starts_with("<<")
-        || SHELL_OPS.contains(&tok)
+    SHELL_OPS.contains(&tok)
         || tok.starts_with('>')
         || tok.starts_with("2>")
         || tok.starts_with("1>")
         || tok.starts_with("&>")
         || tok.starts_with('<')
+}
+
+/// The two pre-spawn gates every argv path shares: no shell operator, and
+/// (unless `allow_any_cmd`) an allowlisted canonical command. `file_hint`
+/// appends the write-a-script fix on the exec/test surfaces; the shell and
+/// process tools own their own escape hatch and omit it.
+fn gate_argv(policy: &Policy, argv: &[String], file_hint: bool) -> Result<(), ToolError> {
+    if let Some(op) = argv.iter().find(|t| is_shell_op(t)) {
+        let fix = if file_hint {
+            " — write the script to a file and run it"
+        } else {
+            ""
+        };
+        return Err(ToolError::Failed(format!(
+            "exec has no shell and stdin is closed: '{op}' is a literal argument here{fix}"
+        )));
+    }
+    // Canonical join: the allowlist sees exactly what exec will run, so a
+    // quoted space can neither smuggle an arg past the check nor split one
+    // apart after it. (An exact-allowlisted command with irregular internal
+    // whitespace no longer matches; prefixes are unaffected.)
+    let canonical = argv.join(" ");
+    if !policy.allow_any_cmd && !prefix_allowed(&policy.allowed_prefixes, &canonical) {
+        return Err(ToolError::Denied(format!(
+            "command not allowlisted: {canonical}"
+        )));
+    }
+    Ok(())
 }
 
 /// Final spawn argv from (policy, argv): `exec_wrap` is prepended at spawn
@@ -111,7 +133,6 @@ pub(crate) fn spawn_argv(policy: &Policy, argv: &[String]) -> Vec<String> {
 fn spawn_allowed(
     policy: &Policy,
     argv: &[String],
-    archive: Option<&std::fs::File>,
     pipe_stdin: bool,
 ) -> Result<tokio::process::Child, ToolError> {
     // The exec wrap (e.g. `docker exec <cid>` for in-container eval) lands
@@ -144,19 +165,9 @@ fn spawn_allowed(
         } else {
             Stdio::null()
         })
-        .env_clear();
-    if let Some(file) = archive {
-        cmd.stdout(Stdio::from(
-            file.try_clone()
-                .map_err(|e| ToolError::Failed(e.to_string()))?,
-        ))
-        .stderr(Stdio::from(
-            file.try_clone()
-                .map_err(|e| ToolError::Failed(e.to_string()))?,
-        ));
-    } else {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    }
+        .env_clear()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for name in PASS_ENV
         .iter()
         .map(|s| s.to_string())
@@ -207,21 +218,8 @@ pub(crate) fn spawn_process(
     policy: &Policy,
     argv: &[String],
 ) -> Result<tokio::process::Child, ToolError> {
-    if let Some(op) = argv.iter().find(|t| is_shell_op(t)) {
-        return Err(ToolError::Failed(format!(
-            "exec has no shell and stdin is closed: '{op}' is a literal argument here"
-        )));
-    }
-    let canonical = argv.join(" ");
-    if !policy.allow_any_cmd
-        && !policy.allowed_commands.iter().any(|a| a == &canonical)
-        && !prefix_allowed(&policy.allowed_prefixes, &canonical)
-    {
-        return Err(ToolError::Denied(format!(
-            "command not allowlisted: {canonical}"
-        )));
-    }
-    spawn_allowed(policy, argv, None, true)
+    gate_argv(policy, argv, false)?;
+    spawn_allowed(policy, argv, true)
 }
 
 /// Per-pipe bound: head + tail cap the retained bytes; the dropped middle
@@ -338,26 +336,9 @@ pub(crate) async fn run_allowed_argv(
     // Before the allowlist: a whole-token shell operator is a semantics
     // trap (no shell, null stdin), so it fails with the fix on the line
     // even when a naive allowlist entry would otherwise accept it.
-    if let Some(op) = argv.iter().find(|t| is_shell_op(t)) {
-        return Err(ToolError::Failed(format!(
-            "exec has no shell and stdin is closed: '{op}' is a literal argument here — write the script to a file and run it"
-        )));
-    }
-    // Canonical join: the allowlist sees exactly what exec will run, so a
-    // quoted space can neither smuggle an arg past the check nor split one
-    // apart after it. (An exact-allowlisted command with irregular internal
-    // whitespace no longer matches; prefixes are unaffected.)
-    let canonical = argv.join(" ");
-    if !policy.allow_any_cmd
-        && !policy.allowed_commands.iter().any(|a| a == &canonical)
-        && !prefix_allowed(&policy.allowed_prefixes, &canonical)
-    {
-        return Err(ToolError::Denied(format!(
-            "command not allowlisted: {canonical}"
-        )));
-    }
+    gate_argv(policy, argv, true)?;
     let mut guard = GroupGuard {
-        child: Some(spawn_allowed(policy, argv, None, false)?),
+        child: Some(spawn_allowed(policy, argv, false)?),
         pgid: None,
     };
     guard.pgid = guard.child.as_ref().and_then(|c| c.id());
@@ -508,20 +489,7 @@ pub(crate) async fn run_allowed_archived(
     path: &Path,
 ) -> Result<(bool, String, bool), ToolError> {
     let argv = split_cmd(cmd);
-    if let Some(op) = argv.iter().find(|t| is_shell_op(t)) {
-        return Err(ToolError::Failed(format!(
-            "exec has no shell and stdin is closed: '{op}' is a literal argument here"
-        )));
-    }
-    let canonical = argv.join(" ");
-    if !policy.allow_any_cmd
-        && !policy.allowed_commands.iter().any(|a| a == &canonical)
-        && !prefix_allowed(&policy.allowed_prefixes, &canonical)
-    {
-        return Err(ToolError::Denied(format!(
-            "command not allowlisted: {canonical}"
-        )));
-    }
+    gate_argv(policy, &argv, false)?;
     const ARCHIVE_CAP: u64 = 64 * 1024 * 1024;
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -530,8 +498,7 @@ pub(crate) async fn run_allowed_archived(
         .map_err(|e| ToolError::Failed(format!("cannot create output artifact: {e}")))?;
     let file = std::sync::Arc::new(std::sync::Mutex::new(file));
     let used = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut child = spawn_allowed(policy, &argv, None, false)?;
-    let pid = child.id();
+    let mut child = spawn_allowed(policy, &argv, false)?;
     let mut stdout = tokio::spawn(copy_archive(
         child.stdout.take(),
         file.clone(),
@@ -582,7 +549,6 @@ pub(crate) async fn run_allowed_archived(
         .read_to_end(&mut preview)
         .map_err(|e| ToolError::Failed(e.to_string()))?;
     let (preview, cut) = cap_chars(String::from_utf8_lossy(&preview).into_owned(), OUT_CAP);
-    let _ = pid;
     Ok((status.success(), preview, dropped > 0 || cut))
 }
 
@@ -616,114 +582,6 @@ async fn copy_archive<R: AsyncReadExt + Unpin>(
         }
     }
     Ok(omitted)
-}
-
-static SYNTAX_N: AtomicUsize = AtomicUsize::new(0);
-
-/// Edit-gate syntax check: candidate bytes go to a file inside a private
-/// staging dir OUTSIDE the tree, `syntax_cmd + [file]` runs through the
-/// `run_allowed_argv` gate (so the checker itself must be allowlisted) as
-/// real argv — never joined into a string — and the staging dir is deleted
-/// best-effort. A failing check vetoes the write; the file is untouched.
-pub(crate) async fn check_syntax(
-    policy: &Policy,
-    candidate: &str,
-    cancel: &CancellationToken,
-) -> Result<(), ToolError> {
-    let argv = policy.syntax_cmd.clone().unwrap_or_default();
-    if argv.is_empty() {
-        return Ok(());
-    }
-    stage_and_check(policy, &argv, candidate, cancel, &std::env::temp_dir()).await
-}
-
-/// Staging parent is a parameter so tests can point it at a path with a
-/// space; production always passes the shared temp dir.
-pub(crate) async fn stage_and_check(
-    policy: &Policy,
-    argv: &[String],
-    candidate: &str,
-    cancel: &CancellationToken,
-    staging_parent: &Path,
-) -> Result<(), ToolError> {
-    let (dir, file) = stage_candidate(staging_parent, candidate).await?;
-    let mut full = argv.to_vec();
-    full.push(file.to_string_lossy().into_owned());
-    let res = run_allowed_argv(policy, &full, EXEC_TIMEOUT, cancel, false).await;
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    match res {
-        Ok((true, _, _)) => Ok(()),
-        Ok((false, out, _)) => Err(ToolError::Failed(format!("syntax check failed: {out}"))),
-        Err(e) => Err(e),
-    }
-}
-
-/// Private staging dir (`0700` on unix) holding one `create_new` candidate
-/// file, all through async fs so no executor thread blocks. `create_new`
-/// fails rather than truncating a file that appeared between staging calls.
-async fn stage_candidate(parent: &Path, candidate: &str) -> Result<(PathBuf, PathBuf), ToolError> {
-    for _ in 0..8 {
-        let dir = parent.join(format!(
-            "tools-std-syntax-{}-{}",
-            std::process::id(),
-            SYNTAX_N.fetch_add(1, Ordering::SeqCst)
-        ));
-        match tokio::fs::create_dir(&dir).await {
-            Ok(()) => {
-                if let Err(e) = lock_down(&dir).await {
-                    let _ = tokio::fs::remove_dir_all(&dir).await;
-                    return Err(e);
-                }
-                let file = dir.join("candidate");
-                let staged = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&file)
-                    .await
-                    .map_err(|e| ToolError::Failed(format!("cannot stage syntax candidate: {e}")));
-                match staged {
-                    Ok(mut f) => {
-                        if let Err(e) = f.write_all(candidate.as_bytes()).await {
-                            let _ = tokio::fs::remove_dir_all(&dir).await;
-                            return Err(ToolError::Failed(format!(
-                                "cannot stage syntax candidate: {e}"
-                            )));
-                        }
-                        if let Err(e) = lock_down(&file).await {
-                            let _ = tokio::fs::remove_dir_all(&dir).await;
-                            return Err(e);
-                        }
-                        return Ok((dir, file));
-                    }
-                    Err(e) => {
-                        let _ = tokio::fs::remove_dir_all(&dir).await;
-                        return Err(e);
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(ToolError::Failed(format!(
-                    "cannot create syntax staging dir: {e}"
-                )));
-            }
-        }
-    }
-    Err(ToolError::Failed(
-        "could not claim a syntax staging dir".to_string(),
-    ))
-}
-
-/// `0700` on unix (dir and candidate file alike); elsewhere creation modes
-/// are umask-governed and there is nothing to tighten from here.
-async fn lock_down(path: &Path) -> Result<(), ToolError> {
-    #[cfg(unix)]
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .await
-        .map_err(|e| ToolError::Failed(format!("cannot lock down {path:?}: {e}")))?;
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
 }
 
 #[derive(Deserialize)]
