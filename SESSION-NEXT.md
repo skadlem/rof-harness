@@ -32,7 +32,7 @@ Disk: Docker/containerd storage is bind-mounted from `/mnt/models` (35 GB free) 
 
 ## Done 2026-11-24
 
-- **Docs housekeeping** (branch `docs-housekeeping`): 49 notes condensed under a
+- **Docs housekeeping** (merged 2026-11-24): 49 notes condensed under a
   decision-bearing rule (keep every conclusion, caveat and our own measurement; external
   side detail and finished plan items collapse to pointers). Tracked `.md` words
   104,955 → 74,791 (−29%). `roadmap.md` is now open work only; its history moved to
@@ -65,8 +65,12 @@ Gemini Hydrogen (Antigravity) did the living-docs review; Neon unused.
 
 ## Repository
 
-- Branch `docs-housekeeping` off `knowledge-vault-trial` (8 commits ahead of `6eaefaa`).
-  `goose/` is an untracked separate repo. Remote `master` at `0fb593f` (README-first docs).
+- `master` and `knowledge-vault-trial` are both at `f519145` (pushed; CI green). master now
+  carries the whole dev line, merged with its README rewrite. CI's stale-reference guard
+  skips `docs/`, `SESSION-NEXT.md`, `NOTES_FOR_PI.md` and `tools/envelope_report.py`.
+  Local branch `docs-housekeeping` is merged and can be deleted. `goose/` is an untracked
+  separate repo. Open from housekeeping: parked Slice A roadmap items (drop or keep?) and
+  the unverified "20 driver invocations" line in `decisions.md`.
 - Run adapter tests with Harbor's Python from `tools/`. The pre-commit hook requires every
   `.md` under `docs/` and the local research notes to appear in `docs/INDEX.md`.
 
