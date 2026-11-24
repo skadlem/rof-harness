@@ -6,15 +6,13 @@ Ordered and spend-gated plan of open work. Decision records and measurements liv
 
 ## Open work (ordered)
 
-1. **TB4.1 CPU option screen (current next step, 2026-11-24):**
-   [tb41-option-screen](superpowers/plans/2026-11-24-tb41-option-screen.md). Four TB4.1.0 CPU
-   tasks (`bun-sourcemap-leak`, `heat-pump-warranty`, `music-harmony`, `ontology-kg-querying`,
-   pinned at `4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`) × 4 Harbor arms (control,
-   `exec_output: "head-tail"`, `rollback_scope: "errors"`, `max_tokens: 32768`) × 3 reps = 48
-   runs at 300k gross tokens / 60 steps / 120 actions (`max_tokens: 8000` control,
-   `--exec-policy any`, `--steer off`), ~$4 estimated, $8 hard stop. Owner approved only the one
-   `heat-pump-warranty` adapter-check trial so far (48-run spend approval pending); a working
-   DeepSeek key exists, so it is not blocked on a key.
+1. **TB4.1 CPU option screen (completed 2026-11-25, 0/48 solved at 300k):**
+   [2026-11-25-tb41-option-screen](experiments/2026-11-25-tb41-option-screen.md). All 48 runs
+   completed with 0 infra errors ($3.68 peak / $1.81 live USD) across control,
+   `exec_output: "head-tail"`, `rollback_scope: "errors"`, and `max_tokens: 32768` at 300k gross
+   tokens; 0/12 solved in every arm (47/48 token halts, 1/48 32k truncation halt). All three
+   mechanisms verified in WALs; defaults unchanged. Next benchmark step: select a non-zero-floor
+   TB4.1 CPU slice (or 1.2M pilot budget) before running further option screens.
 2. **Phased capability sequence (2026-11-11):**
    [capability-phases](superpowers/plans/2026-11-11-capability-phases.md). Phases 0–4 landed
    locally and opt-in ([phase-0-2](phase-0-2-implementation.md),

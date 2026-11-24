@@ -1,41 +1,29 @@
 # Session handoff · 2026-11-25
 
-## Pick up here: owner approval for the 48-run TB4.1 option screen
+## Pick up here: choose next TB4.1 non-zero-floor slice or budget
 
-Plan: [tb41-option-screen](docs/superpowers/plans/2026-11-24-tb41-option-screen.md)
-(4 tasks × 4 arms × 3 reps = 48 runs, ~$4 price-book, hard stop $8; arms: control,
-`exec_output: "head-tail"`, `rollback_scope: "errors"`, `max_tokens: 32768`).
+The 48-run [TB4.1 CPU option screen](docs/experiments/2026-11-25-tb41-option-screen.md)
+completed with **0 infra errors** and **0/48 solved** across all four arms at 300k gross tokens
+(47/48 halted on tokens; 1/48 halted on 32k reasoning truncation on `r3-music-harmony-response`).
+All three mechanisms fired cleanly in WALs; all defaults stay unchanged.
 
-1. **Approval:** the `heat-pump-warranty` adapter-check control trial is **done** (see below);
-   the 48 runs still need owner spend approval before launching.
-2. **Key and balance:** `.env.deepseek` (repo key) live balance after the check trial:
-   **$5.33 USD** (moved from $5.36 USD; $0.03 billed vs $0.0697 peak price book). Pi key
-   (`~/.pi/agent/auth.json`, `deepseek.key`) live balance: **¥157.46 CNY**.
-   `~/.config/jcode/deepseek.env` is a dead key; do not use it. Read the balance
-   (`GET https://api.deepseek.com/user/balance`) before and after.
-3. **Runtime:** built from clean worktree `target/option-screen-build` (detached at
-   `5159e17`, no `-dirty`), bundled in `target/option-screen-runtime/`: `rof` SHA-256
-   `5947b121322700c070c72c1c5984585d1f588fc345153355c2231aa5375cddc6`, Harbor version
-   `runtime-bundle-5947b121322700c0` (confirmed in trial `result.json`).
-4. **Harbor:** same setup as before, the `harbor-rootlogfix` overlay plus `PYTHONPATH`
-   (`harbor-rootlogfix:<repo>`, `docs/current-benchmark-pilot.md`, "Oracle gate");
-   working `harbor run -c` config:
-   `target/tb41-option-screen-20261125/check-heat-pump-warranty-control.json`; task trees in
-   `target/tb41-cpu-baseline-20261123/source/tasks/`.
-5. **Check trial (done 2026-11-25):** `heat-pump-warranty__UH3UuFd` in
-   `target/tb41-option-screen-20261125/jobs/check-heat-pump-warranty-control/` —
-   `runtime-bundle-5947b121322700c0`, exit code `3` (graded, 0 errors), `reward=0.0`
-   (`verifier/reward.txt`), `RunEnd=Failed("tokens")`, 32 turns, `299,513` input /
-   `88,576` cache / `4,875` output (`1,871` reasoning), `$0.0697` peak (`$0.03` live),
-   WAL recorded `raw_stop_reason="tool_calls"` and `attempts=1` on all 32 assistant rows.
-   Counts toward the $8 cap.
-6. **Write-up (after the 48):** raw jobs in `target/tb41-option-screen-<date>/`, a result
-   note in `docs/experiments/` + `docs/INDEX.md` line, arm-table status in
-   `docs/research-next-steps.md`.
+1. **Key and balance (live 2026-11-25):** `.env.deepseek` (repo key): **$3.51 USD** (moved from
+   $5.36 → $5.33 on check trial → $5.32 → $3.51 across all 48 runs; **$1.81 live** vs **$3.6813**
+   peak price book). Pi key (`~/.pi/agent/auth.json`, `deepseek.key`): **¥157.46 CNY**.
+   `~/.config/jcode/deepseek.env` is a dead key; do not use it.
+2. **Runtime:** frozen bundle in `target/option-screen-runtime/` built from detached `5159e17`:
+   `rof` SHA-256 `5947b121322700c070c72c1c5984585d1f588fc345153355c2231aa5375cddc6`, Harbor version
+   `runtime-bundle-5947b121322700c0` (confirmed on all 48/48 runs).
+3. **Next decision:** before spending more on TB4.1 option screens, either (a) preflight easier
+   TB4.1.0 CPU tasks where `deepseek-flash` has a non-zero control solve rate at 300k, or
+   (b) test the 1.2M pilot token budget on a smaller subset, and decide whether `MAX_TOKENS_CEILING`
+   (`crates/provider-openai/src/retry.rs:36`) should scale above 32,768 when `--max-tokens 32768`
+   is set.
+4. **Raw data:** `target/tb41-option-screen-20261125/` (`ledger.jsonl`, `summary-48.json`, `jobs/`).
 
-Disk: Docker/containerd storage is bind-mounted from `/mnt/models` (35 GB free) via
-`/etc/fstab` with a systemd `RequiresMountsFor` drop-in; `/` has ~9 GB free. Build with
-`CARGO_INCREMENTAL=0`.
+Disk: Docker/containerd storage is bind-mounted from `/mnt/models` (33 GB free) via
+`/etc/fstab` with a systemd `RequiresMountsFor` drop-in; `/` has ~6.8 GB free (`target/debug`
+cleaned). Build with `CARGO_INCREMENTAL=0`.
 
 ## Done 2026-11-25
 
@@ -51,8 +39,16 @@ Disk: Docker/containerd storage is bind-mounted from `/mnt/models` (35 GB free) 
   lock before `kill_tree().await` in `ProcessTool`, propagated `cancel.child_token()` to agent-tree
   children, persisted optional `raw_stop_reason` and `attempts` on WAL `Assistant` rows, and fixed
   `USAGE`/`EVAL_USAGE`/`decisions.md` drift (526 Rust tests green).
-- **Adapter-check trial:** verified `heat-pump-warranty` control trial on clean `5159e17` bundle
-  (details above).
+- **Strategic pruning (`0aab2ab`):** retired legacy `rof eval`, `crates/eval/`, and four frozen
+  historical Slice A scripts (`triage_report.py`, `envelope_report.py`, `readme_chart.py`,
+  `deliverable_ab1.sh`) (−7,682 net LOC; 463 Rust + 41 Python tests green).
+- **Harbor adapter reliability (`dd4f8a6` + post-screen JSONL fix):** switched Debian `git` install
+  to `--no-install-recommends` (78 → 49 packages, fixing `bun-sourcemap-leak` 360 s setup timeout),
+  and replaced `.splitlines()` with `.split("\n")` in `tools/harbor_rof.py` and
+  `tools/rof_candidates.py` after Unicode line separators (`\u2028`/`\u2029`) in `music-harmony`
+  PDF output silently dropped usage to `null` on 6/12 runs.
+- **48-run TB4.1 option screen:** completed 48/48 with 0 infra errors, 0/48 solved
+  ([2026-11-25-tb41-option-screen](docs/experiments/2026-11-25-tb41-option-screen.md)).
 
 ## Done 2026-11-24
 
@@ -89,11 +85,10 @@ Gemini Hydrogen (Antigravity) did the living-docs review; Neon unused.
 
 ## Repository
 
-- `master` has local commits `1aef3fa` + `5159e17` ahead of `origin/master` (`1136136`, not yet
-  pushed). CI's stale-reference guard skips `docs/`, `SESSION-NEXT.md`, `NOTES_FOR_PI.md` and
-  `tools/envelope_report.py`. Local branch `docs-housekeeping` was deleted. `goose/` is an
-  untracked separate repo. Open from housekeeping: parked Slice A roadmap items (drop or keep?)
-  and the unverified "20 driver invocations" line in `decisions.md`.
+- `master` is pushed and up to date with `origin/master`. CI's stale-reference guard skips
+  `docs/`, `SESSION-NEXT.md`, and `NOTES_FOR_PI.md`. Local branch `docs-housekeeping` was
+  deleted. `goose/` is an untracked separate repo. Open from housekeeping: parked Slice A
+  roadmap items (drop or keep?) and the unverified "20 driver invocations" line in `decisions.md`.
 - Run adapter tests with Harbor's Python from `tools/`. The pre-commit hook requires every
   `.md` under `docs/` and the local research notes to appear in `docs/INDEX.md`.
 

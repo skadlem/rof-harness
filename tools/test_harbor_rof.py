@@ -132,6 +132,25 @@ class HarborRofOptionsTest(unittest.IsolatedAsyncioTestCase):
                 env.commands,
             )
 
+    def test_populate_context_handles_unicode_line_separators_in_jsonl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rof_dir = root / "rof"
+            rof_dir.mkdir()
+            (rof_dir / "exit-code").write_text("3\n")
+            events = [
+                '{"type":"ToolEnd","id":"1","name":"view","content":"a\u2028b\u2029c"}',
+                '{"type":"TurnEnd","turn":1,"reason":"BudgetExceeded","usage_totals":{"input_tokens":100,"output_tokens":20,"cache_read_tokens":40,"reasoning_tokens":5,"cost_usd":0.01}}',
+            ]
+            (rof_dir / "events.jsonl").write_text("\n".join(events) + "\n")
+            agent = RofAgent(logs_dir=root, model_name="openai/m", runtime_dir=root)
+            context = AgentContext()
+            agent.populate_context_post_run(context)
+            self.assertEqual(context.n_input_tokens, 100)
+            self.assertEqual(context.n_cache_tokens, 40)
+            self.assertEqual(context.n_output_tokens, 20)
+            self.assertEqual(context.cost_usd, 0.01)
+
     async def test_lookup_and_hysteresis_are_independent(self):
         lookup = await self.run_agent(repo_lookup=True)
         self.assertIn("--repo-lookup", lookup)

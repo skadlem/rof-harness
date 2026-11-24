@@ -20,7 +20,7 @@ Update this file in the same commit as adding, superseding or voiding a note.
 - [envelope-phases](superpowers/plans/2026-11-11-envelope-phases.md) — response to the architecture review · **record** (P0+P1 shipped 2026-11-11; P2 never launched; envelope axis closed)
 - [next-after-slice-a](superpowers/plans/2026-11-11-next-after-slice-a.md) — state after Slice A: 5/18; P1–P4 closed · **record** (2026-11-12)
 - [output-fidelity](superpowers/plans/2026-11-11-output-fidelity.md) — archive access + Harbor controls · **record** (done)
-- [tb41-option-screen](superpowers/plans/2026-11-24-tb41-option-screen.md) — three single-field arms (head-tail output, errors-only rollback, 32k responses) vs control on four TB4.1 CPU tasks, ~$4 · **proposed** (owner approved the adapter-check trial only)
+- [tb41-option-screen](superpowers/plans/2026-11-24-tb41-option-screen.md) — three single-field arms (head-tail output, errors-only rollback, 32k responses) vs control on four TB4.1 CPU tasks · **record** (done 2026-11-25; 0/48 solved → [2026-11-25-tb41-option-screen](experiments/2026-11-25-tb41-option-screen.md))
 - [roadmap](roadmap.md) — ordered plan of open work; history lives in decisions.md · **active**
 - [research-next-steps](research-next-steps.md) — handoff + deferred-work register · **active**
 - [harness-capability-plan](harness-capability-plan.md) — the twelve 2026-11-07 proposals · **record**
@@ -69,6 +69,7 @@ Update this file in the same commit as adding, superseding or voiding a note.
 - [budget-line-ab](experiments/2026-11-23-budget-line-ab.md) — requests 1/4, legacy 0/4 on two Slice A tasks, with one pass that did not repeat · **record**
 - [no-evidence-census](experiments/2026-11-24-no-evidence-census.md) — 286 logged runs: the output cut drops 21% of exit verdicts, 1.5% of replies waste 8,000 reasoning tokens, rollback saves little; time, spend and repeat caps never bind · **record**
 - [local-harness-checks](experiments/2026-11-23-local-harness-checks.md) — request payload, archive recovery and rollback measurements · **record**
+- [tb41-option-screen](experiments/2026-11-25-tb41-option-screen.md) — 48 Harbor runs on four TB4.1 CPU tasks at 300k tokens: 0/48 solved across control, head-tail output, errors-only rollback, and 32k responses ($1.81 live / $3.68 peak); mechanisms verified, defaults unchanged · **record**
 
 ## Reviews (independent verdicts)
 

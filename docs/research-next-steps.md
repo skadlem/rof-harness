@@ -15,12 +15,13 @@ Entry point: [`SESSION-NEXT.md`](../SESSION-NEXT.md). The recommended next itera
 oracle preflight (storage/build failures) and no paid baseline on either slice.
 [Slice A plan](superpowers/plans/2026-11-11-next-after-slice-a.md).
 
-> Now (2026-11-24): the current next step is the
-> [TB4.1 CPU option screen](superpowers/plans/2026-11-24-tb41-option-screen.md) (4 tasks ×
-> 4 arms × 3 reps = 48 runs, hard stop at $8; the 2026-11-23 OpenThoughts-TBLite
-> recommendation is dropped per `../SESSION-NEXT.md`). The owner approved only the one
-> `heat-pump-warranty` adapter-check trial so far (48-run spend approval pending); a
-> working DeepSeek key exists, so it is not blocked on a key.
+> Now (2026-11-25): the
+> [TB4.1 CPU option screen](experiments/2026-11-25-tb41-option-screen.md) completed
+> (4 tasks × 4 arms × 3 reps = 48 runs, 0 infra errors, $3.68 peak / $1.81 live USD):
+> **0/48 solved** across control, `exec_output: "head-tail"`, `rollback_scope: "errors"`, and
+> `max_tokens: 32768` at the 300k gross token cap (47/48 token halts, 1/48 32k truncation halt).
+> All three mechanisms verified in WALs, all defaults unchanged; `.env.deepseek` live balance is
+> `$3.51 USD` (Pi key `¥157.46 CNY`).
 
 - **Baseline:** 5/18 on the faithful Slice A slice (`crates/eval/slices/tb-slice-a.json`, frozen
   recipe 300k/60/120); published frontier expectation on the same tasks 12.08/18, gap not
@@ -122,10 +123,9 @@ selected-task evidence above, broader gains remain unestablished, and defaults s
 
 ## Prepared, not run: next experiment protocol
 
-> Now (2026-11-24): the proposed campaign keeps this control shape at 300k gross tokens /
-> 60 steps / 120 actions with four arms (control, `exec_output`, `rollback_scope`,
-> `max_tokens 32768`), pending 48-run spend approval (one `heat-pump-warranty`
-> adapter-check trial approved): [tb41-option-screen](superpowers/plans/2026-11-24-tb41-option-screen.md).
+> Now (2026-11-25): the 48-run 300k screen completed with **0/48 solved** (0/12 per arm;
+> 47/48 halted on tokens): [2026-11-25-tb41-option-screen](experiments/2026-11-25-tb41-option-screen.md).
+> Future screens require non-zero control solve rate (easier TB4.1 tasks or the 1.2M pilot envelope).
 
 1. Freeze a fresh development slice plus untouched holdouts from the then-current official CPU
    release before inference; record release/task hashes, runtime hash, Harbor overlay hashes, full
@@ -151,9 +151,9 @@ Harbor receives adapter options, not raw CLI arguments. Single-field treatment c
 | Preserve executed failing checks | `preserve_failed_checks: true` |
 | Archived output retrieval | `archive_output: true` |
 | Shell composition | `shell: true` |
-| Response allocation (1.5% of logged replies spent all 8,000 on reasoning; see `experiments/2026-11-24-no-evidence-census.md`) | `max_tokens: 32768` |
-| Output shape: status first, head and tail, partial on timeout | `exec_output: "head-tail"` |
-| Rollback only on tool errors, notice only when files changed | `rollback_scope: "errors"` |
+| Response allocation — **screened 0/12 vs 0/12 at 300k, stays opt-in** (eliminated 21 ladder retries; 1 hard 32k reasoning truncation halt; see `experiments/2026-11-25-tb41-option-screen.md`) | `max_tokens: 32768` |
+| Output shape: status first, head and tail, partial on timeout — **screened 0/12 vs 0/12 at 300k, stays opt-in** (22 `[exit N]`-first results, 0 timeouts; see `experiments/2026-11-25-tb41-option-screen.md`) | `exec_output: "head-tail"` |
+| Rollback only on tool errors, notice only when files changed — **screened 0/12 vs 0/12 at 300k, stays opt-in** (cut rollback notices 36 → 1; see `experiments/2026-11-25-tb41-option-screen.md`) | `rollback_scope: "errors"` |
 
 These are chosen settings; paired native task outcomes determine whether they help. Select an
 experiment within verified remaining headroom (the table schedules no arms) and freeze a newly

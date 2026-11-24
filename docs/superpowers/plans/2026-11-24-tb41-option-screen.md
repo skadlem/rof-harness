@@ -1,7 +1,6 @@
 # TB4.1 CPU option screen: three single-field arms against one control, about $4 at list price
 
-**Status: proposed, unstarted.** It needs the owner's spend approval and a live
-balance read; nothing below is a result.
+**Status: record (completed 2026-11-25).** 48/48 runs completed with 0 infra errors ($3.68 peak / $1.81 live USD), 0/48 solved across all four arms; see [2026-11-25-tb41-option-screen](../../experiments/2026-11-25-tb41-option-screen.md).
 
 ## Question
 

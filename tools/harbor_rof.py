@@ -268,7 +268,11 @@ class RofAgent(BaseInstalledAgent):
             pass
         events = logs / "events.jsonl"
         try:
-            parsed = [json.loads(line) for line in events.read_text().splitlines()]
+            parsed = [
+                json.loads(line)
+                for line in events.read_text().split("\n")
+                if line.strip()
+            ]
             usage = next(
                 event["usage_totals"]
                 for event in reversed(parsed)

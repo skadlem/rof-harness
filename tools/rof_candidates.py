@@ -168,7 +168,7 @@ def _run(argv, cwd, deadline, stdout_path, stderr_path):
 def _read_events(events_path):
     totals, has_run_end = None, False
     try:
-        lines = events_path.read_text().splitlines()
+        lines = [line for line in events_path.read_text().split("\n") if line.strip()]
     except OSError:
         return None, False
     for line in lines:
