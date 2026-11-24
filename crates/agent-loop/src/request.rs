@@ -267,10 +267,19 @@ pub(crate) fn build_request(
     if cfg.incentives >= IncentivesLevel::Contract {
         let workflow = if cfg.minimal_workflow {
             WORKFLOW_MINIMAL.to_owned()
-        } else if cfg.observation_keep == 5 {
+        } else if cfg.observation_keep == 5 && cfg.collapse_hysteresis == 0 {
             WORKFLOW_CONTRACT.to_owned()
-        } else {
+        } else if cfg.collapse_hysteresis == 0 {
             WORKFLOW_CONTRACT.replace("last 5", &format!("last {}", cfg.observation_keep))
+        } else {
+            // Hysteresis keeps keep..keep+H verbatim, so "are collapsed" would be false.
+            WORKFLOW_CONTRACT.replace(
+                "older than the last 5 are collapsed",
+                &format!(
+                    "older than the last {} may be collapsed",
+                    cfg.observation_keep
+                ),
+            )
         };
         asm.add(context::ContextItem {
             key: context::ItemKey {

@@ -375,6 +375,11 @@ pub struct RunConfig {
     pub steer: bool,
     /// Keep changes made before a completed test/exec check fails.
     pub preserve_failed_checks: bool,
+    /// `--rollback-scope errors`: a call that ran to completion and reported
+    /// failure (non-zero exit, FAIL verdict) no longer rolls the batch back;
+    /// denials, invalid args and tool errors still do, and the rollback
+    /// notice is sent only when the batch changed files. Off = legacy.
+    pub rollback_errors_only: bool,
     /// Replace the restrictive legacy workflow text with a concise workflow.
     pub minimal_workflow: bool,
     /// Number of newest tool observations kept verbatim in the prompt.
@@ -409,6 +414,7 @@ impl Default for RunConfig {
             budget_shape: BudgetShape::Gross,
             steer: true,
             preserve_failed_checks: false,
+            rollback_errors_only: false,
             minimal_workflow: false,
             observation_keep: 5,
             stall_threshold: 0,
@@ -1550,7 +1556,8 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
                     let (res, completed) = self.execute_call(inv, turn_token).await;
                     let executed_failed_check =
                         completed && res.is_error && is_verification_call(&name, &c.args);
-                    let failed_check = self.cfg.preserve_failed_checks && executed_failed_check;
+                    let failed_check = (self.cfg.preserve_failed_checks && executed_failed_check)
+                        || (self.cfg.rollback_errors_only && completed && res.is_error);
                     check_failed |= failed_check;
                     batch_failed |= res.is_error && !failed_check;
                     // Shared with `drive_tick`: the same
@@ -1653,7 +1660,9 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         };
         // Batch scope: only the failed batch rolls back; the
         // baseline already committed the proven prefix.
-        if batch_failed {
+        // Errors-only scope: a failed batch that changed no file has nothing
+        // to revert, so it gets neither a rollback nor the notice.
+        if batch_failed && !(self.cfg.rollback_errors_only && hunks.is_empty()) {
             // Pre-effect record: the rollback destroys the
             // batch's successful edits, so the notice is
             // durable before the tree moves. `Attempt` is the

@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::time::Duration;
 use tool_core::{CallStatus, Invocation, ToolCall, ToolError};
 
-use crate::policy::ToolPathError;
+use crate::policy::{Policy, ToolPathError};
 
 pub(crate) const VIEW_CAP: usize = 16_384;
 pub(crate) const OUT_CAP: usize = 8_000;
@@ -88,6 +88,17 @@ pub fn apply_hunk(text: &str, search: &str, replace: &str) -> Result<String, Str
     s.push_str(replace);
     s.push_str(&text[end..]);
     Ok(s)
+}
+
+/// Tool description true to the policy: under `--exec-policy any` no list
+/// applies, so the model must not be told the command is "allowlisted".
+pub(crate) fn policy_wording(policy: &Policy, desc: &str) -> String {
+    if policy.allow_any_cmd {
+        desc.replace("one allowlisted command", "one command")
+            .replace("an allowlisted check", "a check")
+    } else {
+        desc.to_string()
+    }
 }
 
 /// Exact match or `prefix + " "` boundary match (`cargo test` covers

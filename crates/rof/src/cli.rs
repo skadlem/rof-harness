@@ -11,7 +11,7 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--workflow legacy|minimal] [--observation-keep N] [--preserve-failed-checks on|off] [--stall-threshold N] [--budget-line legacy|requests] [--archive-output on|off] [--shell on|off] [--processes on|off] [--multi-edit on|off] [--stream on|off] [--mcp 'CMD ARGS']... [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--resume LOG] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]... [--agents FILE]
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--workflow legacy|minimal] [--observation-keep N] [--preserve-failed-checks on|off] [--rollback-scope all|errors] [--exec-output legacy|head-tail] [--stall-threshold N] [--budget-line legacy|requests] [--archive-output on|off] [--shell on|off] [--processes on|off] [--multi-edit on|off] [--stream on|off] [--mcp 'CMD ARGS']... [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--dump-events PATH] [--log-path PATH] [--no-log] [--resume LOG] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]... [--agents FILE]
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
@@ -35,6 +35,8 @@ pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--work
 --allow-inert-spend-cap: run when the $ cap cannot fire because the price book does not price --model (default: refuse; the inert cap is warned once)
 --pass-env NAME: forward env var to exec/test children (repeatable; provider-key-shaped names stay withheld at spawn)
 --repo-lookup on|off: opt-in literal repository lookup (default off)
+--rollback-scope all|errors: errors keeps a batch when a call ran to completion and reported failure (non-zero exit, FAIL); denials and tool errors still roll back, and the notice is sent only when files changed (experimental, unmeasured; default all)
+--exec-output legacy|head-tail: head-tail puts the exit status first, keeps head and tail of long exec/test output, and returns partial output on timeout (experimental, unmeasured; default legacy)
 --repo-evidence on|off: enriched bounded definition/test/config candidates; requires --repo-lookup on (default off)
 --completion-check CMD: exact public test command checked on Done, at most one repair and two checks within the original caps; argv, no shell; cannot combine with --review on (default unset)
 --review on|off: opt-in bounded fresh-context read-only defect review and one repair continuation; default off
@@ -131,6 +133,10 @@ pub(crate) struct Args {
     /// fixed pass-through set (repeatable).
     pub pass_env: Vec<String>,
     pub preserve_failed_checks: bool,
+    /// `--rollback-scope errors` (default `all`): completed failing calls keep the batch.
+    pub rollback_errors_only: bool,
+    /// `--exec-output head-tail` (default `legacy`): status first, head+tail, partial on timeout.
+    pub head_tail_output: bool,
     pub minimal_workflow: bool,
     pub observation_keep: Option<usize>,
     pub stall_threshold: Option<usize>,
@@ -247,6 +253,8 @@ struct RunBuilder {
     allow_inert_spend_cap: bool,
     pass_env: Vec<String>,
     preserve_failed_checks: bool,
+    rollback_errors_only: bool,
+    head_tail_output: bool,
     minimal_workflow: Option<bool>,
     observation_keep: Option<usize>,
     stall_threshold: Option<usize>,
@@ -272,6 +280,32 @@ pub(crate) fn parse_toggle(flag: &str, v: Option<String>) -> Result<bool, String
 
 fn set_preserve_failed_checks(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
     b.preserve_failed_checks = parse_toggle("--preserve-failed-checks", v)?;
+    Ok(())
+}
+
+fn set_rollback_scope(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.rollback_errors_only = match v.as_deref() {
+        Some("all") => false,
+        Some("errors") => true,
+        other => {
+            return Err(format!(
+                "--rollback-scope expects all|errors, got {other:?}"
+            ))
+        }
+    };
+    Ok(())
+}
+
+fn set_exec_output(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.head_tail_output = match v.as_deref() {
+        Some("legacy") => false,
+        Some("head-tail") => true,
+        other => {
+            return Err(format!(
+                "--exec-output expects legacy|head-tail, got {other:?}"
+            ))
+        }
+    };
     Ok(())
 }
 
@@ -718,6 +752,16 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_preserve_failed_checks,
     },
     Flag {
+        name: "--rollback-scope",
+        takes_value: true,
+        set: set_rollback_scope,
+    },
+    Flag {
+        name: "--exec-output",
+        takes_value: true,
+        set: set_exec_output,
+    },
+    Flag {
         name: "--workflow",
         takes_value: true,
         set: set_workflow,
@@ -1071,6 +1115,8 @@ fn parse_cmd(argv: &[String], cmd: &str, usage: &str) -> Result<Args, String> {
         allow_dirty_workdir: b.allow_dirty_workdir,
         pass_env: b.pass_env,
         preserve_failed_checks: b.preserve_failed_checks,
+        rollback_errors_only: b.rollback_errors_only,
+        head_tail_output: b.head_tail_output,
         minimal_workflow: b.minimal_workflow.unwrap_or(false),
         observation_keep: b.observation_keep,
         stall_threshold: b.stall_threshold,
@@ -1260,6 +1306,7 @@ pub(crate) fn run_config(args: &Args) -> RunConfig {
         deliverables: args.deliverables.clone(),
         deliverable_steer: args.deliverable_steer,
         preserve_failed_checks: args.preserve_failed_checks,
+        rollback_errors_only: args.rollback_errors_only,
         minimal_workflow: args.minimal_workflow,
         observation_keep: args.observation_keep.unwrap_or(dflt.observation_keep),
         stall_threshold: args.stall_threshold.unwrap_or(dflt.stall_threshold),
@@ -1374,6 +1421,8 @@ mod tests {
                 allow_dirty_workdir: false,
                 pass_env: Vec::new(),
                 preserve_failed_checks: false,
+                rollback_errors_only: false,
+                head_tail_output: false,
                 minimal_workflow: false,
                 observation_keep: None,
                 stall_threshold: None,
@@ -2081,6 +2130,18 @@ mod tests {
         let req = parse_args(&run_min(&["--budget-line", "requests"])).unwrap();
         assert!(run_config(&req).budget_requests);
         assert!(parse_args(&run_min(&["--budget-line", "tokens"])).is_err());
+        assert!(!plain.rollback_errors_only && !cfg.rollback_errors_only);
+        assert!(!plain.head_tail_output);
+        let scoped = parse_args(&run_min(&[
+            "--rollback-scope",
+            "errors",
+            "--exec-output",
+            "head-tail",
+        ]))
+        .unwrap();
+        assert!(run_config(&scoped).rollback_errors_only && scoped.head_tail_output);
+        assert!(parse_args(&run_min(&["--rollback-scope", "some"])).is_err());
+        assert!(parse_args(&run_min(&["--exec-output", "tail"])).is_err());
 
         let on = parse_args(&run_min(&[
             "--preserve-failed-checks",

@@ -27,6 +27,7 @@ fn policy(root: PathBuf, allow_any_cmd: bool) -> Arc<Policy> {
         pass_env: vec![],
         allow_any_cmd,
         exec_wrap: None,
+        head_tail_output: false,
     })
 }
 

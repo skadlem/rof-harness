@@ -1,3 +1,4 @@
+import json
 import shlex
 import tempfile
 import unittest
@@ -10,19 +11,20 @@ from harbor_rof import RofAgent, RofOptions
 
 
 class FakeEnvironment:
-    def __init__(self):
+    def __init__(self, exit_code=0):
         self.commands = []
+        self.exit_code = exit_code
 
     async def exec(self, *, command, **kwargs):
         self.commands.append(command)
-        return SimpleNamespace(stdout="ROF_EXIT_CODE=0\n", return_code=0)
+        return SimpleNamespace(stdout=f"ROF_EXIT_CODE={self.exit_code}\n", return_code=0)
 
 
 class HarborRofOptionsTest(unittest.IsolatedAsyncioTestCase):
-    async def run_agent(self, **options):
+    async def run_agent(self, exit_code=0, **options):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            environment = FakeEnvironment()
+            environment = FakeEnvironment(exit_code)
             agent = RofAgent(
                 logs_dir=root,
                 model_name="openai/model-id",
@@ -184,6 +186,44 @@ class HarborRofOptionsTest(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 RofOptions(runtime_dir=Path("/tmp"), **{name: 0})
+
+    async def test_output_and_rollback_scope_reach_argv_only_when_set(self):
+        default = await self.run_agent()
+        self.assertNotIn("--exec-output", default)
+        self.assertNotIn("--rollback-scope", default)
+        argv = await self.run_agent(exec_output="head-tail", rollback_scope="errors")
+        self.assertEqual(argv[argv.index("--exec-output") + 1], "head-tail")
+        self.assertEqual(argv[argv.index("--rollback-scope") + 1], "errors")
+
+    async def test_only_graded_exit_codes_pass(self):
+        for code in (0, 3, 8):
+            await self.run_agent(exit_code=code)
+        for code in (2, 4, 7, 101, 137):
+            with self.subTest(code=code), self.assertRaises(RuntimeError):
+                await self.run_agent(exit_code=code)
+
+    def test_usage_is_withheld_after_unknown_usage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rof").mkdir()
+            turn = {"type": "TurnEnd", "usage_totals": {"input_tokens": 5, "cache_read_tokens": 1, "output_tokens": 2}}
+            unknown = {"type": "Error", "error": {"code": "provider-usage-unknown", "message": "x"}}
+            (root / "rof" / "events.jsonl").write_text(
+                "\n".join(json.dumps(e) for e in (unknown, turn)) + "\n"
+            )
+            agent = RofAgent(logs_dir=root, model_name="openai/m", runtime_dir=root)
+            context = AgentContext()
+            agent.populate_context_post_run(context)
+            self.assertIsNone(context.n_input_tokens)
+            self.assertEqual(context.metadata, {"usage_unknown": True})
+
+    def test_version_names_the_runtime_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = RofAgent(logs_dir=root, model_name="openai/m", runtime_dir=root)
+            self.assertEqual(agent.version(), "runtime-bundle")
+            (root / "rof").write_bytes(b"binary")
+            self.assertRegex(agent.version(), r"^runtime-bundle-[0-9a-f]{16}$")
 
 
 if __name__ == "__main__":

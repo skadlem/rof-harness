@@ -373,6 +373,56 @@ async fn settle_usage_rides_message_end_and_cumulates_on_turn_end() {
 }
 
 #[tokio::test]
+async fn errors_only_scope_sends_no_notice_when_nothing_changed() {
+    let root = run_tmp("errors-only-no-change");
+    let client = FakeLlm {
+        order: Arc::new(Mutex::new(Vec::new())),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([
+            script_resp(
+                vec![("c1", "boom", serde_json::json!({}))],
+                StopReason::ToolUse,
+            ),
+            text_resp("done"),
+        ])),
+    };
+    let registry = run_registry(&root);
+    let run_once = |scope: bool| {
+        let (client, registry, root) = (&client, &registry, &root);
+        async move {
+            let mut state = LoopState::new();
+            let mut emitter = Emitter::new();
+            let _ = run(
+                &mut state,
+                Run {
+                    provider: client,
+                    registry,
+                    agent: "agent",
+                    workdir: root,
+                    emitter: &mut emitter,
+                    bets: &NoBets,
+                    cfg: RunConfig {
+                        rollback_errors_only: scope,
+                        ..RunConfig::default()
+                    },
+                },
+                vec![Input::User("go".into())],
+                &CancellationToken::new(),
+            )
+            .await;
+            state.items.iter().any(|i| {
+                matches!(&i.kind, ItemKind::Attempt { error, .. } if error.contains("whole batch was reverted"))
+            })
+        }
+    };
+    assert!(
+        !run_once(true).await,
+        "a failed batch that changed nothing has nothing to revert"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn run_failed_batch_records_rollback_notice_and_queues_it_for_the_model() {
     use agent_log::read_log;
     let root = run_tmp("rollback-notice");

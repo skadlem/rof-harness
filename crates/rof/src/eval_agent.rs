@@ -245,6 +245,8 @@ pub(crate) fn agent_args(a: &EvalArgs, work: &Path, goal: &str, events_path: &Pa
         allow_dirty_workdir: false,
         pass_env: Vec::new(),
         preserve_failed_checks: a.preserve_failed_checks,
+        rollback_errors_only: false,
+        head_tail_output: false,
         minimal_workflow: a.minimal_workflow,
         observation_keep: a.observation_keep,
         stall_threshold: a.stall_threshold,

@@ -25,7 +25,11 @@ not support pipes, redirection or command chaining. Quote arguments containing
 spaces. `write` and `edit` operate on paths under the tool root. This is a
 description-only correction; it does not change tool behavior. `test` documents
 the same argv constraints and its PASS/FAIL verdict; archived variants reuse the
-ordinary descriptions with archive and retrieval guidance. The frozen pilot
+ordinary descriptions with archive and retrieval guidance, but their output
+differs: archived `exec` adds no `[exit N]` marker and archived `test` output is
+not condensed. Until 2026-11-24 both descriptions said "allowlisted" even
+under `--exec-policy any`, which every Harbor run uses; the word is now dropped
+under `any`. The frozen pilot
 binary remains SHA-256
 `c9a25f9041e54540e03feeb1079a63f9ed0a3dd08c88d841fc7116af52ba3aab`, and any
 benchmark gain from the wording change is unmeasured.
@@ -109,7 +113,8 @@ rung is capped, not a doubling. All completed retention experiments used an
 8,000 starting cap. A larger starting cap is a separate allocation experiment.
 
 Prepared, not run: use `--archive-output on` to retrieve output beyond the
-120-character preview through its run-owned handle (archive cap: 64 MiB per
+8,000 characters the tool result shows (or the 120-character stub once the
+observation is collapsed) through its run-owned handle (archive cap: 64 MiB per
 command; omitted bytes are reported); use `--shell on` only with
 `--exec-policy any`. Compare either knob alone against the fixed profile. Also
 test failed-check preservation, retention, minimal workflow, and starting

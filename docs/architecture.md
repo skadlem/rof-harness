@@ -67,7 +67,10 @@ commands run as root and leave root-owned outputs in the bind-mounted workdir.
 `rof eval --tasks-dir DIR` (`eval_cmd.rs`) is a legacy evaluation path distinct
 from the native Harbor adapter (`tools/harbor_rof.py`), which invokes `rof run`
 inside the task container. The eval command loads a frozen task slice and
-aggregates gate stats into a JSON report, but without `--agent` it is a
+writes one JSON row per instance (verdict, token and dollar totals, steps,
+halt reason, provenance). It computes no intervals: `wilson_ci`,
+`paired_bootstrap` and `ComparisonReport` exist in the `eval` crate but only
+tests call them. Without `--agent` it is a
 scaffold: the default engine runs no command and reports no reward, so
 instances grade ErrorNoReport. Default patch-apply provenance is Strict;
 `--lenient-apply` records Lenient instead. Every report carries a
@@ -114,6 +117,28 @@ carry the suite outcome. Every per-instance failure in this mode (missing
 image, container start, verifier spawn/timeout) is infra, never
 capability, and the container is removed best-effort on every path.
 
+### Harbor adapter (`tools/harbor_rof.py`)
+
+The current benchmark path. It uploads the frozen runtime bundle and runs
+`rof run` inside the task container with `/app` as the workdir and the task
+instruction as `--goal`, verbatim: no `GOAL_TAIL` and no `/app` rewrite (those
+are eval-only). It always passes `--exec-policy any`, `--steer off`,
+`--streak-steer off`, `--keep-thinking` and `--allow-dirty-workdir`. Its
+budget defaults are 300,000 tokens, 60 steps, 120 actions and `--max-tokens
+8000`; the TB 4.1 pilot overrode them to 1,200,000 / 120 / 240
+(`current-benchmark-pilot.md`), so a default adapter run does not reproduce the
+pilot. Any budget flag sets ROF's own wall to 3,600 s, below the task's native
+agent allowance. The WAL goes to `/logs/agent/rof/.rof-events.jsonl`, outside
+the workdir, and stdout (the patch) is discarded: Harbor grades the container
+state. Only rof exit codes 0, 3 and 8 are graded trials; any other code (or a
+missing exit marker) raises a trial failure, so a panic (101) or a kill (137)
+is infra. Token and cost totals reported to Harbor are the last
+`TurnEnd.usage_totals`; after a `*-usage-unknown` error they are withheld and
+`metadata.usage_unknown` is set, matching `rof eval`. `cost_usd` uses the PEAK
+price book, an upper bound. `version()` is `runtime-bundle-<first 16 hex of the
+rof binary's SHA-256>`. The opt-in `exec_output` and `rollback_scope` options
+map to `--exec-output` and `--rollback-scope`.
+
 ### Agent tree (`crates/rof/src/agents.rs`, `--agents FILE`)
 
 Stage 1 of a configurable topology, off by default and unmeasured. A JSON
@@ -138,6 +163,15 @@ and is not wired into `rof eval`.
 - `agent-loop` — the loop. `run()` is the shipped sequential driver;
   `drive_tick` is a test harness over the same step helpers. Owns state,
   verification nudge, request building, proof gating, cancellation.
+  The verification nudge, the half/late action directives and the wrap-up
+  nudge run only with `--steer on`; `steer` defaults to off on `rof run` and
+  `rof eval`, and the Harbor adapter forces it off (only
+  `RunConfig::default()`, used by library tests, has it on).
+  Any failed call in a tool batch (denial, invalid args, tool error, non-zero
+  exit) rolls the whole batch back and queues the rollback notice; calls after
+  the failing one still run first. `--rollback-scope errors` (off by default,
+  unmeasured) exempts calls that ran to completion and reported failure, and
+  skips the rollback and notice when the batch changed no file.
   `RunConfig` carries goal/model/context/max-tokens/incentives/proof-cmd
   plus the fold knobs (`thinking_keep`, `collapse_hysteresis`) and the
   WAL path; the loop itself never reads process env.
@@ -150,7 +184,14 @@ and is not wired into `rof eval`.
 - `tools-std` — policy-gated `view/search/edit/write/exec/test` tools.
   `exec` splits its command with POSIX quoting (no shell) and appends
   `[exit N]` to the output of a non-zero exit, since `success` is not shown
-  to the model.
+  to the model. The marker is added before the 8,000-character head cut, so
+  long output loses it; archived exec (`--archive-output on`) never adds it,
+  and archived `test` output is not condensed. Children get a cleared
+  environment (nine names plus `--pass-env`). `--exec-output head-tail` (off
+  by default, unmeasured) puts `[exit N]` on the first line, keeps head and
+  tail around an omission marker within the 8,000 characters, and returns
+  partial output on a 300 s timeout. Under `--exec-policy any` the exec and
+  test descriptions no longer say "allowlisted".
   The path policy checks containment and requested and resolved paths against
   secrets globs, including recursive search descendants, and resolves a leading
   `/app/` to the tool root.
@@ -164,8 +205,9 @@ and is not wired into `rof eval`.
   503 retries use eight attempts, ordinary retryable errors use five, and the
   truncation output-token ladder has its own bounded escalation (see
   `provider-openai/src/retry.rs`).
-- `eval` — slice loading (`load_tb_slice`), winnability, gate stats
-  (verdicts come from the `rof eval --agent` agent leg).
+- `eval` — slice loading (`load_tb_slice`), winnability, per-instance report
+  rows (verdicts come from the `rof eval --agent` agent leg); the interval
+  helpers (`wilson_ci`, `paired_bootstrap`) are test-only.
 - `agent-event` — the live event vocabulary (11 variants; pinned in
   `exit.rs::NAMES`). `agent-log` — the durable JSONL log. `context` —
   compaction/file-map. `bets` — three capability bets, feature-flagged.

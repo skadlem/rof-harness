@@ -5,7 +5,7 @@ use tool_core::{
     CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome, TOOL_TEST,
 };
 
-use crate::common::{dispatch, parse_args, EXEC_TIMEOUT};
+use crate::common::{dispatch, parse_args, policy_wording, EXEC_TIMEOUT};
 use crate::policy::Policy;
 use crate::runner::{cmd_schema, run_allowed, CmdArgs};
 
@@ -18,7 +18,10 @@ impl Tool for TestTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: TOOL_TEST.to_string(),
-            description: "run an allowlisted check, parsed into argv without a shell. Pipes, redirection and command chaining do not work; stdin is closed. Quote arguments containing spaces. Report a PASS/FAIL verdict.".to_string(),
+            description: policy_wording(
+                &self.policy,
+                "run an allowlisted check, parsed into argv without a shell. Pipes, redirection and command chaining do not work; stdin is closed. Quote arguments containing spaces. Report a PASS/FAIL verdict.",
+            ),
             schema: cmd_schema(),
         }
     }

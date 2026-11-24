@@ -1,5 +1,6 @@
 """Harbor adapter that runs ROF inside Harbor's task container."""
 
+import hashlib
 import json
 import shlex
 import tempfile
@@ -52,6 +53,8 @@ class RofOptions(InstalledAgentOptions):
     workflow: Literal["legacy", "minimal"] = "legacy"
     reasoning_effort: Literal["low", "high", "max"] | None = None
     thinking_keep: int | None = Field(default=None, gt=0)
+    exec_output: Literal["legacy", "head-tail"] = "legacy"
+    rollback_scope: Literal["all", "errors"] = "all"
 
     @model_validator(mode="after")
     def validate_evidence(self):
@@ -84,7 +87,12 @@ class RofAgent(BaseInstalledAgent):
 
     @override
     def version(self) -> str:
-        return "runtime-bundle"
+        # Identify the frozen binary, so trials from different builds never pool.
+        try:
+            digest = hashlib.sha256((self.options.runtime_dir / "rof").read_bytes())
+        except OSError:
+            return "runtime-bundle"
+        return f"runtime-bundle-{digest.hexdigest()[:16]}"
 
     @override
     async def install(self, environment: BaseEnvironment) -> None:
@@ -205,6 +213,10 @@ class RofAgent(BaseInstalledAgent):
             args.extend(("--thinking-keep", str(self.options.thinking_keep)))
         if self.options.reasoning_effort is not None:
             args.extend(("--reasoning-effort", self.options.reasoning_effort))
+        if self.options.exec_output != "legacy":
+            args.extend(("--exec-output", self.options.exec_output))
+        if self.options.rollback_scope != "all":
+            args.extend(("--rollback-scope", self.options.rollback_scope))
         command = (
             "set -e; "
             f"mkdir -p {shlex.quote(str(logs))}; "
@@ -232,7 +244,9 @@ class RofAgent(BaseInstalledAgent):
             exit_code = int(result.stdout.split(marker)[-1].strip())
         except ValueError as exc:
             raise RuntimeError("ROF launcher returned an invalid exit code") from exc
-        if exit_code in (2, 4, 5, 6, 7):
+        # 0 done, 3 halt/cancel/provider failure, 8 unmet completion check are
+        # graded outcomes; anything else (2/4-7, a panic 101, a kill 137) is infra.
+        if exit_code not in (0, 3, 8):
             raise RuntimeError(f"ROF infrastructure/startup failure (exit {exit_code})")
 
     @override
@@ -244,12 +258,23 @@ class RofAgent(BaseInstalledAgent):
             pass
         events = logs / "events.jsonl"
         try:
+            parsed = [json.loads(line) for line in events.read_text().splitlines()]
             usage = next(
                 event["usage_totals"]
-                for line in reversed(events.read_text().splitlines())
-                if (event := json.loads(line)).get("type") == "TurnEnd"
+                for event in reversed(parsed)
+                if event.get("type") == "TurnEnd"
             )
         except (OSError, ValueError, KeyError, StopIteration):
+            return
+        # Same rule as the rof eval report: an attempt with unknown usage makes
+        # the totals a lower bound, so report none rather than a wrong number.
+        if any(
+            event.get("type") == "Error"
+            and (event.get("error") or {}).get("code")
+            in ("wallclock-usage-unknown", "provider-usage-unknown")
+            for event in parsed
+        ):
+            context.metadata = {**(context.metadata or {}), "usage_unknown": True}
             return
         context.n_input_tokens = usage["input_tokens"]
         context.n_cache_tokens = usage["cache_read_tokens"]

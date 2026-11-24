@@ -1,8 +1,10 @@
 //! The 6 built-in tools + containment. Implements [`tool_core::Tool`].
 //!
 //! Schemas are hand-built `serde_json` values kept inside tool-core's strict
-//! subset (`required`, `type`, `additionalProperties: false`, `maxLength`);
-//! each tool also parses into a typed `Deserialize` args struct with
+//! subset (`required`, `type`, `additionalProperties: false`); `maxLength` and
+//! other limits are declared for the model but `validate_strict` ignores them,
+//! so a tool enforces a limit only where its own code checks it. Each tool
+//! also parses into a typed `Deserialize` args struct with
 //! `deny_unknown_fields`, so schema and parser pin the same contract.
 //! (ponytail: no `schemars` dep — five `json!` literals use the already-installed
 //! `serde_json`.)
@@ -84,6 +86,7 @@ mod tests {
             pass_env: Vec::new(),
             allow_any_cmd: false,
             exec_wrap: None,
+            head_tail_output: false,
         })
     }
 
@@ -100,6 +103,7 @@ mod tests {
             pass_env: Vec::new(),
             allow_any_cmd: false,
             exec_wrap: None,
+            head_tail_output: false,
         })
     }
 
@@ -881,6 +885,7 @@ mod tests {
             pass_env: Vec::new(),
             allow_any_cmd: false,
             exec_wrap: None,
+            head_tail_output: false,
         };
         let err = run_allowed(
             &pol,
@@ -914,6 +919,7 @@ mod tests {
             pass_env: Vec::new(),
             allow_any_cmd: false,
             exec_wrap: None,
+            head_tail_output: false,
         };
         let (ok, out, _) = run_allowed(
             &pol,
@@ -943,6 +949,7 @@ mod tests {
             pass_env: Vec::new(),
             allow_any_cmd: false,
             exec_wrap: None,
+            head_tail_output: false,
         };
         let err = run_allowed(
             &pol,
@@ -972,6 +979,7 @@ mod tests {
             pass_env: Vec::new(),
             allow_any_cmd: false,
             exec_wrap: None,
+            head_tail_output: false,
         };
         let cancel = CancellationToken::new();
         let killer = cancel.clone();
@@ -1014,6 +1022,7 @@ mod tests {
             pass_env: Vec::new(),
             allow_any_cmd: false,
             exec_wrap: None,
+            head_tail_output: false,
         };
         let start = std::time::Instant::now();
         let (ok, content, truncated) = run_allowed(
@@ -1059,6 +1068,7 @@ mod tests {
             pass_env: Vec::new(),
             allow_any_cmd: false,
             exec_wrap: None,
+            head_tail_output: false,
         };
         for cmd in [
             "python3 - <<'EOF'\nprint(1)\nEOF",
@@ -1123,6 +1133,7 @@ mod tests {
             pass_env: Vec::new(),
             allow_any_cmd: false,
             exec_wrap: None,
+            head_tail_output: false,
         };
         let (ok, out, _) = run_allowed(
             &pol,
@@ -1159,6 +1170,7 @@ mod tests {
             pass_env: Vec::new(),
             allow_any_cmd: false,
             exec_wrap: None,
+            head_tail_output: false,
         };
         let (ok, out, _) = run_allowed(
             &pol,
@@ -1188,6 +1200,7 @@ mod tests {
             pass_env: Vec::new(),
             allow_any_cmd: false,
             exec_wrap: Some(vec!["/nonexistent-rof-wrap/bin".to_string()]),
+            head_tail_output: false,
         };
         let err = run_allowed(&pol, "echo hi", EXEC_TIMEOUT, &CancellationToken::new())
             .await
@@ -1303,6 +1316,7 @@ mod tests {
             pass_env: Vec::new(),
             allow_any_cmd: false,
             exec_wrap: None,
+            head_tail_output: false,
         };
         stage_and_check(
             &pol,
@@ -1360,6 +1374,74 @@ mod tests {
         assert_eq!(ok.content, "");
     }
 
+    fn head_tail_any(root: &Path) -> Arc<Policy> {
+        let mut p = (*policy(root)).clone();
+        p.allow_any_cmd = true;
+        p.head_tail_output = true;
+        Arc::new(p)
+    }
+
+    #[tokio::test]
+    async fn head_tail_output_puts_status_first_and_keeps_the_tail() {
+        let root = tmp_root();
+        let r = reg(head_tail_any(&root));
+        let cmd = r#"python3 -c "import sys; print('H'*9000); print('END'); sys.exit(3)""#;
+        let out = run(&r, "exec", json!({ "cmd": cmd })).await.unwrap();
+        assert!(
+            out.content.starts_with("[exit 3]\nHHH"),
+            "{}",
+            &out.content[..40]
+        );
+        assert!(out.content.contains("...[omitted]..."));
+        assert!(out.content.trim_end().ends_with("END"), "tail kept");
+        assert!(out.content.chars().count() <= 8_000 && out.truncated);
+        // Legacy shape is unchanged: head kept, marker lost past the cut.
+        let legacy = run(&reg(policy(&root)), "exec", json!({ "cmd": "false" }))
+            .await
+            .unwrap();
+        assert_eq!(legacy.content, "[exit 1]");
+    }
+
+    #[tokio::test]
+    async fn head_tail_output_returns_partial_output_on_timeout() {
+        let root = tmp_root();
+        let p = head_tail_any(&root);
+        let cmd = r#"python3 -c "import time; print('early', flush=True); time.sleep(30)""#;
+        let err = crate::runner::run_allowed_raw(
+            &p,
+            cmd,
+            std::time::Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("timeout after 1s; partial output:\nearly"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn exec_and_test_descriptions_follow_the_policy() {
+        use tool_core::Tool;
+        let root = tmp_root();
+        let strict = policy(&root);
+        let any = head_tail_any(&root);
+        assert!(exec_tool(strict.clone())
+            .definition()
+            .description
+            .contains("allowlisted"));
+        assert!(test_tool(strict)
+            .definition()
+            .description
+            .contains("allowlisted"));
+        let e = exec_tool(any.clone()).definition().description;
+        let t = test_tool(any).definition().description;
+        assert!(e.starts_with("run one command, parsed") && !e.contains("allowlisted"));
+        assert!(t.starts_with("run a check, parsed") && !t.contains("allowlisted"));
+    }
+
     // --- test tool verdict ---
 
     #[tokio::test]
@@ -1409,6 +1491,7 @@ mod tests {
             pass_env: Vec::new(),
             allow_any_cmd: false,
             exec_wrap: None,
+            head_tail_output: false,
         });
         let out = run(&reg(pol), "test", json!({"cmd": "cat noisy.txt"}))
             .await

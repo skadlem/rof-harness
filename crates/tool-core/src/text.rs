@@ -1,6 +1,8 @@
 use crate::tool::ToolResult;
 
-/// Cap applied to every string handed to the model at the loop boundary.
+/// Cap on registry-made strings (gate/validation errors, `ToolError`
+/// conversions, MCP and spawn/wait output). Built-in tool output is bounded
+/// by its own caps (`tools-std` OUT_CAP 8,000 chars; some pages 32,768).
 pub const MAX_MODEL_CHARS: usize = 40_000;
 
 /// Head+tail bound with omission marker; total never exceeds `max` (chars).

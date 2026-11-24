@@ -5,7 +5,7 @@ use tool_core::{
     CallStatus, Invocation, Tool, ToolCall, ToolDefinition, ToolError, ToolOutcome, TOOL_EXEC,
 };
 
-use crate::common::{dispatch, parse_args, EXEC_TIMEOUT};
+use crate::common::{dispatch, parse_args, policy_wording, EXEC_TIMEOUT};
 use crate::policy::Policy;
 use crate::runner::{cmd_schema, run_allowed_raw, CmdArgs};
 
@@ -18,7 +18,10 @@ impl Tool for ExecTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: TOOL_EXEC.to_string(),
-            description: "run one allowlisted command, parsed into argv without a shell. Pipes, redirection and command chaining do not work; stdin is closed. Quote arguments containing spaces. For scripts, write a file under the tool root, then execute it.".to_string(),
+            description: policy_wording(
+                &self.policy,
+                "run one allowlisted command, parsed into argv without a shell. Pipes, redirection and command chaining do not work; stdin is closed. Quote arguments containing spaces. For scripts, write a file under the tool root, then execute it.",
+            ),
             schema: cmd_schema(),
         }
     }

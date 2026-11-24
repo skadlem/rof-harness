@@ -83,6 +83,7 @@ fn policy_for(args: &Args) -> tools_std::Policy {
         pass_env: args.pass_env.clone(),
         allow_any_cmd: args.exec_policy == tools_std::ExecPolicy::Any,
         exec_wrap: args.exec_wrap.clone(),
+        head_tail_output: args.head_tail_output,
     }
 }
 

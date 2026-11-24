@@ -57,6 +57,10 @@ pub struct Policy {
     /// the canonical join always see the UNWRAPPED argv; `None` (the
     /// default at every construction site) is zero behavior change.
     pub exec_wrap: Option<Vec<String>>,
+    /// exec/test output shape (`--exec-output head-tail`): exit status on the
+    /// first line, head+tail kept around an omission marker, and partial
+    /// output returned on timeout. `false` keeps the legacy head cut.
+    pub head_tail_output: bool,
 }
 
 /// The stock secrets deny-glob. Callers constructing `Policy` literally

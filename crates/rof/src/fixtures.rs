@@ -226,6 +226,8 @@ pub(crate) fn args_for(dir: &std::path::Path, steps: Option<u32>) -> Args {
         allow_dirty_workdir: false,
         pass_env: Vec::new(),
         preserve_failed_checks: false,
+        rollback_errors_only: false,
+        head_tail_output: false,
         minimal_workflow: false,
         observation_keep: None,
         stall_threshold: None,

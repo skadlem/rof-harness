@@ -781,6 +781,62 @@ async fn preserve_failed_executed_check_keeps_edit_without_proving_it() {
 }
 
 #[tokio::test]
+async fn errors_only_scope_keeps_edit_when_a_completed_call_fails() {
+    let root = run_tmp("errors-only-scope");
+    std::fs::write(root.join("a.rs"), "v1\n").unwrap();
+    let client = FakeLlm {
+        order: Arc::new(Mutex::new(Vec::new())),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([
+            script_resp(
+                vec![
+                    (
+                        "w1",
+                        "write",
+                        serde_json::json!({"path":"a.rs", "content":"v2\n"}),
+                    ),
+                    ("t1", "test", serde_json::json!({"cmd":"check"})),
+                ],
+                StopReason::ToolUse,
+            ),
+            text_resp("done"),
+            text_resp("done again"),
+        ])),
+    };
+    let mut registry = CoreRegistry::new(Arc::new(GrantGate::new(
+        [("agent".to_string(), vec!["write".into(), "test".into()])].into(),
+    )));
+    registry.register(Arc::new(WriteFile { root: root.clone() }));
+    registry.register(Arc::new(ProdCheck));
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let _ = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig {
+                rollback_errors_only: true,
+                ..RunConfig::default()
+            },
+        },
+        vec![Input::User("fix it".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "v2\n");
+    assert!(!state.items.iter().any(|i| matches!(
+        &i.kind,
+        ItemKind::Attempt { error, .. } if error.contains("whole batch was reverted")
+    )));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn policy_denied_check_still_rolls_back_edits() {
     let root = run_tmp("policy-denied-check");
     std::fs::write(root.join("a.rs"), "v1\n").unwrap();

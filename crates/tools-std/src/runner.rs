@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
-use tool_core::ToolError;
+use tool_core::{bound_text, ToolError};
 
 use crate::common::{cap_chars, prefix_allowed, EXEC_TIMEOUT, OUT_CAP};
 use crate::condense::condense_output;
@@ -382,6 +382,24 @@ pub(crate) async fn run_allowed_argv(
     let status = match end {
         End::Timeout => {
             kill_tree(child).await;
+            if policy.head_tail_output {
+                // The group kill closes the pipes, so the readers finish; a
+                // descendant holding them open only costs the short grace.
+                let joined = tokio::select! {
+                    r = async { tokio::join!(&mut out_task, &mut err_task) } => Some(r),
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => None,
+                };
+                out_task.abort();
+                err_task.abort();
+                let partial = match joined {
+                    Some((Ok(o), Ok(e))) => join_streams(&o, &e),
+                    _ => String::new(),
+                };
+                return Err(ToolError::Failed(format!(
+                    "timeout after {timeout:?}; partial output:\n{}",
+                    bound_text(&partial, OUT_CAP)
+                )));
+            }
             out_task.abort();
             err_task.abort();
             return Err(ToolError::Failed(format!("timeout after {timeout:?}")));
@@ -412,14 +430,26 @@ pub(crate) async fn run_allowed_argv(
     let out = out.map_err(|e| ToolError::Failed(format!("output reader failed: {e}")))?;
     let err = err.map_err(|e| ToolError::Failed(format!("output reader failed: {e}")))?;
     guard.pgid = None;
-    let mut s = String::from_utf8_lossy(&out.bytes()).to_string();
-    let err_bytes = err.bytes();
-    let err_text = String::from_utf8_lossy(&err_bytes);
-    if !err_text.is_empty() {
-        s.push_str("\n[stderr]\n");
-        s.push_str(&err_text);
-    }
+    let mut s = join_streams(&out, &err);
     let ok = status.success();
+    let dropped = out.dropped() + err.dropped() > 0;
+    if policy.head_tail_output {
+        // Status first and head+tail kept: the head cut below used to drop
+        // the exit marker and the stderr tail of long failing output.
+        let status_line = match (raw && !ok, status.code()) {
+            (false, _) => String::new(),
+            (true, Some(c)) => format!("[exit {c}]\n"),
+            (true, None) => "[killed by signal]\n".to_string(),
+        };
+        let body = if raw { s } else { condense_output(&s, None) };
+        let room = OUT_CAP - status_line.chars().count();
+        let cut = body.chars().count() > room;
+        return Ok((
+            ok,
+            format!("{status_line}{}", bound_text(&body, room)),
+            cut || dropped,
+        ));
+    }
     // exec only: a silent non-zero exit (grep no-match, `which missing`) is
     // otherwise indistinguishable from an empty success.
     if raw && !ok {
@@ -432,7 +462,19 @@ pub(crate) async fn run_allowed_argv(
         }
     }
     let (content, cap_cut) = cap_chars(if raw { s } else { condense_output(&s, None) }, OUT_CAP);
-    Ok((ok, content, cap_cut || out.dropped() + err.dropped() > 0))
+    Ok((ok, content, cap_cut || dropped))
+}
+
+/// Stdout, then stderr under a `[stderr]` header when non-empty.
+fn join_streams(out: &BoundedOut, err: &BoundedOut) -> String {
+    let mut s = String::from_utf8_lossy(&out.bytes()).to_string();
+    let err_bytes = err.bytes();
+    let err_text = String::from_utf8_lossy(&err_bytes);
+    if !err_text.is_empty() {
+        s.push_str("\n[stderr]\n");
+        s.push_str(&err_text);
+    }
+    s
 }
 
 /// String-cmd entry point: split (no shell) then run the argv path, so the

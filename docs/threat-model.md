@@ -18,8 +18,12 @@ CLI guards (`crates/rof/src/workdir.rs`).
 - Credentials: the API key is read from the env var named by
   `--api-key-env` (default `OPENAI_API_KEY`); missing credentials fail
   fast before any spend (exit 4). The key never appears in argv or logs.
-- `--pass-env NAME` forwards env vars to `exec`/`test` children;
-  provider-key-shaped names stay withheld at spawn.
+- `exec`/`test` children get a cleared environment: PATH, HOME, USER, LANG,
+  LC_ALL, TERM, TMPDIR, CARGO_HOME and RUSTUP_HOME, plus names given with
+  `--pass-env NAME`. A name ending in `API_KEY` is never forwarded; a key
+  under any other name (for example `GO_KEY`) is forwarded if listed.
+- `--mcp` servers are spawned with this process's full environment (no
+  clearing), so they can read the provider key.
 
 ## What the tools do NOT enforce
 

@@ -76,6 +76,30 @@ fn minimal_workflow_keeps_goal_and_finish_without_restrictive_contract() {
 }
 
 #[test]
+fn contract_does_not_claim_collapse_under_hysteresis() {
+    let root = run_tmp("contract-hyst");
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    state.apply_input(Input::User("go".into()));
+    let req = build_request(
+        &mut state,
+        &registry,
+        &root,
+        &RunConfig {
+            collapse_hysteresis: 4,
+            ..RunConfig::default()
+        },
+    );
+    let sys = &req.messages[0].content;
+    assert!(
+        sys.contains("older than the last 5 may be collapsed"),
+        "{sys}"
+    );
+    assert!(!sys.contains("are collapsed"), "{sys}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn build_request_system_is_static_and_budgets_ride_the_tail() {
     let root = run_tmp("contract");
     std::fs::write(root.join("a.rs"), "v1\n").unwrap();
