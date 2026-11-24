@@ -1,514 +1,217 @@
-# ROF capability improvements: phased implementation plan
+# ROF capability improvements: phases 0–4 implemented default-off, phase 5 stopped incomplete, phase 6 evidence-gated
 
-**Status:** phases 0–4 implemented and locally verified from clean reference `411846d`;
-phase 5 ran one interrupted control and stopped; phase 6 remains evidence-gated. The output-fidelity foundation is
-complete. The owner authorized phases 0–2, then phases 3–5 on 2026-11-11. Paid development
-runs require the bounded continuation and preflight below. Reference provenance is recorded in the
+**Status:** phases 0–4 implemented and locally verified from clean reference `411846d`
+([phases 0–2 record](../../phase-0-2-implementation.md),
+[phases 3–5 record](../../phase-3-5-implementation.md)); phase 5 ran one interrupted control and stopped;
+phase 6 remains evidence-gated. The output-fidelity foundation is complete. The owner authorized phases
+0–2, then phases 3–5 on 2026-11-11; paid development runs require the bounded continuation and preflight
+in those records. Reference provenance:
 [manifest](../../experiments/2026-11-11-phases-0-2-reference.json).
 
-**Goal:** improve externally verified coding-task completion through better
-repository evidence, trace-grounded tools, and targeted execution feedback.
+**Goal:** improve externally verified coding-task completion through better repository evidence,
+trace-grounded tools, and targeted execution feedback. Extend the existing sequential loop, optional
+tools, native Harbor adapter and offline analysis; keep the durable log as the source of historical
+observations; separate deployment admission from development-candidate retention; implement no automatic
+optimizer, planner, or runtime MAS. Stack unchanged: existing Rust crates, Python stdlib,
+installed Harbor/Pydantic, existing Docker runner.
 
-**Architecture:** extend the existing sequential loop, optional tools, native
-Harbor adapter, and offline analysis helpers. Keep the durable log as the source
-of historical observations. Separate deployment admission from development
-candidate retention; implement no automatic optimizer, planner, or runtime MAS.
+## Global constraints
 
-**Tech stack:** existing Rust crates, Python standard-library analysis, installed
-Harbor/Pydantic for adapter checks, and the existing Docker task runner.
+- Unmeasured mechanisms remain opt-in; absent-flag behavior and the six-tool default registry (view,
+  search, edit, write, exec, test) are preserved, so no fix silently promotes a research profile.
+- Public traits and enum variants stay compatible. Freeze additive interfaces before consumers start.
+- One exclusive writer per crate directory; root owns `crates/rof/`, docs and README.
+- No new crates, graph service, embeddings, learned judge, or third-party package. One existing internal
+  dependency (`agent-log`) serves historical log reading.
+- Benchmark instructions and official graders stay unchanged. Native hidden verifier results cannot
+  drive repair, retrieval, procedures, or selection.
+- Capability is primary: the 1.3x tokens-per-solved guardrail governs default admission, not whether a
+  promising development candidate can be retained. Authorized USD caps and outstanding reservations stay
+  hard limits.
+- Verify the then-current official benchmark release before any future spend. TB4.1.0 CPU is the last
+  verified pin, not an assertion about the latest release on execution day.
+- Preserve historical results and frozen pilot binaries; build and hash a new runtime for each new code
+  comparison.
 
-## Global constraints and execution order
+Accounting stays stopped and unchanged: the original upper bound `$2.158150338` includes the
+`$0.324172800` unknown reservation; the authorized continuation subledger is capped at `$0.661849662`;
+aggregate reservations/spend cannot exceed `$2.82`. Never reset the old ledger or claim the unknown
+request reconciled; a new unknown stops the new campaign. Ledger paths and rules:
+[phases 3–5 record](../../phase-3-5-implementation.md#bounded-phase-5-authorization).
 
-- All unmeasured mechanisms remain opt-in. Preserve absent-flag behavior and the
-  six-tool default registry; fixes must not silently promote a research profile.
-- Existing public traits and enum variants stay compatible. Freeze additive
-  interfaces below before implementation workers depend on them; each owning
-  worker lands its contract declarations before consumers start.
-- One exclusive writer per crate directory. Root owns `crates/rof/` integration
-  and project documentation; other owners never edit these files concurrently.
-- No new crates, graph service, embeddings, learned judge, or third-party package.
-  One existing internal dependency is allowed for historical log reading.
-- Keep original benchmark instructions and official graders unchanged. Native
-  hidden verifier results cannot drive repair, retrieval, procedures, or selection.
-- Capability is primary. The 1.3x tokens-per-solved guardrail governs default
-  admission, not whether a promising development candidate can be retained.
-  The authorized USD cap and all outstanding reservations remain hard limits.
-- The original campaign remains stopped and unchanged: its $2.158150338 upper
-  bound includes the $0.324172800 unknown reservation. The owner explicitly
-  authorized bounded continuation in a new subledger capped at $0.661849662;
-  aggregate reservations/spend cannot exceed $2.82. Never reset the old ledger
-  or claim its unknown request reconciled; a new unknown stops the new campaign.
-- Verify current official benchmark release before future spend. TB4.1.0 CPU is
-  the last verified pin, not an assertion about the latest release on execution day.
-- Research input remains unchanged. Preserve historical results and frozen pilot
-  binaries; build and hash a new runtime for each new code comparison.
-
-Original experiment ordering: **0 → 1 → 2 → 5 → 6**. By subsequent explicit owner
-request, phases 3–4 are implemented/off before phase 5. Demonstrated historical
-evidence loss and prompt pressure still gate efficacy experiments with those
-mechanisms. They do not enter the initial lookup comparison. Implementation checks are free of model calls; phase 5 is spend-gated.
+Experiment order was **0 → 1 → 2 → 5 → 6**; by later owner request phases 3–4 shipped default-off before
+phase 5. Their observed-need gates still govern efficacy experiments and default admission, and neither
+mechanism enters the initial lookup comparison. Implementation checks are free of
+model calls; phase 5 is spend-gated.
 
 ## Team and parallel-work contracts
 
-Root orchestrates GPT-6 Luna workers, checks contracts and evidence, integrates
-the CLI/adapter paths, and decides which experiment to schedule. Use at most
-three workers alongside root. Spawn with `model="gpt-6-luna"` and a self-contained
-task; replace a finished builder with a fresh Luna reviewer rather than adding
-a fifth concurrent agent.
+Three GPT-6 Luna workers owned tools, loop and offline analysis; root owned CLI, Harbor and documentation
+integration: [split and limits](../../phase-0-2-implementation.md#reference-and-ownership). Every worker task
+states starting commit, allowed paths, input/output contract, default behavior, failing case, commands and stop
+conditions, and requires an observed failing regression before a nontrivial change. Root reviews source
+and runs integration checks before committing; workers touch only their files, never push.
 
-| Owner | Exclusive files | Parallel work permitted |
-|---|---|---|
-| Luna tools | `crates/tools-std/` | Root CLI wiring after the tool/config contract is frozen; a loop worker may own `agent-loop` separately. |
-| Luna loop | `crates/agent-loop/` | Tools and offline reporting; serialize completion, history rendering, and checkpoint edits within this crate. |
-| Luna context | `crates/context/` | Offline reporting and adapter work; its additive config/types must land before loop consumers. |
-| Luna analysis/adapter | Assigned `tools/rof_compare.py`, its test, or `tools/harbor_rof.py` and its test | These paths can have separate workers only with explicit disjoint assignments. |
-| Root integration | `crates/rof/`, docs, README | Integrate frozen sibling APIs; never edit a worker-owned crate during its task. |
+## Phases 0–2 — done (2026-11-11)
 
-Every worker task contains: starting commit, exact allowed paths, input/output
-contract, default behavior, failing case, commands, and stop conditions. Require
-an observed failing regression before nontrivial behavior changes. Return the
-diff, red/green evidence, and limitations. Root reviews source and runs integration
-checks before committing. No worker edits another owner's files or pushes.
+Phase 0 froze clean reference `411846d` with runtime SHA-256, runner/overlay hashes and the complete
+nonsecret recipe in the [manifest](../../experiments/2026-11-11-phases-0-2-reference.json), and froze the
+per-phase contracts. `docs/next-benchmark-slice.json` stays a metadata-only four-task proposal: not a
+representative suite and not a certified historically unseen holdout.
 
-## Phase 0 — freeze the reference and contracts
+Phase 1 added `tools/rof_compare.py` (frozen `compare(experiment: dict) -> dict`,
+`main(argv=None) -> int`) and Harbor forwarding for `repo_lookup` / `collapse_hysteresis`. Failing cases
+first covered the 00/01/10/11 outcome matrix, duplicate attempts and unknown usage; the JSON protocol,
+per-attempt usage semantics, equal weighting and retention/promotion split are in the
+[paired-reporting section](../../phase-0-2-implementation.md#paired-reporting-input). Run
+`python3 -m unittest discover -s tools -p 'test_rof_compare.py' -v` and
+`python3 tools/rof_compare.py --input EXPERIMENT.json --output REPORT.json`; the Harbor venv
+`/home/madiyar/.local/share/uv/tools/harbor/bin/python -m unittest discover -s tools -p 'test_harbor_rof.py' -v`.
+No parity with the legacy `rof eval --agent` CLI: native experiments use the installed adapter, which
+invokes `rof run`.
 
-**Owner:** root, with read-only Luna source inspection. **Dependencies:** none.
+Phase 2 added evidence-aware lookup and the bounded completion predicate; contracts still governing the
+code, not in the record:
 
-- [x] Record a clean reference source commit, runtime SHA-256, runner/overlay
-  hashes, and the complete nonsecret recipe in the new experiment manifest.
-  Do not reuse old pilot outcomes as a new-binary control.
-- [x] Confirm existing mechanisms before adding code: `repo_lookup`, minimal
-  workflow, failed-check preservation, shell, output archive, thinking retention,
-  collapse hysteresis, review, and proof commands already exist in some paths.
-- [x] Freeze the per-phase interfaces below. Record any necessary signature
-  revision before dispatching consumers; do not invent stubs for conditional work
-  before its gate is met.
-- [x] Preserve the current task/split proposal in `docs/next-benchmark-slice.json`.
-  Its packages/oracles and historical exposure remain unvalidated; it is not a
-  representative suite or a certified historically unseen holdout.
+- `repo_evidence: bool = false`, CLI `--repo-evidence on|off`, requires `repo_lookup`. Activation is an
+  explicit run configuration, not an argument the control can select, so the ablation stays clean.
+  Evidence mode groups bounded literal, definition, test-path and config-path candidates: explicit
+  heuristics, not a semantic caller graph. Output is bounded to `common::OUT_CAP` (8,000 chars) with an
+  omission/scan-limit notice and `ToolOutcome.truncated`; legacy output and the loop's
+  `tool_core::MAX_MODEL_CHARS` (40,000) bound are unchanged. Current lookup has no tool-local character
+  cap, so this is an evidence-mode contract, not a claim about its old behavior. No second shell tool, no
+  automatic LLM tool optimizer.
+- `RunConfig.completion_check: Option<String>` (default `None`), CLI `--completion-check CMD`, Harbor
+  `completion_check: str | None`. Zero exit satisfies this operator-supplied predicate, not a proof of
+  arbitrary task requirements. `FailureKind::Completion` was added without renaming existing variants and
+  maps to exit 8. At most one repair continuation and two predicate executions, sharing the original
+  usage totals, caps, deadline and cancellation, with no allowlist grants; a repair continuation may span
+  multiple model/tool steps. The last-step Done grace cannot buy an extra provider request. `--review on`
+  cannot be combined with it until a shared intervention contract exists.
+- Rivet and AT-AT motivate this bet, not an expected ROF effect size. Measure false rejection on
+  reference successes before promotion; no universal completion rule is inferred from JevAct.
 
-**Exit:** reviewable manifest and owner assignments, with all planned behavior
-clearly distinguished from shipped behavior. No model calls.
+Validation ([record](../../phase-0-2-implementation.md#validation-and-remaining-gates)): 323 scoped Rust
+tests (budget 7, loop 142, CLI 84 + 1 build-provenance, standard tools 66 + experimental 23), 21 Python
+tests (14 comparison, 7 Harbor adapter), all-target Clippy, fmt, Ruff and six captured Harbor argv
+recipes passed. No provider inference ran. Two fresh Luna reviews found the null-reward
+denominator and unbounded-directory collection bugs; the fixes and further completion regressions are
+tested. Usage limits interrupted the final review turns, so root finished the source review and reran the
+gates. No paid benchmark or capability improvement is claimed.
 
-## Phase 1 — make experiments observable and reachable
+## Phases 3–4 — implemented, default-off, efficacy gates still open
 
-### 1A. Paired reporting, rescue/harm, and candidate status
+The historical actor sample showed no irrecoverable observation and no context overflow, so these
+default-off mechanisms enter no efficacy experiment or default admission until their gates are met;
+synthetic mutation/pressure fixtures validate mechanics only. Independent Luna and
+`codex review --commit` checks of phases 0–2 found no actionable defect (its own Python run errored; the
+prescribed environments passed separately). Validation (352 Rust tests across context,
+tools, loop and CLI; 10 adapter tests; Clippy, fmt, Ruff; the actual loop restored an old observation
+after its live file was overwritten):
+[record](../../phase-3-5-implementation.md#implemented-locally-2026-11-11).
 
-**Owner:** Luna analysis. **Files:** create `tools/rof_compare.py` and
-`tools/test_rof_compare.py`; reuse the zero-solve semantics in
-`crates/eval/src/report.rs` without changing that crate.
+Phase 3 (gate: traces show necessary history unrecoverable by `view` or `output_read`):
+`history_read({item_id, offset?, limit?})` behind `--history-read on`, with host-supplied absolute
+`ExperimentalToolsConfig.history_log` and `RunConfig.history_read` defaulting false. It reads only
+historical ToolResults from the fixed current WAL, append-only: no command replay, no rewriting of old
+durable rows. Pages default 8,000 characters and cap at 32,768; the source snapshot is bounded before
+whole-log load (chosen 64 MiB, validated by boundary tests, not a paper constant). `Item.id` is WAL-local. `--history-read on` is refused with `--no-log` or
+`--review on`.
 
-Frozen Python entry points:
+- [ ] Open: compare rendering hysteresis independently of restoration. A histogram of cached-input
+  receipts can diagnose it, but hosted KV-memory/throughput wins from ReFold are not portable claims.
 
-```python
-def compare(experiment: dict) -> dict: ...
-def main(argv=None) -> int: ...
-```
+Out of scope: runtime resume, replaying effects, cross-run memory.
 
-Input is a JSON object with `protocol`, `arms`, and `rows`. `protocol` pins
-dataset/release/task hashes, model/endpoint identity, runner/grade path, budgets,
-splits and allowed treatment difference. `arms` pins each runtime hash and config.
-Each row contains `arm`, `task_id`, `attempt_id`, `replicate_id`, `artifact_reward`
-(number or null), `run_status`, `run_completed`, `accounting_complete`, `usage`
-(null or input/cached-input/output totals including retries), and artifact source
-paths/hashes. Explicitly supplied JSON is normalized evidence, not an excuse to
-invent missing usage or infer success from an actor exit code.
-`attempt_id` identifies an agent trial; provider retries belong in that trial's
-usage rather than masquerading as independent task repetitions. `usage` keys
-are exactly `input_tokens`, `cached_input_tokens`, `output_tokens`, all
-nonnegative integers with cached input no larger than input. `protocol.pairs`
-lists the expected `(task_id, replicate_id)` pairs so missing rows are visible
-even when both arms lack the same task. Require at most one row per arm/pair.
-The helper reports token/capability evidence; financial reconciliation remains
-in the existing reservation ledger, linked by source path/hash in `protocol`.
-It neither computes an invoice nor converts an unknown charge/reservation to $0
-or authorizes more spend.
+Phase 4A (gate: an experiment requires compaction because observed prompt pressure threatens
+continuation): `CompactionConfig.context_capacity_tokens: Option<u64>`, `output_reserve_tokens: u64`, and
+`compaction_due(estimate, capacity, cfg)` keeping its signature; the caller passes usable input capacity
+(`context_capacity_tokens - output_reserve_tokens`), never the cumulative run allowance, and the function
+rejects any other value. Trigger: `estimate > frac * usable`. CLI `--context-capacity N`,
+`--output-reserve N` (adapter: underscores). Capacity must be positive and above the reserve, never
+guessed from a model name; the reserve must cover the provider's largest output allocation,
+`max(initial_max_tokens, 32768)`. Old compaction calls need the new values: an intentional validation
+change. They establish units and bounds, not a summarization benefit.
 
-`run_completed` means the attempt reached a valid protocol terminal state, not
-that the model declared success. Configured token/step/wall-limit terminations
-remain system attempts with their native artifact rewards; they are not removed
-from the task denominator as infrastructure failures.
-
-- [x] Write failing cases for 00/01/10/11 outcomes, duplicate attempts, mismatched
-  tasks/protocols, unknown usage, budget-limited failure, interrupted reward-1
-  artifacts, unequal repeat counts, and zero-solve ratios.
-- [x] Implement deterministic JSON output with per-task paired rows, rescue,
-  harm, unchanged outcomes and explicit incomplete pairs. Report raw artifact
-  results separately from completed/accounted comparisons; list every attempt.
-- [x] Compute input/output totals across all attempts, including failures and
-  retries. Never add cached-input twice. Return null for tokens-per-solved or
-  the treatment/control ratio when denominators or usage are unavailable.
-- [x] Average repetitions within task before equal weighting across tasks.
-  Keep incomplete tasks visible; do not improve a score through exclusions.
-- [x] Record `retained_for_research` separately from `eligible_for_promotion`.
-  Do not implement automatic default promotion, significance claims on the
-  four-task proposal, or an automatic search scheduler.
-
-Run: `python3 -m unittest discover -s tools -p 'test_rof_compare.py' -v`.
-CLI: `python3 tools/rof_compare.py --input EXPERIMENT.json --output REPORT.json`.
-
-**Exit:** synthetic fixtures preserve the interrupted React distinction and
-zero-solve semantics; no campaign or provider is contacted.
-
-### 1B. Expose existing lookup and rendering controls through Harbor
-
-**Owner:** Luna adapter; root owns any `rof` integration test.
-**Files:** `tools/harbor_rof.py`, `tools/test_harbor_rof.py`.
-
-```python
-repo_lookup: bool = False
-collapse_hysteresis: int | None = Field(default=None, gt=0)
-```
-
-- [x] Observe failing forwarding checks, then pass `--repo-lookup on` only when
-  enabled and `--collapse-hysteresis N` only when supplied.
-- [x] Keep existing goal, budgets, exec policy, retention, workflow, shell and
-  archive behavior unchanged. Both controls must remain independently testable.
-- [x] Capture actual adapter argv and validate it with the built ROF parser,
-  using a deliberately missing credential variable to stop before inference.
-- [x] Do not claim parity with the legacy `rof eval --agent` CLI. Current native
-  experiments use the installed Harbor adapter, which invokes `rof run`.
-
-Run: `/home/madiyar/.local/share/uv/tools/harbor/bin/python -m unittest discover -s tools -p 'test_harbor_rof.py' -v`.
-
-**Exit:** false/absent options preserve the old argv; enabled values reach the
-real CLI. This lane can run alongside 1A and the trace audit below.
-
-## Phase 2 — improve coding evidence and targeted feedback
-
-### 2A. Trace-grounded tools and evidence-aware lookup
-
-**Owner:** Luna tools. **Files:** `crates/tools-std/src/experimental.rs`,
-`runner.rs`/individual tool files only where a reproduced defect requires them,
-and `crates/tools-std/tests/experimental.rs`. Root registers integration tests
-under `crates/rof/` after the contract is stable.
-
-- [x] Audit recorded development actor traces, excluding hidden grader content.
-  Count repeated malformed calls, unrecoverable outputs, and missing repository
-  evidence. Preserve trace IDs and exact tool schemas/binary identities.
-- [x] Reproduce one remaining tool-contract failure locally. If none remains,
-  record that result and skip speculative execution API changes. In particular,
-  do not add a second shell tool or automatic LLM tool optimizer.
-- [x] Add `repo_evidence: bool = false` to `ExperimentalToolsConfig`, CLI
-  `--repo-evidence on|off`, and the Harbor option; require `repo_lookup` when it
-  is enabled. Preserve the tool's required `symbol`, optional `limit`, and
-  default output. The control cannot select enriched mode through an argument:
-  activation is an explicit run configuration for clean ablation.
-  Evidence mode groups bounded literal locations, definition candidates, test
-  path candidates and configuration path candidates. These are explicit
-  heuristics, not a semantic caller graph or guaranteed complete dependencies.
-- [x] Reuse current traversal, containment, cancellation and scan caps. Keep
-  one shared result limit across categories. Bound evidence-mode output to
-  `common::OUT_CAP` (8,000 characters), with an explicit omission/scan-limit
-  notice and `ToolOutcome.truncated`; preserve legacy-mode output. The normal
-  loop's `tool_core::MAX_MODEL_CHARS` bound remains unchanged. Current lookup
-  has no tool-local character cap, so this is an evidence-mode contract rather
-  than a claim about its old behavior. Deduplicate repeated path/line hits and
-  define test/config path heuristics explicitly in fixture tests.
-- [x] Test old calls, mixed-language definition candidates, duplicate hits,
-  test/config paths, deterministic ordering, output limits, and existing escape
-  and cancellation behavior. A planted caller/config dependency must be findable
-  in evidence mode without asserting that arbitrary semantic dependencies resolve.
-
-**Exit:** unchanged default-tool behavior and a small evidence-mode treatment.
-Benchmark the exposed original lookup before crediting the enriched version.
-Rivet and AT-AT motivate this bet, not an expected ROF effect size.
-
-### 2B. A bounded, public completion predicate
-
-**Owner:** Luna loop, in parallel with 2A. **Files:**
-`crates/agent-loop/src/run.rs`, `state.rs`, `verify.rs`, focused loop tests.
-Root later wires `crates/rof/src/cli.rs`, `main.rs`, fixture initializers,
-`tools/harbor_rof.py`, and adapter tests while the adapter worker is idle.
-
-Frozen additive contract: `RunConfig.completion_check: Option<String>` defaults
-to `None`; CLI `--completion-check CMD`; Harbor `completion_check: str | None`.
-The command is explicitly supplied by the task/operator. Zero exit satisfies
-this predicate, not a claim that arbitrary task requirements are proven.
-Add `FailureKind::Completion` at the contract gate and adapt exhaustive consumers;
-do not rename existing variants or misclassify an unmet predicate as budget or
-infrastructure failure.
-
-- [x] Write failing scripted cases: passing predicate, failing predicate then
-  successful repair, two failed predicate checks, policy rejection, timeout,
-  cancellation, and exhausted step/token budget. Include a valid no-edit task.
-- [x] Intercept `ClaimOutcome::Done` in `settle_success` before terminal
-  settlement can close the run. Route the exact command through the existing
-  policy-checked, wrapped `test` dispatch and logging/budget path. Do not use the
-  host proof executor or a hidden native verifier. Reserve action capacity before
-  dispatch and add no allowlist grants. Record the invocation as harness-origin
-  with a matching tool-call/result pair; do not fabricate provider usage.
-- [x] Allow at most one repair continuation and two predicate executions total.
-  Both share the original usage totals, action caps, deadline and cancellation.
-  A first failed check sets continuation state once and supplies its new result
-  as feedback; a second proposed completion executes the final check. Unmet or
-  unknown predicates return `Outcome::Failed { kind: FailureKind::Completion,
-  message }`; genuine budget exhaustion keeps its normal outcome. Preserve a
-  gradeable artifact. The existing last-step Done grace cannot buy an extra
-  provider request for repair after a failed predicate.
-- [x] Disable repeated generic verification nudges for this completion path so
-  they cannot multiply the repair allowance. A previous unrelated passing check
-  cannot satisfy the exact configured predicate. Default `None` is unchanged.
-- [x] Record command, exit/timeout/denial, output and intervention count using
-  existing logs/events. Preserve failed-check rollback semantics as configured.
-
-**Exit:** bounded behavior is verified locally and does not falsely require a
-patch on read-only tasks. Measure false rejection on reference successes before
-promotion; no universal completion rule is inferred from JevAct.
-
-Implementation contract refinement (phase 2): `rof run` rejects combining the
-new completion predicate with `--review on`. These mechanisms each offer a repair
-continuation; composing them needs a separate experiment and a shared intervention
-contract. `FailureKind::Completion` maps to exit 8, a task failure that the native
-Harbor adapter does not classify as startup/infrastructure failure. A repair
-continuation may include multiple model/tool steps under the original caps;
-it is not limited to one model response. Root also owns the small additive
-`agent-budget` integration: `BudgetGuard::exceeded_except_steps()` delegates to
-the existing non-step cap checks. This prevents step grace from masking other
-exhausted caps without duplicating budgets in the loop.
-
-Implementation evidence (2026-11-11): 323 scoped Rust tests passed (budget 7,
-loop 142, CLI 84 plus build-provenance 1, standard tools 66 plus experimental
-23); comparison tests 14 and Harbor adapter tests 7 passed. Scoped all-target
-Clippy, Rust formatting, Python Ruff checks and six captured Harbor argv parser
-recipes passed. No provider inference was used for these checks. Two fresh Luna
-reviews found the null-reward denominator and unbounded-directory collection
-issues; their fixes and further completion integration regressions are tested.
-Luna usage limits interrupted the final follow-up turns; root finished the
-remaining source review/fixes and reran the finish gates. No paid benchmark or
-capability improvement is claimed. See the
-[implementation record](../../phase-0-2-implementation.md) for provenance/limits.
-
-## Execution update after the phase 0–2 recheck (2026-11-11)
-
-The owner explicitly requested phases 3–5 after re-verification and a push.
-Re-verification passed (323 Rust tests, 21 Python tests, scoped lint/format gates),
-and both the independent Luna review and dedicated `codex review --commit`
-found no actionable defects. The dedicated review's Python invocation had an
-environment/import error; the prescribed Python environments passed separately.
-The requested push was rejected by automatic approval review because this
-session requires approval for the operation while its approval policy is `never`.
-No remote CI result is attributed to the local commit.
-
-The owner request authorizes building phases 3–4 as complete, default-off
-experimental features now. Their original observed-need gates below remain
-requirements for efficacy experiments/default admission, not claims established
-by implementation fixtures. The sampled historical actors did not demonstrate
-irrecoverable historical evidence or context-limit pressure. Chosen synthetic
-mutation/pressure fixtures validate mechanics only. The owner then explicitly
-revised the stop to allow bounded continuation with the full old reservation
-preserved. The [phase 3–5 record](../../phase-3-5-implementation.md) is current.
-
-## Phase 3 — conditional historical restoration
-
-**Gate:** actor traces show necessary historical observations cannot be recovered
-by existing `view` or `output_read`. Root records the concrete case before coding.
-
-**Owners:** Luna tools and Luna loop in parallel after additive config contracts
-are frozen; root then integrates `rof` and Harbor. No simultaneous second writer
-for `tools-std` or `agent-loop`.
-
-**Files:** `crates/tools-std/{Cargo.toml,src/experimental.rs,tests/experimental.rs}`;
-`crates/agent-loop/src/{request.rs,run.rs}` and fold tests; root CLI/registry/tests.
-Reuse `agent-log::read_log`; add the existing internal `agent-log` dependency to
-`tools-std`, with no reverse dependency or new crate.
-
-Frozen interfaces: `ExperimentalToolsConfig.history_log: Option<PathBuf>` is
-host-supplied and fixed to the current run; `RunConfig.history_read: bool = false`
-controls rendering metadata. CLI/Harbor `history_read` defaults off. The tool is
-`history_read({item_id: string, offset?: integer, limit?: integer})`.
-
-- [x] Bind the resolved current WAL path at registry construction and read it
-  only during the primary run, after existing WAL rotation has completed;
-  refuse `--history-read on` with `--no-log`. Bind it to the primary run only;
-  do not accidentally expose previous archived WALs or the review phase log.
-- [x] Treat `Item.id` as WAL-local: fresh runs reuse IDs such as `item-5`.
-  The fixed WAL prevents reading an older run, but an unqualified ID cannot
-  distinguish colliding names across runs. Advertise current `Item.id` values
-  in collapsed tool-result stubs only
-  when enabled, preserving their existing output archive handles. Never rewrite
-  old durable rows or assistant/tool-call associations.
-- [x] Resolve only `ItemKind::ToolResult` in the fixed current WAL. The model
-  supplies no path. Return a historical marker, original item/call IDs, sequence,
-  observation time, original error status, and a bounded page of stored text.
-  A successful lookup of an originally failed command is a successful lookup,
-  not a newly failed command to replay or roll back.
-- [x] Use 8,000 characters by default, at most 32,768 per page. Bound source log
-  size before whole-log loading (chosen 64 MiB initial ceiling); return a clear
-  limit result rather than unbounded memory use. Respect cancellation. These
-  chosen limits are validated by focused boundary tests, not paper constants.
-- [x] Test mutated-file history versus current reads, unknown IDs, non-tool IDs,
-  prior-WAL isolation despite colliding local IDs, paging, malformed/torn logs,
-  disabled defaults, and append-only
-  retrieval through the actual loop. No original command is executed again.
-- [ ] Compare rendering hysteresis independently of restoration. A histogram
-  of cached-input receipts can diagnose it, but hosted KV-memory/throughput wins
-  from ReFold are not portable claims.
-
-**Exit:** the demonstrated information-loss case is recoverable, with historical
-meaning explicit. Runtime resume, replaying effects, and cross-run memory remain
-out of scope.
-
-## Phase 4 — conditional compaction correctness and provenance
-
-**Gate:** an experiment requires compaction because observed prompt pressure
-threatens useful continuation. Default-off compaction is not a prerequisite for
-the Phase 2 experiments.
-
-### 4A. Fix capacity units before any compaction efficacy run
-
-**Owners:** Luna context first, Luna loop next, root CLI/Harbor integration last.
-**Files:** `crates/context/src/compact.rs`, context tests;
-`crates/agent-loop/src/request.rs`, loop tests; root CLI/run config and adapter.
-
-Add `context_capacity_tokens: Option<u64>` and `output_reserve_tokens: u64` to
-`CompactionConfig`, defaulting to unknown/zero with compaction disabled. Preserve
-`compaction_due(estimate: u64, capacity: u64, cfg: &CompactionConfig) -> bool`;
-its caller supplies usable input capacity, never the cumulative run allowance.
-CLI names: `--context-capacity N`, `--output-reserve N`; adapter equivalents use
-the same names with underscores.
-
-- [x] Require known positive capacity and a reserve below capacity when
-  compaction is requested. Unknown model capacity must not be guessed from its
-  name. Explicit old compaction calls need these new values; document this
-  intentional validation change to the experimental path.
-- [x] Trigger at `estimate > frac * (capacity - reserve)`. Validate the reserve
-  against the largest output allocation permitted by the active provider retry
-  profile, including a starting cap above its escalation ceiling. Keep spend
-  and token accounting in the unchanged run-wide BudgetGuard.
-  For the current OpenAI-compatible client that maximum is
-  `max(initial_max_tokens, 32768)`. Root supplies this knowledge at CLI/provider
-  wiring; the generic loop cannot inspect a nonexistent provider-profile API.
-- [x] Test fixed capacity/varying total allowance, fixed allowance/varying
-  capacity, insufficient generation headroom, invalid values, disabled-path
-  equivalence, and metered summary usage. Expose the compaction fraction through
-  Harbor only with the validated capacity/reserve controls.
-
-**Exit:** deterministic unit/loop checks establish the units and bounds; this
-does not establish any summarization capability benefit.
-
-### 4B. Distinguish observed facts, hypotheses and plans
-
-**Owners:** Luna context for additive types/prompt, then the same Luna loop owner
-for parsing/fold behavior; root wires an independent opt-in switch afterward.
-**Files:** `crates/context/src/compact.rs`, public exports if needed;
-`crates/agent-loop/src/{request.rs,state.rs}` and their tests.
-
-Proposed types live in `context`, not a new memory crate:
-
-```rust
-pub enum CheckpointKind { Fact, Hypothesis, Plan }
-pub struct CheckpointEntry {
-    pub kind: CheckpointKind,
-    pub text: String,
-    pub source_item_ids: Vec<String>,
-}
-```
-
-Also add `source_item_id: Option<String>` to `CompactMessage`; default/unattributed
-messages use `None`. The context owner freezes that field before loop consumers
-start. The loop must construct IDs alongside its ordered source items before
-`compact_view` loses them; an injected earlier checkpoint has no invented item ID.
-
-- [x] Add `checkpoint_sources: bool = false` to `CompactionConfig`, CLI
-  `--checkpoint-sources on|off`, and the Harbor boolean. Keep the original
-  summary format as the control after 4A so provenance is an isolated treatment.
-- [x] Include that explicit ID/content mapping in the summarizer view; request
-  these entries in plain
-  generated JSON. Resolve fact references to eligible original user/tool records.
-  Unknown/unattributed claims remain labelled hypotheses rather than established
-  facts. Preserve useful plans under their own label; do not delete every claim
-  that lacks a quotation or accept an ID as proof its interpretation is correct.
-- [x] A malformed response leaves history intact and records a refused
-  checkpoint. Never let parse failure erase the only recoverable history.
-- [x] Test exact IDs, unknown IDs, conflicting hypotheses, user requirements,
-  malformed output, protected recent tool groups, and unchanged default format.
-  Charge the existing summary call; add no source-judging model call.
-
-**Exit:** provenance references resolve and categories remain explicit. SJC-style
-judge efficacy and automatic memory learning remain deferred.
+Phase 4B: `CheckpointKind {Fact, Hypothesis, Plan}` and `CheckpointEntry {kind, text, source_item_ids}`
+live in `context` (no new memory crate); `CompactMessage.source_item_id: Option<String>`;
+`--checkpoint-sources on|off` requires `--compaction`. Fact references must resolve to records actually
+shown in the summarized prefix; unknown or unattributed claims stay hypotheses, plans keep their label,
+and a resolving ID is provenance, not proof the interpretation is true. A malformed response leaves
+history intact, records a refused checkpoint and still charges the summary call; no extra source-judging
+model call. The original summary format remains the control. SJC-style judge efficacy and automatic
+memory learning stay deferred.
 
 ## Phase 5 — controlled external development experiments
 
-**Owner:** root as sole campaign/spend writer. Luna workers can audit actor traces,
-runtime/config hashes and results independently, without reading hidden feedback
-into the solving agent or sharing the live credential.
+**Owner:** root as sole campaign/spend writer. Luna workers may audit actor traces, runtime/config hashes
+and results independently, without reading hidden feedback into the solving agent or sharing the live
+credential.
 
-- [x] Preserve the stopped accounting state and obtain explicit owner revision
-  allowing a new subledger within verified remaining cap/reservations. Recheck official
-  release/task relevance and freeze all exclusions before outcomes are viewed.
-- [x] Obtain complete pinned tasks, check actual disk/build footprint, run native
-  oracle readiness checks and an appropriate known-bad artifact control, and bind
-  task/image/runtime/runner hashes. The prior disk snapshot is historical, not
-  a current capacity guarantee. Prune no unrelated owner images automatically.
-- [x] Freeze development/holdout assignments, comparison rule, model endpoint,
-  generation limits and budgets. Treat the proposed four-task slice as a small
-  convenience pilot. Increase task coverage before a suite-level conclusion.
-- [ ] Test one change at a time. Start with the existing exposed lookup versus
-  no lookup; then evidence mode versus the same lookup control. Test minimal
-  workflow, preserved checks, retention and response caps independently rather
-  than attributing a combined profile to one mechanism.
-- [ ] Compare targeted completion feedback with an equal-budget repair/resampling
-  opportunity when claiming benefit from the predicate rather than extra calls.
-  Review/reflection/candidate generation also require resample-only controls.
-- [ ] Run the Phase 1 helper, preserve rescue and harm, and retain cap-limited
-  failures and incomplete rows visibly. A candidate may be retained for research
-  despite temporary token overhead; neither retention nor a small pilot changes
-  production defaults. Spend constraints can end the experiment without proving
-  or disproving the hypothesis.
+- [x] Preserve the stopped accounting state and obtain explicit owner revision allowing a new subledger
+  within verified remaining cap/reservations. Recheck official release/task relevance and freeze all
+  exclusions before outcomes are viewed.
+- [x] Obtain complete pinned tasks, check actual disk/build footprint, run native oracle readiness checks
+  and an appropriate known-bad artifact control, and bind task/image/runtime/runner hashes. The prior
+  disk snapshot is historical, not a current capacity guarantee. Prune no unrelated owner images
+  automatically.
+- [x] Freeze development/holdout assignments, comparison rule, model endpoint, generation limits and
+  budgets. The four-task slice is a small convenience pilot; task coverage must grow before a suite-level
+  conclusion.
+- [ ] Test one change at a time. Start with the existing exposed lookup versus no lookup; then evidence
+  mode versus the same lookup control. Test minimal workflow, preserved checks, retention and response
+  caps independently rather than attributing a combined profile to one mechanism.
+- [ ] Compare targeted completion feedback with an equal-budget repair/resampling opportunity when
+  claiming benefit from the predicate rather than extra calls. Review/reflection/candidate generation
+  also require resample-only controls.
+- [ ] Run the Phase 1 helper, preserve rescue and harm, and retain cap-limited failures and incomplete
+  rows visibly. A candidate may be retained for research despite temporary token overhead; neither
+  retention nor a small pilot changes production defaults. Spend constraints can end the experiment
+  without proving or disproving the hypothesis.
 
-**Exit:** reviewable paired per-task evidence, fully accounted attempts, and an
-explicit verdict of promising, unsupported, harmful, or incomplete. Do not force
-a significance claim or claim published unmatched external rows are controls.
+**Exit:** reviewable paired per-task evidence, fully accounted attempts, and an explicit verdict of
+promising, unsupported, harmful, or incomplete. Do not force a significance claim or claim published
+unmatched external rows are controls.
 
-Outcome (2026-11-11): **incomplete**. Both development oracle/bad controls passed
-readiness, but only Cargo control ran (artifact reward 0.0). One response body
-reset after HTTP 200 without usage: 26 requests, 25 receipts. Its reservation
-remains held; the runner stopped before all other cells. Combined upper bound
-$2.519179098 stays below $2.82, with zero usable headroom while stopped. Do not
-check off the paired experiment merely because it launched. The
-[record](../../phase-3-5-implementation.md) carries evidence and continuation rules.
+**Outcome (2026-11-11): incomplete.** Both development oracle/bad controls passed readiness, but only the
+Cargo control ran (artifact reward 0.0). One response body reset after HTTP 200 without usage: 26
+requests, 25 receipts. Its reservation remains held and the runner stopped before all other cells.
+Combined upper bound `$2.519179098` stays below `$2.82`, with zero usable headroom while stopped. Do not
+check off the paired experiment merely because it launched; accounting detail and continuation rules are
+in the [record](../../phase-3-5-implementation.md#phase-5-outcome-incomplete-stopped-on-a-new-unknown-request).
 
 ## Phase 6 — held-out confirmation, admission, and maintenance
 
-- [ ] Freeze the surviving profile and evaluate it on prospectively untouched
-  tasks without using holdout outcomes to revise it. Report task coverage,
-  attempt counts, release, limits and uncertainty; do not call a selected slice
-  a full CPU-suite score or frontier-level performance.
-- [ ] Promote only with repeatable held-out capability evidence and a defined
-  tokens-per-solved ratio within 1.3x. When a control solves zero, record the
-  undefined ratio and keep the candidate experimental pending a usable reference.
-- [ ] Keep published external agent/model/protocol comparisons labelled as
-  unmatched context. Frontier claims require a relevant benchmark/coverage
-  protocol; no paid comparison against an owner's personal agent setup.
-- [ ] Update the handoff, deferred register, architecture, experiment controls,
-  README and this checklist in the same change. Each deferred idea retains its
-  reason and revisit evidence; measured failure is not silently relabelled unbuilt.
-- [ ] Commit only verified owned changes, with user-only attribution. Push only
-  when authorized and permitted; verify CI for that exact commit after a push.
-  A local check is never a claim that remote CI ran.
+- [ ] Freeze the surviving profile and evaluate it on prospectively untouched tasks without using holdout
+  outcomes to revise it. Report task coverage, attempt counts, release, limits and uncertainty; do not
+  call a selected slice a full CPU-suite score or frontier-level performance.
+- [ ] Promote only with repeatable held-out capability evidence and a defined tokens-per-solved ratio
+  within 1.3x. When a control solves zero, record the undefined ratio and keep the candidate experimental
+  pending a usable reference.
+- [ ] Keep published external agent/model/protocol comparisons labelled as unmatched context. Frontier
+  claims require a relevant benchmark/coverage protocol; no paid comparison against an owner's personal
+  agent setup.
+- [ ] Update the handoff, deferred register, architecture, experiment controls, README and this checklist
+  in the same change. Each deferred idea retains its reason and revisit evidence; measured failure is not
+  silently relabelled unbuilt.
+- [ ] Commit only verified owned changes, with user-only attribution. Push only when authorized and
+  permitted; verify CI for that exact commit after a push. A local check is never a claim that remote CI
+  ran.
 
 ## Per-crate finish gate and root integration checks
 
-For each changed crate `X`, run `cargo test --locked -p X`,
-`cargo clippy --locked -p X --all-targets -- -D warnings`, and
-`cargo fmt -p X -- --check`; check changed code for unfinished placeholders.
-Root runs affected cross-crate tests after integrating frozen APIs. Run focused
-Python unittest discovery, adapter usage-context self-check, Ruff when available,
-and the repository's tracked-reference and diff checks. Do not repeatedly run
-unrelated suites after the relevant checks pass without a new concern.
-
-Every phase ends with a fresh Luna diff review against its contract. Root checks
-the findings and actual command output. A phase cannot become complete merely
-because its implementation exists, and an experiment cannot become validated
-merely because its local tests pass.
+For each changed crate `X`: `cargo test --locked -p X`,
+`cargo clippy --locked -p X --all-targets -- -D warnings`, `cargo fmt -p X -- --check`, and no unfinished
+placeholders. Root then runs affected cross-crate tests, focused Python unittest discovery, the adapter
+usage-context self-check, Ruff when available, and the tracked-reference and diff checks; unrelated
+suites are not re-run after the relevant checks pass without a new concern. Every phase ends with a fresh
+Luna diff review against its contract: a phase is not complete because its implementation exists, and an
+experiment is not validated because its local tests pass.
 
 ## Deferred beyond this plan
 
-Automatic harness search, learned restart/allocation predictors, semantic graph
-infrastructure, training a memory network, server KV-cache control, cross-run
-learning, crash resume, and runtime MAS stay in the existing
-[deferred register](../../research-next-steps.md#deferred-work-register).
-The independent resampling control and paired report precede any reconsideration
-of review/reflection/racing. The proposed compaction and historical tools do not
-authorize those larger systems.
+Automatic harness search, learned restart/allocation predictors, semantic graph infrastructure, training a
+memory network, server KV-cache control, cross-run learning, crash resume and runtime MAS stay in the
+[deferred register](../../research-next-steps.md#deferred-work-register). The independent resampling
+control and paired report precede any reconsideration of review/reflection/racing; the compaction and
+historical tools do not authorize those larger systems.

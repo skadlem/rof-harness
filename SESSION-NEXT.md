@@ -1,139 +1,92 @@
 # Session handoff · 2026-11-24
 
-## Pick up here (2026-11-24): run the TB4.1 option screen
+## Pick up here: run the TB4.1 option-screen check trial
 
-The plan is [tb41-option-screen](docs/superpowers/plans/2026-11-24-tb41-option-screen.md).
-It covers 4 tasks × 4 arms × 3 reps, 48 runs, about $4 at price-book rates with
-a hard stop at $8. The arms are control, `exec_output: "head-tail"`,
-`rollback_scope: "errors"` and `max_tokens: 32768`.
+Plan: [tb41-option-screen](docs/superpowers/plans/2026-11-24-tb41-option-screen.md)
+(4 tasks × 4 arms × 3 reps = 48 runs, ~$4 price-book, hard stop $8; arms: control,
+`exec_output: "head-tail"`, `rollback_scope: "errors"`, `max_tokens: 32768`).
 
-1. **Spend approval is still pending.** The owner chose to start the run in a
-   new session. Before any paid call, confirm the scope and the $8 cap, and
-   read the live provider balance.
-2. **Build the runtime from a clean worktree** at `a43c35e` or later. `goose/`
-   is untracked in the main checkout and would mark the build `-dirty`. Record
-   the binary's SHA-256 and the adapter's `runtime-bundle-<sha>` version.
-3. **Use the same Harbor setup as before.** Earlier runs used the
-   `harbor-rootlogfix` overlay and `PYTHONPATH`, not vanilla Harbor (see
-   `docs/current-benchmark-pilot.md`, "Oracle gate"). For a working
-   `harbor run -c <config>` caller, see
-   `target/tb41-cpu-baseline-20261123/oracle.py`. Use the task trees in
-   `source/tasks/`.
-4. **Run one control trial on `heat-pump-warranty` first.** Check:
-   - the version string,
-   - the exit-code grading (0/3/8),
-   - the reward file,
-   - per-request usage.
+1. **Approval:** the owner approved only the one `heat-pump-warranty` control trial
+   (adapter check), not the 48 runs. Ask again before the 48.
+2. **Key and balance:** use the key from `~/.pi/agent/auth.json` (`deepseek.key`; the
+   budget-line A/B used it, `target/budget-line-ab-20261123/run.py:46`) or the repo's
+   git-ignored `.env.deepseek`. Live balances 2026-11-24: Pi key ¥174.08 CNY, repo key
+   $5.36 USD. `~/.config/jcode/deepseek.env` is a dead key; do not use it. Read the
+   balance (`GET https://api.deepseek.com/user/balance`) before and after.
+3. **Runtime:** built from clean worktree `target/option-screen-build` (detached at
+   `ebf720b`, no `-dirty`): `target/release/rof`, SHA-256
+   `55e3383a72d166ee7161d1f21ad759cd3f5b4c7ddf4c9d17c1505ea11247ae95`. The adapter's
+   `runtime-bundle-<sha>` version is computed at trial time (`tools/harbor_rof.py:95`).
+4. **Harbor:** same setup as before, the `harbor-rootlogfix` overlay plus `PYTHONPATH`
+   (`docs/current-benchmark-pilot.md`, "Oracle gate"); working `harbor run -c` caller:
+   `target/tb41-cpu-baseline-20261123/oracle.py`; task trees in `source/tasks/`.
+5. **Check trial:** confirm the version string, exit-code grading (0/3/8), the reward
+   file and per-request usage. It counts toward the $8 cap.
+6. **Write-up (after the 48):** raw jobs in `target/tb41-option-screen-<date>/`, a result
+   note in `docs/experiments/` + `docs/INDEX.md` line, arm-table status in
+   `docs/research-next-steps.md`.
 
-   Then run the 48 runs, one trial at a time, rotating arm order across reps.
-5. **Write up the result.** Raw jobs go in `target/tb41-option-screen-<date>/`.
-   Write a result note in `docs/experiments/` and add it to `docs/INDEX.md`.
-   Update the arm table in `docs/research-next-steps.md`.
-
-**Disk (fixed 2026-11-24):**
-- Docker and containerd storage now live on the `models` partition
-  (`/mnt/models`, 35 GB free).
-- They are bind-mounted onto `/var/lib/docker` and `/var/lib/containerd` via
-  `/etc/fstab`. A systemd `RequiresMountsFor` drop-in keeps the daemons from
-  starting before the mounts are up.
-- `/` has 12 GB free.
-- Build with `CARGO_INCREMENTAL=0` to keep `target/` small.
+Disk: Docker/containerd storage is bind-mounted from `/mnt/models` (35 GB free) via
+`/etc/fstab` with a systemd `RequiresMountsFor` drop-in; `/` has ~9 GB free. Build with
+`CARGO_INCREMENTAL=0`.
 
 ## Done 2026-11-24
 
-- [Harness audit](https://claude.ai/artifact/7SUFD4vh2TaUC4DskWZeAG) covers 109
-  choices, each with a backing label. The full inventories are in
-  `target/no-evidence-census-20261124/`.
-- The [no-evidence census](docs/experiments/2026-11-24-no-evidence-census.md)
-  used zero model calls. It covers 286 logged runs plus a source survey of nine
-  harnesses.
-- Commit `dbf52b6` adds two opt-in options, neither measured on benchmark tasks:
-  - `--exec-output head-tail`
-  - `--rollback-scope errors`
+- **Docs housekeeping** (branch `docs-housekeeping`): 49 notes condensed under a
+  decision-bearing rule (keep every conclusion, caveat and our own measurement; external
+  side detail and finished plan items collapse to pointers). Tracked `.md` words
+  104,955 → 74,791 (−29%). `roadmap.md` is now open work only; its history moved to
+  `decisions.md`. Superseded/void notes are stubs (full text in git at `ebf720b`;
+  `NEXT.md` original in `target/docs-housekeeping-originals/`). Corrections, checked
+  against raw reports: envelope arm 10 of 11 token halts (not 5), easy-miss binary
+  `af0002b`, `hf-model-inference` 3 of 4 recorded runs solved. From the note's own
+  table: slice-a-vs-published has four ≥0.88 misses (adds `sam-cell-seg`). Recount of a
+  lost script: reread census 59 of 1,698 (original 61). Originals, drafts, logs and
+  checks: `target/docs-housekeeping-originals/hk/` (`STATUS.txt` is the ledger).
+  Untouched by choice: `docs/decisions/design*.md` and `docs/architecture/design.md`
+  (reviewed briefs).
+- [Harness audit](https://claude.ai/artifact/7SUFD4vh2TaUC4DskWZeAG): 109 choices with
+  backing labels; inventories in `target/no-evidence-census-20261124/`.
+- [No-evidence census](docs/experiments/2026-11-24-no-evidence-census.md): zero model
+  calls, 286 logged runs plus a nine-harness source survey.
+- `dbf52b6`: opt-in `--exec-output head-tail` and `--rollback-scope errors` (unmeasured on
+  benchmark tasks), plus default-on correctness fixes (exec/test descriptions drop
+  "allowlisted" under `any`; adapter grades only exits 0/3/8, withholds usage after
+  usage-unknown errors, versions trials by binary hash; hysteresis contract text).
+- **Benchmark:** TB 4.1.0 CPU (2026-11-03), the only recent cheap option with a
+  leaderboard; OpenThoughts-TBLite dropped (2026-02-20, fails the September cutoff).
+- **Budget:** under $10 for this campaign.
 
-  It also turns on these correctness fixes by default:
-  - Exec and test descriptions drop "allowlisted" under `any`.
-  - The adapter grades only exits 0, 3 and 8.
-  - The adapter withholds usage after usage-unknown errors.
-  - The adapter versions trials by the binary hash.
-  - The contract text under hysteresis is fixed.
-- Commit `a43c35e` adds the docs, the census, the 2026-11-23 notes and the
-  README.
-- **Benchmark choice: TB 4.1.0 CPU (2026-11-03).** It is the only recent, cheap
-  option with a leaderboard. The 2026-11-23 OpenThoughts-TBLite recommendation
-  is dropped, because TBLite dates to 2026-02-20 and fails the owner's
-  September cutoff.
-- **Owner budget:** under $10 for this campaign.
+## Agents
 
-For delegation, the owner allows OpenCode HY4 Flash Free, Pi DeepSeek Flash and
-Haiku agents through T3.
+Pi DeepSeek flash children each start a rust-analyzer via pi-lens (0.5–1 GB): keep ≤ 6
+concurrent on this 14 GB machine. OpenCode HY4 free failed every task at 9 concurrent.
+Gemini Hydrogen (Antigravity) did the living-docs review; Neon unused.
 
-## Repository and published work
+## Repository
 
-- Active checkout is `knowledge-vault-trial`, eight commits ahead of its local
-  upstream reference `6eaefaa`. The only untracked entry is `goose/`, a separate
-  repository. Check `git status --short --branch` before editing or committing.
-- Verified remote `master` at `0fb593f`. Its README leads with context,
-  tooling and the loop, with container execution described as evaluation
-  infrastructure. The docs-only commits are `a540b0b` and `0fb593f`.
-  The detached master docs checkout is `target/readme-master-20261123/`.
-  The development branch was not merged into master.
-- The owner prefers a concise README with measured claims and scoped results.
+- Branch `docs-housekeeping` off `knowledge-vault-trial` (8 commits ahead of `6eaefaa`).
+  `goose/` is an untracked separate repo. Remote `master` at `0fb593f` (README-first docs).
+- Run adapter tests with Harbor's Python from `tools/`. The pre-commit hook requires every
+  `.md` under `docs/` and the local research notes to appear in `docs/INDEX.md`.
 
-## Results with evidence
+## Evidence pointers
 
-- [Local harness checks](docs/experiments/2026-11-23-local-harness-checks.md).
-  Over 40 scripted 8 KiB reads, retaining five observations cut cumulative
-  request bytes 72% and final request bytes 83%. Archived stdout recovered
-  1 MiB byte-for-byte from a 159-byte collapsed result. Rollback matched all
-  file checks in 16/16 injected failures. These are local mechanism measurements.
-  Runners and raw results are in `target/context-retention-bench-20261123/`
-  and `target/harness-local-checks/`.
-- [Budget-line A/B](docs/experiments/2026-11-23-budget-line-ab.md).
-  Eight Slice A rows. Requests 1/4, legacy 0/4. The pass did not repeat.
-  All rows halted on tokens and the relative efficiency guardrail was undefined.
-  Keep the flag opt-in. Harness price total $0.667861 and the account balance
-  moved from ¥183.19 to ¥179.58. Raw runs in `target/budget-line-ab-20261123/`.
-- Earlier ROF versus Hermes. Regraded copied workspaces for all 36 historical
-  runs with the original checks. Both passed 18/18 on six internal multi-file
-  tasks with three repeats. Same Atria-Dawn-Preview model and verifiers, with
-  harness-specific settings. Mean billed tokens 7,906.5 vs 40,527.9, about 80%
-  fewer for ROF. Suite and workspaces in `~/.local/share/rof-crossbench/`.
-  Usage in `~/.local/share/rof-cost/mf-billed-by-rep.json`.
-- The original 8/8 environment-state claim was wrong. The exact archived arm had
-  2/8 native passes. Removed the claim from the README. The audit is
-  `target/tb41-cpu-baseline-20261123/fidelity-audit.json`.
-
-## Terminal-Bench 4.1 CPU preflight
-
-Frozen inputs and logs are under `target/tb41-cpu-baseline-20261123/`. The
-eight selected task trees match the v4.1.0 source at `4070d6cef56a`. Use
-`source/tasks/`. The registry exports in `tasks/` differ from the tag.
-
-- **Oracle reward 1:** `bun-sourcemap-leak`, `heat-pump-warranty`,
-  `music-harmony`, `ontology-kg-querying` (retry).
-- **No valid reward:** `production-planning`, `risk-scorer-replay`,
-  `rs-archive-clone`. Harbor reports verifier timeouts, but their retry
-  tracebacks fail in Docker Compose image build before the grader.
-- **In progress at handoff:** `nextjs-performance-retry-1`. Check the trial and
-  job result under `jobs/nextjs-performance-retry-1/`. The first attempt had
-  no native reward. The original production job's running counter is stale
-  from the disk-full abort.
-- The original runner exhausted disk. Recovered space by clearing rebuildable
-  local Cargo debug artifacts and selected BuildKit records from completed
-  preflight jobs. Around 3.3 GiB remained at handoff. Preserve `target/` evidence
-  and unrelated Docker state. `retry-oracles.py` writes fresh trial names and
-  checks disk before each attempt. No paid 4.1 baseline ran.
-
-## References and constraints
-
-- [Documentation index](docs/INDEX.md) and [research handoff](docs/research-next-steps.md)
-  track current experiments, earlier decisions and deferred work.
-- Slice A faithful baseline was 5/18 at 300k gross tokens, 60 steps and 120
-  actions. The trace audit found 47/52 failures halted on tokens. Exclude
-  `dna-insert`, `dna-assembly` and `make-mips-interpreter` from validation of
-  changes motivated by the diagnosis because their oracle solutions were read.
-- Agent tree is opt-in and unwired from `rof eval`. Rollback-policy changes
-  and write-plus-exec workflow changes were discussed and remain unbuilt.
-- Run adapter tests with Harbor's Python from `tools/`. The local commit
-  hook requires every documentation note to appear in `docs/INDEX.md`.
+- [Local harness checks](docs/experiments/2026-11-23-local-harness-checks.md),
+  [budget-line A/B](docs/experiments/2026-11-23-budget-line-ab.md) (requests 1/4, legacy
+  0/4, did not repeat; flag stays opt-in).
+- ROF vs Hermes: both 18/18 on six internal multi-file tasks × 3 reps, mean billed tokens
+  7,906.5 vs 40,527.9 (~80% fewer for ROF). Suite `~/.local/share/rof-crossbench/`, usage
+  `~/.local/share/rof-cost/mf-billed-by-rep.json`.
+- The earlier 8/8 environment-state claim was wrong (archived arm: 2/8 native passes);
+  audit `target/tb41-cpu-baseline-20261123/fidelity-audit.json`.
+- TB4.1 CPU preflight (`target/tb41-cpu-baseline-20261123/`, tasks pinned at
+  `4070d6cef56a`): oracle reward 1 on `bun-sourcemap-leak`, `heat-pump-warranty`,
+  `music-harmony`, `ontology-kg-querying`; `production-planning`, `risk-scorer-replay`,
+  `rs-archive-clone` fail in image build; `nextjs-performance` retry ended in
+  `VerifierTimeoutError`. No paid 4.1 baseline ran.
+- Slice A faithful baseline 5/18 at 300k/60/120; 47 of 52 failures halted on tokens.
+  Exclude `dna-insert`, `dna-assembly`, `make-mips-interpreter` from validating
+  diagnosis-motivated changes (oracle solutions were read).
+- Agent tree is opt-in and unwired from `rof eval`. Rollback-policy and write-plus-exec
+  workflow changes remain unbuilt.

@@ -1,128 +1,118 @@
-# Harness capability experiments
+# Harness capability experiments: locally verified, benchmark benefit unmeasured
 
 Archive handle recovery and Harbor `archive_output` / `shell` forwarding are
-implemented and verified locally, including end-to-end recovery through
-`output_read`. The retention pilot has one clean WAL pass at observation keep
-32 and thinking keep 256; the React retention artifact also received reward 1,
-but its provider attempt and accounting were incomplete. These selected-task
-results do not establish general capability improvement. Other experimental
-tool mechanisms remain unmeasured on benchmark tasks, and defaults remain in
-force. See [`research-next-steps.md`](research-next-steps.md) for the bounded
-continuation policy and prepared recipes, and
-[`superpowers/plans/2026-11-11-capability-phases.md`](superpowers/plans/2026-11-11-capability-phases.md)
-for the phased evaluation plan.
-
-The goal is competitive coding-agent performance supported by external benchmark
-results and same-model comparisons. These switches expose hypotheses for testing;
-local regression tests do not establish benchmark improvements. Each switch keeps
-the previous behaviour as its default control.
+implemented and verified locally, including end-to-end `output_read` recovery.
+The retention pilot has one clean WAL pass at observation keep 32 and thinking
+keep 256; the React retention artifact also received reward 1, but its provider
+attempt and accounting were incomplete. These selected-task results do not
+establish general capability improvement. Other experimental tool mechanisms
+remain unmeasured on benchmark tasks, defaults remain in force, and each switch
+exposes a hypothesis for testing while keeping the previous behaviour as its
+default control. Continuation policy and recipes:
+[`research-next-steps.md`](research-next-steps.md); phased plan:
+[`superpowers/plans/2026-11-11-capability-phases.md`](superpowers/plans/2026-11-11-capability-phases.md).
+The goal is competitive coding-agent performance arbitrated by external
+benchmark results and same-model comparisons; local regression tests do not
+establish improvements.
 
 ## Default tool contract
 
-After a trace audit, the built-in tool descriptions were clarified: `exec`
-parses one allowlisted command into argv without a shell, closes stdin, and does
-not support pipes, redirection or command chaining. Quote arguments containing
-spaces. `write` and `edit` operate on paths under the tool root. This is a
-description-only correction; it does not change tool behavior. `test` documents
-the same argv constraints and its PASS/FAIL verdict; archived variants reuse the
-ordinary descriptions with archive and retrieval guidance, but their output
-differs: archived `exec` adds no `[exit N]` marker and archived `test` output is
-not condensed. Until 2026-11-24 both descriptions said "allowlisted" even
-under `--exec-policy any`, which every Harbor run uses; the word is now dropped
-under `any`. The frozen pilot
+A trace audit clarified the built-in descriptions: `exec` parses one allowlisted
+command into argv without a shell (stdin closed; no pipes, redirection or
+chaining; quote arguments containing spaces), `write` and `edit` stay under the
+tool root, and `test` documents the same argv constraints plus its PASS/FAIL
+verdict. Archived variants reuse those descriptions with archive and retrieval
+guidance, but archived `exec` adds no `[exit N]` marker and archived `test`
+output is not condensed. Until 2026-11-24 both said "allowlisted" even under
+`--exec-policy any`, which every Harbor run uses; the word is now dropped under
+`any`. The change is description-only with unchanged behavior. The frozen pilot
 binary remains SHA-256
 `c9a25f9041e54540e03feeb1079a63f9ed0a3dd08c88d841fc7116af52ba3aab`, and any
 benchmark gain from the wording change is unmeasured.
 
 ## Independent controls
 
-The `rof run` command exposes the following experimental controls. The native
-Harbor adapter (`tools/harbor_rof.py`) currently forwards
-`max_tokens`, `observation_keep`, `thinking_keep`, `preserve_failed_checks`,
-`budget_line`,
+`rof run` exposes these experimental controls. The native Harbor adapter
+(`tools/harbor_rof.py`) forwards `max_tokens`, `observation_keep`,
+`thinking_keep`, `preserve_failed_checks`, `budget_line`,
 `archive_output`, `shell`, `workflow`, `reasoning_effort`, `repo_lookup`,
 `repo_evidence`, `collapse_hysteresis`, `completion_check`, `history_read`,
-`compaction`, `context_capacity`, `output_reserve`, and `checkpoint_sources`.
-The adapter also accepts the native task `workdir` (default `/app`). The legacy
-`rof eval --agent` path is separate and does not currently pass
-`thinking_keep` into its run configuration. The remaining listed features are
-not Harbor adapter options; do not treat their presence in the ROF CLI as
-availability in the current Harbor pilot. The table lists run flags; the
-paragraphs below identify the separate adapter and legacy-eval limitations.
+`compaction`, `context_capacity`, `output_reserve`, `checkpoint_sources`,
+`exec_output` and `rollback_scope`, and accepts the native task `workdir`
+(default `/app`). It does not forward `stall_threshold`, `processes`,
+`multi_edit`, `review` or `procedure_file`: presence in `rof run` is not
+availability in the current Harbor pilot.
 
 | Flag | Treatment | Default |
 | --- | --- | --- |
-| `--preserve-failed-checks on` | Keep edits after an executed verification check fails; the check remains failed | off |
+| `--preserve-failed-checks on` | Keep edits after a failed executed check; the check remains failed | off |
 | `--workflow minimal` | Allow exploration before editing; retain normal finish instructions | legacy |
-| `--observation-keep N` | Retain N recent tool observations verbatim | 5 |
-| `--thinking-keep N` | Retain reasoning text for N assistant messages | 2 |
-| `--collapse-hysteresis N` | Batch advances of the observation-collapse boundary | 0 |
-| `--stall-threshold N` | Notice repeated identical failed checks with unchanged source evidence | 0 (off) |
-| `--budget-line requests` | Print the budget line as replies left at the last reply's cost, counting the current one, with no `N/M` figures (`rof run`, `rof eval`, and the Harbor adapter's `budget_line`) | legacy |
+| `--observation-keep N` | Keep N recent tool observations verbatim | 5 |
+| `--thinking-keep N` | Keep reasoning text for N assistant messages | 2 |
+| `--collapse-hysteresis N` | Batch advances of the collapse boundary | 0 |
+| `--stall-threshold N` | Notice repeated identical failed checks with unchanged evidence | 0 (off) |
+| `--budget-line requests` | Print the budget line as replies left at the last reply's cost, counting the current one, no `N/M` figures (`rof run`, `rof eval`, adapter `budget_line`) | legacy |
 | `--archive-output on` | Archive command output and expose paginated retrieval through `output_read` | off |
 | `--shell on` | Add shell composition through the execution wrapper | off |
 | `--processes on` | Add persistent pipe sessions with start/poll/input/stop | off |
+| `--exec-output head-tail` | Exit status first, head and tail of long exec/test output kept, partial output on timeout | legacy |
+| `--rollback-scope errors` | Keep a batch when a call completed and reported failure; denials and tool errors still roll back | all |
 | `--repo-lookup on` | Add bounded literal occurrences and heuristic test-file classification | off |
-| `--repo-evidence on` | Group literal, definition, test-path and configuration candidates; requires lookup | off |
-| `--completion-check CMD` | Run the exact public predicate on Done, with at most one repair continuation and two checks | none |
+| `--repo-evidence on` | Group literal, definition, test-path and configuration candidates; needs lookup | off |
+| `--completion-check CMD` | Run the exact public predicate on Done, at most one repair and two checks | none |
 | `--history-read on` | Restore a historical observation from the current primary WAL; advertises IDs on collapsed results | off |
 | `--checkpoint-sources on` | Label checkpoint facts, hypotheses and plans against the exact supplied source prefix | off |
 | `--multi-edit on` | Validate a set of file edits before applying them | off |
 | `--review on` | Run one fresh-context review and, for a concrete finding, one repair continuation | off |
-| `--procedure-file PATH` | Load an applicable procedure with a recorded content digest (repeatable) | none |
+| `--procedure-file PATH` | Load an applicable procedure with a recorded digest (repeatable) | none |
 
-`--compaction FRAC` stays off by default. Enabling it requires a positive
+`--compaction FRAC` stays off by default; enabling it requires positive
 `--context-capacity N` and `--output-reserve N` below capacity and at least the
-active provider output ceiling (`max(initial_max_tokens, 32768)`). The trigger
-uses `FRAC * (capacity - reserve)`; cumulative run allowance is separate.
-`--checkpoint-sources on` independently labels sourced facts, hypotheses and
-plans; it requires compaction. Malformed summaries preserve history and still
-charge summary usage. Resolving an eligible source ID does not prove a claim.
+active provider output ceiling (`max(initial_max_tokens, 32768)`). The trigger is
+`FRAC * (capacity - reserve)`; the run allowance is separate.
+`--checkpoint-sources on` labels sourced facts, hypotheses and plans
+independently and requires compaction. Malformed summaries preserve history and
+still charge summary usage. Resolving an eligible source ID does not prove a
+claim.
 
 `--history-read on` restores historical ToolResults from the current primary WAL;
 collapsed stubs advertise current WAL-local IDs. It preserves archive handles,
 never replays commands, and rejects `--no-log` or `--review on`. Pages are bounded
 in characters (8,000 default, 32,768 maximum) and input logs at 64 MiB. Historical
 error status is metadata, not a failure of a successful lookup. These controls
-also have underscore-named Harbor equivalents. The legacy eval CLI does not
-expose them or thinking retention/collapse hysteresis. See the
+also have underscore-named Harbor equivalents; the legacy eval CLI exposes
+neither them nor thinking retention/collapse hysteresis. See the
 [phase 3–5 record](phase-3-5-implementation.md) for limits and source mapping.
 
-Pipe sessions, multi-edit, review and procedure loading remain outside this
-Harbor adapter. New controls remain off by default and unmeasured on external
-tasks; exposing an option does not establish a capability gain.
+Shell and process sessions require `--exec-policy any` and inherit the configured
+execution wrapper in container evaluation; host execution grants host code
+execution. Pipe sessions have no pseudo-terminal. Repository lookup is a text
+index, not a semantic call graph. Output archives live outside the deliverable
+workspace, and the retrieval tool accepts run-owned handles; archive limits and
+omitted bytes must be explicit in returned results.
 
-Shell and process sessions require `--exec-policy any`. They inherit the
-configured execution wrapper in container evaluation; host execution grants
-host code execution. Pipe sessions do not provide a pseudo-terminal. Repository
-lookup is a text index rather than a semantic call graph. Output archives are
-outside the deliverable workspace; the output retrieval tool accepts run-owned
-handles. Archive limits and omitted bytes must be explicit in returned results.
+`--thinking-keep` controls transcript retention; `--keep-thinking` controls the
+provider's thinking-suppression setting. The legacy `rof eval --agent` path is
+separate: it sets `thinking_keep` to `None`. The WAL pilot's passing profile used
+observation keep 32 and thinking keep 256 on one task; broader replication remains
+pending in the [pilot record](current-benchmark-pilot.md).
 
-`--thinking-keep` controls transcript retention; `--keep-thinking` controls
-the provider's thinking-suppression setting. `rof run` and the native Harbor
-adapter support `thinking_keep`; the legacy `rof eval --agent` path currently
-sets it to `None`. The WAL pilot's passing profile used observation keep 32
-and thinking keep 256 on one task. Broader replication remains pending in the
-[pilot record](current-benchmark-pilot.md).
+The Harbor adapter's `kwargs.max_tokens` (default 8,000) sets the first request's
+cap; on truncation the provider ladder can raise it through 16,000 and 32,000 to a
+32,768 ceiling, capped rather than doubled. All completed retention experiments
+started at 8,000; a larger starting cap is a separate allocation experiment.
 
-The Harbor adapter exposes the response-budget control as `kwargs.max_tokens`,
-default 8,000. It sets the first request's cap. On truncation, the provider
-ladder can raise it through 16,000 and 32,000 to a ceiling of 32,768; the last
-rung is capped, not a doubling. All completed retention experiments used an
-8,000 starting cap. A larger starting cap is a separate allocation experiment.
+Prepared, not run: `--archive-output on` retrieves output beyond the 8,000
+characters the tool result shows (120-character stub once the observation is
+collapsed) through its run-owned handle (cap 64 MiB per command; omitted bytes
+reported); `--shell on` only with `--exec-policy any`. Compare either knob alone
+against the fixed profile, and test failed-check preservation, retention, minimal
+workflow and starting response cap one at a time. Preflight, holdout and spend
+rules are in [`research-next-steps.md`](research-next-steps.md). New controls stay
+off by default and unmeasured on external tasks: an exposed option is not a
+measured gain, and these recipes imply no benchmark outcome.
 
-Prepared, not run: use `--archive-output on` to retrieve output beyond the
-8,000 characters the tool result shows (or the 120-character stub once the
-observation is collapsed) through its run-owned handle (archive cap: 64 MiB per
-command; omitted bytes are reported); use `--shell on` only with
-`--exec-policy any`. Compare either knob alone against the fixed profile. Also
-test failed-check preservation, retention, minimal workflow, and starting
-response cap one at a time. The exact preflight, holdout and spend rules are in
-[`research-next-steps.md`](research-next-steps.md). These recipes do not imply
-any benchmark outcome.
-
-Preserving a failing check does not grant proof to its edits. Mutation or policy
+Preserving a failing check does not grant proof to its edits; mutation or policy
 errors retain the existing rollback behaviour. Multi-file editing is not an
 operating-system transaction and cannot roll back external services or packages.
 
@@ -131,29 +121,29 @@ operating-system transaction and cannot roll back external services or packages.
 `--repo-lookup on --repo-evidence on` keeps the existing tool arguments (`symbol`,
 optional `limit`) and selects enriched output through run configuration. It groups
 literal locations, heuristic definition candidates, test paths and configuration
-paths under one shared hit limit and an 8,000-character output ceiling. Omitted
-results and scan limits are explicit. These candidates are literal matches, not
-semantic dependency resolution. Without evidence mode, legacy lookup is unchanged.
+paths under one shared hit limit and an 8,000-character output ceiling, with
+omitted results and scan limits explicit. These candidates are literal matches,
+not semantic dependency resolution. Without evidence mode, legacy lookup is unchanged.
 Harbor uses `repo_lookup: true` and `repo_evidence: true`; evidence without lookup
 is rejected. `collapse_hysteresis` accepts a positive integer; absence retains
-ROF's existing default of zero.
+ROF's default of zero.
 
-`--completion-check "python3 -m unittest"` uses the normal `test` tool, command
-policy, execution wrapper, action allowance, deadline and cancellation. It parses
-argv without a shell. Supply only a task/operator-owned public check; hidden
-native graders must never be used. A passing unrelated earlier test cannot
-satisfy this exact predicate. Passing can complete a valid read-only task.
-After the first failed predicate the model gets one repair continuation within
-the original budgets; its next Done is checked once more. Unmet/unknown checks
-are task failures (`FailureKind::Completion`, exit 8), while actual budget or
-cancellation outcomes retain their usual meaning. Tool calls/results and the
-harness origin are logged without fabricated provider usage. Failed checks obey
-`preserve_failed_checks`. Generic verification nudges are disabled for this path.
+`--completion-check "python3 -m unittest"` uses the normal `test` tool with its
+command policy, execution wrapper, action allowance, deadline and cancellation,
+parsing argv without a shell. Supply only a task/operator-owned public check;
+hidden native graders must never be used. An unrelated passing earlier test cannot
+satisfy the exact predicate; passing can complete a valid read-only task. After
+the first failure the model gets one repair continuation within the original
+budgets, and its next Done is checked once more. Unmet/unknown checks are task
+failures (`FailureKind::Completion`, exit 8); budget or cancellation outcomes keep
+their meaning. Tool calls/results and the harness origin are logged without
+fabricated provider usage. Failed checks obey `preserve_failed_checks`, and
+generic verification nudges are disabled on this path.
 
 Harbor's `completion_check` is the exact nonempty command string. `rof run`
 rejects combining completion checks with `--review on`: composing their repair
-opportunities has not been specified or measured. No universal completion rule
-or benchmark improvement is claimed; false rejection must be measured before
+opportunities has not been specified or measured. No universal completion rule or
+benchmark improvement is claimed; false rejection must be measured before
 promotion. Per-hunk `--proof-cmd` admission remains a separate mechanism.
 
 ## Offline paired reporting
@@ -164,8 +154,8 @@ pins a shared protocol, control/treatment runtime hashes and configs, and every
 agent-trial row. Expected task/replicate pairs expose missing attempts in either
 arm. The report separates native artifact rewards from completed/accounted
 comparisons, shows rescue/harm/unchanged outcomes and incomplete pairs, and
-retains failures and interrupted attempts. Gross tokens include cached input
-once, plus output; provider retry usage belongs in its agent-trial row.
+retains failures and interrupted attempts. Gross tokens include cached input once,
+plus output; provider retry usage belongs in its agent-trial row.
 
 See the [input/output contract](phase-0-2-implementation.md) for the schema,
 weighting and zero/unknown semantics. This is an evidence report, not an invoice,
@@ -173,37 +163,35 @@ a budget override or an automatic promotion decision.
 
 ## External evaluation
 
-The current implementation path uses the native Harbor adapter and controlled
-ROF ablations on a pinned release. Published external agent results provide
-context; they are not matched controls when model, endpoint or protocol differ.
-A future compatible agent comparison must match those variables and the task
-slice. Freeze development and held-out tasks before spend. The current four-task
-proposal is a convenience pilot, not a representative suite. Publish per-task
-outcomes, infrastructure failures, retries, settings, usage, wall time and
-uncertainty where estimable. Do not reinterpret named-test counts as task solve
-rates or drop budget-limited failures from the denominator.
-
-Run a control and one changed mechanism before combining changes. Review extra
-inference and candidate generation must be counted in the system's total budget.
-Hidden benchmark tests are only for final grading; they cannot be a runtime
-review, procedure-learning or candidate-selection signal.
+The implementation path is the native Harbor adapter with controlled ROF ablations
+on a pinned release. Published external agent results give context but are not
+matched controls when model, endpoint or protocol differ; a compatible future
+comparison must match those variables and the task slice. Freeze development and
+held-out tasks before spend; the current four-task proposal is a convenience
+pilot, not a representative suite. Publish per-task outcomes, infrastructure
+failures, retries, settings, usage, wall time and estimable uncertainty. Do not
+read named-test counts as task solve rates or drop budget-limited failures from
+the denominator. Run a control and one changed mechanism before combining
+changes; review inference and candidate generation count against the system's
+total budget. Hidden benchmark tests are final grading only and cannot be a
+runtime review, procedure-learning or candidate-selection signal.
 
 ## Review and procedure retrieval
 
 Review receives the original task and a bounded patch, with file reads/search
-available for further inspection. Its context is fresh and its tool access is
+available for further inspection; its context is fresh and its tool access
 read-only. It has at most two logical model requests (provider retries still
-apply); a concrete structured finding can
-start one repair phase. Every phase shares the original BudgetGuard, deadline
-and cancellation token. Review refusal or invalid output is recorded as unknown;
-it is not approval of the patch. A suggested reproduction is a hypothesis for
-the repair phase to investigate using available checks.
+apply), and a concrete structured finding can start one repair phase. Every phase
+shares the original BudgetGuard, deadline and cancellation token. Review refusal
+or invalid output is recorded as unknown, not as approval of the patch; a
+suggested reproduction is a hypothesis for the repair phase to investigate with
+available checks.
 
 Each procedure file is one JSON object with nonempty `id`, `cue`, `instruction`
-and `source_repositories` fields. The last field is an array of repository IDs;
-the others are strings. The cue matches the original task case-insensitively.
-File content is frozen once, bounded and hashed. Eval provenance records hashes
-and selected IDs. Procedure loading does not establish learned transfer.
+and `source_repositories` fields; the last is an array of repository IDs, the
+others are strings. The cue matches the original task case-insensitively. File
+content is frozen once, bounded and hashed, and eval provenance records hashes and
+selected IDs. Procedure loading does not establish learned transfer.
 
 ## Offline procedure distillation
 
@@ -211,9 +199,9 @@ and selected IDs. Procedure loading does not establish learned transfer.
 prompt without model calls. The corpus has a `pairs` array; each pair contains
 `task_id`, `success` and `failure`. Both attempts name the same `repo_id` and a
 `path` to an agent-visible trace. Use development trajectories, not held-out
-evaluation data. The helper bounds the input, rejects grader/secret markers,
-and records source hashes. These filters do not establish that arbitrary input
-traces are free from contamination; the caller must supply appropriate data.
+evaluation data. The helper bounds the input, rejects grader/secret markers, and
+records source hashes. These filters do not establish that arbitrary input traces
+are free from contamination; the caller must supply appropriate data.
 
 Explicit `--execute --model MODEL --endpoint URL --budget-tokens N
 --output-dir NEW_DIR` launches ROF to write procedure proposals. Proposals remain
@@ -222,22 +210,21 @@ required before promotion. This command is paid when connected to a paid model.
 
 ## Alternative candidates
 
-`python3 tools/rof_candidates.py PLAN.json` runs two candidates in separate
-copies of a source directory. Required plan fields are `source_dir`, `binary`,
-`out_dir` (new), `model`, `goal`, `alternative_goal`, `check` (a public command argv
-array), `budget_tokens`, `budget_steps`, `budget_actions` and
-`total_timeout_seconds`. Optional fields are `endpoint` and `extra_args`.
-The runner splits declared caps between candidates and uses a shared deadline.
-ROF's token caps retain their existing grace/overshoot semantics; this helper
-does not provide a hard provider spending quota. Use the campaign's reservation
-proxy when spending paid-pilot funds.
+`python3 tools/rof_candidates.py PLAN.json` runs two candidates in separate copies
+of a source directory. Required plan fields are `source_dir`, `binary`, `out_dir`
+(new), `model`, `goal`, `alternative_goal`, `check` (a public command argv array),
+`budget_tokens`, `budget_steps`, `budget_actions` and `total_timeout_seconds`;
+optional fields are `endpoint` and `extra_args`. The runner splits declared caps
+between candidates and uses a shared deadline; ROF's token caps keep their
+grace/overshoot semantics, so this helper is not a hard provider spending quota.
+Use the campaign's reservation proxy when spending paid-pilot funds.
 
-The first candidate passing the fixed public check is selected; if neither
-passes, the control is retained as a fallback, not labelled a success. Both
-workspaces, logs, final cumulative usage and selection evidence are preserved
-under `out_dir`. Explicit local check inputs are fingerprinted to reject a
-candidate changing its own check. This is not a tamper-resistant grader: host
-processes have host permissions and separate work directories do not isolate
-external services or container state. Hidden benchmark tests cannot be used as
-the selection command. This helper is an explicit experiment, not automatic
-branching inside the runtime loop.
+The first candidate passing the fixed public check is selected; if neither passes,
+the control is retained as a fallback, not labelled a success. Both workspaces,
+logs, final cumulative usage and selection evidence are preserved under `out_dir`.
+Explicit local check inputs are fingerprinted to reject a candidate changing its
+own check. This is not a tamper-resistant grader: host processes have host
+permissions, and separate work directories do not isolate external services or
+container state. Hidden benchmark tests cannot be used as the selection command.
+This helper is an explicit experiment, not automatic branching inside the runtime
+loop.

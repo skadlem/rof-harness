@@ -6,7 +6,8 @@ published-easy misses coin flips, making the single-rep 5/18 baseline unreadable
 
 Setup: 3 reps each of `dna-insert`, `dna-assembly`, `make-mips-interpreter`, frozen recipe
 (300k gross tokens / 60 steps / 120 actions), `--exec-policy any`, steers off, deliverable
-shadow on, binary at `1dd9a56`. Rows: `~/.local/share/rof-tb/work/variance-reps-2026-11-13/`.
+shadow on, binary at `af0002b` (`binary_git_sha` in all nine reports). Rows:
+`~/.local/share/rof-tb/work/variance-reps-2026-11-13/`, reports in `reports/`.
 
 ## Result (measured)
 

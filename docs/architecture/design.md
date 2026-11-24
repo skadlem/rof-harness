@@ -230,7 +230,7 @@ KNOWN DEBT:
     documented; the alternate shape exists but is not the default.
   - ~~Compaction's capacity check passes the run-wide token allowance where a
     context-window capacity belongs.~~ CORRECTED 2026-11-11: already fixed —
-    `request.rs:445-448` passes `context_capacity_tokens - output_reserve_tokens`
+    `request.rs:484-488` passes `context_capacity_tokens - output_reserve_tokens`
     into `compaction_due`, and `--compaction` requires both flags. The stale
     claim survives in `docs/research-next-steps.md`; that doc is corrected too.
   - `--exec-policy any` removes the allowlist inside the container because the

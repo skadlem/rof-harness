@@ -1,657 +1,73 @@
 # Roadmap
 
-Ordered and spend-gated. Design decisions anchor to `docs/decisions.md`;
-measured numbers carry a date and live with the run artifacts.
+Ordered and spend-gated plan of open work. Decision records and measurements live in
+[decisions](decisions.md); current state, deferred gates and campaign handoff live in
+[research-next-steps](research-next-steps.md).
 
-## Capability implementation sequence (2026-11-11)
+## Open work (ordered)
 
-The active [phased plan](superpowers/plans/2026-11-11-capability-phases.md)
-implements the direct paper audit through disjoint GPT-6 Luna workers and root
-integration. Phases 0–4 are implemented and locally verified: pinned reference, offline paired
-reporting, Harbor lookup/hysteresis, repository evidence and public completion
-checks, historical restoration and capacity/source checkpoints. The
-[implementation record](phase-3-5-implementation.md) gives contracts
-and limitations. Existing archive recovery and Harbor archive/shell forwarding
-remain the foundation; no benchmark effect is established for these additions.
+1. **TB4.1 CPU option screen (current next step, 2026-11-24):**
+   [tb41-option-screen](superpowers/plans/2026-11-24-tb41-option-screen.md). Four TB4.1.0 CPU
+   tasks (`bun-sourcemap-leak`, `heat-pump-warranty`, `music-harmony`, `ontology-kg-querying`,
+   pinned at `4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`) × 4 Harbor arms (control,
+   `exec_output: "head-tail"`, `rollback_scope: "errors"`, `max_tokens: 32768`) × 3 reps = 48
+   runs at 300k gross tokens / 60 steps / 120 actions (`max_tokens: 8000` control,
+   `--exec-policy any`, `--steer off`), ~$4 estimated, $8 hard stop. Owner approved only the one
+   `heat-pump-warranty` adapter-check trial so far (48-run spend approval pending); a working
+   DeepSeek key exists, so it is not blocked on a key.
+2. **Phased capability sequence (2026-11-11):**
+   [capability-phases](superpowers/plans/2026-11-11-capability-phases.md). Phases 0–4 landed
+   locally and opt-in ([phase-0-2](phase-0-2-implementation.md),
+   [phase-3-5](phase-3-5-implementation.md)); Phase 5 paused on an unknown-usage reset.
+   Remaining open sequence: development screening → held-out confirmation on untouched TB4.1.0
+   CPU tasks, admitting promotions only on held-out solve gain within ≤1.3× tokens per solved
+   task and the USD ceiling.
+3. **Opt-in mechanisms awaiting benchmark validation or observed-need gates:**
+   - `--compaction FRAC` (with `--context-capacity` and `--output-reserve`),
+     `--history-read on` and `--checkpoint-sources on`: implemented off; gated on observed
+     prompt pressure and irrecoverable-evidence loss in traces (`architecture.md`,
+     `research-next-steps.md`).
+   - `--repo-lookup on` / `--repo-evidence on`, `--completion-check`, `--archive-output on`,
+     `--shell on`, `--budget-line requests`: implemented off; single-knob development arms when
+     prioritized (`harness-experiments.md`, `research-next-steps.md`).
+   - `--agents FILE` (stage 1 read-only `spawn`/`wait`): implemented off, unwired from
+     `rof eval`; stages 2–3 rejected at load (`decisions.md`).
+   - **Parked nits** (only if earned): search depth cap, `/app` word-boundary in goal mapping,
+     assemble budget accounting, `finalize_dump` exit code.
+   - **Superseded Slice A items (2026-11-06):** broader portfolio baseline (0b: `dna-assembly`,
+     `raman-fitting`, `model-extraction-relu-logits`, `break-filter-js-from-html`,
+     `make-mips-interpreter`, ~$0.60) and near-miss rep top-ups (item 6) are parked/superseded
+     under the TB2.1 → TB4.1.0 benchmark transition ([deepseek-official-pilot](deepseek-official-pilot.md)).
 
-Order: freeze contracts/reference → offline paired reporting and existing Harbor
-controls → evidence-aware lookup plus a targeted public completion predicate →
-controlled development runs → held-out confirmation. Historical restoration is
-implemented/off; demonstrated evidence loss and prompt pressure still gate
-experiments with restoration or compaction/provenance. These phases do not add runtime
-subagents or a planner. No new benchmark result is claimed by this plan.
+## Historical state and closed items (collapsed)
 
-Report rescue and harm, retain budget-limited failures, and distinguish artifact
-reward from run completion and accounting. Promising development candidates may
-be retained above the deployment token ratio; production admission still requires
-held-out capability evidence and the 1.3x guardrail. The existing USD ceiling and
-the revised bounded-continuation accounting policy remain hard constraints.
-
-The proposed four-task slice is a convenience pilot and is not a suite score or
-certified historically unseen holdout. Recheck official release relevance,
-actual disk/image capacity, native oracle readiness and preserved accounting
-before any paid run. Deferred items and revisit criteria remain in the
-[handoff](research-next-steps.md#deferred-work-register).
-
-## Output fidelity handoff (2026-11-11)
-
-Capability remains the objective; ≤1.3x tokens per solved task is the guardrail.
-The official CPU reference is TB4.1.0 (63 tasks; release tag `v4.1.0`, commit
-`4070d6cef56a7d20cb5dc98d5e10ada88a6b9440`, verified 2026-11-10). Recheck the
-official release before future spend. The original campaign stopped with one unknown request. On 2026-11-11 the owner
-explicitly authorized a new bounded continuation subledger capped at $0.661849662,
-preserving the $2.158150338 carried upper bound (including the $0.324172800 unknown
-reservation) under the unchanged $2.82 total ceiling. The old attempt remains
-incomplete and its ledger unchanged. The first new development comparison was
-original lookup versus no lookup, with history/compaction off. It stopped after
-one interrupted Cargo control (artifact 0.0): 25 receipts/26 requests, with a new
-unknown reservation. No pair completed. Aggregate upper bound is $2.519179098;
-no further paid calls under the current stop.
-Details: [current continuation](phase-3-5-implementation.md) and
-[historical pilot](current-benchmark-pilot.md).
-
-Archive recovery plus Harbor `archive_output` / `shell` are implemented and
-verified locally through end-to-end `output_read`; scoped tests, Clippy and fmt
-passed. No benchmark effect is established for those fixes. The retention pilot
-has one clean WAL task pass; broader capability gains are unestablished and
-defaults are unchanged. The
-next work is prepared only: release and hash pinning, free native oracle gate,
-fresh development tasks plus untouched holdouts, and single-knob comparisons of
-existing Harbor controls with `--archive-output on` and `--shell on`. Do not use
-hidden verifier feedback for selection; add independent control resampling only
-when evaluating extra inference. Recipes and the explicit deferred-work register
-are in [`research-next-steps.md`](research-next-steps.md); opt-in controls are
-listed in [`harness-experiments.md`](harness-experiments.md). No new experiment
-result is claimed here.
-
-## Official DeepSeek campaign (2026-11-10)
-
-The owner authorized a new **$2.82** ceiling on the official DeepSeek account,
-with credentials in the repository's ignored `.env.deepseek`. Use published web
-results for external agent reference points; the owner excluded Pi comparisons.
-Spend this campaign on ROF controls and focused ablations under Harbor, with
-unchanged task instructions and verifiers. The preregistered development slice,
-accounting rules and historical outcomes are in `docs/deepseek-official-pilot.md`.
-Historical DPHN ledgers below belong to separate campaigns/accounts.
-The TB2.1 slice is now superseded by the owner's recency correction; no further
-paid attempts should use it. The verified latest stable release is TB4.1.0,
-published 2026-11-03, with a 63-task CPU edition. The current protocol is in
-`docs/current-benchmark-pilot.md`; the requested Space's source and cost review
-is in `docs/harness-leaderboard-review.md`. Current DeepSeek docs
-also document low/high/max reasoning effort; the October no-effect probe below
-does not establish current API behavior.
-
-## Direction reset (2026-11-10)
-
-The owner reaffirmed the goal: a coding agent with competitive frontier-system
-benchmark results, plus same-model comparisons that establish the harness's
-contribution. The first external comparison should use ROF and a compatible
-established agent on the same pinned benchmark, model snapshot and task slice.
-Develop on that slice, diagnose paired disagreements, and reserve unseen tasks
-for final evaluation. Internal tests establish implementation correctness only.
-
-The owner authorized implementation of the twelve capability proposals with
-GPT-6 Luna workers. The implementation contract and status are in
-`docs/harness-capability-plan.md`. Unmeasured mechanisms remain opt-in, and the
-historical checklist experiment below is superseded as the top priority by the
-external comparison. Implementation tests use scripted providers; this does not
-authorize exceeding the cumulative paid-pilot budget.
-
-## Budget update (2026-11-05)
-
-The owner authorized $5 additional spend for the steering pilot, raising the cumulative ceiling to $10. The fresh campaign stopped without an eligible result: both heap-control verifiers lacked CTRF output after the `uv` download failed, and the retry also encountered an HTTP 524 with unknown usage. The proxy denied subsequent requests. Its ledger accounts for or reserves $4.83727350, including five unknown-usage reservations; this is not the billed amount. Verify the task verifiers before further paid work and carry all reservations into any newly registered campaign. The proxy assumes regular DeepSeek V4.1 Flash 1017 peak rates, not an independently verified dphn account quota. The full protocol and historical records remain in `docs/steering-experiment.md`.
-
-## Current state (2026-11-06)
-
-- **Corrected-pipeline capability map (all numbers above the fold are measured):**
-  log-summary 3/3 solved, kv-store-grpc 3/3 solved (fresh 0/7 cell, ~$0.01/row),
-  hf-model-inference 2/3 (r1 died on the task's own 900s agent wall at 28 steps;
-  r2/r3 solved in 309-352s), custom-memory-heap-crash 0/3 at its 5/6 floor with
-  the crux test failing *even with* `--exec-policy any` and `gdb`/`valgrind` in
-  hand, video-processing 0/1 at its 2/5 floor, query-optimize 0/1 wall-clocked at
-  900s after 12 steps. Excluded: mcmc (no rstan), protein-assembly and
-  sanitize-git-repo (broken gold). Read: the harness works at this model tier on
-  ordinary tasks; the legacy headroom cells are hard for the model, not broken by
-  a missing lever.
-- **Five fidelity/measurement defects found and fixed today, each with a
-  test:** build-context workspace seeding, `/tests` visible to the agent, no
-  agent wall clock, `task.toml` timeouts never parsed (`timeout_sec` vs
-  `timeout_secs`, and both sections), and the in-container git
-  `safe.directory` + empty-workdir baseline pair. Every pre-fix in-container
-  capability reading is void on cells whose verifier tests could not move.
-- **The initiative nudge layer is measured-dead and ships off (`dphn-steer2`,
-  12 rows, $0.89).** Two cells with measured corrected baselines x 3 reps x 2
-  arms (`--steer on|off`, differing by that flag only, `--streak-steer off` in
-  both): capability identical everywhere — cmhc 0/3 vs 0/3 with every row at the
-  5/6 floor and the crux test never passed by either arm, log-summary 3/3 vs 3/3
-  at 2/2 — while on the solved cell the nudges cost **2.64x gross tokens per
-  solved task** (175,657 vs 66,620), 2x the steps (22 vs 11) and 2.7x the wall
-  (155s vs 56s); cmhc is token-capped in both arms (0.98x). Mechanism was
-  verified, not assumed: every `off` WAL carries zero nudge text, every `on` row
-  fired (log-summary declare hold 2x + wrap-up 1x per rep; cmhc wrap-up 1x, plus
-  one half directive in r3). Default flipped to off (`--steer on` re-enables),
-  nudges flagged measured-dead and kept as the substrate for a future gate.
-  Limit: 2 cells x 3 reps is a deletion check on those tasks, not a capability
-  estimate.
-
-- **In-container workspaces were the Docker build context, not the task
-  workspace — fixed, and it invalidates in-container capability rows on four of
-  the five cells used so far.** `fresh_workdir` seeded `/app` from
-  `<task>/environment`; that directory is the build context. Measured with zero
-  model calls: `custom-memory-heap-crash` `environment/` = {Dockerfile,
-  patches/, program/} while image `/app` = {main.cpp, user.cpp, user.h}, and its
-  verifier md5-checks and compiles `/app/main.cpp` — a structurally impossible
-  0/6 whatever the model does. Same shape on mcmc ({Dockerfile, task-deps/} vs
-  {data.csv}), query-optimize ({Dockerfile, task-deps/} vs {my-sql-query.sql,
-  oewn.sqlite}) and log-summary ({Dockerfile, generator} vs {logs/, 164 files,
-  6 MB}); only video-processing coincided. A banked paid row shows it in-run: the
-  model's first `ls -la` in `/app` returned `Dockerfile patches program`.
-  In-container now resets the workdir from the image (`cp -a /app/.`, chowned to
-  the host uid so host-side `edit`/`write` keep working); host mode keeps
-  `environment/` because it has no image. Preflight after the fix: heap 6 tests,
-  pristine workdir 0/6 reward 0, gold solve 6/6 reward 1; log-summary 2 tests,
-  pristine 0/2, gold 2/2. Both verifiers run again (the earlier `uv` failure was
-  transient network: `apt-get update` and the astral download both work).
-- **`/tests` was mounted for the whole run, so the agent could read the
-  grader.** Harbor mounts only `/logs`, the agent dir and artifacts for the
-  agent phase and uploads `tests/` inside `Verifier.verify()` (checked in the
-  installed harbor source). One baseline row opened `/tests/test.sh` and
-  `/tests/test_outputs.py` before working. Fixed the same way: the container
-  starts without `/tests` and the frozen snapshot's tests are `docker cp`-ed in
-  right before `bash /tests/test.sh`.
-- **Measured floor on the corrected workspace (3 rows, `dphn-seedfix-base`,
-  $0.32): cmhc 0/3 resolved and 5/6 named tests is the FLOOR.** A pristine
-  image-seeded workdir with no agent work already scores 5/6 reward 0 (only
-  `test_release_build_runs_without_crash` fails); the gold solution scores 6/6
-  reward 1. All three rows: Unresolved, 5/6, `halt=tokens`, 286-293k tokens,
-  41-44 steps, 14-19 reads / 0-3 writes, zero nudges. So pass^1 is 0/3 before
-  and after the seed fix, the fix restored the floor rather than exposing a
-  near-miss, and cmhc arms must be read as pass^1 plus "did it break the
-  floor". The old 0/6 was *below* floor — the build-context seed failed tests
-  the untouched sources pass.
-- **Fourth and fifth gaps, same family, both fixed: `task.toml` timeouts were
-  never read (the loader looked for `timeout_secs`, the file says `timeout_sec`,
-  and it appears in both `[verifier]` and `[agent]` with different values per
-  task), so every cell ran on the 1800s default — too tight for
-  video-processing (3600) and too loose for query-optimize (900). Section-aware
-  parsing now feeds separate agent and verifier budgets, and the agent budget is
-  the wall clock. Also measured: `mcmc-sampling-stan` is a **blocked cell** — its
-  reference solution fails in-image (`no package called 'rstan'`), pristine is
-  2/6, and a paid row burned 291k tokens in 1,743s before its verifier hung for
-  the full 2,100s timeout. It is dropped from cell selection.
-- **Third fidelity gap found and fixed: the agent phase had no wall clock.**
-  `inst.timeout_secs` bounded only the verifier, so an agent row ran until the
-  token/step caps; the first map row on mcmc was still working at ~2,100s where
-  harbor's `[agent] timeout_sec=900` would have stopped it. Agent rows now cancel
-  at that limit through the same token Ctrl-C uses (clean `Outcome::Cancelled`,
-  `RunEnd` still emitted, workdir still graded) and record
-  `halt_reason = agent wall timeout (...)` so a timeout is never read as a model
-  failure. Rows banked before the fix all ran under 900s except the voided mcmc
-  row, so their readings stand.
-- **Pipeline validity re-established (3 rows, `dphn-seedfix-base2`, $0.14):**
-  `log-summary-date-ranges` — the cell the broken-seed arms "solved" — is
-  **3/3 Resolved, 2/2 tests** on the corrected pipeline (124s/112s/69s, 14-32
-  steps, 72-226k tokens, 1-5 reads / 2-9 writes), with zero `/tests` mentions
-  in the event logs and ctrf present in all three. One task x three reps is a
-  pipeline check, not a capability estimate. Campaign spend to date: $0.5786
-  over 6 banked rows plus 3 upload-failure rows and 1 provider-404 row, all
-  retained under `pilot-seedfix/void/`.
-- Consequence: `dphn-effort`, `dphn-effort2` and the single banked `dphn-steer`
-  row measured a *different task* on cmhc, mcmc and query-optimize (and a
-  generator-reconstructed variant on log-summary). Their within-arm comparisons
-  stay internally paired, but no capability claim about those benchmark tasks
-  survives, and the read-starvation pathology (23-33 reads, 0-1 write on cmhc)
-  is at least partly the wrong workspace rather than a model habit. Read-streak
-  counts on the corrected workspace: 14-19 reads per row, 0-3 writes.
-- No spend since the pause. The stopped ledger still reports `denied=true`
-  ($4.8372735 of $10 accounted or reserved, five unknown-usage reservations); a
-  new campaign must carry all of it.
-
-## Current state (2026-11-05)
-
-- `--streak-steer on|off` implements the proposed treatment, default off; both arms log threshold crossings, and treatment logs request/response delivery. Local scripted and Docker rehearsals verified the paired driver and treatment markers without paid calls.
-- The paid pilot is stopped with one eligible heap control (Unresolved, 0/6 verifier tests, 286,477 input and 19,368 output tokens; threshold crossed). Its treatment crossed and was delivered but was interrupted before grading when one provider attempt had unknown usage. The pair is incomplete; no capability conclusion follows.
-- The earlier budget ledger retained $3.80367360 for three HTTP 403/1010 attempts and a full reservation for another unknown-usage attempt, totaling $4.30645020 accounted or reserved before the fresh campaign. The original 403 was reproduced without credentials as a Cloudflare block caused by the proxy's Python user agent; forwarding the harness user agent fixes that problem. The proxy refuses the next request immediately after any unknown usage.
-
-## Current state (2026-11-03)
-
-- Reliability fixes landed in `32f6b36`. Historical event logs replayed against the old and new parser sources show 74 argument differences in 2,609 exec calls across 86 completed logs; the replay did not execute historical commands or establish a verdict change. The selection is completed logs, not a curated benchmark sample, and individual historical binaries were not verified against those two source versions. Recorded tool output was already condensed, so its raw-output counterfactual is unavailable.
-- A local scripted-provider check on real containers graded a synthetic known-answer task Resolved and a deliberately failing task Unresolved, with task/image identities recorded and containers cleaned up. A reused output directory with a planted stale success still graded Unresolved. This is a pipeline check, not a Terminal-Bench capability measurement.
-- The old `dphn-steer` driver stays paused: its frozen binary predates the reliability fixes and the banked row cannot be combined with new-binary results. The newly registered feasibility protocol is in `docs/steering-experiment.md`; the treatment is opt-in; subsequent pilot status is recorded above. The owner authorized paid calls up to $5, assuming regular DeepSeek V4.1 Flash 1017 pricing.
-
-## Current state (2026-10-19)
-
-- **Reasoning effort is now a request knob** (`--reasoning-effort` on `run`
-  and `eval`), because a $0 probe showed the harness ran every arm at the
-  endpoint's default while the gateway honors `none|low|high|xhigh|max`
-  (0/722/1060/1149/2976 reasoning tokens on one prompt; 236 -> 568 inside
-  `rof run` at equal caps; api.deepseek.com ignores the field). The level
-  rides `EndpointProfile`, is off by default (byte-identical body) and is
-  recorded in the report provenance, so effort rows never pool with
-  frozen-recipe rows. Reasoning length is bounded by `max_tokens`, and the
-  overflow ladder raises that ceiling on a truncated attempt.
-- **The unpriced-spend warning gate is closed.** A run whose model has no
-  price-book entry now says on stderr, once, that the `$` cap is inert and
-  that the token/step caps are the guards.
-- **The reasoning-effort dial has now been measured and is not a
-  capability lever** (`dphn-effort`, 18 rows, 2026-10-19): zero named-test
-  flips, and the manipulation itself only moved median reasoning tokens
-  1.23x (per-pair 0.42x-2.4x), so the endpoint's default reasoner already
-  matches the task on real tool-loop turns. Every **passive** dial — caps,
-  step envelope, tool allowlist, path resolution, goal text, reasoning
-  effort — is therefore measured out at this model tier. Passive is the
-  operative word: a **state-triggered** gate (a deterministic rule that
-  inspects trajectory state and blocks an action) is a different class,
-  only ever tested once here (`VerifyHold`, 2026-10-06, no-shipped on two
-  cells that could not show the effect) — see the literature sweep below.
-- **Literature sweep 2026-10-19** (local report `lit-sweep-2026-10-19.md`, four
-  researcher lanes, primary sources): three results change the picture and
-  two levers are now foreclosed by measurement. (a) Deterministic
-  state-triggered gating is real at our model class — LivePlan
-  (arXiv:2608.06701) monitor-only, no advisor LLM, +1.7 to +5.8 pp on
-  213-234 instances; the full method needs an advisor *stronger* than the
-  executor, which we do not have. (b) Reward-free harness search is real at
-  our exact family — SelfSearch (arXiv:2609.37968) 65.2 -> 73.0 on TB 2.1
-  with a deepseek-v4-flash executor at matched limits and 12% lower cost,
-  search $4.03 — but it is a re-architecture (editable substrate + 20
-  episodes), not a knob. (c) Agent-written oracles *hurt* at a fixed model
-  (ExecCritic, 61.2 -> 57.3), and prompt-text levers on TB 2.1 are null at
-  13x our n (-1.50 to +2.25 pp, arXiv:2610.22289). Google's Harness²
-  (arXiv:2610.14224) was reviewed at primary-source level and the deferred
-  search gate **stays closed**: no attempts-matched ablation is reported,
-  its floor is 4 executor rollouts + 3 importer sessions per task against a
-  1.3x tokens-per-solved rule, its wins are per-task workspace-fact
-  injection, and its release has no base fallback.
-- **Measurement rules from the sweep (binding on future claims).** At 21 tasks
-  the paired MDE is 40.8 / 32.2 / 28.8 pp at 1 / 2 / 3 reps and never drops
-  below 20.4 pp, so no arm is justified by a smaller expected solve-rate
-  delta; task count is the power lever, reps buy reliability only. The honest
-  headline is **pass^1 with a paired, task-clustered CI** (pass@k is an order
-  statistic, and using unit-test counts as `n` inflates scores by 0.85-0.97
-  absolute). **Named-test counts are never capability percentages** — one
-  pilot reads 0.80 macro test-pass against 0.20 task resolution, and 19.7 % of
-  previously passing patches are semantically wrong. Verifier/environment
-  variance (94.3 % -> 65.5 % from a reward defect; -5.3 to -9.2 pp from tool
-  descriptions) is larger than the effects this repo chases, so per-row
-  pre-flight classification plus a known-answer control belongs in provenance,
-  not in prose.
-
-## Current state (2026-10-18)
-
-Five arms measured on the in-container leg in one session (68 graded cells,
-deepseek-v4.1-flash via a vLLM gateway, reward-file estimand, frozen recipe):
-the envelope axis (token-cap shape, doubled step envelope) is **dead** — it
-moves walls and not capability; the command allowlist was a real friction and a
-fix (`--exec-policy any`) removes it with no capability effect; the file tools
-refused the workspace spelled `/app/...` as the task statements spell it, which
-is fixed (correctness; the solved regression cell now finishes in ~half the
-steps and tokens); and one **capability-positive** lever exists: a generic
-completion checklist in the goal converts deliverable-verification defects
-(5/6 → 6/6) but changes nothing on cells that fail on accuracy. Each arm's rows
-self-describe through the provenance block; no arm's rows pool with another's.
-
-## Current state (2026-10-16)
-
-- A second experiment endpoint is wired: `deepseek-ai/DeepSeek-V4.1-Flash`
-  behind a vLLM gateway (`lighthouse.dphn.ai/run/text-v/v1`). Verified by
-  live probes: tool calls work, prefix-cache reads are reported, thinking
-  arrives under `reasoning` (the adapter now reads that as a fallback and
-  still prefers `reasoning_content` when both keys are present), and
-  DeepSeek's `thinking:{type:disabled}` knob is accepted but ignored. The
-  endpoint is **unpriced** for this harness (it reports a cost on only
-  some routes), so dollars are `null` there by design and the token/step
-  caps are the operative guards.
-- The **compaction premise was refuted by measurement before spend**: the
-  landed `--compaction FRAC` trigger compares a *per-request* prompt
-  estimate against `frac x token budget`, but the frozen recipe's budget
-  is *cumulative billed tokens*. Measured per-request prompts in the
-  banked arms top out at 18.0k tokens (median 2-3k), so the registered
-  0.7 x 300k = 210k trigger cannot fire, and the 20k verbatim-keep budget
-  exceeds a whole prompt. The knob is a context-window guard mis-keyed to
-  a spend cap; the registered validation arm is inert and returns to
-  design.
-
-## Current state (2026-10-12)
-
-- The live frontier is in-container eval: `rof eval --agent
-  --in-container` runs the agent inside the task environment container
-  (installed packages and live services persist into grading) and grades
-  from the task-written reward file (estimand fix landed with the
-  2026-10-12 commit sequence; exit-code-only grading was retired after it
-  read always-zero verifier exits as passes).
-- Measured on the frozen TB Slice A (21 tasks): 26 banked in-container
-  cells (glm-5.3-flash, frozen recipe 300k tokens / 60 steps / 120
-  actions), reward-verified **6 Resolved / 19 Unresolved / 1 infra**
-  (2026-10-12; re-derived from the summary artifact 2026-10-13 — an
-  earlier note that read 6/17/1 summed to 24 and was an arithmetic slip).
-  The env-mutation family (installed-by-the-agent imports,
-  a live server) is winnable in-container and structurally impossible
-  under the file-copy grading bridge.
-- The file-artifact widening read **4/18 solved**
-  (break-filter-js-from-html, hf-model-inference,
-  log-summary-date-ranges, sam-cell-seg; 2026-10-12).
-- Every report self-describes (2026-10-13): the provenance block
-  carries the binary git sha (embedded at build time), the agent-leg
-  budget recipe including the token-cap shape, the apply mode, and the
-  estimand label — `Ungraded` (plain eval), `HarborOracle` (`--agent`),
-  `InContainerReward` (`--agent --in-container`). Reports written before
-  the block existed still deserialize.
-- The budget-shape knob landed OFF by default (2026-10-13):
-  `--budget-shape gross|miss-plus-out` on `rof run` and `rof eval`.
-  `miss-plus-out` charges `(input - cache_read) + output` against the
-  token cap (reported usage and dollars stay gross); it is a different
-  estimand from `gross`, recorded on every provenance block, and its
-  first arm run is still owner-gated spend.
-
-## Next (ordered, spend-gated)
-
-0a. **Re-measure the completion checklist in the goal — the only lever that was
-   ever capability-positive, and the top spend item (2026-11-06).** `dphn-goalchk`
-   converted a 5/6 into a 6/6 solve (its deliverable worked where it was written
-   but not where an evaluator runs it); the verdict is void because it ran under
-   the build-context seed. Re-register on the faithful pipeline against a cell
-   with a measured floor: `hf-model-inference` (2/3, wall-bound, live-server
-   deliverable, ~24s verifier) first, then `kv-store-grpc` (3/3, ceiling control).
-   PASS = a named test the control never passes in >=2 of 3 pairs; KILL = no
-   named-test difference, in which case the lever is retired with a measured
-   basis instead of a void one. Estimated $0.15-0.30.
-0b. **Broader pass-rate baseline on the valid portfolio cells** (dna-assembly
-   ~$0.05/row, raman-fitting, model-extraction-relu-logits, break-filter-js-from-html,
-   make-mips-interpreter; all pristine 0/N with gold passing). One number — pass^1
-   per cell at 3 reps — that every future lever gets measured against. ~$0.60 for
-   five cells. Do this before any second lever, not after.
-
-0. **Steering ablation (`dphn-steer`) — PRE-REGISTERED 2026-10-19, PAUSED at
-   owner request after 1/18 rows; the pause found a design defect first.**
-   **SUPERSEDED 2026-11-06: its premise is void.** The workspace-seeding bug
-   above means cmhc/query-optimize rows were reading a Docker build context, so
-   the read-starvation streaks that motivate the re-keyed trigger are not
-   evidence about the benchmark task. Do not resume this arm or the frozen
-   `pilot-steer/rof-steer` binary.
-   **RE-REGISTERED 2026-11-06 as `dphn-steer2`** (owner approved spend) on the
-   corrected pipeline: binary `a6da984` (md5 `b2f696dc`), arms `--steer on|off`
-   differing by that one flag, `--streak-steer off` in both, 2 cells x 3 reps x
-   2 arms = 12 rows with matched windows (r1 on→off, r2 off→on, r3 on→off).
-   Cells from the corrected baseline, not the old firing tables:
-   custom-memory-heap-crash (0/3 resolved, 5/6 floor, crux test
-   `test_release_build_runs_without_crash`) and log-summary-date-ranges (3/3
-   resolved 2/2). Measured mechanism: log-summary fires declare hold 2/1/2 and
-   the wrap-up once per row; cmhc fires the wrap-up once per row and never the
-   declare hold; the half directive needs 60 actions and cmhc makes 41-44
-   steps, so it stays unreachable and untested. KILL = `off` >= `on` on pass^1
-   in both cells and `on` never wins the cmhc crux test in >=2 of 3 pairs => the
-   default flips off and the nudges are flagged measured-dead. PASS = `on` wins a
-   named test `off` never wins in >=2 of 3 pairs at <=1.3x tokens/test-passed.
-   The forensics below stay valid as facts about the old code:
-   The state-triggered gate as originally registered was **unbuildable, and
-   the forensics are the finding**: `VerifyHold` (the declare hold) is an
-   ancestor of the current branch, so it has shipped in every in-container
-   arm — it just emits no event and is invisible in our dumps. Counting the
-   hold text in banked WALs: it fires **6/6, 3/4, 4/4, 3/4** on
-   log-summary-date-ranges and **0/6, 0/4, 0/4, 0/4** on mcmc, video,
-   cmhc and make-mips. A declare-keyed gate needs a *declare*, and every
-   headroom row dies on the token cap before issuing one — so gates of that
-   shape are structurally unreachable on the cells we fail. What *is*
-   reachable is read-only starvation: cmhc runs 55-68 steps with 23-33 reads
-   and 0-1 writes; query-optimize 9-20 reads with 0-7 writes; the solved
-   cell never exceeds a 2-read streak. And that nudge exists too ("0 edits so
-   far after N actions. Stop reading. Apply your first edit NOW."). So the
-   real open question is a **deletion test**: three initiative nudges ship by
-   default (declare hold, half/late action directives, wrap-up) and none has
-   ever been ablated in-container. New knob `--steer on|off` (default on =
-   byte-identical; `off` keeps the workflow contract and rollback notice, so
-   the ablation isolates the nudges). Arms on/off x 3 reps over cmhc (nudges
-   fire), query-optimize (1/6) and log-summary (2/2, where the hold fires
-   6/6) = 18 rows. PASS: `on` passes a named test `off` never passes in >=2
-   of 3 reps at <=1.3x tokens per test-passed. KILL: `off` >= `on` everywhere
-   => the default flips to off and the nudges are flagged measured-dead (they
-   remain the substrate for a future gate).
-   **Pause finding (measured, 2026-10-19):** the two starvation nudges are
-   keyed to caps that never bind — the half directive needs 60 *actions* of a
-   120-action cap, but cmhc rows make only 54-68 tool calls before the 300k
-   token cap kills them, and the completed `on` row's WAL shows no
-   "Stop reading" text at all (only the budget wrap-up). So the ablation would
-   mostly compare the wrap-up nudge against nothing. This is the third
-   intervention measured to be mispositioned the same way (declare hold needs
-   a declare, which failing rows never reach; action directives need
-   60/96 actions; both are keyed to the envelope while the *token* cap binds).
-   **Resume requires re-keying the trigger to a reachable signal** — N
-   consecutive read-only file-tool calls (streak >= 6 is reached in cmhc rows,
-   7-9 observed, and the solved cell never exceeds 2) — not a fraction of a
-   non-binding action cap. Binary frozen at `pilot-steer/rof-steer`
-   (md5 `eedca26f`, build `ca2c164`); the driver is skip-guarded, so a rerun
-   executes only the 17 missing rows.
-1. **Model swap — RETIRED 2026-10-19 (owner directive + vendor card).**
-   `deepseek-v4.1-flash` is the frontier-tier model here, and its **1017
-   snapshot (2026-10-17)** is a large step above its predecessor on agentic
-   benchmarks (vendor card: Terminal-Bench 4.0 **42.3** vs 31.2 for the prior
-   snapshot, 37.9 GLM-5.3, 39.9 GPT-5.6 Sol; DeepSWE v1.1 77.0 vs 74.2;
-   MIT weights, 1M context). A cheaper-tier substitute is therefore not the
-   lever, and no further model reps are bought. The sweep's shortlist stays in
-   local report `models-2026h2-shortlist.md` as a record, and one correction from
-   it survives: every published number for those candidates is a **vendor**
-   claim, so vendor rows rank candidates and never predict our solve rate.
-2. **Zero-cost instrumentation: a pairwise, answer-key-free judge — PARKED
-   2026-11-06.** The motivation was "arms stop returning tie-at-zero-solves", but
-   every graded row now carries per-test CTRF named results, which are a stronger
-   and cheaper signal than a judge; the free validation surgery (banked solved vs
-   failed workdirs) stays available if a future arm needs a signal where tests are
-   uninformative. Original note: From
-   Harness2's selector and RRSI (local report `harness-steals-2026h2.md` steal
-   1 + 2): score two anonymised deliverables of the same task against each
-   other instead of against a hidden verifier, so arms stop returning "tie at
-   zero solves". Validate it **for free** against the banked (solved, failed)
-   workdirs before trusting it, and add RRSI's noise-adjusted floor + cost
-   rule as pure functions in `eval`. Instrument only — it cannot make a
-   capability claim on its own.
-
-3. **Wire fidelity against the vendor's own encoder — DONE 2026-11-06
-   (zero-cost diff; local untracked report `wire-fidelity-2026-11-06.md`; outcomes in
-   `docs/decisions.md`; one claim refuted by banked cache data, nothing
-   changed).** DeepSeek released
-   `github.com/deepseek-ai/deepseek-recipe` (MIT, Rust) — a protocol-aware
-   toolkit that converts Chat Completions/Messages/Responses requests into
-   DeepSeek V4/V4.1 prompts and parses output back. `provider-openai`
-   hand-rolls exactly that surface and infers the wire from 400s. Two things
-   it already settled: (a) reasoning effort on V4.1 is a **prompt line**
-   (`Reasoning Effort: {1-100}`, low=50 / absent=75 / max=100), not a request
-   field — see Next 4; (b) `reasoning_content` presence in thinking mode is
-   vendor behavior with an empty string allowed, which corroborates our
-   shape-based belt. The item itself is a **diff, not a port**: read the
-   vendor's conversion for the shapes we construct, and pin any disagreement
-   with a test. No dependency, no rewrite.
-4. **Native effort channel (`dphn-effort2`) — MEASURED 2026-10-19, KILL
-   RULE TRIGGERED: the effort axis is dead with a *delivered* treatment.**
-   18 rows, same binary, the arms differing only by the vendor line
-   (`Reasoning Effort: 100 (range 1-100, ...)`) prepended to a task copy's
-   instruction. One named-test flip in 9 treated rows
-   (`test_jump_analyzer_imports`, video r1, 3/5) — 1 of 3 reps, so the
-   registered >=2-of-3 rule fails, and that test has flipped as variance
-   before. Mechanism did not deliver either: median reasoning tokens 6,558 →
-   8,283 = **1.26x** against a >=1.5x rule, even though the same marker
-   measures 4.0x on an ungrounded prompt — because rows die on the token cap
-   and reasoning length is set by the task, not the marker. Guardrail 1.26x
-   tokens per test-passed with *fewer* tests passed, and the solved
-   regression cell got slower (17-23 steps / 71-107k control vs 26-38 /
-   129-270k treatment). Caveat: mcmc is rstan-bimodal and all three treatment
-   rows hit the env-failure class, so that cell is uninformative again.
-   Portable finding: **in-loop reasoning effort is only weakly steerable**,
-   which is what both channels measured. No further effort work at this
-   model/endpoint.
-5. **Reasoning-effort arm (`dphn-effort`) — MEASURED 2026-10-19, KILL RULE
-   TRIGGERED: the effort dial is not a capability lever.** 18 in-container
-   rows on one binary, the arms differing by one flag (control vs
-   `--reasoning-effort max`). No named verifier test flipped in any treatment
-   row that a control row had not already passed: query-optimize 1/6,1/6 ->
-   0/6,0/6, video the same three fails in all four rows, cmhc 0/6 everywhere,
-   and the arm's only solve was a *control* row. The manipulation itself
-   under-delivered — median reasoning tokens +1.23x against a pre-registered
-   1.5x, per-pair ratios 0.42x-2.4x — so the honest claim is "this knob does
-   not raise effort on tool-loop turns", not "effort does not help"; the raw
-   probe's 497 -> 2976 tokens came from a short ungrounded prompt, and on real
-   turns the endpoint's default already sits near the task's natural reasoning
-   length. Guardrail also failed (1.54x tokens per test-passed). No further
-   effort or wording variants. With this, every harness-side dial that does
-   not need a different model has been measured: same named failures survive
-   more budget, more steps, a full toolchain, `/app`-correct paths, a stricter
-   goal and more reasoning.
-
-6. **Near-miss rep top-ups** (if they earn the spend): the
-   partial-credit cells (1/3, 1/2, 2/4, 2/3 test shapes) are the
-   cheapest capability information per cell.
-7. **S-1 compaction experiment** — BLOCKED, premise refuted
-   2026-10-16 (see Current state): the landed trigger keys on per-request
-   prompt size while the recipe's budget is cumulative billed tokens, so
-   it cannot fire at any plausible `frac`. Re-design first (trigger on
-   spent-vs-cap, keep-budget scaled to real prompts), then re-register a
-   pass rule; do not run the original arm.
-   **Update 2026-11-14:** the trigger was since changed to compare one
-   request against `--context-capacity` minus `--output-reserve`
-   (`context::compaction_due`; see `research-next-steps.md`, "Separate context
-   capacity from cumulative token allowance"). It is still a per-request
-   trigger, so it fires only when the capacity is set near the real request
-   size (about 10k tokens on Slice A; the reserve must be at least 32,768).
-   It remains off and has no benchmark result.
-8. **File-tool `/app` parity — FIXED 2026-10-18 (correctness, no capability
-   claim).** Joining denials to their tool arguments showed the largest
-   file-tool denial class was the workspace spelled the way task statements
-   spell it (`/app/<file>`): the host-side tools root elsewhere, so agents
-   were refused the files they were told to edit and fell back to `exec cat`.
-   The resolver now strips a leading `/app/` (strictly additive, traversal /
-   secrets / git refusals unchanged, pinned by test). A two-binary A/B (12
-   rows) shows the class gone, no test moved on the failing cells, and the
-   already-solved regression cell reached the same result in about half the
-   steps and tokens. What is left is container-only paths (`/tests`), which
-   host-side tools cannot serve — serving them would let the agent read the
-   verifier's tests, a fairness decision deliberately not taken.
-9. **In-container exec policy — MEASURED 2026-10-18: mechanism confirmed,
-   capability unconverted.** `--exec-policy allowlist|any` landed (default
-   allowlist, recorded as a required provenance field). The measured
-   friction is real — 83% of banked in-container rows hit a tool denial and
-   the denied set included the tasks' own toolchains — and the treatment
-   removed it completely (allowlist denials 3-9 per row -> 0). But on the
-   three cells chosen because their zeros looked like denial artefacts, the
-   freed toolchain converted nothing: the same named tests fail in every
-   arm, at the same steps and tokens, and the solved regression cell stays
-   solved. So the zeros on this slice are capability/semantic, not policy:
-   the published in-container solve numbers do not need a re-label, the knob
-   stays flagged mechanism-validated / capability-unconverted, and no
-   further policy arms are planned.
-10. **Envelope arm — MEASURED 2026-10-16/18, KILL RULE TRIGGERED.** Three
-   matched arms (control = frozen recipe; shape = miss-plus-out at the
-   same cap; joint = miss-plus-out plus a doubled step/action envelope)
-   over two headroom cells and one already-solved regression cell. The
-   envelope moved walls but not capability: on one cell it converted a
-   token-death into a step-death and then into 87 of 120 steps (1.85x
-   steps, 3.0x gross input) while the same single failing test survived in
-   every arm — a semantic requirement, not budget. Tests per treated cell
-   were flat, tokens per test passed were 1.85x/2.35x against a 1.3x rule.
-   No further cap/envelope arms; near-miss top-ups stay parked.
-11. **Budget-shape arm run** — MEASURED 2026-10-14 (first arm,
-   4 near-miss cells, owner-authorized): the pre-registered gate
-   (more solves at ≤1.3× dollars-per-solved) **failed** — 0/4
-   solves on both shapes, arm cost 1.42×, tests flat-to-down. The
-   mechanism itself is confirmed (the token-dead cells migrated to
-   the step cap, consuming 1.6–1.7× the gross arm's input), and the
-   frozen recipe now binds both caps nearly together (84.6%/99.8%
-   of the miss+out cap at step death), so raising either cap alone
-   just moves the wall. The knob stays OFF by default, opt-in via
-   `--budget-shape`, flagged mechanism-validated /
-   capability-unconverted.
-12. **Rivals grid comparisons** — DONE 2026-10-14 (free): the legal
-   tables are computed and published in the local analysis artifact
-   (L1/L2 screening, L4/L5 single-arm cost+solve tables). Cross-harness
-   cost is not computable (rival logs carry no usage fields); pass-rate
-   deltas sit below the noise floor. Estimands and arms never mix.
-
-## Deferred / gated (build only when the gate opens)
-
-Reconsideration gate = the concrete conditions under which building it
-starts making sense. Both gates below were reviewed against the 2026
-literature on 2026-10-13 and deliberately stay closed.
-
-- **Harness-search outer loop** (an agentic proposer rewrites harness
-  code, reads every prior candidate's traces and scores from disk, and
-  keeps the best by frozen-model score; the arXiv:2603.28052 lineage
-  plus the 2026 cluster — arXiv:2604.25850, arXiv:2608.01918,
-  arXiv:2608.23041, arXiv:2609.38349): deferred, reconsider when BOTH
-  (a) a cross-harness grid shows a reproducible capability or cost gap
-  this harness could plausibly close by code search, and (b) the suite
-  is large enough to measure the loop's own improvement — by the
-  arXiv:2610.04433 noise-floor calibration, hundreds of tasks for
-  pass-rate deltas, or a cost-metric loop on the frozen slice. One
-  published run costs ~60 harness candidates over hours with up to
-  10M tokens of diagnostics per evaluation; at 21 tasks its gains
-  would be indistinguishable from rerun noise.
-  **Reviewed and closed 2026-10-19** (local report `harness2-teardown.md`,
-  local report `harness-steals-2026h2.md`): Harness2 (arXiv:2610.14224) is the
-  verifier-free member of this cluster and does **not** open either
-  condition. It reports no attempts-matched ablation (best-of-k is defined
-  and never numbered), its cost floor is 4 executor rollouts + 3 importer
-  sessions per task, its wins are per-task workspace-fact injection on
-  34-100 tasks x 3 streams with deltas inside 1 SD, and it needs a mounted
-  8-file harness surface this binary does not have. SelfSearch
-  (arXiv:2609.37968) is the same shape without a reward signal and with a
-  10-generation, 2-lineage editable-substrate requirement. Condition (b)
-  is weakened, not satisfied: a reward-free search needs no suite to
-  *drive* it, but a suite is still needed to *validate* a gain.
-- **Orchestration / policy meta-layer above harnesses** (a layer that
-  supervises running agents — cross-harness delegation, live policies,
-  session control): deferred, reconsider when this harness runs
-  unattended on machines its author does not own or is driven by more
-  than one operator. The measured core is already shipped: the command
-  allowlist and policy gate cut attack effects at small utility cost
-  (arXiv:2610.07639), and multi-agent orchestration stays out of
-  scope by the no-planner/no-MAS rule.
-- **Bet C (candidate racing)**: not wired until a workload shows
-  proof-gate interventions (zero in all measured runs to date). The winner
-  selection exists (`bets::pick_winner`, `RaceConfig` in
-  `crates/bets/src/race.rs`) but nothing calls it.
-- ~~**Unpriced-model spend warning**: gate triggered 2026-10-16, CLOSED
-  2026-10-19.~~ A run whose model has no price-book entry prints one stderr
-  warning naming the inert `$` cap and the operative token/step caps
-  (`cli::budget_for`; `provider_openai::prices_model` is the single
-  predicate), so an unpriced run never looks guarded. The other half of the
-  gate — a per-endpoint price book — is still unbuilt by choice: no price is
-  invented. **Superseded:** an armed `$` cap on an unpriced model is now a
-  refusal, not a warning (`cli::spend_guard_error`, exit 7); the one-time
-  warning prints only with `--allow-inert-spend-cap`. See `architecture.md`.
-- **Dynamic / lossy context** (owner idea, 2026-11-06; the per-read
-  summarizer is not built. Since then these related pieces landed, all off by
-  default and without a benchmark result: `--compaction` with
-  `--checkpoint-sources`, `--history-read`, and `--archive-output` with
-  `output_read`): keep a summary plus the extracted facts in context instead of the
-  long source, and re-acquire the source when it is needed again. There is no
-  web tool (the default registry is `view`/`search`/`edit`/`write`/`exec`/`test`;
-  shell, processes, repo-lookup, multi-edit and `--mcp` servers are opt-in;
-  network is otherwise reachable only through `exec`), so the payloads this would shrink
-  are `view` bodies, `search` dumps and `exec` output — the same share the
-  token cap already binds on. Reconsider when BOTH (a) an offline replay of
-  banked event logs attributes the binding wall on failing cells to those
-  result bodies rather than to reasoning or tool round-trips (the cmhc rows
-  die at the 300k cap after 23-33 reads / 0-1 writes, so this is
-  candidate-visible, not measured) and (b) retention can be scored without a
-  judge — e.g. re-fetch fidelity against the banked workdirs. Two named costs:
-  the failure mode is silent (the dropped line is the one that mattered) and
-  an LLM-mediated summarizer adds one model call per long read whose selection
-  quality is unverifiable at fixed model. Cheaper first step if the gate ever
-  opens: `view` already caps and pages by offset, so measure the cap's hit rate
-  before adding a summarizer.
-- **Parked nits** (only if they earn it): search depth cap, `/app`
-  word-boundary in goal mapping, assemble budget accounting,
-  finalize_dump exit code.
-
-## Known ceilings (documented upgrade paths)
-
-- In-container containers hardcode `--cpus=2 / --memory=4096m`
-  (upgrade: parse `[environment]` from task.toml per task).
-- Timeout/cancel kill the docker-exec client; the in-container process
-  may outlive it (upgrade: docker kill or exec-session tracking).
-- Root-owned in-container artifacts survive host-side `git clean`
-  during batch rollback. Measured across 70 banked in-container rows:
-  snapshot-class halts in 5, of which 4 are this class — fail-soft in
-  3 (the row still grades) but a **hard halt** in 2, including one that
-  voided a run at step 3 (2026-10-16) and one at the end-of-run patch
-  digest (`halt=snapshot` on install-windows-3.11, 2026-10-14).
-  Upgrade: make the workdir agent-owned inside the container (chown
-  before rollback/digest) or digest via a root-readable copy.
+- `2026-11-11` Output fidelity handoff, $2.82 ceiling, $0.661849662 subledger and Phase 5 stop:
+  see [phase-3-5-implementation](phase-3-5-implementation.md) and
+  [research-next-steps](research-next-steps.md#objective-and-current-state).
+- `2026-11-10` Official DeepSeek campaign, TB4.1.0 selection and direction reset: see
+  [deepseek-official-pilot](deepseek-official-pilot.md),
+  [harness-capability-plan](harness-capability-plan.md) and
+  [harness-leaderboard-review](harness-leaderboard-review.md).
+- `2026-11-06` Corrected-pipeline capability map, `dphn-steer2`, `dphn-seedfix-base`/`base2`,
+  `--exec-policy any` (`dphn-env1`), workspace/tests/timeout/git fixes, and `mcmc` exclusion: see
+  [decisions](decisions.md).
+- `2026-11-05` Steering pilot ($10 cumulative cap, HTTP 403/524 stop, voided 2026-11-06): see
+  [steering-experiment](steering-experiment.md) and [decisions](decisions.md).
+- `2026-11-03` Reliability fixes (`32f6b36`) and parser replay: see [fix-plan](fix-plan.md) and
+  [decisions](decisions.md).
+- `2026-10-19` Reasoning effort (`dphn-effort`, `dphn-effort2` killed), model-swap retirement,
+  literature sweep and measurement rules: see [decisions](decisions.md).
+- `2026-10-18` Five in-container arms (envelope kill, exec policy, `/app` parity, completion
+  checklist): see [decisions](decisions.md),
+  [allowlist-and-named-deliverable](experiments/2026-11-11-allowlist-and-named-deliverable.md) and
+  [next-after-slice-a](superpowers/plans/2026-11-11-next-after-slice-a.md).
+- `2026-10-16` Second vLLM gateway endpoint and compaction premise refutation: see
+  [decisions](decisions.md).
+- `2026-10-12/14` In-container eval estimand, provenance block, `--budget-shape` arm and rivals
+  grid: see [decisions](decisions.md) and [current-benchmark-pilot](current-benchmark-pilot.md).
+- Deferred work register (`harness-search`, `adaptive predictors`, `memory/compaction`, `MAS`,
+  `review/candidates`, `schema/KV`, `Bet C`): see
+  [research-next-steps](research-next-steps.md#deferred-work-register).
+- Known container/rollback ceilings (`--cpus=2 / --memory=4096m`, docker-exec descendants,
+  root-owned artifact rollback): see [decisions](decisions.md) and
+  [architecture](architecture.md#guarantee-limits-and-runner-scope).

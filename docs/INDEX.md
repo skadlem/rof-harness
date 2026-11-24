@@ -1,7 +1,7 @@
 # Knowledge index
 
 Map of every note in this repo. Read this first; open only what the question needs.
-Status: **active** (current, edit freely) · **record** (finished result, don't rewrite) · **superseded → X** (read X instead) · **void** (premise was wrong).
+Status: **active** (current, edit freely) · **record** (finished result; may be condensed, never given new claims) · **superseded → X** (read X instead) · **void** (premise was wrong).
 Update this file in the same commit as adding, superseding or voiding a note.
 
 ## Start here
@@ -9,7 +9,7 @@ Update this file in the same commit as adding, superseding or voiding a note.
 | Need | Read |
 |---|---|
 | Rules for working in this repo | [AGENTS.md](../AGENTS.md) |
-| What to do next | [research-next-steps.md](research-next-steps.md) (canonical), then the newest session state: [next-after-slice-a](superpowers/plans/2026-11-11-next-after-slice-a.md) (2026-11-12) |
+| What to do next | [SESSION-NEXT.md](../SESSION-NEXT.md) (session handoff), then [research-next-steps.md](research-next-steps.md) (canonical state and deferred register) |
 | Why something is the way it is | [decisions.md](decisions.md) (decision log, with measurements) |
 | How the system works | [architecture.md](architecture.md) |
 | Ordered plan | [roadmap.md](roadmap.md) |
@@ -17,11 +17,11 @@ Update this file in the same commit as adding, superseding or voiding a note.
 ## Plans
 
 - [capability-phases](superpowers/plans/2026-11-11-capability-phases.md) — phased capability plan · **active** (0–4 done, 5 stopped, 6 evidence-gated)
-- [envelope-phases](superpowers/plans/2026-11-11-envelope-phases.md) — response to the architecture review · **proposed, unstarted**
-- [next-after-slice-a](superpowers/plans/2026-11-11-next-after-slice-a.md) — state after Slice A: 5/18, $1.56 left · **active** (2026-11-12)
+- [envelope-phases](superpowers/plans/2026-11-11-envelope-phases.md) — response to the architecture review · **record** (P0+P1 shipped 2026-11-11; P2 never launched; envelope axis closed)
+- [next-after-slice-a](superpowers/plans/2026-11-11-next-after-slice-a.md) — state after Slice A: 5/18; P1–P4 closed · **record** (2026-11-12)
 - [output-fidelity](superpowers/plans/2026-11-11-output-fidelity.md) — archive access + Harbor controls · **record** (done)
-- [tb41-option-screen](superpowers/plans/2026-11-24-tb41-option-screen.md) — three single-field arms (head-tail output, errors-only rollback, 32k responses) vs control on four TB4.1 CPU tasks, ~$4 · **proposed, unstarted**
-- [roadmap](roadmap.md) — ordered, spend-gated plan · **active**
+- [tb41-option-screen](superpowers/plans/2026-11-24-tb41-option-screen.md) — three single-field arms (head-tail output, errors-only rollback, 32k responses) vs control on four TB4.1 CPU tasks, ~$4 · **proposed** (owner approved the adapter-check trial only)
+- [roadmap](roadmap.md) — ordered plan of open work; history lives in decisions.md · **active**
 - [research-next-steps](research-next-steps.md) — handoff + deferred-work register · **active**
 - [harness-capability-plan](harness-capability-plan.md) — the twelve 2026-11-07 proposals · **record**
 - [fix-plan](fix-plan.md) — five reliability fixes · **record** (all shipped)
@@ -45,8 +45,8 @@ Update this file in the same commit as adding, superseding or voiding a note.
 - [current-benchmark-pilot](current-benchmark-pilot.md) — TB 4.1 ROF pilot, eight paid rows
 - [harness-experiments](harness-experiments.md) — capability experiments log
 - [phase-0-2-implementation](phase-0-2-implementation.md) · [phase-3-5-implementation](phase-3-5-implementation.md) — what each phase shipped
-- [deepseek-official-pilot](deepseek-official-pilot.md) — **superseded** (benchmark-recency correction)
-- [steering-experiment](steering-experiment.md) — **void** (workspace-seeding bug, 2026-11-06)
+- [deepseek-official-pilot](deepseek-official-pilot.md) — **superseded → [current-benchmark-pilot](current-benchmark-pilot.md)** (benchmark-recency correction; stub)
+- [steering-experiment](steering-experiment.md) — **void** (workspace-seeding bug, 2026-11-06; stub)
 - 2026-11-11 Slice A session, in order:
   [oracle-preflight](experiments/2026-11-11-slice-a-oracle-preflight.md) →
   [triage](experiments/2026-11-11-triage.md) →
@@ -59,7 +59,7 @@ Update this file in the same commit as adding, superseding or voiding a note.
   [zero-write-prevalence](experiments/2026-11-11-zero-write-prevalence.md) →
   [hf-within-task](experiments/2026-11-11-hf-within-task.md) (zero-write gate fails) →
   [allowlist-and-named-deliverable](experiments/2026-11-11-allowlist-and-named-deliverable.md)
-- [reread-census](experiments/2026-11-12-reread-census.md) — re-reads are 3.6% of tool calls; collapse does not explain the token deaths · **record**
+- [reread-census](experiments/2026-11-12-reread-census.md) — re-reads are 3.5–3.6% of tool calls (59–61 of 1,698; recount of a lost script); collapse does not explain the token deaths · **record**
 - [deliverable-forcing-arm](experiments/2026-11-12-deliverable-forcing-arm.md) — step-15 directive is read and ignored, 0 of 4; control re-run solved despite the step-15 flag · **record**
 - [easy-miss-variance](experiments/2026-11-13-easy-miss-variance.md) — 0 of 9 reps on the three published-easy misses; they are stable misses, `dna-insert` 1 in 5 · **record**
 - [exec-observation-bugs](experiments/2026-11-13-exec-observation-bugs.md) — exec mangled 78 of 1,698 banked commands and hid 79 silent failures; both fixed, effect on solve rate unmeasured · **record**
@@ -77,8 +77,9 @@ Update this file in the same commit as adding, superseding or voiding a note.
 ## Root files
 
 - [README.md](../README.md) — project overview and current measurements
-- [NOTES_FOR_PI.md](../NOTES_FOR_PI.md) — older handoff (state as of 2026-11-06) · **superseded → research-next-steps + next-after-slice-a**
-- `NEXT.md`, `folder-hierarchy.md` — local-only (git-excluded); NEXT.md is the old session log
+- [NOTES_FOR_PI.md](../NOTES_FOR_PI.md) — older handoff (state as of 2026-11-06) · **superseded → research-next-steps + next-after-slice-a** (stub)
+- [SESSION-NEXT.md](../SESSION-NEXT.md) — session handoff: state, decisions, next task · **active**
+- `NEXT.md`, `folder-hierarchy.md` — local-only (git-excluded); NEXT.md is the old session log, now a stub · **superseded → roadmap + research-next-steps** (full text: `target/docs-housekeeping-originals/NEXT.md`)
 
 ## Research (`research/`, read-only input, local-only)
 
