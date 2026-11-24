@@ -96,8 +96,18 @@ class RofAgent(BaseInstalledAgent):
 
     @override
     async def install(self, environment: BaseEnvironment) -> None:
-        await self.ensure_system_dependencies(environment, ("git",))
         git = await environment.exec(command="command -v git", user="root")
+        if git.return_code:
+            apt = await environment.exec(command="command -v apt-get", user="root")
+            if apt.return_code == 0:
+                await environment.exec(
+                    command="apt-get update && apt-get install -y --no-install-recommends git",
+                    user="root",
+                    env={"DEBIAN_FRONTEND": "noninteractive"},
+                )
+            else:
+                await self.ensure_system_dependencies(environment, ("git",))
+            git = await environment.exec(command="command -v git", user="root")
         if git.return_code:
             raise RuntimeError("ROF requires git in the task environment")
         missing = [

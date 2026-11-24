@@ -94,6 +94,44 @@ class HarborRofOptionsTest(unittest.IsolatedAsyncioTestCase):
         argv = await self.run_agent(reasoning_effort="xhigh")
         self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "xhigh")
 
+    async def test_install_uses_no_install_recommends_for_git_on_apt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in (
+                "rof",
+                "ld-linux-x86-64.so.2",
+                "libc.so.6",
+                "libm.so.6",
+                "libgcc_s.so.1",
+            ):
+                (root / name).write_bytes(b"x")
+
+            class AptEnv:
+                def __init__(self):
+                    self.commands = []
+                    self.has_git = False
+
+                async def exec(self, *, command, **kwargs):
+                    self.commands.append(command)
+                    if command == "command -v git":
+                        return SimpleNamespace(stdout="", return_code=0 if self.has_git else 1)
+                    if command == "command -v apt-get":
+                        return SimpleNamespace(stdout="/usr/bin/apt-get\n", return_code=0)
+                    if "apt-get install" in command:
+                        self.has_git = True
+                    return SimpleNamespace(stdout="", return_code=0)
+
+                async def upload_file(self, src, dst):
+                    pass
+
+            env = AptEnv()
+            agent = RofAgent(logs_dir=root, model_name="openai/m", runtime_dir=root)
+            await agent.install(env)
+            self.assertIn(
+                "apt-get update && apt-get install -y --no-install-recommends git",
+                env.commands,
+            )
+
     async def test_lookup_and_hysteresis_are_independent(self):
         lookup = await self.run_agent(repo_lookup=True)
         self.assertIn("--repo-lookup", lookup)
