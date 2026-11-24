@@ -1,27 +1,34 @@
-# Session handoff · 2026-11-24
+# Session handoff · 2026-11-25
 
-## Pick up here: run the TB4.1 option-screen check trial
+## Pick up here: owner approval for the 48-run TB4.1 option screen
 
 Plan: [tb41-option-screen](docs/superpowers/plans/2026-11-24-tb41-option-screen.md)
 (4 tasks × 4 arms × 3 reps = 48 runs, ~$4 price-book, hard stop $8; arms: control,
 `exec_output: "head-tail"`, `rollback_scope: "errors"`, `max_tokens: 32768`).
 
-1. **Approval:** the owner approved only the one `heat-pump-warranty` control trial
-   (adapter check), not the 48 runs. Ask again before the 48.
-2. **Key and balance:** use the key from `~/.pi/agent/auth.json` (`deepseek.key`; the
-   budget-line A/B used it, `target/budget-line-ab-20261123/run.py:46`) or the repo's
-   git-ignored `.env.deepseek`. Live balances 2026-11-24: Pi key ¥174.08 CNY, repo key
-   $5.36 USD. `~/.config/jcode/deepseek.env` is a dead key; do not use it. Read the
-   balance (`GET https://api.deepseek.com/user/balance`) before and after.
+1. **Approval:** the `heat-pump-warranty` adapter-check control trial is **done** (see below);
+   the 48 runs still need owner spend approval before launching.
+2. **Key and balance:** `.env.deepseek` (repo key) live balance after the check trial:
+   **$5.33 USD** (moved from $5.36 USD; $0.03 billed vs $0.0697 peak price book). Pi key
+   (`~/.pi/agent/auth.json`, `deepseek.key`) live balance: **¥157.46 CNY**.
+   `~/.config/jcode/deepseek.env` is a dead key; do not use it. Read the balance
+   (`GET https://api.deepseek.com/user/balance`) before and after.
 3. **Runtime:** built from clean worktree `target/option-screen-build` (detached at
-   `ebf720b`, no `-dirty`): `target/release/rof`, SHA-256
-   `55e3383a72d166ee7161d1f21ad759cd3f5b4c7ddf4c9d17c1505ea11247ae95`. The adapter's
-   `runtime-bundle-<sha>` version is computed at trial time (`tools/harbor_rof.py:95`).
+   `5159e17`, no `-dirty`), bundled in `target/option-screen-runtime/`: `rof` SHA-256
+   `5947b121322700c070c72c1c5984585d1f588fc345153355c2231aa5375cddc6`, Harbor version
+   `runtime-bundle-5947b121322700c0` (confirmed in trial `result.json`).
 4. **Harbor:** same setup as before, the `harbor-rootlogfix` overlay plus `PYTHONPATH`
-   (`docs/current-benchmark-pilot.md`, "Oracle gate"); working `harbor run -c` caller:
-   `target/tb41-cpu-baseline-20261123/oracle.py`; task trees in `source/tasks/`.
-5. **Check trial:** confirm the version string, exit-code grading (0/3/8), the reward
-   file and per-request usage. It counts toward the $8 cap.
+   (`harbor-rootlogfix:<repo>`, `docs/current-benchmark-pilot.md`, "Oracle gate");
+   working `harbor run -c` config:
+   `target/tb41-option-screen-20261125/check-heat-pump-warranty-control.json`; task trees in
+   `target/tb41-cpu-baseline-20261123/source/tasks/`.
+5. **Check trial (done 2026-11-25):** `heat-pump-warranty__UH3UuFd` in
+   `target/tb41-option-screen-20261125/jobs/check-heat-pump-warranty-control/` —
+   `runtime-bundle-5947b121322700c0`, exit code `3` (graded, 0 errors), `reward=0.0`
+   (`verifier/reward.txt`), `RunEnd=Failed("tokens")`, 32 turns, `299,513` input /
+   `88,576` cache / `4,875` output (`1,871` reasoning), `$0.0697` peak (`$0.03` live),
+   WAL recorded `raw_stop_reason="tool_calls"` and `attempts=1` on all 32 assistant rows.
+   Counts toward the $8 cap.
 6. **Write-up (after the 48):** raw jobs in `target/tb41-option-screen-<date>/`, a result
    note in `docs/experiments/` + `docs/INDEX.md` line, arm-table status in
    `docs/research-next-steps.md`.
@@ -29,6 +36,23 @@ Plan: [tb41-option-screen](docs/superpowers/plans/2026-11-24-tb41-option-screen.
 Disk: Docker/containerd storage is bind-mounted from `/mnt/models` (35 GB free) via
 `/etc/fstab` with a systemd `RequiresMountsFor` drop-in; `/` has ~9 GB free. Build with
 `CARGO_INCREMENTAL=0`.
+
+## Done 2026-11-25
+
+- **Behavior-preserving cleanup (`1aef3fa`):** removed `crates/trace`, 3 unused Cargo deps
+  (`eval/tokio`, `bets/serde_json`, `agent-budget/serde_json`), unwired Bet C (`bets/src/race.rs`),
+  test-only `drive_tick` + `EffectGate` + no-op `ContextAssembler`, 0-caller `eval`/`snapshot`/
+  `provider`/`tools-std`/`agent-event` APIs, and duplicated `cli.rs`/`eval_cmd.rs`/`rof` setup
+  and runner logic (−3,760 net LOC across 86 files; 522 Rust + 41 Python tests green; deleted
+  merged local branch `docs-housekeeping`).
+- **Pre-benchmark bug fixes & WAL metadata (`5159e17`):** fixed `write("/app/<newdir>/<file>")`
+  parent creation via shared `policy::strip_app_alias`, aligned `TreeService::is_repo` with
+  `workdir_state`'s `.git/HEAD` check, routed `MultiEdit` through `common::overwrite`, dropped
+  lock before `kill_tree().await` in `ProcessTool`, propagated `cancel.child_token()` to agent-tree
+  children, persisted optional `raw_stop_reason` and `attempts` on WAL `Assistant` rows, and fixed
+  `USAGE`/`EVAL_USAGE`/`decisions.md` drift (526 Rust tests green).
+- **Adapter-check trial:** verified `heat-pump-warranty` control trial on clean `5159e17` bundle
+  (details above).
 
 ## Done 2026-11-24
 
@@ -65,12 +89,11 @@ Gemini Hydrogen (Antigravity) did the living-docs review; Neon unused.
 
 ## Repository
 
-- `master` and `knowledge-vault-trial` are both at `f519145` (pushed; CI green). master now
-  carries the whole dev line, merged with its README rewrite. CI's stale-reference guard
-  skips `docs/`, `SESSION-NEXT.md`, `NOTES_FOR_PI.md` and `tools/envelope_report.py`.
-  Local branch `docs-housekeeping` is merged and can be deleted. `goose/` is an untracked
-  separate repo. Open from housekeeping: parked Slice A roadmap items (drop or keep?) and
-  the unverified "20 driver invocations" line in `decisions.md`.
+- `master` has local commits `1aef3fa` + `5159e17` ahead of `origin/master` (`1136136`, not yet
+  pushed). CI's stale-reference guard skips `docs/`, `SESSION-NEXT.md`, `NOTES_FOR_PI.md` and
+  `tools/envelope_report.py`. Local branch `docs-housekeeping` was deleted. `goose/` is an
+  untracked separate repo. Open from housekeeping: parked Slice A roadmap items (drop or keep?)
+  and the unverified "20 driver invocations" line in `decisions.md`.
 - Run adapter tests with Harbor's Python from `tools/`. The pre-commit hook requires every
   `.md` under `docs/` and the local research notes to appear in `docs/INDEX.md`.
 
