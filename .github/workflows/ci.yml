@@ -19,7 +19,7 @@ jobs:
       - run: cargo test --locked --workspace
       - name: no stale references in tracked files
         run: |
-          if git grep -n "research/\|AGENTS\.md\|DECISIONS\.md\|~/rof-harness" -- . ':!.github/workflows/ci.yml' ':!docs' ':!SESSION-NEXT.md' ':!NOTES_FOR_PI.md' ':!tools/envelope_report.py'; then
+          if git grep -n "research/\|AGENTS\.md\|DECISIONS\.md\|~/rof-harness" -- . ':!.github/workflows/ci.yml' ':!docs' ':!SESSION-NEXT.md' ':!NOTES_FOR_PI.md'; then
             echo "forbidden reference found in tracked files" >&2
             exit 1
           fi

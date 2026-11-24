@@ -72,6 +72,7 @@ Use a disposable workspace. ROF edits it in place.
 | Command | Use |
 |---|---|
 | `rof run` | Run an agent on a goal and emit its patch. |
-| `rof eval` | Run repeatable task evaluations. |
+| `rof chat` | Run an interactive line-based session over the same flags. |
+| `tools/harbor_rof.py` | Run Terminal-Bench evaluations inside task containers via Harbor. |
 
 [Documentation](docs/INDEX.md) · [License](LICENSE)

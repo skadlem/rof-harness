@@ -6,8 +6,6 @@ mod agents;
 mod chat;
 mod cli;
 mod dump;
-mod eval_agent;
-mod eval_cmd;
 mod exit;
 #[cfg(test)]
 mod fixtures;
@@ -32,7 +30,6 @@ use cli::{
     run_config, Args,
 };
 use dump::{attach_dump, finalize_dump};
-use eval_cmd::{parse_eval, run_eval};
 use exit::{exit_code, summarize, EXIT_NO_CREDENTIALS};
 use workdir::{exclude_sidecar, resolve_log_path, validate_workdir};
 
@@ -784,16 +781,6 @@ pub(crate) fn build_provider(
 #[tokio::main]
 async fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    if argv.get(1).map(String::as_str) == Some("eval") {
-        let eargs = match parse_eval(&argv) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(2);
-            }
-        };
-        std::process::exit(run_eval(&eargs).await);
-    }
     let chat = argv.get(1).map(String::as_str) == Some("chat");
     let mut args = match if chat {
         parse_chat(&argv)

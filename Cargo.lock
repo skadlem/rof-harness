@@ -171,15 +171,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eval"
-version = "0.1.0"
-dependencies = [
- "agent-event",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -839,7 +830,6 @@ dependencies = [
  "agent-loop",
  "async-trait",
  "bets",
- "eval",
  "provider-core",
  "provider-openai",
  "ring",

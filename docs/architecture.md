@@ -60,56 +60,10 @@ Host-side `write`/`edit` replace a file they cannot open for writing when they
 own its directory (`common::overwrite`), because in-container commands run as
 root and leave root-owned outputs in the bind-mounted workdir.
 
-`rof eval --tasks-dir DIR` (`eval_cmd.rs`) is the legacy path (the native Harbor
-adapter, `tools/harbor_rof.py`, runs `rof run` in the task container instead).
-It loads a frozen task slice and writes one JSON row per instance (verdict,
-token and dollar totals, steps, halt reason, provenance), and computes no
-intervals (offline paired statistics live in `tools/rof_compare.py`). Without
-`--agent` it is a scaffold: no command, no reward, so
-instances grade ErrorNoReport. Patch apply is Strict by default, Lenient under
-`--lenient-apply`. Every report carries `eval::RunProvenance`: the binary's
-short git sha (embedded by `crates/rof/build.rs`, `unknown` when git is
-unavailable), the agent-leg budget recipe (token/step/action caps, token-cap
-shape `gross` or `miss-plus-out`), the apply mode, and the estimand —
-`Ungraded` (plain eval), `HarborOracle` (`--agent`), `InContainerReward`
-(`--agent --in-container`) — so an arm is identified by its own report file.
-
-With `--agent`, the per-instance engine is the agent leg (`eval_agent.rs`), the
-real grading path: fresh seeded workdir; the loop in-process through the same
-`execute()` wiring as `rof run`, bounded by `[agent] timeout_sec` via
-`execute_with_deadline` (the verifier and the harbor run use `[verifier]
-timeout_sec`); then the harbor CLI as grading seam (job yaml + `harbor run -c
-<job> -y -q`). Spawn failure, grading timeout, workdir refusal and a run with no
-RunEnd in the events dump are infra failures, never capability. The container
-default is unchanged.
-
-With `--in-container`:
-
-- The task environment container (`Instance.image`, from task.toml
-  `docker_image`) starts before the agent run, workdir bind-mounted at `/app`,
-  cpus/memory capped at 2/4096m.
-- Tests are NOT mounted: harbor uploads `tests/` only inside
-  `Verifier.verify()`, and a live `/tests` lets the agent read the grader, so the
-  frozen snapshot's tests are `docker cp`-ed in immediately before
-  `bash /tests/test.sh`.
-- Tool policy carries an exec wrap (`docker exec <container>`): exec/test land
-  in the container while the allowlist and shell-op guard see the unwrapped
-  argv; file tools stay host-side on the bind-mounted workdir.
-- The workdir resets from the image's `/app` (`cp -a /app/.`, chowned to the
-  host uid) — harbor parity: `<task>/environment` is the Docker build context,
-  not the workspace, and the two differ on 4 of the 5 cells used so far
-  (`docs/decisions.md`, 2026-11-06).
-- The verifier execs the same live container, so installed packages and running
-  services persist to grading. The verdict is the task-written reward file
-  (`/logs/verifier/reward.txt`, mounted writable, persisted at
-  `<home>/verifier-logs`) with the verifier exit code as the no-artifact
-  fallback — a new estimand, never mixed with the harbor `result.json` reward.
-  Measured 2026-10-12: every TB2.1 slice `test.sh` ends with `echo 1|0 >
-  /logs/verifier/reward.txt`, so its exit code is always 0 and cannot carry the
-  suite outcome.
-- Every per-instance failure (missing image, container start, verifier
-  spawn/timeout) is infra, never capability; the container is removed
-  best-effort on every path.
+`rof eval` and `crates/eval` (the legacy host/in-container evaluation driver)
+were retired in favor of the native Harbor adapter (`tools/harbor_rof.py`),
+which runs `rof run` directly inside each task container. Historical reports and
+implementation remain in git history (through `41393ae`).
 
 ### Harbor adapter (`tools/harbor_rof.py`)
 
@@ -196,7 +150,6 @@ declares roles (tools, optional prompt, token/step budget), limits (`max_depth`,
 | `agent-budget` | step/action/token/spend caps, halts, `with_steps()` (warn clamp + refund re-derive); `config_for` presets per capability, run budgets resolve in `cli::budget_for`. |
 | `snapshot` | git-overlay tree: baselines, rollbacks, bounded evidence patch, unbounded `patch_since_start_full()` deliverable. |
 | `provider-core` / `provider-openai` | `LlmClient` trait + OpenAI-compatible client. Separate retry bounds: cold-start 503 retries use eight attempts, ordinary retryable errors five, and the truncation output-token ladder its own bounded escalation (`provider-openai/src/retry.rs`). |
-| `eval` | slice loading (`load_tb_slice`), winnability, per-instance rows (verdicts from the `rof eval --agent` leg). |
 | `agent-event` / `agent-log` | live event vocabulary (11 variants; pinned in `exit.rs::NAMES`); durable JSONL log. |
 | `context` | compaction/file-map. |
 | `bets` | capability bets A/B (claim + proof-gated commits), feature-flagged. |

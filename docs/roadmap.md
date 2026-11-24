@@ -31,7 +31,7 @@ Ordered and spend-gated plan of open work. Decision records and measurements liv
      `--shell on`, `--budget-line requests`: implemented off; single-knob development arms when
      prioritized (`harness-experiments.md`, `research-next-steps.md`).
    - `--agents FILE` (stage 1 read-only `spawn`/`wait`): implemented off, unwired from
-     `rof eval`; stages 2–3 rejected at load (`decisions.md`).
+     Harbor; stages 2–3 rejected at load (`decisions.md`).
    - **Parked nits** (only if earned): search depth cap, `/app` word-boundary in goal mapping,
      assemble budget accounting, `finalize_dump` exit code.
    - **Superseded Slice A items (2026-11-06):** broader portfolio baseline (0b: `dna-assembly`,
