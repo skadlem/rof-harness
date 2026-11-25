@@ -193,7 +193,11 @@ inside the task container.
 
 ## Budget defaults (`cli::budget_for`)
 
-- Explicit `--budget-steps` / `--budget-actions` / `--budget-tokens` win.
+- Explicit `--budget-steps` / `--budget-actions` / `--budget-tokens` / `--budget-spend-cents` win.
+  `--budget-tokens 0` uncaps cumulative tokens (the budget line omits the token segment);
+  `--budget-spend-cents 0` disables the spend cap (`--max-tokens 0|omit` omits `max_tokens` on the
+  wire so the endpoint uses its native default; the overflow retry ladder raises up to
+  `MAX_TOKENS_CEILING = 393_216`).
 - Any explicit budget flag lifts the preset's 900s wall-clock cap to the
   LongTask 3600s allowance: the wall is the measured runaway guard for 20-step
   default batches, never part of a flagged recipe (measured 2026-10-08: v0 sweep

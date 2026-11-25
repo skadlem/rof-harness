@@ -718,3 +718,25 @@ FILE`), one runtime with `spawn` and `wait` tools, budget carved from the parent
 it. JSON rather than TOML because `serde_json` is already a dependency. The `AGENTS.md`
 rule still applies elsewhere: no planner, no multi-agent code outside this flag. [chosen:
 owner directive; stage 1 validated only by scripted-provider tests]
+
+- **Uncapped cumulative tokens, USD spend cap CLI/Harbor wiring, omitted `max_tokens`, and DeepSeek 384K output ceiling (2026-11-25).**
+  Across 11 coding agents/harnesses verified from primary sources (Claude Code, Codex CLI,
+  OpenCode, Pi, Goose, mini-SWE-agent, SWE-agent, OpenHands SDK, Terminus-2, Hermes Agent,
+  Aider/Roo Code), **0 of 11** enforce a hard cumulative gross token cap by default; 7 of 11
+  omit `max_tokens` on OpenAI-compatible endpoints; and DeepSeek's live docs (`api-docs.deepseek.com`,
+  2026-11-25) specify a 1M context window, 64K default thinking output when `max_tokens` is
+  omitted, and **384K (`393_216`)** max output tokens. In our 48-run TB4.1.0 CPU screen
+  ([2026-11-25-tb41-option-screen](experiments/2026-11-25-tb41-option-screen.md)), 47/48 runs
+  halted on the 300k gross token cap at 25–33 turns ($0.038 live USD/run), 1/48 halted on
+  `MAX_TOKENS_CEILING = 32_768` truncation under `--keep-thinking`, and default `5/2`
+  prefix-mutating retention averaged only 42.0% DeepSeek cache hit rate (dropping from 69–79%
+  on turns 2–3 to 12–15% on turns 4–6). Implemented without changing defaults:
+  (1) `--budget-tokens 0` / Harbor `budget_tokens: 0` uncaps cumulative tokens and omits the
+  token fragment in `budget_line()`; (2) `--budget-spend-cents N` / Harbor `budget_usd` sets
+  the USD spend cap (`0` disables it); (3) `--max-tokens 0|omit` / Harbor `max_tokens: 0|None`
+  omits `"max_tokens"` on the wire; (4) `MAX_TOKENS_CEILING` raised from `32_768` to
+  `393_216` (`OMITTED_FIRST_RAISE = 131_072` when omitted `max_tokens` truncates). Skipped
+  a continuation loop above 393k: max observed reply across 342 runs is 61,518 tokens, and
+  retrying past 384k risks ~$0.47/reply runaway loops. [measured: 48-run screen + 342-run
+  corpus; verified-from-source: 11 harnesses + DeepSeek docs; defaults unchanged until
+  benchmarked]

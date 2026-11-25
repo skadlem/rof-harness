@@ -240,13 +240,36 @@ class HarborRofOptionsTest(unittest.IsolatedAsyncioTestCase):
 
     def test_zero_numeric_values_are_rejected_by_pydantic(self):
         for name in (
-            "max_tokens",
             "observation_keep",
             "thinking_keep",
             "collapse_hysteresis",
         ):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 RofOptions(runtime_dir=Path("/tmp"), **{name: 0})
+
+    async def test_uncapped_tokens_usd_budget_and_omitted_max_tokens(self):
+        default = await self.run_agent()
+        self.assertNotIn("--budget-spend-cents", default)
+        self.assertEqual(default[default.index("--budget-tokens") + 1], "300000")
+        self.assertEqual(default[default.index("--max-tokens") + 1], "8000")
+
+        argv = await self.run_agent(budget_tokens=0, budget_usd=1.25, max_tokens=0)
+        self.assertEqual(argv[argv.index("--budget-tokens") + 1], "0")
+        self.assertEqual(argv[argv.index("--budget-spend-cents") + 1], "125")
+        self.assertEqual(argv[argv.index("--max-tokens") + 1], "0")
+
+        omitted = await self.run_agent(budget_usd=0.0, max_tokens=None)
+        self.assertEqual(omitted[omitted.index("--budget-spend-cents") + 1], "0")
+        self.assertEqual(omitted[omitted.index("--max-tokens") + 1], "0")
+
+        with self.assertRaises(ValueError):
+            RofOptions(
+                runtime_dir=Path("/tmp"),
+                compaction=0.7,
+                context_capacity=131072,
+                output_reserve=32768,
+                max_tokens=0,
+            )
 
     async def test_output_and_rollback_scope_reach_argv_only_when_set(self):
         default = await self.run_agent()

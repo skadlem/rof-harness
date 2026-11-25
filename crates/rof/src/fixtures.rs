@@ -196,6 +196,7 @@ pub(crate) fn args_for(dir: &std::path::Path, steps: Option<u32>) -> Args {
         budget_steps: steps,
         budget_actions: None,
         budget_tokens: None,
+        budget_spend_cents: None,
         budget_shape: None,
         context_files: Vec::new(),
         max_tokens: None,

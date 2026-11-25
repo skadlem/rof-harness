@@ -29,10 +29,11 @@ class RofOptions(InstalledAgentOptions):
         description="Host directory containing the frozen ROF runtime bundle."
     )
     workdir: str = Field(default="/app", pattern=r"^/.+")
-    budget_tokens: int = Field(default=300000, gt=0)
+    budget_tokens: int = Field(default=300000, ge=0)
     budget_steps: int = Field(default=60, gt=0)
     budget_actions: int = Field(default=120, gt=0)
-    max_tokens: int = Field(default=8000, gt=0)
+    budget_usd: float | None = Field(default=None, ge=0)
+    max_tokens: int | None = Field(default=8000, ge=0)
     budget_shape: Literal["gross", "miss-plus-out"] = "gross"
     observation_keep: int | None = Field(default=None, gt=0)
     preserve_failed_checks: bool = False
@@ -63,7 +64,11 @@ class RofOptions(InstalledAgentOptions):
         if self.checkpoint_sources and self.compaction is None:
             raise ValueError("checkpoint_sources requires compaction")
         if self.compaction is not None:
-            maximum_output = max(self.max_tokens, 32768)
+            maximum_output = (
+                65536
+                if self.max_tokens in (None, 0)
+                else max(self.max_tokens, 32768)
+            )
             if (
                 self.context_capacity is None
                 or self.output_reserve is None
@@ -169,7 +174,7 @@ class RofAgent(BaseInstalledAgent):
             "--budget-shape",
             self.options.budget_shape,
             "--max-tokens",
-            str(self.options.max_tokens),
+            str(0 if self.options.max_tokens is None else self.options.max_tokens),
             "--exec-policy",
             "any",
             "--steer",
@@ -187,6 +192,10 @@ class RofAgent(BaseInstalledAgent):
             "--log-path",
             str(logs / ".rof-events.jsonl"),
         ]
+        if self.options.budget_usd is not None:
+            args.extend(
+                ("--budget-spend-cents", str(round(self.options.budget_usd * 100)))
+            )
         if self.options.archive_output:
             args.extend(("--archive-output", "on"))
         if self.options.shell:

@@ -185,8 +185,24 @@ const WORKFLOW_MINIMAL: &str = "WORKFLOW\n\
 pub(crate) fn budget_line(state: &LoopState, requests: bool) -> String {
     let cfg = state.budget.config();
     let counters = state.budget.counters();
+    let steps = cfg.max_steps.get().saturating_sub(counters.steps);
+    let actions = cfg
+        .actions_per_trial
+        .saturating_sub(counters.actions_this_trial);
+    if cfg.max_tokens == 0 {
+        return if requests {
+            format!(
+                "budgets remaining: steps left {steps} of {}; actions left {actions} of {}",
+                cfg.max_steps, cfg.actions_per_trial,
+            )
+        } else {
+            format!(
+                "budgets remaining: steps {}/{}; actions {}/{}",
+                steps, cfg.max_steps, actions, cfg.actions_per_trial,
+            )
+        };
+    }
     if requests {
-        let steps = cfg.max_steps.get().saturating_sub(counters.steps);
         let tokens = cfg.max_tokens.saturating_sub(counters.tokens);
         // Counts the reply this line asks for. ceil is exact on 68% of banked
         // request points with 1-3 left, floor on 25%; it overestimates
@@ -209,19 +225,15 @@ pub(crate) fn budget_line(state: &LoopState, requests: bool) -> String {
             String::new()
         };
         return format!(
-            "budgets remaining: {head}{tail}steps left {steps} of {}; actions left {} of {}",
-            cfg.max_steps,
-            cfg.actions_per_trial
-                .saturating_sub(counters.actions_this_trial),
-            cfg.actions_per_trial,
+            "budgets remaining: {head}{tail}steps left {steps} of {}; actions left {actions} of {}",
+            cfg.max_steps, cfg.actions_per_trial,
         );
     }
     format!(
         "budgets remaining: steps {}/{}; actions {}/{}; tokens {}/{}",
-        cfg.max_steps.get().saturating_sub(counters.steps),
+        steps,
         cfg.max_steps,
-        cfg.actions_per_trial
-            .saturating_sub(counters.actions_this_trial),
+        actions,
         cfg.actions_per_trial,
         cfg.max_tokens.saturating_sub(counters.tokens),
         cfg.max_tokens,

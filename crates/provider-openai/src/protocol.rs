@@ -64,8 +64,10 @@ pub(crate) fn wire_body(model: &str, req: &Request, k: &WireKnobs) -> serde_json
     let mut b = serde_json::json!({
         "model": model,
         "messages": messages,
-        "max_tokens": k.max_tokens,
     });
+    if k.max_tokens > 0 {
+        b["max_tokens"] = serde_json::json!(k.max_tokens);
+    }
     if k.thinking_suppressed {
         if let Some(frag) = k.thinking_off.as_ref().and_then(|f| f.as_object()) {
             for (kk, vv) in frag {
@@ -98,7 +100,7 @@ pub(crate) fn wire_body(model: &str, req: &Request, k: &WireKnobs) -> serde_json
     if let Some(o) = req.extras.as_object() {
         for (kk, vv) in o {
             // Extras add keys; they never overwrite model/max_tokens/messages/tools.
-            if b.get(kk).is_none() {
+            if kk != "max_tokens" && b.get(kk).is_none() {
                 b[kk] = vv.clone();
             }
         }
@@ -352,9 +354,14 @@ pub(crate) fn parse_body(
     let content_chars = text.trim().len();
     let reasoning_chars = reasoning.trim().len();
     if stop == StopReason::MaxTokens {
+        let cap = if max_tokens == 0 {
+            "server default".to_string()
+        } else {
+            format!("{max_tokens} tokens")
+        };
         return Err(BodyFail {
             msg: format!(
-                "output truncated at {max_tokens} tokens (finish_reason=length; content={content_chars} chars; reasoning_content={reasoning_chars} chars); raise max_tokens",
+                "output truncated at {cap} (finish_reason=length; content={content_chars} chars; reasoning_content={reasoning_chars} chars); raise max_tokens",
             ),
             usage: wire,
             truncated: true,
@@ -409,6 +416,26 @@ mod tests {
         assert_eq!(b["model"], "m");
         assert_ne!(b["max_tokens"], 1);
         assert_eq!(b["novel"], 7);
+    }
+    #[test]
+    fn wire_body_omits_max_tokens_when_zero_and_extras_cannot_inject_it() {
+        let mut req = req_with_tool();
+        req.max_tokens = 0;
+        req.extras = serde_json::json!({"max_tokens": 123, "novel": 7});
+        let b = wire_body(
+            "m",
+            &req,
+            &WireKnobs::from_req(&req, &EndpointProfile::default()),
+        );
+        assert!(b.get("max_tokens").is_none(), "0 omits max_tokens: {b}");
+        assert_eq!(b["novel"], 7);
+        let v = serde_json::json!({
+            "choices": [{"message": {"content": "", "reasoning_content": "rrr"},
+                         "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 64}
+        });
+        let e = parse_body(&v, "m", 0).unwrap_err();
+        assert!(e.msg.contains("at server default"), "{}", e.msg);
     }
     #[test]
     fn wire_body_threads_tool_ids_for_strict_providers() {

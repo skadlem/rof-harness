@@ -11,7 +11,10 @@ use provider_openai::EndpointProfile;
 
 use crate::workdir::resolve_log_path;
 
-pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--workflow legacy|minimal] [--observation-keep N] [--preserve-failed-checks on|off] [--rollback-scope all|errors] [--exec-output legacy|head-tail] [--stall-threshold N] [--budget-line legacy|requests] [--archive-output on|off] [--shell on|off] [--processes on|off] [--multi-edit on|off] [--stream on|off] [--mcp 'CMD ARGS']... [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--review on|off] [--procedure-file PATH]... [--dump-events PATH] [--log-path PATH] [--no-log] [--resume LOG] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]... [--agents FILE]
+pub(crate) const USAGE: &str = "usage: rof run --goal TEXT --workdir DIR (--workdir must be a disposable dir: never /, $HOME, or the harness checkout) --model ID [--endpoint URL] [--api-key-env NAME] [--header NAME:VALUE] [--allow-cmd CMD...] [--budget-steps N] [--budget-actions N] [--budget-tokens N] [--budget-spend-cents N] [--budget-shape gross|miss-plus-out] [--exec-policy allowlist|any] [--max-tokens N|omit] [--reasoning-effort LEVEL] [--steer on|off] [--streak-steer on|off] [--deliverable PATH]... [--deliverable-steer on|off] [--workflow legacy|minimal] [--observation-keep N] [--preserve-failed-checks on|off] [--rollback-scope all|errors] [--exec-output legacy|head-tail] [--stall-threshold N] [--budget-line legacy|requests] [--archive-output on|off] [--shell on|off] [--processes on|off] [--multi-edit on|off] [--stream on|off] [--mcp 'CMD ARGS']... [--context-file PATH]... [--proof-cmd CMD] [--completion-check CMD] [--repo-lookup on|off] [--repo-evidence on|off] [--incentives LEVEL] [--bets] [--compaction FRAC --context-capacity N --output-reserve N] [--checkpoint-sources on|off] [--history-read on|off] [--review on|off] [--procedure-file PATH]... [--dump-events PATH] [--log-path PATH] [--no-log] [--resume LOG] [--keep-thinking] [--thinking-keep N] [--collapse-hysteresis N] [--allow-dirty-workdir] [--allow-inert-spend-cap] [--pass-env NAME]... [--agents FILE]
+--budget-tokens N: cumulative token cap (0 = uncapped; default preset 50000)
+--budget-spend-cents N: spend cap in USD cents (0 = uncapped; default preset 400 = $4.00)
+--max-tokens N|omit: per-request output token cap (0 or omit leaves max_tokens off the wire for the server default; default 8000)
 --dump-events PATH: JSONL, one event per line (LF); replaces any previous dump at PATH
 --log-path PATH: fail-closed WAL (default <workdir>/.rof-events.jsonl)
 --no-log: disable the WAL (run without a durable log)
@@ -67,6 +70,9 @@ pub(crate) struct Args {
     pub budget_steps: Option<u32>,
     pub budget_actions: Option<u32>,
     pub budget_tokens: Option<u64>,
+    /// Explicit USD cent cap (`Some(0)` disables the spend cap; `None` keeps
+    /// the preset `$4.00` cap).
+    pub budget_spend_cents: Option<u64>,
     /// Token-cap accounting shape (`None` = the loop default `Gross`);
     /// `MissPlusOut` is a different estimand — never mixed with Gross rows.
     pub budget_shape: Option<agent_loop::BudgetShape>,
@@ -224,6 +230,7 @@ struct RunBuilder {
     budget_steps: Option<u32>,
     budget_actions: Option<u32>,
     budget_tokens: Option<u64>,
+    budget_spend_cents: Option<u64>,
     budget_shape: Option<agent_loop::BudgetShape>,
     max_tokens: Option<usize>,
     context_files: Vec<String>,
@@ -562,12 +569,21 @@ fn set_context_file(b: &mut RunBuilder, v: Option<String>) -> Result<(), String>
 }
 
 fn set_max_tokens(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    b.max_tokens = Some(parse_int("--max-tokens", "positive", v)?);
+    if v.as_deref() == Some("omit") {
+        b.max_tokens = Some(0);
+        return Ok(());
+    }
+    b.max_tokens = Some(parse_int("--max-tokens", "non-negative", v)?);
     Ok(())
 }
 
 fn set_budget_tokens(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
-    b.budget_tokens = Some(parse_int("--budget-tokens", "positive", v)?);
+    b.budget_tokens = Some(parse_int("--budget-tokens", "non-negative", v)?);
+    Ok(())
+}
+
+fn set_budget_spend_cents(b: &mut RunBuilder, v: Option<String>) -> Result<(), String> {
+    b.budget_spend_cents = Some(parse_int("--budget-spend-cents", "non-negative", v)?);
     Ok(())
 }
 
@@ -914,6 +930,11 @@ const RUN_FLAGS: &[Flag<RunBuilder>] = &[
         set: set_budget_tokens,
     },
     Flag {
+        name: "--budget-spend-cents",
+        takes_value: true,
+        set: set_budget_spend_cents,
+    },
+    Flag {
         name: "--exec-policy",
         takes_value: true,
         set: set_exec_policy,
@@ -1044,7 +1065,11 @@ fn parse_cmd(argv: &[String], cmd: &str, usage: &str) -> Result<Args, String> {
         let reserve = b
             .output_reserve
             .ok_or("--compaction requires --output-reserve")?;
-        let maximum_output = b.max_tokens.unwrap_or(8000).max(32768) as u64;
+        let maximum_output = match b.max_tokens {
+            Some(0) => 65_536,
+            Some(n) => n.max(32_768),
+            None => 32_768,
+        } as u64;
         if reserve >= capacity || reserve < maximum_output {
             return Err(format!(
                 "--output-reserve must be >= {maximum_output} and below --context-capacity"
@@ -1070,6 +1095,7 @@ fn parse_cmd(argv: &[String], cmd: &str, usage: &str) -> Result<Args, String> {
         budget_steps: b.budget_steps,
         budget_actions: b.budget_actions,
         budget_tokens: b.budget_tokens,
+        budget_spend_cents: b.budget_spend_cents,
         budget_shape: b.budget_shape,
         dump_events: b.dump_events,
         log_path: b.log_path,
@@ -1150,7 +1176,10 @@ fn read_env_usize(name: &str) -> Result<Option<usize>, String> {
 /// (cfg-over-state) is documented on `agent_loop::run`.
 pub(crate) fn budget_for(args: &Args) -> Result<BudgetGuard, String> {
     let mut b = config_for(Capability::UnattendedBatch);
-    if args.budget_steps.is_some() || args.budget_actions.is_some() || args.budget_tokens.is_some()
+    if args.budget_steps.is_some()
+        || args.budget_actions.is_some()
+        || args.budget_tokens.is_some()
+        || args.budget_spend_cents.is_some()
     {
         // Explicit recipe flags own the whole budget. The preset wall
         // (900s) is the measured guard for the 20-step default batch, not
@@ -1167,6 +1196,9 @@ pub(crate) fn budget_for(args: &Args) -> Result<BudgetGuard, String> {
     }
     if let Some(n) = args.budget_actions {
         b.actions_per_trial = n;
+    }
+    if let Some(cents) = args.budget_spend_cents {
+        b.max_spend_cents = (cents > 0).then_some(cents);
     }
     // The child pool is carved out of the root's token budget up front.
     let root_tokens = match &args.agents {
@@ -1372,6 +1404,7 @@ mod tests {
                 budget_steps: Some(7),
                 budget_actions: Some(9),
                 budget_tokens: None,
+                budget_spend_cents: None,
                 budget_shape: Some(agent_loop::BudgetShape::MissPlusOut),
                 context_files: vec!["app/a.py".into()],
                 max_tokens: None,
@@ -2219,5 +2252,65 @@ mod tests {
         b.max_spend_cents = None;
         let guard = BudgetGuard::new(b, Instant::now());
         assert_eq!(spend_guard_error(&unpriced, &guard), None);
+    }
+
+    #[test]
+    fn uncapped_tokens_spend_cents_and_omitted_max_tokens_flags() {
+        let a = parse_args(&run_min(&[
+            "--budget-tokens",
+            "0",
+            "--budget-spend-cents",
+            "100",
+            "--max-tokens",
+            "omit",
+        ]))
+        .unwrap();
+        assert_eq!(a.budget_tokens, Some(0));
+        assert_eq!(a.budget_spend_cents, Some(100));
+        assert_eq!(a.max_tokens, Some(0));
+        assert_eq!(run_config(&a).max_tokens, 0);
+        let mut priced = a;
+        priced.model = "deepseek-flash".into();
+        let g = budget_for(&priced).expect("priced model starts");
+        assert_eq!(g.config().max_tokens, 0);
+        assert_eq!(g.config().max_spend_cents, Some(100));
+        assert_eq!(g.config().max_wallclock, Duration::from_secs(3600));
+
+        // --budget-spend-cents 0 disables the spend cap, allowing unpriced models.
+        let mut uncapped_spend = parse_args(&run_min(&[
+            "--budget-spend-cents",
+            "0",
+            "--max-tokens",
+            "0",
+        ]))
+        .unwrap();
+        uncapped_spend.model = "unpriced-local-model".into();
+        let g2 = budget_for(&uncapped_spend).expect("0 spend cap disables guard");
+        assert_eq!(g2.config().max_spend_cents, None);
+        assert_eq!(run_config(&uncapped_spend).max_tokens, 0);
+
+        // Compaction reserve check enforces 64k floor when max_tokens is omitted (0).
+        assert!(parse_args(&run_min(&[
+            "--compaction",
+            "0.7",
+            "--context-capacity",
+            "131072",
+            "--output-reserve",
+            "32768",
+            "--max-tokens",
+            "omit",
+        ]))
+        .is_err());
+        assert!(parse_args(&run_min(&[
+            "--compaction",
+            "0.7",
+            "--context-capacity",
+            "131072",
+            "--output-reserve",
+            "65536",
+            "--max-tokens",
+            "0",
+        ]))
+        .is_ok());
     }
 }

@@ -1,6 +1,6 @@
 # Session handoff · 2026-11-25
 
-## Pick up here: choose next TB4.1 non-zero-floor slice or budget
+## Pick up here: run Step 2 uncapped-token + append-only calibration on 4 oracle-verified TB4.1 tasks
 
 The 48-run [TB4.1 CPU option screen](docs/experiments/2026-11-25-tb41-option-screen.md)
 completed with **0 infra errors** and **0/48 solved** across all four arms at 300k gross tokens
@@ -11,15 +11,29 @@ All three mechanisms fired cleanly in WALs; all defaults stay unchanged.
    $5.36 → $5.33 on check trial → $5.32 → $3.51 across all 48 runs; **$1.81 live** vs **$3.6813**
    peak price book). Pi key (`~/.pi/agent/auth.json`, `deepseek.key`): **¥157.46 CNY**.
    `~/.config/jcode/deepseek.env` is a dead key; do not use it.
-2. **Runtime:** frozen bundle in `target/option-screen-runtime/` built from detached `5159e17`:
-   `rof` SHA-256 `5947b121322700c070c72c1c5984585d1f588fc345153355c2231aa5375cddc6`, Harbor version
-   `runtime-bundle-5947b121322700c0` (confirmed on all 48/48 runs).
-3. **Next decision:** before spending more on TB4.1 option screens, either (a) preflight easier
-   TB4.1.0 CPU tasks where `deepseek-flash` has a non-zero control solve rate at 300k, or
-   (b) test the 1.2M pilot token budget on a smaller subset, and decide whether `MAX_TOKENS_CEILING`
-   (`crates/provider-openai/src/retry.rs:36`) should scale above 32,768 when `--max-tokens 32768`
-   is set.
-4. **Raw data:** `target/tb41-option-screen-20261125/` (`ledger.jsonl`, `summary-48.json`, `jobs/`).
+2. **Step 1 plumbing landed (uncommitted in working tree; defaults unchanged):**
+   - `--budget-tokens 0` / Harbor `budget_tokens=0` uncaps cumulative tokens (`budget_line()` omits
+     the token segment cleanly in both `legacy` and `requests` modes).
+   - `--budget-spend-cents N` / Harbor `budget_usd` configures the USD spend cap (`0` disables it;
+     omitted keeps the `$4.00` preset).
+   - `--max-tokens 0|omit` / Harbor `max_tokens=0|None` omits `"max_tokens"` on the wire (letting
+     DeepSeek use its 64K thinking default); `MAX_TOKENS_CEILING` raised from `32_768` →
+     **`393_216`** (DeepSeek 384K wire ceiling; omitted truncation jumps `0 → 131_072 → 262_144 →
+     393_216`).
+   - Verified green: `provider-openai` + `agent-loop` + `rof` tests, `clippy --tests -- -D warnings`,
+     `cargo fmt --check`, and 44/44 Python tests.
+3. **Free oracle preflights (`4070d6cef56a`, `target/tb41-oracle-20261125/`):**
+   - `photonic-waveguide-routing` (0.75 h): oracle **1.0** (0 exceptions, 7m 29s cold build).
+   - `html-js-filter` (0.75 h): excluded (`VerifierTimeoutError` in `_separate_verifier_env`, 10m 39s).
+4. **Next decision (Step 2 calibration, pending owner go-ahead):** rebuild frozen runtime bundle,
+   then run a **4-task × 2-arm × 1-rep** (8 trials, hard-capped at `$1.00`/trial peak / `$1.50`
+   total live USD) calibration on `photonic-waveguide-routing` (0.75 h), `music-harmony` (1.0 h),
+   `bun-sourcemap-leak` (1.5 h), and `heat-pump-warranty` (4.0 h) with `budget_tokens=0`,
+   `budget_usd=1.0`, `budget_steps=200`, `budget_actions=400`, `max_tokens=0` (omitted → 64K server
+   default): **Arm A** `5/2` retention vs **Arm B** `1000/1000` append-only prefix retention (tests
+   both non-zero solve floor and DeepSeek prefix cache-hit rate vs the measured 42.0% under `5/2`).
+5. **Raw data:** `target/tb41-option-screen-20261125/` (`ledger.jsonl`, `summary-48.json`, `jobs/`),
+   `target/tb41-oracle-20261125/`.
 
 Disk: Docker/containerd storage is bind-mounted from `/mnt/models` (33 GB free) via
 `/etc/fstab` with a systemd `RequiresMountsFor` drop-in; `/` has ~6.8 GB free (`target/debug`

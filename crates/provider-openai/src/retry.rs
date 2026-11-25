@@ -31,17 +31,22 @@ impl WireKnobs {
     }
 }
 
-/// Ceiling the overflow ladder may raise `max_tokens` to. Chosen (no anchor):
-/// bounds one ladder's spend; the ladder unit test pins the bound. Note: when
-/// a caller starts at `max_tokens >= MAX_TOKENS_CEILING` with `thinking_off`
-/// unset (e.g. Harbor `--keep-thinking --max-tokens 32768`), `apply_ladder`
-/// has zero raise rungs and returns `false` on the first truncation.
-pub(crate) const MAX_TOKENS_CEILING: usize = 32_768;
+/// Ceiling the overflow ladder may raise `max_tokens` to. Verified from
+/// DeepSeek API docs (2026-11-25): `deepseek-flash` (`DeepSeek-V4.1-Flash-1017`)
+/// and `deepseek-v4-pro` support up to 384K (`393_216`) output tokens.
+pub const MAX_TOKENS_CEILING: usize = 393_216;
+
+/// First explicit `max_tokens` rung when a request omitted `max_tokens` (`0`)
+/// and the server's native default (64K for DeepSeek thinking mode) still
+/// truncated (`finish_reason=length`): jumps straight to 128K, then doubles to
+/// `MAX_TOKENS_CEILING`.
+const OMITTED_FIRST_RAISE: usize = 131_072;
 
 /// Cheapest-first reshape for one truncated (`finish_reason=length`) attempt.
 /// Overflow needs room, never less of it: (1) thinking off — reasoning ate
 /// the whole budget (content=0, reasoning>0) and the endpoint has a real
-/// knob, applied once; (2) raise `max_tokens` — double, ceiling-bounded.
+/// knob, applied once; (2) raise `max_tokens` — jump from omitted (`0`) to
+/// [`OMITTED_FIRST_RAISE`], otherwise double, ceiling-bounded.
 /// Returns whether a reshape applied; false ends the ladder.
 pub(crate) fn apply_ladder(
     k: &mut WireKnobs,
@@ -56,7 +61,11 @@ pub(crate) fn apply_ladder(
         k.thinking_suppressed = true;
         return true;
     }
-    let raised = k.max_tokens.saturating_mul(2).min(MAX_TOKENS_CEILING);
+    let raised = if k.max_tokens == 0 {
+        OMITTED_FIRST_RAISE.min(MAX_TOKENS_CEILING)
+    } else {
+        k.max_tokens.saturating_mul(2).min(MAX_TOKENS_CEILING)
+    };
     if raised > k.max_tokens {
         k.max_tokens = raised;
         return true;
@@ -218,13 +227,12 @@ mod tests {
         assert!(apply_ladder(&mut k, 0, 500));
         assert!(k.thinking_suppressed);
         assert_eq!(k.max_tokens, 8_000);
-        // Same failure again: the one-shot rung is spent, so raise (double).
-        assert!(apply_ladder(&mut k, 0, 500));
-        assert_eq!(k.max_tokens, 16_000);
-        assert!(apply_ladder(&mut k, 0, 500));
-        assert_eq!(k.max_tokens, 32_000);
-        assert!(apply_ladder(&mut k, 0, 500));
-        assert_eq!(k.max_tokens, MAX_TOKENS_CEILING, "bounded by the ceiling");
+        // Same failure again: the one-shot rung is spent, so raise (double) up
+        // to DeepSeek's 384K wire ceiling.
+        for expected in [16_000, 32_000, 64_000, 128_000, 256_000, MAX_TOKENS_CEILING] {
+            assert!(apply_ladder(&mut k, 0, 500));
+            assert_eq!(k.max_tokens, expected);
+        }
         assert!(!apply_ladder(&mut k, 0, 500), "no rung left at the ceiling");
         // Content shipped: thinking is not the culprit, raise immediately.
         let mut c = WireKnobs::from_req(&req, &profile);
@@ -240,15 +248,18 @@ mod tests {
         assert!(apply_ladder(&mut n, 0, 500));
         assert!(!n.thinking_suppressed);
         assert_eq!(n.max_tokens, 16_000);
-        // Degenerate zero budget: no rung may claim progress (no endless ladder).
+        // Omitted `max_tokens` (0): jumps past server 64K default to 128K -> 256K -> 384K.
         let mut z = WireKnobs {
             max_tokens: 0,
             thinking_off: None,
             thinking_suppressed: true,
             reasoning_effort: None,
         };
-        assert!(!apply_ladder(&mut z, 50, 0));
-        assert_eq!(z.max_tokens, 0);
+        for expected in [OMITTED_FIRST_RAISE, 262_144, MAX_TOKENS_CEILING] {
+            assert!(apply_ladder(&mut z, 50, 0));
+            assert_eq!(z.max_tokens, expected);
+        }
+        assert!(!apply_ladder(&mut z, 50, 0), "bounded at ceiling");
     }
     #[test]
     fn ladder_rung_wire_body_sends_thinking_disabled_and_keeps_max_tokens() {

@@ -585,3 +585,19 @@ async fn action_cap_stops_mid_batch_without_reverting_admitted_edits() {
     assert_eq!(state.budget.counters().actions_this_trial, 1);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn budget_line_omits_token_segment_when_uncapped() {
+    let mut state = LoopState::new();
+    let mut config = agent_budget::config_for(agent_budget::Capability::UnattendedBatch);
+    config.max_tokens = 0;
+    state.budget = agent_budget::BudgetGuard::new(config, std::time::Instant::now());
+    state.last_request_tokens = 5_000;
+    let legacy = crate::request::budget_line(&state, false);
+    assert_eq!(legacy, "budgets remaining: steps 20/20; actions 30/30");
+    let requests = crate::request::budget_line(&state, true);
+    assert_eq!(
+        requests,
+        "budgets remaining: steps left 20 of 20; actions left 30 of 30"
+    );
+}
