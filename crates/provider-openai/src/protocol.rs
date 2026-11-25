@@ -394,6 +394,7 @@ pub(crate) fn parse_body(
         attempts: 1,
         raw_stop_reason: finish,
         retry_usage: None,
+        usage_unknown: false,
     })
 }
 

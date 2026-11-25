@@ -535,6 +535,7 @@ mod tests {
             attempts: 1,
             raw_stop_reason: None,
             retry_usage: None,
+            usage_unknown: false,
         }
     }
 

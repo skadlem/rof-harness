@@ -107,7 +107,6 @@ impl OpenAiCompat {
             http: reqwest::Client::builder()
                 .user_agent(format!("rof/{}", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(REQUEST_TIMEOUT)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             creds: CredentialSource::env("OPENAI_API_KEY"),
@@ -199,6 +198,7 @@ impl OpenAiCompat {
         // usage are billed (completed, or truncated then rejected);
         // pre-generation HTTP failures carry no usage and are not charged.
         let mut usage_acc: Option<Usage> = None;
+        let mut saw_unknown_usage = false;
         let mut last_retryable = false;
         let mut attempt = 0u32;
         loop {
@@ -224,12 +224,14 @@ impl OpenAiCompat {
                     // Ladder-recovered attempts were billed too: carry what
                     // the failed re-sends cost so metering can count it.
                     r.retry_usage = usage_acc.take().map(Box::new);
+                    r.usage_unknown = saw_unknown_usage;
                     return Ok(r);
                 }
                 Err(f) => {
                     last_label = f.msg.clone();
                     last_err = *f.error;
                     last_retryable = f.retryable;
+                    saw_unknown_usage |= f.usage_unknown;
                     usage_acc = match (usage_acc, f.usage.map(|u| *u)) {
                         (Some(a), Some(n)) => Some(a.plus(&n)),
                         (a, n) => a.or(n),
@@ -279,6 +281,9 @@ struct OnceFail {
     /// Usage the failed response carried; summed across attempts in `complete`.
     /// Boxed: keeps the `Result` small (the failure path is cold).
     usage: Option<Box<Usage>>,
+    /// True when the server may have billed tokens for this attempt without
+    /// returning usage (post-connect timeout, cut stream, mid-body disconnect).
+    usage_unknown: bool,
 }
 
 /// Stale-credential text. Only a refreshable source may retry it; a static
@@ -314,29 +319,41 @@ impl OpenAiCompat {
             content_chars: 0,
             reasoning_chars: 0,
             usage: None,
+            usage_unknown: false,
         })?;
         let mut call = self
             .http
             .post(format!("{}/chat/completions", self.endpoint));
-        // Per-request ceiling from the field: `RequestBuilder::timeout`
-        // replaces the client default for this call, so `with_request_timeout`
-        // is real. Default equals `REQUEST_TIMEOUT` — byte-identical without it.
-        call = call.timeout(self.request_timeout);
         for (name, value) in &self.headers {
             call = call.header(name.as_str(), value.as_str());
         }
         call = call.bearer_auth(key.api_key);
         let mut body = wire_body(model, req, k);
-        if sink.is_some() {
+        let streaming = sink.is_some();
+        if streaming {
             body["stream"] = true.into();
             body["stream_options"] = serde_json::json!({"include_usage": true});
+        } else {
+            // Non-streaming: whole-request ceiling stays `self.request_timeout`.
+            // Streaming uses per-phase idle timeouts below so active >600s
+            // reasoning streams never disconnect mid-generation.
+            call = call.timeout(self.request_timeout);
         }
-        let resp = call.json(&body).send().await.map_err(|e| {
+        let send_fut = call.json(&body).send();
+        let resp = if streaming {
+            tokio::time::timeout(self.request_timeout, send_fut)
+                .await
+                .map_err(|_| transport_fail("stream header timed out".into(), true))?
+        } else {
+            send_fut.await
+        }
+        .map_err(|e| {
             // reqwest's Display stops at "error sending request for url
             // (...)"; the timeout only lives in the source chain. Walk it
             // so forensics can tell a hang from connection-refused. The
             // chain of a send error never contains "503" (statuses take
             // the status branch), so `is_cold_start` is unaffected.
+            let usage_unknown = e.is_timeout() && !e.is_connect();
             let mut msg = e.to_string();
             let mut src = std::error::Error::source(&e);
             while let Some(x) = src {
@@ -353,6 +370,7 @@ impl OpenAiCompat {
                 content_chars: 0,
                 reasoning_chars: 0,
                 usage: None,
+                usage_unknown,
             }
         })?;
         if !resp.status().is_success() {
@@ -385,6 +403,7 @@ impl OpenAiCompat {
                         content_chars: 0,
                         reasoning_chars: 0,
                         usage,
+                        usage_unknown: false,
                     });
                 }
                 let error = Box::new(LlmError::Auth(msg.clone()));
@@ -397,6 +416,7 @@ impl OpenAiCompat {
                     content_chars: 0,
                     reasoning_chars: 0,
                     usage,
+                    usage_unknown: false,
                 });
             }
             let error = Box::new(LlmError::Http {
@@ -414,14 +434,15 @@ impl OpenAiCompat {
                 content_chars: 0,
                 reasoning_chars: 0,
                 usage,
+                usage_unknown: false,
             });
         }
         let v: serde_json::Value = match sink {
-            Some(sink) => read_stream(resp, sink).await?,
+            Some(sink) => read_stream(resp, sink, self.request_timeout).await?,
             None => resp
                 .json()
                 .await
-                .map_err(|e| transport_fail(e.to_string()))?,
+                .map_err(|e| transport_fail(e.to_string(), true))?,
         };
         parse_body(&v, model, k.max_tokens).map_err(
             |BodyFail {
@@ -442,13 +463,14 @@ impl OpenAiCompat {
                     content_chars,
                     reasoning_chars,
                     usage: usage.map(Box::new),
+                    usage_unknown: false,
                 }
             },
         )
     }
 }
 
-fn transport_fail(msg: String) -> OnceFail {
+fn transport_fail(msg: String, usage_unknown: bool) -> OnceFail {
     OnceFail {
         error: Box::new(LlmError::Transport(msg.clone())),
         msg,
@@ -458,6 +480,7 @@ fn transport_fail(msg: String) -> OnceFail {
         content_chars: 0,
         reasoning_chars: 0,
         usage: None,
+        usage_unknown,
     }
 }
 
@@ -483,15 +506,16 @@ fn sse_line(line: &[u8], acc: &mut StreamAcc, sink: &mut (dyn FnMut(Delta) + Sen
 async fn read_stream(
     mut resp: reqwest::Response,
     sink: &mut (dyn FnMut(Delta) + Send),
+    idle_timeout: Duration,
 ) -> Result<serde_json::Value, OnceFail> {
     let mut acc = StreamAcc::default();
     let mut buf: Vec<u8> = Vec::new();
     let mut done = false;
     while !done {
-        let chunk = resp
-            .chunk()
+        let chunk = tokio::time::timeout(idle_timeout, resp.chunk())
             .await
-            .map_err(|e| transport_fail(format!("stream broke: {e}")))?;
+            .map_err(|_| transport_fail("stream idle timed out".into(), true))?
+            .map_err(|e| transport_fail(format!("stream broke: {e}"), true))?;
         let at_eof = chunk.is_none();
         if let Some(c) = chunk {
             buf.extend_from_slice(&c);
@@ -512,6 +536,7 @@ async fn read_stream(
     if !done && acc.finish.is_none() {
         return Err(transport_fail(
             "stream ended before [DONE] or finish_reason".into(),
+            true,
         ));
     }
     Ok(acc.into_body())
@@ -1082,9 +1107,104 @@ mod tests {
             stream("TEST_OAI_KEY_S5", vec![ok_sse(cut.clone()), ok_sse(good)]).await;
         let r = r.unwrap();
         assert_eq!((r.message.content.as_str(), r.attempts), ("whole", 2));
+        assert!(r.usage_unknown, "cut prior attempt had unreported usage");
         assert_eq!(bodies.len(), 2);
         // Retry replays: display-only deltas saw the cut text too.
         assert_eq!(seen[0], Delta::Text("par".into()));
+    }
+    /// Streaming bounds idle gaps per chunk, not total stream duration: active
+    /// chunks arriving past `request_timeout` total must complete cleanly.
+    #[tokio::test]
+    async fn stream_survives_total_duration_past_idle_timeout_while_chunks_arrive() {
+        use std::io::Write;
+        std::env::set_var("TEST_OAI_KEY_S_SLOW", "k");
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ep = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut s, &mut buf);
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            let _ = s.flush();
+            for chunk in [
+                "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"c\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ] {
+                std::thread::sleep(Duration::from_millis(60));
+                let _ = s.write_all(chunk.as_bytes());
+                let _ = s.flush();
+            }
+        });
+        let c =
+            client_on(&ep, "TEST_OAI_KEY_S_SLOW").with_request_timeout(Duration::from_millis(120));
+        let mut req = req_with_tool();
+        req.tools.clear();
+        let mut seen = Vec::new();
+        let r = c
+            .complete_streaming("m", &req, &mut |d| seen.push(d))
+            .await
+            .expect("active chunks past 120ms total must not time out");
+        assert_eq!(r.message.content, "abc");
+        assert!(!r.usage_unknown);
+        assert_eq!(r.attempts, 1);
+    }
+    /// A stream that stops emitting chunks past the idle timeout retries and
+    /// flags `usage_unknown` on the recovered response (since the stalled
+    /// attempt may have billed tokens on the server).
+    #[tokio::test]
+    async fn stream_idle_gap_past_timeout_retries_and_marks_usage_unknown() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        std::env::set_var("TEST_OAI_KEY_S_IDLE", "k");
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ep = format!("http://{}", l.local_addr().unwrap());
+        let n = std::sync::Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        std::thread::spawn(move || {
+            for stream in l.incoming().flatten() {
+                let idx = n2.fetch_add(1, Ordering::SeqCst);
+                let mut s = stream;
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let _ = std::io::Read::read(&mut s, &mut buf);
+                    if idx == 0 {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
+                              data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                        );
+                        let _ = s.flush();
+                        // Hold open silently without finishing.
+                        std::mem::forget(s);
+                    } else {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                              data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"},\"finish_reason\":\"stop\"}]}\n\n\
+                              data: [DONE]\n\n",
+                        );
+                        let _ = s.flush();
+                    }
+                });
+            }
+        });
+        let c =
+            client_on(&ep, "TEST_OAI_KEY_S_IDLE").with_request_timeout(Duration::from_millis(80));
+        let mut req = req_with_tool();
+        req.tools.clear();
+        let mut seen = Vec::new();
+        let r = c
+            .complete_streaming("m", &req, &mut |d| seen.push(d))
+            .await
+            .expect("second attempt recovers after idle timeout");
+        assert_eq!(r.message.content, "recovered");
+        assert_eq!(r.attempts, 2);
+        assert!(
+            r.usage_unknown,
+            "stalled prior stream must mark usage_unknown"
+        );
     }
     #[tokio::test]
     async fn non_streaming_body_has_no_stream_key() {

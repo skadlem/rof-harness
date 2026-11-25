@@ -56,6 +56,7 @@ class RofOptions(InstalledAgentOptions):
     thinking_keep: int | None = Field(default=None, gt=0)
     exec_output: Literal["legacy", "head-tail"] = "legacy"
     rollback_scope: Literal["all", "errors"] = "all"
+    stream: bool = False
 
     @model_validator(mode="after")
     def validate_evidence(self):
@@ -236,6 +237,8 @@ class RofAgent(BaseInstalledAgent):
             args.extend(("--exec-output", self.options.exec_output))
         if self.options.rollback_scope != "all":
             args.extend(("--rollback-scope", self.options.rollback_scope))
+        if self.options.stream:
+            args.extend(("--stream", "on"))
         command = (
             "set -e; "
             f"mkdir -p {shlex.quote(str(logs))}; "

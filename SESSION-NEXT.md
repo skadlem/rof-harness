@@ -1,6 +1,6 @@
 # Session handoff · 2026-11-25
 
-## Pick up here: fix 600s non-streaming timeout double-billing before next TB4.1 run
+## Pick up here: off-peak streaming + append-only calibration (timeout bug fixed)
 
 Step 1 plumbing (`bd482ba`) and the first pair of the [TB4.1 uncapped calibration](docs/experiments/2026-11-25-tb41-uncapped-calib.md)
 completed on `photonic-waveguide-routing` (0.75 h, oracle 1.0) before the `$1.50` live-spend
@@ -18,24 +18,21 @@ guard cleanly stopped the sweep (**0/2 solved**, `$1.88` live / `$1.6208` peak):
    `$3.47 → $2.47 → $1.59` during PEAK hours across the 2 calibration trials). Pi key
    (`~/.pi/agent/auth.json`, `deepseek.key`): **¥157.46 CNY**. `~/.config/jcode/deepseek.env` is a
    dead key; do not use it.
-2. **Root bug exposed by `append_1000` (`t05`, `dt=1,727s`, `attempts=4`, `+$0.30` silent spend):**
-   - Non-streaming HTTP requests use a whole-body `REQUEST_TIMEOUT = 600s`
-     (`crates/provider-openai/src/client.rs:47`). A >64K reasoning reply takes >600s, times out on
-     the client, returns `usage: None`, and retries up to 5× while DeepSeek still bills the
-     aborted generations on the server (`$0.88` live vs `$0.58` recorded peak) without emitting
-     `provider-usage-unknown`.
-   - Three long reasoning turns (`t05` 91.6k / 1,727s, `t09` 74.5k / 388s, `t10` 174.4k / 841s)
-     ate 82% of the 3,600s wallclock.
-3. **Next decision (ordered):**
-   - **(a) Fix provider timeout/streaming & accounting ($0 spend):** use SSE streaming with a
-     per-chunk idle timeout (so active >600s reasoning streams never disconnect mid-generation)
-     and mark timed-out in-flight requests `usage_unknown` (never silently re-billing 600s
-     timeouts).
-   - **(b) Re-run a cheap off-peak calibration (50% cheaper on DeepSeek):** test `append_1000`
-     (which already proved **99.5% cache hit** / `$0.0015/turn` input cost) with streaming +
-     bounded per-turn reasoning (e.g. `reasoning_effort` or explicit `max_tokens: 32768` vs
-     omitted) on `music-harmony`, `bun-sourcemap-leak`, `photonic-waveguide-routing`, and
-     `heat-pump-warranty`.
+2. **Fixed ($0 spend, defaults unchanged):**
+   - `crates/provider-openai/src/client.rs`: removed client-wide `.timeout(REQUEST_TIMEOUT)` so
+     SSE streaming (`complete_streaming`) uses per-phase/per-chunk idle timeouts instead of a 600 s
+     whole-body cap (active >600 s reasoning streams stay alive; wedged streams still fail on idle).
+   - `crates/provider-core/src/types.rs` + `crates/agent-loop/src/run.rs`: added
+     `Response.usage_unknown` (`#[serde(default)]`) so any post-connect timeout or cut stream
+     during retries emits `provider-usage-unknown` and clears `cost_usd` rather than silently
+     reporting understated spend.
+   - `tools/harbor_rof.py`: added opt-in `stream: bool = False` → `--stream on`.
+3. **Next decision (off-peak DeepSeek calibration — 50% cheaper):**
+   - Rebuild frozen release runtime bundle (after committing this fix), then run an off-peak
+     calibration pairing `append_1000` (proven **99.5% cache hit** / `$0.0015/turn` input) +
+     `stream=True` with bounded per-turn reasoning (e.g., `reasoning_effort="low"` vs default
+     `"high"`, or explicit `max_tokens: 32768` vs omitted) across `photonic-waveguide-routing`,
+     `music-harmony`, `bun-sourcemap-leak`, and `heat-pump-warranty`.
 4. **Raw data:** `target/tb41-option-screen-20261125/`, `target/tb41-oracle-20261125/`,
    `target/tb41-calib-20261125/` (`ledger.jsonl`, `calib.log`, `jobs/`).
    Frozen runtime: `target/calibration-runtime-20261125/rof` (`bd482ba`, SHA-256

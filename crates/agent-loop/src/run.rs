@@ -821,6 +821,14 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         };
         self.state
             .on_provider_failed(&msg, cancelled, usage.as_ref());
+        if !cancelled
+            && usage.is_none()
+            && (msg.contains("timed out")
+                || msg.contains("stream broke")
+                || msg.contains("stream ended before"))
+        {
+            self.provider_usage_unknown();
+        }
         self.sync().await?;
         self.emitter.emit(AgentEvent::Error {
             error: AgentError {
@@ -864,6 +872,9 @@ impl<P: LlmClient> RunCtx<'_, '_, P> {
         // retry ladder was billed every failed re-send too.
         let billed = resp.billed_usage();
         self.state.on_provider_settled(Some(&billed));
+        if resp.usage_unknown {
+            self.provider_usage_unknown();
+        }
         if streak_delivered {
             self.state.experiment.streak_pending = false;
             self.record(

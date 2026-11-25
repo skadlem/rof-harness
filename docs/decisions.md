@@ -740,3 +740,16 @@ owner directive; stage 1 validated only by scripted-provider tests]
   retrying past 384k risks ~$0.47/reply runaway loops. [measured: 48-run screen + 342-run
   corpus; verified-from-source: 11 harnesses + DeepSeek docs; defaults unchanged until
   benchmarked]
+- **SSE per-chunk idle timeout, recovered-attempt `usage_unknown` accounting, and opt-in Harbor streaming (2026-11-25).**
+  In [2026-11-25-tb41-uncapped-calib](experiments/2026-11-25-tb41-uncapped-calib.md),
+  `append_1000` turn 5 (`dt = 1,727 s`, `attempts = 4`) hit `reqwest`'s whole-request 600 s
+  timeout twice while DeepSeek generated >64K reasoning tokens, returning `usage: None` and
+  silently retrying for `+$0.30` unrecorded server spend (`$0.88` live vs `$0.58` recorded).
+  Fixed without changing defaults: (1) `OpenAiCompat::new` drops the client-wide `.timeout(...)`
+  so SSE streaming (`complete_streaming`) bounds only header-wait and per-chunk idle gaps via
+  `tokio::time::timeout(self.request_timeout, ...)` (non-streaming keeps per-request `.timeout(...)`);
+  (2) `provider_core::Response.usage_unknown` (default `false`) propagates dropped/timed-out
+  in-flight retry attempts so `agent-loop` emits `provider-usage-unknown` and clears `cost_usd`
+  on both recovered and failed timeouts/cut streams; (3) Harbor `RofOptions.stream: bool = False`
+  forwards `--stream on` when opt-in enabled. [measured: TB4.1 calibration trace; verified by
+  scripted-server idle-timeout and agent-loop tests]

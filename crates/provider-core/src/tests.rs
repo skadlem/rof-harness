@@ -20,6 +20,7 @@ fn billed_usage_folds_failed_attempts_into_the_bill() {
         attempts: 1,
         raw_stop_reason: None,
         retry_usage: None,
+        usage_unknown: false,
     };
     assert_eq!(r.billed_usage().input, 100, "no retries: identical");
     r.retry_usage = Some(Box::new(usage(400, 10, Some(0.02))));
@@ -282,6 +283,7 @@ impl LlmClient for OldClient {
             attempts: 1,
             raw_stop_reason: None,
             retry_usage: None,
+            usage_unknown: false,
         })
     }
 }

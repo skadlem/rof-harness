@@ -1171,6 +1171,43 @@ async fn cancel_during_provider_complete_aborts_promptly_as_cancelled() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn recovered_response_with_unknown_prior_usage_emits_usage_unknown_error() {
+    let root = run_tmp("resp-usage-unknown");
+    let mut r = text_response("done");
+    r.usage_unknown = true;
+    let client = FakeLlm {
+        order: Default::default(),
+        requests: Default::default(),
+        queue: Mutex::new(VecDeque::from([Scripted::Respond(r)])),
+    };
+    let registry = run_registry(&root);
+    let mut state = LoopState::new();
+    let mut emitter = Emitter::new();
+    let outcome = run(
+        &mut state,
+        Run {
+            provider: &client,
+            registry: &registry,
+            agent: "agent",
+            workdir: &root,
+            emitter: &mut emitter,
+            bets: &NoBets,
+            cfg: RunConfig::default(),
+        },
+        vec![Input::User("go".into())],
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    assert!(state.usage_totals.cost_usd.is_none());
+    assert!(emitter.history().iter().any(|e| matches!(
+        e,
+        AgentEvent::Error { error } if error.code == "provider-usage-unknown"
+    )));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // --- S5 Step 0 characterization: event + log sequences pinned before refactor ---
 //
 // These pin the observable behavior (emitted event order, durable log order,

@@ -114,6 +114,10 @@ pub struct Response {
     /// `#[serde(default)]` keeps stored responses parsing.
     #[serde(default)]
     pub retry_usage: Option<Box<Usage>>,
+    /// True when an earlier in-flight attempt in this call timed out or broke
+    /// mid-stream without reporting usage (so billed totals are a lower bound).
+    #[serde(default)]
+    pub usage_unknown: bool,
 }
 
 impl Response {

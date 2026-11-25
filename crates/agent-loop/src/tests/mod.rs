@@ -149,6 +149,7 @@ fn response(calls: Vec<(&str, &str, serde_json::Value)>, stop: StopReason) -> Re
         attempts: 1,
         raw_stop_reason: None,
         retry_usage: None,
+        usage_unknown: false,
     }
 }
 
@@ -175,6 +176,7 @@ fn text_response(text: &str) -> Response {
         attempts: 1,
         raw_stop_reason: None,
         retry_usage: None,
+        usage_unknown: false,
     }
 }
 

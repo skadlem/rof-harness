@@ -275,9 +275,13 @@ class HarborRofOptionsTest(unittest.IsolatedAsyncioTestCase):
         default = await self.run_agent()
         self.assertNotIn("--exec-output", default)
         self.assertNotIn("--rollback-scope", default)
-        argv = await self.run_agent(exec_output="head-tail", rollback_scope="errors")
+        self.assertNotIn("--stream", default)
+        argv = await self.run_agent(
+            exec_output="head-tail", rollback_scope="errors", stream=True
+        )
         self.assertEqual(argv[argv.index("--exec-output") + 1], "head-tail")
         self.assertEqual(argv[argv.index("--rollback-scope") + 1], "errors")
+        self.assertEqual(argv[argv.index("--stream") + 1], "on")
 
     async def test_only_graded_exit_codes_pass(self):
         for code in (0, 3, 8):

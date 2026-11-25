@@ -103,6 +103,7 @@ pub(crate) fn tool_resp() -> Response {
         attempts: 1,
         raw_stop_reason: None,
         retry_usage: None,
+        usage_unknown: false,
     }
 }
 
@@ -119,6 +120,7 @@ pub(crate) fn text_resp() -> Response {
         attempts: 1,
         raw_stop_reason: None,
         retry_usage: None,
+        usage_unknown: false,
     }
 }
 
@@ -144,6 +146,7 @@ pub(crate) fn edit_resp(path: &str, search: &str, replace: &str) -> Response {
         attempts: 1,
         raw_stop_reason: None,
         retry_usage: None,
+        usage_unknown: false,
     }
 }
 
@@ -168,6 +171,7 @@ pub(crate) fn write_resp(path: &str, content: &str) -> Response {
         attempts: 1,
         raw_stop_reason: None,
         retry_usage: None,
+        usage_unknown: false,
     }
 }
 
