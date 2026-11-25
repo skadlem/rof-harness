@@ -80,20 +80,27 @@ cleaned). Build with `CARGO_INCREMENTAL=0`.
 ## Agents
 
 Pi DeepSeek flash children each start a rust-analyzer via pi-lens (0.5–1 GB): keep ≤ 6
-concurrent on this 14 GB machine. OpenCode HY4 free failed every task at 9 concurrent.
-Gemini Hydrogen (Antigravity) did the living-docs review; Neon unused.
+concurrent on this 14 GB machine (2 concurrent worked reliably). OpenCode HY4 free failed
+every task at 9 concurrent but worked cleanly at 1 concurrent. Gemini Hydrogen and Neon
+(Antigravity) both handled codebase audits/refactors well (watch Neon individual quota).
 
 ## Repository
 
-- `master` is pushed and up to date with `origin/master`. CI's stale-reference guard skips
-  `docs/`, `SESSION-NEXT.md`, and `NOTES_FOR_PI.md`. Local branch `docs-housekeeping` was
-  deleted. `goose/` is an untracked separate repo. Open from housekeeping: parked Slice A
-  roadmap items (drop or keep?) and the unverified "20 driver invocations" line in `decisions.md`.
-- Run adapter tests with Harbor's Python from `tools/`. The pre-commit hook requires every
-  `.md` under `docs/` and the local research notes to appear in `docs/INDEX.md`.
+- `master` is at `d489a38` (pushed to `origin/master`; GitHub Actions CI ✓ green across
+  `0aab2ab`, `dd4f8a6`, `d489a38`). CI's stale-reference guard skips `docs/`,
+  `SESSION-NEXT.md`, and `NOTES_FOR_PI.md`. Local branch `docs-housekeeping` was deleted.
+  `goose/` is an untracked separate repo. Open from housekeeping: parked Slice A roadmap
+  items (drop or keep?) and the unverified "20 driver invocations" line in `decisions.md`.
+- Run adapter tests with Harbor's Python from `tools/` (`18/18` green + `25/25` `test_rof_*`
+  green; Rust workspace `463` passed, `0` failed, `2` ignored live tests, 13 crates). The
+  pre-commit hook requires every `.md` under `docs/` and the local research notes to appear
+  in `docs/INDEX.md`.
 
 ## Evidence pointers
 
+- [TB4.1 CPU option screen](docs/experiments/2026-11-25-tb41-option-screen.md) (48 Harbor runs
+  at 300k: 0/48 solved across control, `exec_output`, `rollback_scope`, `max_tokens: 32768`;
+  `$1.81` live / `$3.6813` peak; mechanisms verified, defaults unchanged).
 - [Local harness checks](docs/experiments/2026-11-23-local-harness-checks.md),
   [budget-line A/B](docs/experiments/2026-11-23-budget-line-ab.md) (requests 1/4, legacy
   0/4, did not repeat; flag stays opt-in).
@@ -104,11 +111,12 @@ Gemini Hydrogen (Antigravity) did the living-docs review; Neon unused.
   audit `target/tb41-cpu-baseline-20261123/fidelity-audit.json`.
 - TB4.1 CPU preflight (`target/tb41-cpu-baseline-20261123/`, tasks pinned at
   `4070d6cef56a`): oracle reward 1 on `bun-sourcemap-leak`, `heat-pump-warranty`,
-  `music-harmony`, `ontology-kg-querying`; `production-planning`, `risk-scorer-replay`,
-  `rs-archive-clone` fail in image build; `nextjs-performance` retry ended in
-  `VerifierTimeoutError`. No paid 4.1 baseline ran.
+  `music-harmony`, `ontology-kg-querying` (all 4 screened 0/12 per arm at 300k above);
+  `production-planning`, `risk-scorer-replay`, `rs-archive-clone` fail in image build;
+  `nextjs-performance` retry ended in `VerifierTimeoutError`.
 - Slice A faithful baseline 5/18 at 300k/60/120; 47 of 52 failures halted on tokens.
   Exclude `dna-insert`, `dna-assembly`, `make-mips-interpreter` from validating
   diagnosis-motivated changes (oracle solutions were read).
-- Agent tree is opt-in and unwired from `rof eval`. Rollback-policy and write-plus-exec
+- Agent tree is opt-in and unwired from Harbor (`rof eval` retired in `0aab2ab`).
+  `--rollback-scope errors` is built and screened (0/12 at 300k; stays opt-in); write-plus-exec
   workflow changes remain unbuilt.
