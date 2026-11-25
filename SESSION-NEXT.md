@@ -1,39 +1,45 @@
 # Session handoff · 2026-11-25
 
-## Pick up here: run Step 2 uncapped-token + append-only calibration on 4 oracle-verified TB4.1 tasks
+## Pick up here: fix 600s non-streaming timeout double-billing before next TB4.1 run
 
-The 48-run [TB4.1 CPU option screen](docs/experiments/2026-11-25-tb41-option-screen.md)
-completed with **0 infra errors** and **0/48 solved** across all four arms at 300k gross tokens
-(47/48 halted on tokens; 1/48 halted on 32k reasoning truncation on `r3-music-harmony-response`).
-All three mechanisms fired cleanly in WALs; all defaults stay unchanged.
+Step 1 plumbing (`bd482ba`) and the first pair of the [TB4.1 uncapped calibration](docs/experiments/2026-11-25-tb41-uncapped-calib.md)
+completed on `photonic-waveguide-routing` (0.75 h, oracle 1.0) before the `$1.50` live-spend
+guard cleanly stopped the sweep (**0/2 solved**, `$1.88` live / `$1.6208` peak):
 
-1. **Key and balance (live 2026-11-25):** `.env.deepseek` (repo key): **$3.51 USD** (moved from
-   $5.36 → $5.33 on check trial → $5.32 → $3.51 across all 48 runs; **$1.81 live** vs **$3.6813**
-   peak price book). Pi key (`~/.pi/agent/auth.json`, `deepseek.key`): **¥157.46 CNY**.
-   `~/.config/jcode/deepseek.env` is a dead key; do not use it.
-2. **Step 1 plumbing landed (uncommitted in working tree; defaults unchanged):**
-   - `--budget-tokens 0` / Harbor `budget_tokens=0` uncaps cumulative tokens (`budget_line()` omits
-     the token segment cleanly in both `legacy` and `requests` modes).
-   - `--budget-spend-cents N` / Harbor `budget_usd` configures the USD spend cap (`0` disables it;
-     omitted keeps the `$4.00` preset).
-   - `--max-tokens 0|omit` / Harbor `max_tokens=0|None` omits `"max_tokens"` on the wire (letting
-     DeepSeek use its 64K thinking default); `MAX_TOKENS_CEILING` raised from `32_768` →
-     **`393_216`** (DeepSeek 384K wire ceiling; omitted truncation jumps `0 → 131_072 → 262_144 →
-     393_216`).
-   - Verified green: `provider-openai` + `agent-loop` + `rof` tests, `clippy --tests -- -D warnings`,
-     `cargo fmt --check`, and 44/44 Python tests.
-3. **Free oracle preflights (`4070d6cef56a`, `target/tb41-oracle-20261125/`):**
-   - `photonic-waveguide-routing` (0.75 h): oracle **1.0** (0 exceptions, 7m 29s cold build).
-   - `html-js-filter` (0.75 h): excluded (`VerifierTimeoutError` in `_separate_verifier_env`, 10m 39s).
-4. **Next decision (Step 2 calibration, pending owner go-ahead):** rebuild frozen runtime bundle,
-   then run a **4-task × 2-arm × 1-rep** (8 trials, hard-capped at `$1.00`/trial peak / `$1.50`
-   total live USD) calibration on `photonic-waveguide-routing` (0.75 h), `music-harmony` (1.0 h),
-   `bun-sourcemap-leak` (1.5 h), and `heat-pump-warranty` (4.0 h) with `budget_tokens=0`,
-   `budget_usd=1.0`, `budget_steps=200`, `budget_actions=400`, `max_tokens=0` (omitted → 64K server
-   default): **Arm A** `5/2` retention vs **Arm B** `1000/1000` append-only prefix retention (tests
-   both non-zero solve floor and DeepSeek prefix cache-hit rate vs the measured 42.0% under `5/2`).
-5. **Raw data:** `target/tb41-option-screen-20261125/` (`ledger.jsonl`, `summary-48.json`, `jobs/`),
-   `target/tb41-oracle-20261125/`.
+- `control_5_2` (`5/2` retention): `0.0` reward (12/14 tests), 188 turns, `4.41M` in (**`62.4%`**
+  cache hit, `1.66M` uncached), `440k` out, `$1.0431` peak / `$1.00` live, `3,064s`, halted on
+  `$1.00` spend cap (`0.00 µm` net overlap).
+- `append_1000` (`1000/1000` retention): `0.0` reward (12/14 tests), 25 turns, `3.29M` in
+  (**`92.9%`** cache hit, **99.3%–99.6% steady-state**, `234k` uncached — **7.1× lower cache-miss
+  spend**), `408k` out, `$0.5777` peak / `$0.88` live, `3,753s`, halted on `3,600s` wallclock
+  (`7.87 µm` vs `8.00 µm` min sep — within `0.13 µm` of valid geometry).
+
+1. **Key and balance (live 2026-11-25):** `.env.deepseek` (repo key): **`$1.59 USD`** (moved
+   `$3.47 → $2.47 → $1.59` during PEAK hours across the 2 calibration trials). Pi key
+   (`~/.pi/agent/auth.json`, `deepseek.key`): **¥157.46 CNY**. `~/.config/jcode/deepseek.env` is a
+   dead key; do not use it.
+2. **Root bug exposed by `append_1000` (`t05`, `dt=1,727s`, `attempts=4`, `+$0.30` silent spend):**
+   - Non-streaming HTTP requests use a whole-body `REQUEST_TIMEOUT = 600s`
+     (`crates/provider-openai/src/client.rs:47`). A >64K reasoning reply takes >600s, times out on
+     the client, returns `usage: None`, and retries up to 5× while DeepSeek still bills the
+     aborted generations on the server (`$0.88` live vs `$0.58` recorded peak) without emitting
+     `provider-usage-unknown`.
+   - Three long reasoning turns (`t05` 91.6k / 1,727s, `t09` 74.5k / 388s, `t10` 174.4k / 841s)
+     ate 82% of the 3,600s wallclock.
+3. **Next decision (ordered):**
+   - **(a) Fix provider timeout/streaming & accounting ($0 spend):** use SSE streaming with a
+     per-chunk idle timeout (so active >600s reasoning streams never disconnect mid-generation)
+     and mark timed-out in-flight requests `usage_unknown` (never silently re-billing 600s
+     timeouts).
+   - **(b) Re-run a cheap off-peak calibration (50% cheaper on DeepSeek):** test `append_1000`
+     (which already proved **99.5% cache hit** / `$0.0015/turn` input cost) with streaming +
+     bounded per-turn reasoning (e.g. `reasoning_effort` or explicit `max_tokens: 32768` vs
+     omitted) on `music-harmony`, `bun-sourcemap-leak`, `photonic-waveguide-routing`, and
+     `heat-pump-warranty`.
+4. **Raw data:** `target/tb41-option-screen-20261125/`, `target/tb41-oracle-20261125/`,
+   `target/tb41-calib-20261125/` (`ledger.jsonl`, `calib.log`, `jobs/`).
+   Frozen runtime: `target/calibration-runtime-20261125/rof` (`bd482ba`, SHA-256
+   `eda776330e9e963b8a953b9d3ec9b82ffbec09779bece1a6332f01457addc2ae`).
 
 Disk: Docker/containerd storage is bind-mounted from `/mnt/models` (33 GB free) via
 `/etc/fstab` with a systemd `RequiresMountsFor` drop-in; `/` has ~6.8 GB free (`target/debug`

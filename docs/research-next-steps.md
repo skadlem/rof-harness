@@ -20,8 +20,14 @@ oracle preflight (storage/build failures) and no paid baseline on either slice.
 > (4 tasks × 4 arms × 3 reps = 48 runs, 0 infra errors, $3.68 peak / $1.81 live USD):
 > **0/48 solved** across control, `exec_output: "head-tail"`, `rollback_scope: "errors"`, and
 > `max_tokens: 32768` at the 300k gross token cap (47/48 token halts, 1/48 32k truncation halt).
-> All three mechanisms verified in WALs, all defaults unchanged; `.env.deepseek` live balance is
-> `$3.51 USD` (Pi key `¥157.46 CNY`).
+> Follow-up Step 1 plumbing (`bd482ba`: `--budget-tokens 0`, `--budget-spend-cents`, `--max-tokens 0|omit`,
+> `MAX_TOKENS_CEILING = 393_216`) + [uncapped calibration](experiments/2026-11-25-tb41-uncapped-calib.md)
+> on `photonic-waveguide-routing` (0.75 h, oracle 1.0) ran 2 trials before hitting the `$1.50` live
+> stop (`$1.88` live / `$1.62` peak; 0/2 solved): `append_1000` lifted cache hit **62.4% → 92.9%**
+> (**99.5% steady-state**) and got within `0.13 µm` of valid geometry in 25 turns vs `control_5_2`'s
+> `0.00 µm` overlap at 188 turns, but exposed a 600 s non-streaming `REQUEST_TIMEOUT` silent
+> double-billing / 29-minute stall on `t05` (`attempts=4`, `+$0.30` unrecorded server spend).
+> All defaults unchanged; `.env.deepseek` live balance is **`$1.59 USD`** (Pi key `¥157.46 CNY`).
 
 - **Baseline:** 5/18 on the faithful Slice A slice (`crates/eval/slices/tb-slice-a.json`, frozen
   recipe 300k/60/120); published frontier expectation on the same tasks 12.08/18, gap not

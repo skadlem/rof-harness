@@ -70,6 +70,7 @@ Update this file in the same commit as adding, superseding or voiding a note.
 - [no-evidence-census](experiments/2026-11-24-no-evidence-census.md) — 286 logged runs: the output cut drops 21% of exit verdicts, 1.5% of replies waste 8,000 reasoning tokens, rollback saves little; time, spend and repeat caps never bind · **record**
 - [local-harness-checks](experiments/2026-11-23-local-harness-checks.md) — request payload, archive recovery and rollback measurements · **record**
 - [tb41-option-screen](experiments/2026-11-25-tb41-option-screen.md) — 48 Harbor runs on four TB4.1 CPU tasks at 300k tokens: 0/48 solved across control, head-tail output, errors-only rollback, and 32k responses ($1.81 live / $3.68 peak); mechanisms verified, defaults unchanged · **record**
+- [tb41-uncapped-calib](experiments/2026-11-25-tb41-uncapped-calib.md) — 2 Harbor runs on TB4.1 `photonic-waveguide-routing` (uncapped tokens, omitted `max_tokens`, `$1.00` cap, `$1.88` live / `$1.62` peak, stopped by `$1.50` live guard): 0/2 solved; `append_1000` lifted cache hit 62.4% → 92.9% (99.5% steady-state) and exposed 600s non-streaming timeout double-billing · **record**
 
 ## Reviews (independent verdicts)
 

@@ -6,13 +6,16 @@ Ordered and spend-gated plan of open work. Decision records and measurements liv
 
 ## Open work (ordered)
 
-1. **TB4.1 CPU option screen (completed 2026-11-25, 0/48 solved at 300k):**
-   [2026-11-25-tb41-option-screen](experiments/2026-11-25-tb41-option-screen.md). All 48 runs
-   completed with 0 infra errors ($3.68 peak / $1.81 live USD) across control,
-   `exec_output: "head-tail"`, `rollback_scope: "errors"`, and `max_tokens: 32768` at 300k gross
-   tokens; 0/12 solved in every arm (47/48 token halts, 1/48 32k truncation halt). All three
-   mechanisms verified in WALs; defaults unchanged. Next benchmark step: select a non-zero-floor
-   TB4.1 CPU slice (or 1.2M pilot budget) before running further option screens.
+1. **TB4.1 CPU option screen (completed 2026-11-25, 0/48 solved at 300k) & uncapped calibration (2026-11-25, 0/2 on `photonic-waveguide-routing`):**
+   [2026-11-25-tb41-option-screen](experiments/2026-11-25-tb41-option-screen.md) and
+   [2026-11-25-tb41-uncapped-calib](experiments/2026-11-25-tb41-uncapped-calib.md). Step 1
+   plumbing (`bd482ba`) added `--budget-tokens 0`, `--budget-spend-cents`, `--max-tokens 0|omit`,
+   and `MAX_TOKENS_CEILING = 393_216`. On `photonic-waveguide-routing` (`$1.00`/trial cap,
+   `$1.88` live / `$1.62` peak, stopped by `$1.50` live guard), `append_1000` lifted cache hit
+   **62.4% → 92.9%** (**99.5% steady-state**) and cut cache-miss input **7.1×**, but exposed
+   a 600 s non-streaming `REQUEST_TIMEOUT` silent double-billing / 29-min stall on long
+   reasoning turns. Next step: fix the streaming/idle-timeout + timeout-usage-unknown bug before
+   further paid TB4.1 runs (live `.env.deepseek` balance `$1.59 USD`).
 2. **Phased capability sequence (2026-11-11):**
    [capability-phases](superpowers/plans/2026-11-11-capability-phases.md). Phases 0–4 landed
    locally and opt-in ([phase-0-2](phase-0-2-implementation.md),
