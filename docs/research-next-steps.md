@@ -23,11 +23,15 @@ oracle preflight (storage/build failures) and no paid baseline on either slice.
 > Follow-up Step 1 plumbing (`bd482ba`: `--budget-tokens 0`, `--budget-spend-cents`, `--max-tokens 0|omit`,
 > `MAX_TOKENS_CEILING = 393_216`) + [uncapped calibration](experiments/2026-11-25-tb41-uncapped-calib.md)
 > on `photonic-waveguide-routing` (0.75 h, oracle 1.0) ran 2 trials before hitting the `$1.50` live
-> stop (`$1.88` live / `$1.62` peak; 0/2 solved): `append_1000` lifted cache hit **62.4% → 92.9%**
-> (**99.5% steady-state**) and got within `0.13 µm` of valid geometry in 25 turns vs `control_5_2`'s
-> `0.00 µm` overlap at 188 turns, but exposed a 600 s non-streaming `REQUEST_TIMEOUT` silent
-> double-billing / 29-minute stall on `t05` (`attempts=4`, `+$0.30` unrecorded server spend).
-> All defaults unchanged; `.env.deepseek` live balance is **`$1.59 USD`** (Pi key `¥157.46 CNY`).
+> stop (`$1.88` live / `$1.62` peak; 0/2 solved), lifting cache hit **62.4% → 92.9%** (**99.5%
+> steady-state**) and exposing a 600 s non-streaming timeout double-billing bug (fixed in `47e9811`:
+> SSE per-chunk idle timeout + `Response.usage_unknown` + Harbor `stream: bool`).
+> The subsequent 4-task [off-peak streaming pass](experiments/2026-11-25-tb41-offpeak-streaming.md)
+> (`append_1000` + `stream=True` + uncapped tokens, **`$0.71` live / `$1.4171` peak**) ran all 4/4
+> cleanly with `0` timeouts, `0` `usage_unknown`, **95.5%–98.0% cache hit**, and **66/85 subtests
+> passing** (3/4 declared Done voluntarily at `$0.06–$0.19` live/run; `0/4` binary solves —
+> remaining gaps are semantic/edge-case misses, not budget starvation).
+> All defaults unchanged; `.env.deepseek` live balance is **`$0.87 USD`** (Pi key `¥157.46 CNY`).
 
 - **Baseline:** 5/18 on the faithful Slice A slice (`crates/eval/slices/tb-slice-a.json`, frozen
   recipe 300k/60/120); published frontier expectation on the same tasks 12.08/18, gap not

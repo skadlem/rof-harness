@@ -71,6 +71,7 @@ Update this file in the same commit as adding, superseding or voiding a note.
 - [local-harness-checks](experiments/2026-11-23-local-harness-checks.md) — request payload, archive recovery and rollback measurements · **record**
 - [tb41-option-screen](experiments/2026-11-25-tb41-option-screen.md) — 48 Harbor runs on four TB4.1 CPU tasks at 300k tokens: 0/48 solved across control, head-tail output, errors-only rollback, and 32k responses ($1.81 live / $3.68 peak); mechanisms verified, defaults unchanged · **record**
 - [tb41-uncapped-calib](experiments/2026-11-25-tb41-uncapped-calib.md) — 2 Harbor runs on TB4.1 `photonic-waveguide-routing` (uncapped tokens, omitted `max_tokens`, `$1.00` cap, `$1.88` live / `$1.62` peak, stopped by `$1.50` live guard): 0/2 solved; `append_1000` lifted cache hit 62.4% → 92.9% (99.5% steady-state) and exposed 600s non-streaming timeout double-billing · **record**
+- [tb41-offpeak-streaming](experiments/2026-11-25-tb41-offpeak-streaming.md) — 4 off-peak Harbor runs on TB4.1 (`append_1000` + `stream=True` + uncapped tokens + omitted `max_tokens`, `$0.71` live / `$1.42` peak): 0/4 binary solves (66/85 subtests, 71%–86% per task); 3/4 finished voluntarily (`exit=0`), 95.5%–98.0% cache hit, 0 timeouts, 0 `usage_unknown`, `$0.06–$0.38` live/run · **record**
 
 ## Reviews (independent verdicts)
 
