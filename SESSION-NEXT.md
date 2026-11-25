@@ -32,12 +32,32 @@ peak):
    `ledger.jsonl`, `offpeak.log`, `jobs/`); runtime `target/stream-calib-runtime-20261125/rof`
    (`47e9811`, SHA-256 `5d67f0cb9e244ecbbaf04e1ef4117e236964c152e49d0d33cd060db3f12e24a3`).
 
-Disk: Docker/containerd storage is bind-mounted from `/mnt/models` (33 GB free) via
-`/etc/fstab` with a systemd `RequiresMountsFor` drop-in; `/` has ~6.8 GB free (`target/debug`
+Disk: Docker/containerd storage is bind-mounted from `/mnt/models` (31 GB free) via
+`/etc/fstab` with a systemd `RequiresMountsFor` drop-in; `/` has ~5.7 GB free (`target/debug`
 cleaned). Build with `CARGO_INCREMENTAL=0`.
 
 ## Done 2026-11-25
 
+- **Off-peak streaming + append-only pass (`bdef143`):** 4/4 TB4.1 CPU tasks completed cleanly
+  with `0` timeouts, `0` `usage_unknown`, `0` rollbacks, `95.5%–98.0%` prefix cache hit,
+  `66/85` subtests passing (3/4 declared Done voluntarily at `$0.06–$0.19` live/run), `$0.71`
+  live / `$1.4171` peak (`0/4` binary solves; defaults unchanged)
+  ([2026-11-25-tb41-offpeak-streaming](docs/experiments/2026-11-25-tb41-offpeak-streaming.md)).
+- **SSE idle-timeout & `usage_unknown` fix (`47e9811`):** removed client-wide `reqwest`
+  `.timeout(REQUEST_TIMEOUT)` so SSE streaming uses per-phase/per-chunk idle timeouts (fixing the
+  600 s timeout silent double-billing bug), added `Response.usage_unknown` propagation to
+  `agent-loop` (`provider-usage-unknown` + cleared `cost_usd`), and wired opt-in Harbor
+  `stream: bool = False` → `--stream on`.
+- **Uncapped-token plumbing (`bd482ba`) & peak calibration pair (`256bdc2`):** added
+  `--budget-tokens 0` (uncapped; omitted from `budget_line()`), `--budget-spend-cents N` / Harbor
+  `budget_usd`, `--max-tokens 0|omit` (omitted on wire → DeepSeek 64K default), and raised
+  `MAX_TOKENS_CEILING` `32_768 → 393_216` (DeepSeek 384K ceiling). Verified 11 coding-agent
+  harnesses (0/11 cap cumulative gross tokens). Free oracle preflights on shortest TB4.1 tasks:
+  `photonic-waveguide-routing` (0.75 h) **1.0**, `html-js-filter` (0.75 h) excluded
+  (`VerifierTimeoutError`). Paired peak calibration on `photonic-waveguide-routing` confirmed
+  `append_1000` lifted cache hit `62.4% → 92.9%` (`99.5%` steady-state, 7.1× lower cache-miss
+  spend) and caught the 600 s non-streaming timeout bug
+  ([2026-11-25-tb41-uncapped-calib](docs/experiments/2026-11-25-tb41-uncapped-calib.md)).
 - **Behavior-preserving cleanup (`1aef3fa`):** removed `crates/trace`, 3 unused Cargo deps
   (`eval/tokio`, `bets/serde_json`, `agent-budget/serde_json`), unwired Bet C (`bets/src/race.rs`),
   test-only `drive_tick` + `EffectGate` + no-op `ContextAssembler`, 0-caller `eval`/`snapshot`/
@@ -97,18 +117,25 @@ every task at 9 concurrent but worked cleanly at 1 concurrent. Gemini Hydrogen a
 
 ## Repository
 
-- `master` is at `d489a38` (pushed to `origin/master`; GitHub Actions CI ✓ green across
-  `0aab2ab`, `dd4f8a6`, `d489a38`). CI's stale-reference guard skips `docs/`,
-  `SESSION-NEXT.md`, and `NOTES_FOR_PI.md`. Local branch `docs-housekeeping` was deleted.
-  `goose/` is an untracked separate repo. Open from housekeeping: parked Slice A roadmap
-  items (drop or keep?) and the unverified "20 driver invocations" line in `decisions.md`.
-- Run adapter tests with Harbor's Python from `tools/` (`18/18` green + `25/25` `test_rof_*`
-  green; Rust workspace `463` passed, `0` failed, `2` ignored live tests, 13 crates). The
-  pre-commit hook requires every `.md` under `docs/` and the local research notes to appear
-  in `docs/INDEX.md`.
+- `master` is pushed to `origin/master` through the 2026-11-25 streaming/calibration handoff
+  (`bd482ba`, `256bdc2`, `47e9811`, `bdef143` + this handoff). CI's stale-reference guard skips
+  `docs/`, `SESSION-NEXT.md`, and `NOTES_FOR_PI.md`. `goose/` is an untracked separate repo.
+  Open from housekeeping: parked Slice A roadmap items (drop or keep?) and the unverified
+  "20 driver invocations" line in `decisions.md`.
+- Run adapter tests with Harbor's Python from `tools/` (`19/19` `test_harbor_rof.py` + `25/25`
+  `test_rof_*` = `44/44` green; Rust workspace `provider-core`/`provider-openai`/`agent-loop`/
+  `rof` tests + `clippy --tests -- -D warnings` + `cargo fmt --check` green). The pre-commit
+  hook requires every `.md` under `docs/` and the local research notes to appear in
+  `docs/INDEX.md`.
 
 ## Evidence pointers
 
+- [TB4.1 off-peak streaming pass](docs/experiments/2026-11-25-tb41-offpeak-streaming.md) (4
+  Harbor runs: `append_1000` + `stream=True` + uncapped tokens; 0/4 binary solves, 66/85 subtests
+  passing, 3/4 voluntary `Done`, 95.5%–98.0% cache hit, 0 timeouts, `$0.71` live / `$1.4171` peak).
+- [TB4.1 uncapped calibration pair](docs/experiments/2026-11-25-tb41-uncapped-calib.md) (2 peak
+  Harbor runs on `photonic-waveguide-routing`: `control_5_2` vs `append_1000`; confirmed prefix
+  cache fix `62.4% → 92.9%` and exposed 600 s non-streaming timeout double-billing; `$1.88` live).
 - [TB4.1 CPU option screen](docs/experiments/2026-11-25-tb41-option-screen.md) (48 Harbor runs
   at 300k: 0/48 solved across control, `exec_output`, `rollback_scope`, `max_tokens: 32768`;
   `$1.81` live / `$3.6813` peak; mechanisms verified, defaults unchanged).
@@ -120,11 +147,13 @@ every task at 9 concurrent but worked cleanly at 1 concurrent. Gemini Hydrogen a
   `~/.local/share/rof-cost/mf-billed-by-rep.json`.
 - The earlier 8/8 environment-state claim was wrong (archived arm: 2/8 native passes);
   audit `target/tb41-cpu-baseline-20261123/fidelity-audit.json`.
-- TB4.1 CPU preflight (`target/tb41-cpu-baseline-20261123/`, tasks pinned at
-  `4070d6cef56a`): oracle reward 1 on `bun-sourcemap-leak`, `heat-pump-warranty`,
-  `music-harmony`, `ontology-kg-querying` (all 4 screened 0/12 per arm at 300k above);
-  `production-planning`, `risk-scorer-replay`, `rs-archive-clone` fail in image build;
-  `nextjs-performance` retry ended in `VerifierTimeoutError`.
+- TB4.1 CPU preflight (`target/tb41-cpu-baseline-20261123/` & `target/tb41-oracle-20261125/`,
+  tasks pinned at `4070d6cef56a`): oracle reward 1 on `photonic-waveguide-routing` (0.75 h),
+  `music-harmony` (1.0 h), `bun-sourcemap-leak` (1.5 h), `heat-pump-warranty` (4.0 h),
+  `ontology-kg-querying` (20.0 h), plus `freight-dispatch-shift` & `cargo-flight-dispatch` in
+  `~/.local/share/rof-tb/datasets/tb41-next-slice-20261111-full/tasks/`; `production-planning`,
+  `risk-scorer-replay`, `rs-archive-clone` fail in image build; `nextjs-performance` and
+  `html-js-filter` ended in `VerifierTimeoutError`.
 - Slice A faithful baseline 5/18 at 300k/60/120; 47 of 52 failures halted on tokens.
   Exclude `dna-insert`, `dna-assembly`, `make-mips-interpreter` from validating
   diagnosis-motivated changes (oracle solutions were read).
